@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 
 from app.audit.routes import router as audit_router
+from app.compliance.routes import router as compliance_router
 from app.core.database import engine
 from app.numbering.identity.routes import router as identity_router
 
@@ -18,6 +19,7 @@ app.add_middleware(
 
 app.include_router(identity_router)
 app.include_router(audit_router)
+app.include_router(compliance_router)
 
 
 @app.get("/health")

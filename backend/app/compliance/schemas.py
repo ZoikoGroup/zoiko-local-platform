@@ -1,0 +1,33 @@
+from datetime import datetime
+
+from pydantic import BaseModel, ConfigDict
+
+
+class ComplianceRuleResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    country: str
+    requirement_type: str
+    required_documents: list
+    is_active: bool
+
+
+class ComplianceCaseCreate(BaseModel):
+    jurisdiction: str
+    requirement_type: str
+    number_id: str | None = None
+
+
+class ComplianceCaseResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    account_id: str
+    number_id: str | None
+    jurisdiction: str
+    requirement_type: str
+    status: str
+    documents: list
+    expires_at: datetime | None
+    created_at: datetime
