@@ -1,11 +1,13 @@
 "use client";
 
-import { useRouter } from "next/navigation";
+import { useRouter, usePathname } from "next/navigation";
 import { clearToken } from "@/lib/auth";
+import { currentPageLabel } from "@/lib/nav";
 import type { User } from "@/lib/api";
 
 export default function Topbar({ user }: { user: User | null }) {
   const router = useRouter();
+  const pathname = usePathname();
 
   function handleLogout() {
     clearToken();
@@ -14,7 +16,7 @@ export default function Topbar({ user }: { user: User | null }) {
 
   return (
     <header className="h-16 border-b border-slate-200 bg-white flex items-center justify-between px-6">
-      <h1 className="text-lg font-semibold text-slate-900">Dashboard</h1>
+      <h1 className="text-lg font-semibold text-slate-900">{currentPageLabel(pathname)}</h1>
 
       <div className="flex items-center gap-4">
         <button className="bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-medium rounded-lg px-4 py-2 transition">
