@@ -1,4 +1,5 @@
 import enum
+import uuid
 from datetime import datetime
 
 from sqlalchemy import DateTime, Enum, ForeignKey, String, func
@@ -6,7 +7,10 @@ from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
-from app.core.ids import new_uuid
+
+
+def new_uuid() -> str:
+    return str(uuid.uuid4())
 
 
 class AccountType(str, enum.Enum):
