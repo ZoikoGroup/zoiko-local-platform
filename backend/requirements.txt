@@ -9,6 +9,7 @@ passlib==1.7.4
 bcrypt==4.0.1  # pinned: passlib 1.7.4 is incompatible with bcrypt>=4.1 (removed __about__ + wrap-bug self-test API)
 python-jose[cryptography]==3.3.0
 email-validator==2.2.0
+twilio==9.10.9
 
 # dev/test
 pytest==8.3.3

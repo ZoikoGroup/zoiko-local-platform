@@ -4,8 +4,10 @@ from sqlalchemy import text
 
 from app.core.database import engine
 from app.numbering.identity.routes import router as identity_router
+from app.media.voice import router as voice_router
 
 app = FastAPI(title="Zoiko Local API")
+app.include_router(voice_router)
 
 app.add_middleware(
     CORSMiddleware,

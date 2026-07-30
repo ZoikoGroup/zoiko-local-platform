@@ -21,5 +21,13 @@ Source architecture: `docs/Zoiko_Local_Backend_Architecture.docx`, `docs/Zoiko_L
 ## Build sequence (see README.md for full list)
 We build one stage fully working end-to-end before starting the next. Do not scaffold folders for a stage you haven't reached yet.
 
+**Exception (2026-07-30):** Founder approved starting Stage 2/3 telecom groundwork
+(`integrations/telecom/twilio.py`, `app/media/voice.py`) in parallel with Stage 1, since
+it has no dependency on Account/User models. This code has no auth, entitlement, or audit
+checks yet and is not wired to any data model — it's a working Provider Gateway + call
+webhook, not a finished feature. Whoever finishes Stage 1 and starts Stage 2 properly
+needs to go back and add the Account/Number linkage, audit logging, and access control
+before this is production-ready. Don't treat its existence as "Stage 3 is done."
+
 ## What NOT to build yet
 No Kafka/event bus, no Kubernetes, no multi-country compliance, no ZoikoNex integration (use Stripe as a local stand-in when we reach billing), no AI Receptionist/video until the core number+voice loop is solid.

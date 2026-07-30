@@ -8,5 +8,7 @@ class Settings(BaseSettings):
     jwt_secret_key: str = "change-me-in-real-env"
     environment: str = "development"
 
+    twilio_account_sid: str = ""
+    twilio_auth_token: str = ""
 
 settings = Settings()
