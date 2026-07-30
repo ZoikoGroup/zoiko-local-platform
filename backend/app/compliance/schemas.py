@@ -19,6 +19,15 @@ class ComplianceCaseCreate(BaseModel):
     number_id: str | None = None
 
 
+class DocumentSubmit(BaseModel):
+    document_type: str
+    reference: str
+
+
+class CaseRejectRequest(BaseModel):
+    reason: str | None = None
+
+
 class ComplianceCaseResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 

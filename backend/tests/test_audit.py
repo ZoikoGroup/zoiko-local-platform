@@ -16,8 +16,14 @@ def _signup_and_login(client, email: str) -> str:
 def test_signup_creates_an_audit_event(client, db_session):
     from app.audit.models import AuditEvent
 
-    client.post("/auth/signup", json=_signup_payload("audit1@example.com"))
-    events = db_session.query(AuditEvent).filter(AuditEvent.action == "account.signup").all()
+    signup_response = client.post("/auth/signup", json=_signup_payload("audit1@example.com"))
+    account_id = signup_response.json()["account_id"]
+
+    events = (
+        db_session.query(AuditEvent)
+        .filter(AuditEvent.action == "account.signup", AuditEvent.target == f"account:{account_id}")
+        .all()
+    )
     assert len(events) == 1
     assert events[0].after_hash is not None
 
@@ -25,8 +31,15 @@ def test_signup_creates_an_audit_event(client, db_session):
 def test_login_creates_an_audit_event(client, db_session):
     from app.audit.models import AuditEvent
 
-    _signup_and_login(client, "audit2@example.com")
-    events = db_session.query(AuditEvent).filter(AuditEvent.action == "user.login").all()
+    token = _signup_and_login(client, "audit2@example.com")
+    me_response = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"})
+    user_id = me_response.json()["id"]
+
+    events = (
+        db_session.query(AuditEvent)
+        .filter(AuditEvent.action == "user.login", AuditEvent.target == f"user:{user_id}")
+        .all()
+    )
     assert len(events) == 1
 
 
