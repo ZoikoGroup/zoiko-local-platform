@@ -45,3 +45,25 @@ def test_login_unknown_email_fails(client):
         "/auth/login", json={"email": "doesnotexist@example.com", "password": "whatever"}
     )
     assert response.status_code == 401
+
+
+def test_me_returns_current_user_with_valid_token(client):
+    client.post("/auth/signup", json=_signup_payload("me@example.com"))
+    login_response = client.post(
+        "/auth/login", json={"email": "me@example.com", "password": "supersecret123"}
+    )
+    token = login_response.json()["access_token"]
+
+    response = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"})
+    assert response.status_code == 200
+    assert response.json()["email"] == "me@example.com"
+
+
+def test_me_rejects_missing_token(client):
+    response = client.get("/auth/me")
+    assert response.status_code == 401
+
+
+def test_me_rejects_invalid_token(client):
+    response = client.get("/auth/me", headers={"Authorization": "Bearer not-a-real-token"})
+    assert response.status_code == 401

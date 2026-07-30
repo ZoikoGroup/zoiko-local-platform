@@ -1,1 +1,1 @@
-Frontend tests. Empty until the frontend itself is started in Stage 9.
+Frontend tests. Empty for now — add tests here as pages get built out.
