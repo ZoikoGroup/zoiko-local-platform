@@ -64,3 +64,33 @@ export function getCurrentUser(token: string): Promise<User> {
     headers: { Authorization: `Bearer ${token}` },
   });
 }
+
+export type ComplianceRule = {
+  id: string;
+  country: string;
+  requirement_type: string;
+  required_documents: string[];
+  is_active: boolean;
+};
+
+export function getComplianceRules(country: string): Promise<ComplianceRule[]> {
+  return request<ComplianceRule[]>(`/compliance/rules?country=${country}`);
+}
+
+export type ComplianceCase = {
+  id: string;
+  status: string;
+  jurisdiction: string;
+  requirement_type: string;
+};
+
+export function openComplianceCase(
+  token: string,
+  input: { jurisdiction: string; requirement_type: string }
+): Promise<ComplianceCase> {
+  return request<ComplianceCase>("/compliance/cases", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify(input),
+  });
+}
