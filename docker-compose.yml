@@ -1,0 +1,15 @@
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: zoiko
+      POSTGRES_PASSWORD: zoiko
+      POSTGRES_DB: zoiko_local
+    ports:
+      - "5432:5432"
+    volumes:
+      - zoiko_pgdata:/var/lib/postgresql/data
+
+volumes:
+  zoiko_pgdata:
