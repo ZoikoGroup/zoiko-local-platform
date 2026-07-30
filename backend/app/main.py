@@ -2,8 +2,10 @@ from fastapi import FastAPI
 from sqlalchemy import text
 
 from app.core.database import engine
+from app.numbering.identity.routes import router as identity_router
 
 app = FastAPI(title="Zoiko Local API")
+app.include_router(identity_router)
 
 
 @app.get("/health")

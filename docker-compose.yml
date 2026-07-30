@@ -7,7 +7,7 @@ services:
       POSTGRES_PASSWORD: zoiko
       POSTGRES_DB: zoiko_local
     ports:
-      - "5432:5432"
+      - "5433:5432"  # host 5433 -> avoids conflict with other local Postgres containers on 5432
     volumes:
       - zoiko_pgdata:/var/lib/postgresql/data
 
