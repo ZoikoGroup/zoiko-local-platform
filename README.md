@@ -60,7 +60,17 @@ cd backend
 python -m venv venv
 venv\Scripts\activate        # Windows
 pip install -r requirements.txt
-docker-compose up -d          # starts Postgres
-uvicorn app.main:app --reload
+cd ..
+make db        # starts Postgres
+make migrate   # applies migrations
+make seed      # creates a demo account (optional)
+make dev       # starts the API with reload
+make test      # runs the test suite
 ```
-# zoiko-local-platform
+
+**Windows only**: `make` isn't installed by default. Install it once with:
+```
+winget install ezwinports.make
+```
+(Restart your terminal afterwards so `make` is on PATH.)
+

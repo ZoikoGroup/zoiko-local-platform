@@ -1,16 +1,18 @@
+PY := venv/Scripts/python.exe
+
 .PHONY: dev db migrate test seed
 
 dev:
-	cd backend && uvicorn app.main:app --reload
+	cd backend && $(PY) -m uvicorn app.main:app --reload
 
 db:
 	docker-compose up -d
 
 migrate:
-	cd backend && alembic upgrade head
+	cd backend && $(PY) -m alembic upgrade head
 
 test:
-	cd backend && pytest
+	cd backend && $(PY) -m pytest
 
 seed:
-	cd backend && python -m app.seed
+	cd backend && $(PY) -m app.seed
