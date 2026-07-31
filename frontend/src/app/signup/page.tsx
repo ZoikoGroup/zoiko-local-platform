@@ -3,7 +3,7 @@
 import { useState } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
-import { signup, login, ApiError } from "@/lib/api";
+import { signup, login, googleAuth, ApiError } from "@/lib/api";
 import { saveToken } from "@/lib/auth";
 import AuthLayout from "@/components/AuthLayout";
 import GoogleSignInButton from "@/components/GoogleSignInButton";
@@ -40,12 +40,20 @@ export default function SignupPage() {
     }
   }
 
+  async function handleGoogleCredential(credential: string) {
+    setError(null);
+    try {
+      const { access_token } = await googleAuth(credential);
+      saveToken(access_token);
+      router.push("/dashboard");
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Google sign-in failed");
+    }
+  }
+
   return (
     <AuthLayout title="Create your account" subtitle="Get started with Zoiko Local.">
-      <GoogleSignInButton disabled />
-      <p className="text-xs text-slate-400 text-center mt-2">
-        Google sign-in coming soon
-      </p>
+      <GoogleSignInButton onCredential={handleGoogleCredential} />
 
       <div className="flex items-center gap-3 my-5">
         <div className="h-px bg-slate-200 flex-1" />

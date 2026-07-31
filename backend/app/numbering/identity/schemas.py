@@ -13,6 +13,10 @@ class LoginRequest(BaseModel):
     password: str
 
 
+class GoogleAuthRequest(BaseModel):
+    credential: str  # the ID token from Google's Sign-In button
+
+
 class TokenResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"

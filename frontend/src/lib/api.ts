@@ -65,6 +65,13 @@ export function getCurrentUser(token: string): Promise<User> {
   });
 }
 
+export function googleAuth(credential: string): Promise<{ access_token: string; token_type: string }> {
+  return request("/auth/google", {
+    method: "POST",
+    body: JSON.stringify({ credential }),
+  });
+}
+
 export type ComplianceRule = {
   id: string;
   country: string;

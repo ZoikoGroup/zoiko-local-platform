@@ -3,10 +3,11 @@ from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.core.deps import get_current_user
-from app.core.security import create_access_token
+from app.core.security import create_access_token, verify_google_id_token
 from app.numbering.identity import service
 from app.numbering.identity.models import User
 from app.numbering.identity.schemas import (
+    GoogleAuthRequest,
     LoginRequest,
     SignupRequest,
     TokenResponse,
@@ -32,6 +33,17 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)):
     user = service.authenticate_user(db, payload.email, payload.password)
     if not user:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid email or password")
+    token = create_access_token(subject=user.id, scope="customer")
+    return TokenResponse(access_token=token)
+
+
+@router.post("/google", response_model=TokenResponse)
+def google_auth(payload: GoogleAuthRequest, db: Session = Depends(get_db)):
+    claims = verify_google_id_token(payload.credential)
+    if claims is None or not claims.get("email"):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid Google credential")
+
+    user = service.find_or_create_user_from_google(db, claims["email"], claims.get("name"))
     token = create_access_token(subject=user.id, scope="customer")
     return TokenResponse(access_token=token)
 

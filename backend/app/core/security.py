@@ -1,5 +1,7 @@
 from datetime import datetime, timedelta, timezone
 
+from google.auth.transport import requests as google_requests
+from google.oauth2 import id_token as google_id_token
 from jose import JWTError, jwt
 from passlib.context import CryptContext
 
@@ -31,4 +33,16 @@ def decode_access_token(token: str) -> dict | None:
     try:
         return jwt.decode(token, settings.jwt_secret_key, algorithms=[ALGORITHM])
     except JWTError:
+        return None
+
+
+def verify_google_id_token(credential: str) -> dict | None:
+    """Verifies a Google Identity Services credential (ID token) against
+    Google's public keys and our own Client ID. Returns the decoded
+    payload (contains 'email', 'name', etc.) or None if invalid."""
+    try:
+        return google_id_token.verify_oauth2_token(
+            credential, google_requests.Request(), settings.google_client_id
+        )
+    except ValueError:
         return None
