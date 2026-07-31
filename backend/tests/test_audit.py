@@ -43,9 +43,26 @@ def test_login_creates_an_audit_event(client, db_session):
     assert len(events) == 1
 
 
-def test_owner_can_list_audit_events(client):
+def test_customer_owner_cannot_list_audit_events(client):
+    """Audit lists events across ALL accounts, so a customer - even an
+    account owner - must never be able to view it. Staff-only."""
     token = _signup_and_login(client, "audit3@example.com")
     response = client.get("/audit/events", headers={"Authorization": f"Bearer {token}"})
+    assert response.status_code == 401
+
+
+def test_staff_can_list_audit_events(client, db_session):
+    from app.staff import service as staff_service
+
+    _signup_and_login(client, "audit4@example.com")
+
+    staff_service.create_staff(db_session, email="staffaudit1@zoikolocal.com", password="staffpass123")
+    login_response = client.post(
+        "/staff/login", json={"email": "staffaudit1@zoikolocal.com", "password": "staffpass123"}
+    )
+    staff_token = login_response.json()["access_token"]
+
+    response = client.get("/audit/events", headers={"Authorization": f"Bearer {staff_token}"})
     assert response.status_code == 200
     actions = [e["action"] for e in response.json()]
     assert "account.signup" in actions

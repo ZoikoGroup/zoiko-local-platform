@@ -14,6 +14,7 @@ from app.compliance import models as compliance_models  # noqa: F401
 from app.core.config import settings
 from app.core.database import Base
 from app.numbering.identity import models as identity_models  # noqa: F401
+from app.staff import models as staff_models  # noqa: F401
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.

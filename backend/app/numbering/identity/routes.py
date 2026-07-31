@@ -32,7 +32,7 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)):
     user = service.authenticate_user(db, payload.email, payload.password)
     if not user:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid email or password")
-    token = create_access_token(subject=user.id)
+    token = create_access_token(subject=user.id, scope="customer")
     return TokenResponse(access_token=token)
 
 

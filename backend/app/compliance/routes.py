@@ -10,8 +10,9 @@ from app.compliance.schemas import (
     DocumentSubmit,
 )
 from app.core.database import get_db
-from app.core.deps import get_current_user, require_admin
+from app.core.deps import get_current_staff, get_current_user
 from app.numbering.identity.models import User
+from app.staff.models import PlatformStaff
 
 router = APIRouter(prefix="/compliance", tags=["compliance"])
 
@@ -72,10 +73,10 @@ def submit_document(
 def approve_case(
     case_id: str,
     db: Session = Depends(get_db),
-    admin: User = Depends(require_admin),
+    staff: PlatformStaff = Depends(get_current_staff),
 ):
     case = _get_case_or_404(db, case_id)
-    return service.approve_case(db, case, actor=admin.id)
+    return service.approve_case(db, case, actor=staff.id)
 
 
 @router.post("/cases/{case_id}/reject", response_model=ComplianceCaseResponse)
@@ -83,7 +84,7 @@ def reject_case(
     case_id: str,
     payload: CaseRejectRequest,
     db: Session = Depends(get_db),
-    admin: User = Depends(require_admin),
+    staff: PlatformStaff = Depends(get_current_staff),
 ):
     case = _get_case_or_404(db, case_id)
-    return service.reject_case(db, case, actor=admin.id, reason=payload.reason)
+    return service.reject_case(db, case, actor=staff.id, reason=payload.reason)

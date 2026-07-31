@@ -6,6 +6,7 @@ Run with: python -m app.seed
 from app.compliance.models import ComplianceRule
 from app.core.database import Base, SessionLocal, engine
 from app.numbering.identity import service
+from app.staff import service as staff_service
 
 # Tier A / Tier B markets per the Roadmap doc's Phase 1 Launch Market Doctrine.
 COMPLIANCE_RULES = [
@@ -48,7 +49,7 @@ def run():
                 db,
                 account_name="Demo Account",
                 account_type="individual",
-                email="demo@zoikolocal.test",
+                email="demo@zoikolocal.com",
                 password="demo12345",
             )
             print(f"Seeded demo user: {user.email} (account_id={user.account_id})")
@@ -56,6 +57,12 @@ def run():
             print(f"Skipped seeding: {e}")
 
         seed_compliance_rules(db)
+
+        try:
+            staff = staff_service.create_staff(db, email="ops@zoikolocal.com", password="staffdemo12345")
+            print(f"Seeded demo staff account: {staff.email}")
+        except ValueError as e:
+            print(f"Skipped seeding staff: {e}")
     finally:
         db.close()
 

@@ -19,15 +19,16 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
     return pwd_context.verify(plain_password, hashed_password)
 
 
-def create_access_token(subject: str) -> str:
+def create_access_token(subject: str, scope: str = "customer") -> str:
+    """scope distinguishes a customer account token from a platform staff
+    token, so one can never be used where the other is required."""
     expire = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    payload = {"sub": subject, "exp": expire}
+    payload = {"sub": subject, "scope": scope, "exp": expire}
     return jwt.encode(payload, settings.jwt_secret_key, algorithm=ALGORITHM)
 
 
-def decode_access_token(token: str) -> str | None:
+def decode_access_token(token: str) -> dict | None:
     try:
-        payload = jwt.decode(token, settings.jwt_secret_key, algorithms=[ALGORITHM])
-        return payload.get("sub")
+        return jwt.decode(token, settings.jwt_secret_key, algorithms=[ALGORITHM])
     except JWTError:
         return None

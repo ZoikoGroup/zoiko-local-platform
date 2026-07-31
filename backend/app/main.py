@@ -6,6 +6,7 @@ from app.audit.routes import router as audit_router
 from app.compliance.routes import router as compliance_router
 from app.core.database import engine
 from app.numbering.identity.routes import router as identity_router
+from app.staff.routes import router as staff_router
 
 app = FastAPI(title="Zoiko Local API")
 
@@ -20,6 +21,7 @@ app.add_middleware(
 app.include_router(identity_router)
 app.include_router(audit_router)
 app.include_router(compliance_router)
+app.include_router(staff_router)
 
 
 @app.get("/health")

@@ -85,6 +85,14 @@ def test_opening_a_case_creates_an_audit_event(client, db_session):
     assert len(events) == 1
 
 
+def _create_and_login_staff(db_session, client, email: str) -> str:
+    from app.staff import service as staff_service
+
+    staff_service.create_staff(db_session, email=email, password="staffpass123")
+    response = client.post("/staff/login", json={"email": email, "password": "staffpass123"})
+    return response.json()["access_token"]
+
+
 def _open_case(client, headers, jurisdiction="US") -> str:
     response = client.post(
         "/compliance/cases",
@@ -133,32 +141,45 @@ def test_submit_document_on_missing_case_is_404(client):
     assert response.status_code == 404
 
 
-def test_owner_can_approve_a_case(client):
+def test_customer_owner_cannot_approve_their_own_case(client):
+    """The gap flagged earlier: approving KYC must be a staff-only action,
+    not something a customer can do to their own case."""
     token = _signup_and_login(client, "approve1@example.com")
     headers = {"Authorization": f"Bearer {token}"}
     case_id = _open_case(client, headers)
 
     response = client.post(f"/compliance/cases/{case_id}/approve", headers=headers)
+    assert response.status_code == 401  # customer token rejected outright - wrong scope
+
+
+def test_staff_can_approve_a_case(client, db_session):
+    customer_token = _signup_and_login(client, "approve2@example.com")
+    case_id = _open_case(client, {"Authorization": f"Bearer {customer_token}"})
+
+    staff_token = _create_and_login_staff(db_session, client, "staffapprove1@zoikolocal.com")
+    response = client.post(
+        f"/compliance/cases/{case_id}/approve", headers={"Authorization": f"Bearer {staff_token}"}
+    )
     assert response.status_code == 200
     assert response.json()["status"] == "approved"
 
 
-def test_owner_can_reject_a_case_with_a_reason(client):
-    token = _signup_and_login(client, "reject1@example.com")
-    headers = {"Authorization": f"Bearer {token}"}
-    case_id = _open_case(client, headers)
+def test_staff_can_reject_a_case_with_a_reason(client, db_session):
+    customer_token = _signup_and_login(client, "reject1@example.com")
+    case_id = _open_case(client, {"Authorization": f"Bearer {customer_token}"})
 
+    staff_token = _create_and_login_staff(db_session, client, "staffreject1@zoikolocal.com")
     response = client.post(
         f"/compliance/cases/{case_id}/reject",
         json={"reason": "Document was blurry"},
-        headers=headers,
+        headers={"Authorization": f"Bearer {staff_token}"},
     )
     assert response.status_code == 200
     assert response.json()["status"] == "rejected"
 
 
 def test_approve_requires_authentication(client):
-    token = _signup_and_login(client, "approve2@example.com")
+    token = _signup_and_login(client, "approve3@example.com")
     case_id = _open_case(client, {"Authorization": f"Bearer {token}"})
 
     response = client.post(f"/compliance/cases/{case_id}/approve")
@@ -168,10 +189,11 @@ def test_approve_requires_authentication(client):
 def test_approving_a_case_creates_an_audit_event(client, db_session):
     from app.audit.models import AuditEvent
 
-    token = _signup_and_login(client, "approve3@example.com")
-    headers = {"Authorization": f"Bearer {token}"}
-    case_id = _open_case(client, headers)
-    client.post(f"/compliance/cases/{case_id}/approve", headers=headers)
+    customer_token = _signup_and_login(client, "approve4@example.com")
+    case_id = _open_case(client, {"Authorization": f"Bearer {customer_token}"})
+
+    staff_token = _create_and_login_staff(db_session, client, "staffapprove2@zoikolocal.com")
+    client.post(f"/compliance/cases/{case_id}/approve", headers={"Authorization": f"Bearer {staff_token}"})
 
     events = (
         db_session.query(AuditEvent)
