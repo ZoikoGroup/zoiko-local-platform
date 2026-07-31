@@ -78,3 +78,62 @@ def find_or_create_user_from_google(db: Session, email: str, name: str | None) -
         after={"account_id": account.id, "user_id": user.id, "email": user.email, "role": user.role},
     )
     return user
+
+
+def add_team_member(
+    db: Session, *, account_id: str, email: str, password: str, role: str, actor: str
+) -> User:
+    if role == UserRole.OWNER.value:
+        raise ValueError("Cannot add a second owner - there is exactly one owner per account")
+    if role not in (UserRole.ADMIN.value, UserRole.MEMBER.value):
+        raise ValueError("role must be 'admin' or 'member'")
+
+    existing = db.query(User).filter(User.email == email).first()
+    if existing:
+        raise ValueError("A user with this email already exists")
+
+    member = User(
+        account_id=account_id,
+        email=email,
+        hashed_password=hash_password(password),
+        role=UserRole(role),
+    )
+    db.add(member)
+    db.commit()
+    db.refresh(member)
+
+    log_event(
+        db,
+        actor=actor,
+        action="team.member_added",
+        target=f"user:{member.id}",
+        after={"user_id": member.id, "email": member.email, "role": member.role},
+    )
+    return member
+
+
+def list_team_members(db: Session, account_id: str) -> list[User]:
+    return db.query(User).filter(User.account_id == account_id).order_by(User.created_at).all()
+
+
+def remove_team_member(db: Session, *, account_id: str, user_id: str, actor: str) -> None:
+    member = db.query(User).filter(User.id == user_id).first()
+    if member is None or member.account_id != account_id:
+        raise ValueError("No such team member on this account")
+    if member.role == UserRole.OWNER:
+        raise ValueError("Cannot remove the account owner")
+
+    # Capture values before delete+commit - the ORM object is expired/
+    # detached afterward since the underlying row no longer exists.
+    removed_email, removed_role = member.email, member.role
+
+    db.delete(member)
+    db.commit()
+
+    log_event(
+        db,
+        actor=actor,
+        action="team.member_removed",
+        target=f"user:{user_id}",
+        before={"user_id": user_id, "email": removed_email, "role": removed_role},
+    )

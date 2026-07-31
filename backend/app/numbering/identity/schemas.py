@@ -29,3 +29,9 @@ class UserResponse(BaseModel):
     email: str
     role: str
     account_id: str
+
+
+class TeamMemberAdd(BaseModel):
+    email: EmailStr
+    password: str
+    role: str  # "admin" or "member" - never "owner", there is exactly one per account
