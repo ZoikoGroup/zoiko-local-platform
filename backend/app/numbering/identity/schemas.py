@@ -50,6 +50,7 @@ class UserResponse(BaseModel):
     email: str
     role: str
     account_id: str
+    mfa_enabled: bool
 
 
 class TeamMemberAdd(BaseModel):

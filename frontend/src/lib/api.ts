@@ -6,6 +6,7 @@ export type User = {
   email: string;
   role: string;
   account_id: string;
+  mfa_enabled: boolean;
 };
 
 export class ApiError extends Error {
@@ -32,6 +33,10 @@ async function request<T>(
   if (!response.ok) {
     const body = await response.json().catch(() => ({}));
     throw new ApiError(body.detail ?? "Request failed", response.status);
+  }
+
+  if (response.status === 204) {
+    return undefined as T;
   }
 
   return response.json();
@@ -73,6 +78,39 @@ export function googleAuth(credential: string): Promise<{ access_token: string; 
   return request("/auth/google", {
     method: "POST",
     body: JSON.stringify({ credential }),
+  });
+}
+
+export function completeMfaLogin(
+  mfaToken: string,
+  code: string
+): Promise<{ access_token: string; token_type: string }> {
+  return request("/auth/mfa/login", {
+    method: "POST",
+    body: JSON.stringify({ mfa_token: mfaToken, code }),
+  });
+}
+
+export function mfaSetup(token: string): Promise<{ secret: string; otpauth_uri: string }> {
+  return request("/auth/mfa/setup", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export function mfaEnable(token: string, code: string): Promise<void> {
+  return request("/auth/mfa/enable", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ code }),
+  });
+}
+
+export function mfaDisable(token: string, code: string): Promise<void> {
+  return request("/auth/mfa/disable", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ code }),
   });
 }
 

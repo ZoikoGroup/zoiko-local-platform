@@ -3,7 +3,7 @@
 import { useState } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
-import { login, googleAuth, ApiError } from "@/lib/api";
+import { login, googleAuth, completeMfaLogin, ApiError } from "@/lib/api";
 import { saveToken } from "@/lib/auth";
 import AuthLayout from "@/components/AuthLayout";
 import GoogleSignInButton from "@/components/GoogleSignInButton";
@@ -12,6 +12,8 @@ export default function LoginPage() {
   const router = useRouter();
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [code, setCode] = useState("");
+  const [mfaToken, setMfaToken] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
 
@@ -21,16 +23,34 @@ export default function LoginPage() {
     setLoading(true);
     try {
       const result = await login({ email, password });
-      if (result.mfa_required || !result.access_token) {
-        // Backend MFA is real and tested; this UI doesn't have the code-entry
-        // step yet, so fail loudly here rather than saving a null token.
-        setError("This account requires a verification code. MFA sign-in isn't supported in this screen yet.");
+      if (result.mfa_required && result.mfa_token) {
+        setMfaToken(result.mfa_token);
+        return;
+      }
+      if (!result.access_token) {
+        setError("Something went wrong signing in.");
         return;
       }
       saveToken(result.access_token);
       router.push("/dashboard");
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Something went wrong");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function handleMfaSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    if (!mfaToken) return;
+    setError(null);
+    setLoading(true);
+    try {
+      const { access_token } = await completeMfaLogin(mfaToken, code);
+      saveToken(access_token);
+      router.push("/dashboard");
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Invalid code");
     } finally {
       setLoading(false);
     }
@@ -45,6 +65,48 @@ export default function LoginPage() {
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Google sign-in failed");
     }
+  }
+
+  if (mfaToken) {
+    return (
+      <AuthLayout title="Two-factor verification" subtitle="Enter the 6-digit code from your authenticator app.">
+        <form onSubmit={handleMfaSubmit} className="space-y-4">
+          <input
+            type="text"
+            inputMode="numeric"
+            autoFocus
+            required
+            maxLength={6}
+            value={code}
+            onChange={(e) => setCode(e.target.value.replace(/\D/g, ""))}
+            className="w-full rounded-lg border border-slate-300 px-3.5 py-2.5 text-center text-lg tracking-[0.5em] font-mono placeholder:tracking-normal placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-indigo-500/40 focus:border-indigo-500 transition"
+            placeholder="000000"
+          />
+
+          {error && <p className="text-sm text-red-600 bg-red-50 rounded-lg px-3 py-2">{error}</p>}
+
+          <button
+            type="submit"
+            disabled={loading || code.length !== 6}
+            className="w-full flex items-center justify-center gap-2 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-60 text-white rounded-lg py-2.5 text-sm font-medium transition shadow-sm shadow-indigo-600/20"
+          >
+            {loading ? "Verifying..." : "Verify"}
+          </button>
+
+          <button
+            type="button"
+            onClick={() => {
+              setMfaToken(null);
+              setCode("");
+              setError(null);
+            }}
+            className="w-full text-xs text-slate-400 hover:text-slate-700"
+          >
+            Back to login
+          </button>
+        </form>
+      </AuthLayout>
+    );
   }
 
   return (
