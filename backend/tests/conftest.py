@@ -1,9 +1,19 @@
+import asyncio
+import sys
+
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import sessionmaker
 
 from app.core.database import Base, engine, get_db
 from app.main import app
+
+if sys.platform == "win32":
+    # aiohttp (used by the LiveKit SDK) can hang on Windows' default
+    # ProactorEventLoop when many event loops are created/torn down in
+    # sequence (once per test, via TestClient) — the selector policy doesn't
+    # have this issue.
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 
 @pytest.fixture(scope="session", autouse=True)

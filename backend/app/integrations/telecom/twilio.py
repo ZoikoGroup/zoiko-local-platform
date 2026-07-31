@@ -8,7 +8,9 @@ exception note). No Account/Number model linkage, no audit logging, no
 entitlement checks — that gets added once Stage 1/2 land properly.
 """
 
+import httpx
 from twilio.base.exceptions import TwilioRestException
+from twilio.request_validator import RequestValidator
 from twilio.rest import Client
 from twilio.twiml.voice_response import VoiceResponse
 
@@ -72,15 +74,27 @@ def buy_number(phone_number: str) -> dict:
     """Not yet exercised against a real purchase (see docs/stage2-twilio-numbering-notes.md
     — deliberately skipped to avoid spending trial credit). Written directly
     against the documented IncomingPhoneNumbers create contract.
+
+    Registers our own status-callback URL on the number (when a public base
+    URL is configured) so inbound calls to it get a final completed/duration
+    event, not just the initial ringing state from the voice webhook.
     """
+    kwargs = {"phone_number": phone_number}
+    if settings.public_base_url:
+        kwargs["voice_status_callback"] = f"{settings.public_base_url}/media/voice/status-callback"
+        kwargs["voice_status_callback_method"] = "POST"
+
     try:
-        number = _client().incoming_phone_numbers.create(phone_number=phone_number)
+        number = _client().incoming_phone_numbers.create(**kwargs)
     except TwilioRestException as e:
         raise TelecomError(str(e)) from e
     return {"sid": number.sid, "phone_number": number.phone_number, "capabilities": number.capabilities}
 
 
-def place_call(to: str, from_: str, twiml_url: str | None = None, twiml: str | None = None) -> dict:
+def place_call(
+    to: str, from_: str, twiml_url: str | None = None, twiml: str | None = None,
+    status_callback_url: str | None = None,
+) -> dict:
     """`from_` must be a Twilio number owned on this account. Confirmed live:
     Twilio rejects with a 400 ("not yet verified for your account") if `from_`
     isn't an owned/verified number — see docs/stage3-twilio-calling-notes.md.
@@ -93,6 +107,10 @@ def place_call(to: str, from_: str, twiml_url: str | None = None, twiml: str | N
         kwargs["url"] = twiml_url
     else:
         kwargs["twiml"] = twiml
+    if status_callback_url:
+        kwargs["status_callback"] = status_callback_url
+        kwargs["status_callback_event"] = ["completed"]
+        kwargs["status_callback_method"] = "POST"
 
     try:
         call = _client().calls.create(**kwargs)
@@ -127,3 +145,82 @@ def build_say_response(message: str) -> str:
     response = VoiceResponse()
     response.say(message)
     return str(response)
+
+
+def build_forward_response(forwarding_number: str, status_callback_url: str | None = None) -> str:
+    """Builds TwiML that forwards (dials out) the incoming call to another number."""
+    response = VoiceResponse()
+    dial_kwargs = {}
+    if status_callback_url:
+        dial_kwargs = {
+            "action": status_callback_url,
+            "status_callback": status_callback_url,
+            "status_callback_event": "completed",
+        }
+    response.dial(forwarding_number, **dial_kwargs)
+    return str(response)
+
+
+def build_gather_response(prompt: str, action_url: str) -> str:
+    """Builds TwiML for the AI Receptionist's single free-form capture: Twilio
+    transcribes the caller's speech itself (no vendor call needed for this
+    part) and POSTs the SpeechResult to `action_url`."""
+    response = VoiceResponse()
+    gather = response.gather(input="speech", action=action_url, method="POST", speech_timeout="auto", timeout=8)
+    gather.say(prompt)
+    response.say("We didn't catch that. Please try calling again.")
+    return str(response)
+
+
+def build_receptionist_reply_response(
+    message: str, forward_to: str | None = None, status_callback_url: str | None = None
+) -> str:
+    """Closes out the receptionist flow: a spoken reply, then either an
+    escalation dial to a human or a hangup."""
+    response = VoiceResponse()
+    response.say(message)
+    if forward_to:
+        dial_kwargs = {}
+        if status_callback_url:
+            dial_kwargs = {
+                "action": status_callback_url,
+                "status_callback": status_callback_url,
+                "status_callback_event": "completed",
+            }
+        response.dial(forward_to, **dial_kwargs)
+    else:
+        response.hangup()
+    return str(response)
+
+
+def build_record_response(callback_url: str) -> str:
+    """Builds TwiML that prompts the caller and records a voicemail, POSTing
+    the result to `callback_url` once recording finishes."""
+    response = VoiceResponse()
+    response.say("Please leave a message after the tone.")
+    response.record(action=callback_url, method="POST", max_length=120, play_beep=True)
+    return str(response)
+
+
+def download_recording(recording_url: str) -> bytes:
+    """Recording media URLs require the same Basic Auth as the REST API —
+    unauthenticated fetches get a 401, so this can't just be a plain GET."""
+    try:
+        response = httpx.get(
+            recording_url, auth=(settings.twilio_account_sid, settings.twilio_auth_token), timeout=30.0
+        )
+        response.raise_for_status()
+    except httpx.HTTPError as e:
+        raise TelecomError(f"Could not download recording: {e}") from e
+    return response.content
+
+
+def validate_webhook_signature(url: str, params: dict, signature: str | None) -> bool:
+    """Verifies a Twilio webhook actually came from Twilio (HMAC-SHA1 over the
+    callback URL + POST params, per Twilio's X-Twilio-Signature scheme) —
+    without this, anyone can POST fake call/recording events to our webhooks.
+    """
+    if not signature:
+        return False
+    validator = RequestValidator(settings.twilio_auth_token)
+    return validator.validate(url, params, signature)

@@ -4,10 +4,22 @@ from sqlalchemy import text
 
 from app.core.database import engine
 from app.numbering.identity.routes import router as identity_router
+from app.numbering.numbers.routes import router as numbers_router
 from app.media.voice import router as voice_router
+from app.media.voicemail import router as voicemail_router
+from app.media.video import router as video_router
+from app.media.receptionist import router as receptionist_router
+from app.intelligence.routes import router as intelligence_router
+from app.compliance.routes import router as compliance_router
 
 app = FastAPI(title="Zoiko Local API")
 app.include_router(voice_router)
+app.include_router(voicemail_router)
+app.include_router(video_router)
+app.include_router(receptionist_router)
+app.include_router(numbers_router)
+app.include_router(intelligence_router)
+app.include_router(compliance_router)
 
 app.add_middleware(
     CORSMiddleware,
