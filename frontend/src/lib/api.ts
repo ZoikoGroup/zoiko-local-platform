@@ -144,6 +144,17 @@ export function openComplianceCase(
   });
 }
 
+export type MyComplianceCase = ComplianceCase & {
+  documents: { document_type: string; reference: string }[];
+  created_at: string;
+};
+
+export function listMyComplianceCases(token: string): Promise<MyComplianceCase[]> {
+  return request<MyComplianceCase[]>("/compliance/cases/me", {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
 // --- Staff / Admin console ---
 
 export function staffLogin(input: {

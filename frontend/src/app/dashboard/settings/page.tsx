@@ -2,14 +2,32 @@
 
 import { useEffect, useState } from "react";
 import { QRCodeSVG } from "qrcode.react";
-import { getCurrentUser, mfaSetup, mfaEnable, mfaDisable, ApiError, type User } from "@/lib/api";
+import {
+  getCurrentUser,
+  mfaSetup,
+  mfaEnable,
+  mfaDisable,
+  listMyComplianceCases,
+  ApiError,
+  type User,
+  type MyComplianceCase,
+} from "@/lib/api";
 import { getToken } from "@/lib/auth";
 
 type SetupState = { secret: string; otpauth_uri: string } | null;
 
+const STATUS_STYLES: Record<string, string> = {
+  pending: "bg-amber-50 text-amber-700",
+  approved: "bg-emerald-50 text-emerald-700",
+  rejected: "bg-red-50 text-red-700",
+  expired: "bg-slate-100 text-slate-600",
+};
+
 export default function SettingsPage() {
   const [user, setUser] = useState<User | null>(null);
   const [loading, setLoading] = useState(true);
+  const [cases, setCases] = useState<MyComplianceCase[]>([]);
+  const [casesLoading, setCasesLoading] = useState(true);
 
   const [setupState, setSetupState] = useState<SetupState>(null);
   const [code, setCode] = useState("");
@@ -25,6 +43,9 @@ export default function SettingsPage() {
     getCurrentUser(token)
       .then(setUser)
       .finally(() => setLoading(false));
+    listMyComplianceCases(token)
+      .then(setCases)
+      .finally(() => setCasesLoading(false));
   }, []);
 
   async function refreshUser() {
@@ -215,6 +236,49 @@ export default function SettingsPage() {
               </button>
             </div>
           </form>
+        )}
+      </div>
+
+      <div className="bg-white rounded-xl border border-slate-200 p-6 space-y-4">
+        <div>
+          <h3 className="font-semibold text-slate-900">Identity verification</h3>
+          <p className="text-xs text-slate-500 mt-0.5">
+            Status of any ID verification requests on your account.
+          </p>
+        </div>
+
+        {casesLoading && <p className="text-sm text-slate-500">Loading...</p>}
+
+        {!casesLoading && cases.length === 0 && (
+          <p className="text-sm text-slate-500">
+            No verification requests yet — these appear here when a number purchase requires ID
+            checks for that country.
+          </p>
+        )}
+
+        {!casesLoading && cases.length > 0 && (
+          <ul className="divide-y divide-slate-100">
+            {cases.map((c) => (
+              <li key={c.id} className="py-3 flex items-center justify-between gap-4">
+                <div>
+                  <div className="text-sm font-medium text-slate-800">
+                    {c.jurisdiction} — {c.requirement_type.replaceAll("_", " ")}
+                  </div>
+                  <div className="text-xs text-slate-500 mt-0.5">
+                    {c.documents.length} document{c.documents.length === 1 ? "" : "s"} submitted ·{" "}
+                    {new Date(c.created_at).toLocaleDateString()}
+                  </div>
+                </div>
+                <span
+                  className={`text-xs font-medium rounded-full px-2.5 py-1 capitalize shrink-0 ${
+                    STATUS_STYLES[c.status] ?? "bg-slate-100 text-slate-600"
+                  }`}
+                >
+                  {c.status}
+                </span>
+              </li>
+            ))}
+          </ul>
         )}
       </div>
     </div>
