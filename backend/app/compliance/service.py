@@ -65,6 +65,39 @@ def list_cases_for_account(db: Session, account_id: str) -> list[ComplianceCase]
     )
 
 
+def list_all_cases(db: Session, status: str | None = None) -> list[dict]:
+    """Staff-only view across every account - joins in the account name
+    and owner email so a reviewer has enough context without a second
+    lookup. Not exposed to customers (see routes.py: get_current_staff)."""
+    from app.numbering.identity.models import Account, User, UserRole
+
+    query = (
+        db.query(ComplianceCase, Account.name, User.email)
+        .join(Account, Account.id == ComplianceCase.account_id)
+        .join(User, (User.account_id == Account.id) & (User.role == UserRole.OWNER))
+    )
+    if status:
+        query = query.filter(ComplianceCase.status == ComplianceCaseStatus(status))
+
+    rows = query.order_by(ComplianceCase.created_at.desc()).all()
+    return [
+        {
+            "id": case.id,
+            "account_id": case.account_id,
+            "account_name": account_name,
+            "account_owner_email": owner_email,
+            "number_id": case.number_id,
+            "jurisdiction": case.jurisdiction,
+            "requirement_type": case.requirement_type,
+            "status": case.status,
+            "documents": case.documents,
+            "expires_at": case.expires_at,
+            "created_at": case.created_at,
+        }
+        for case, account_name, owner_email in rows
+    ]
+
+
 def get_case(db: Session, case_id: str) -> ComplianceCase | None:
     try:
         uuid.UUID(case_id)

@@ -204,3 +204,38 @@ def test_approving_a_case_creates_an_audit_event(client, db_session):
         .all()
     )
     assert len(events) == 1
+
+
+def test_customer_cannot_list_all_cases(client):
+    token = _signup_and_login(client, "listall1@example.com")
+    response = client.get("/compliance/cases", headers={"Authorization": f"Bearer {token}"})
+    assert response.status_code == 401
+
+
+def test_staff_can_list_all_cases_with_account_context(client, db_session):
+    customer_token = _signup_and_login(client, "listall2@example.com")
+    case_id = _open_case(client, {"Authorization": f"Bearer {customer_token}"})
+
+    staff_token = _create_and_login_staff(db_session, client, "staffcases1@zoikolocal.com")
+    response = client.get("/compliance/cases", headers={"Authorization": f"Bearer {staff_token}"})
+    assert response.status_code == 200
+
+    match = next(c for c in response.json() if c["id"] == case_id)
+    assert match["account_owner_email"] == "listall2@example.com"
+    assert match["account_name"] == "Compliance Test Co"
+
+
+def test_staff_can_filter_cases_by_status(client, db_session):
+    customer_token = _signup_and_login(client, "listall3@example.com")
+    headers = {"Authorization": f"Bearer {customer_token}"}
+    pending_case_id = _open_case(client, headers, jurisdiction="US")
+    approved_case_id = _open_case(client, headers, jurisdiction="GB")
+
+    staff_token = _create_and_login_staff(db_session, client, "staffcases2@zoikolocal.com")
+    staff_headers = {"Authorization": f"Bearer {staff_token}"}
+    client.post(f"/compliance/cases/{approved_case_id}/approve", headers=staff_headers)
+
+    response = client.get("/compliance/cases?status=pending", headers=staff_headers)
+    ids = [c["id"] for c in response.json()]
+    assert pending_case_id in ids
+    assert approved_case_id not in ids

@@ -6,6 +6,7 @@ from app.compliance.schemas import (
     CaseRejectRequest,
     ComplianceCaseCreate,
     ComplianceCaseResponse,
+    ComplianceCaseStaffResponse,
     ComplianceRuleResponse,
     DocumentSubmit,
 )
@@ -51,6 +52,15 @@ def my_cases(
     current_user: User = Depends(get_current_user),
 ):
     return service.list_cases_for_account(db, current_user.account_id)
+
+
+@router.get("/cases", response_model=list[ComplianceCaseStaffResponse])
+def list_all_cases(
+    status: str | None = None,
+    db: Session = Depends(get_db),
+    _staff: PlatformStaff = Depends(get_current_staff),
+):
+    return service.list_all_cases(db, status=status)
 
 
 @router.post("/cases/{case_id}/documents", response_model=ComplianceCaseResponse)

@@ -40,3 +40,8 @@ class ComplianceCaseResponse(BaseModel):
     documents: list
     expires_at: datetime | None
     created_at: datetime
+
+
+class ComplianceCaseStaffResponse(ComplianceCaseResponse):
+    account_name: str
+    account_owner_email: str

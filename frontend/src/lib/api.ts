@@ -143,3 +143,54 @@ export function openComplianceCase(
     body: JSON.stringify(input),
   });
 }
+
+// --- Staff / Admin console ---
+
+export function staffLogin(input: {
+  email: string;
+  password: string;
+}): Promise<{ access_token: string; token_type: string }> {
+  return request("/staff/login", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+export type StaffComplianceCase = ComplianceCase & {
+  account_id: string;
+  account_name: string;
+  account_owner_email: string;
+  number_id: string | null;
+  documents: { document_type: string; reference: string }[];
+  expires_at: string | null;
+  created_at: string;
+};
+
+export function listStaffCases(
+  token: string,
+  status?: string
+): Promise<StaffComplianceCase[]> {
+  const query = status ? `?status=${status}` : "";
+  return request<StaffComplianceCase[]>(`/compliance/cases${query}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export function staffApproveCase(token: string, caseId: string): Promise<ComplianceCase> {
+  return request<ComplianceCase>(`/compliance/cases/${caseId}/approve`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export function staffRejectCase(
+  token: string,
+  caseId: string,
+  reason?: string
+): Promise<ComplianceCase> {
+  return request<ComplianceCase>(`/compliance/cases/${caseId}/reject`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ reason }),
+  });
+}
