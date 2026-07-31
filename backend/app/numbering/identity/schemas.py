@@ -22,6 +22,27 @@ class TokenResponse(BaseModel):
     token_type: str = "bearer"
 
 
+class LoginResponse(BaseModel):
+    mfa_required: bool = False
+    access_token: str | None = None
+    token_type: str = "bearer"
+    mfa_token: str | None = None  # only set when mfa_required=True
+
+
+class MfaSetupResponse(BaseModel):
+    secret: str
+    otpauth_uri: str
+
+
+class MfaCodeRequest(BaseModel):
+    code: str
+
+
+class MfaLoginRequest(BaseModel):
+    mfa_token: str
+    code: str
+
+
 class UserResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 

@@ -20,8 +20,14 @@ export default function LoginPage() {
     setError(null);
     setLoading(true);
     try {
-      const { access_token } = await login({ email, password });
-      saveToken(access_token);
+      const result = await login({ email, password });
+      if (result.mfa_required || !result.access_token) {
+        // Backend MFA is real and tested; this UI doesn't have the code-entry
+        // step yet, so fail loudly here rather than saving a null token.
+        setError("This account requires a verification code. MFA sign-in isn't supported in this screen yet.");
+        return;
+      }
+      saveToken(result.access_token);
       router.push("/dashboard");
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Something went wrong");

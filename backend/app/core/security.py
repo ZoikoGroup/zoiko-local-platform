@@ -1,5 +1,6 @@
 from datetime import datetime, timedelta, timezone
 
+import pyotp
 from google.auth.transport import requests as google_requests
 from google.oauth2 import id_token as google_id_token
 from jose import JWTError, jwt
@@ -21,10 +22,13 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
     return pwd_context.verify(plain_password, hashed_password)
 
 
-def create_access_token(subject: str, scope: str = "customer") -> str:
+def create_access_token(subject: str, scope: str = "customer", expire_minutes: int | None = None) -> str:
     """scope distinguishes a customer account token from a platform staff
-    token, so one can never be used where the other is required."""
-    expire = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    token (or a short-lived mfa_pending token), so one can never be used
+    where another is required."""
+    expire = datetime.now(timezone.utc) + timedelta(
+        minutes=expire_minutes if expire_minutes is not None else ACCESS_TOKEN_EXPIRE_MINUTES
+    )
     payload = {"sub": subject, "scope": scope, "exp": expire}
     return jwt.encode(payload, settings.jwt_secret_key, algorithm=ALGORITHM)
 
@@ -46,3 +50,17 @@ def verify_google_id_token(credential: str) -> dict | None:
         )
     except ValueError:
         return None
+
+
+def generate_mfa_secret() -> str:
+    return pyotp.random_base32()
+
+
+def mfa_provisioning_uri(secret: str, email: str) -> str:
+    """The otpauth:// URI an authenticator app (Google Authenticator,
+    Authy, etc.) scans as a QR code to start generating codes."""
+    return pyotp.totp.TOTP(secret).provisioning_uri(name=email, issuer_name="Zoiko Local")
+
+
+def verify_totp_code(secret: str, code: str) -> bool:
+    return pyotp.totp.TOTP(secret).verify(code, valid_window=1)

@@ -30,8 +30,14 @@ export default function SignupPage() {
         email,
         password,
       });
-      const { access_token } = await login({ email, password });
-      saveToken(access_token);
+      const result = await login({ email, password });
+      if (!result.access_token) {
+        // Unreachable in practice - a brand new account has no MFA yet -
+        // but guarded for type-safety since login() can return null here.
+        setError("Something went wrong finishing sign-in after signup.");
+        return;
+      }
+      saveToken(result.access_token);
       router.push("/dashboard");
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Something went wrong");

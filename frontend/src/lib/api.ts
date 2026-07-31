@@ -49,10 +49,14 @@ export function signup(input: {
   });
 }
 
-export function login(input: {
-  email: string;
-  password: string;
-}): Promise<{ access_token: string; token_type: string }> {
+export type LoginResult = {
+  mfa_required: boolean;
+  access_token: string | null;
+  token_type: string;
+  mfa_token: string | null;
+};
+
+export function login(input: { email: string; password: string }): Promise<LoginResult> {
   return request("/auth/login", {
     method: "POST",
     body: JSON.stringify(input),

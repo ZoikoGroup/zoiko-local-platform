@@ -1,7 +1,13 @@
 from sqlalchemy.orm import Session
 
 from app.audit.service import log_event
-from app.core.security import hash_password, verify_password
+from app.core.security import (
+    generate_mfa_secret,
+    hash_password,
+    mfa_provisioning_uri,
+    verify_password,
+    verify_totp_code,
+)
 from app.numbering.identity.models import Account, AccountType, User, UserRole
 
 
@@ -43,7 +49,11 @@ def authenticate_user(db: Session, email: str, password: str) -> User | None:
     if not user or user.hashed_password is None or not verify_password(password, user.hashed_password):
         return None
 
-    log_event(db, actor=user.id, action="user.login", target=f"user:{user.id}")
+    # Only log "user.login" here if this IS the complete login. If MFA is
+    # enabled, the real login isn't done yet - complete_mfa_login() logs
+    # it once the code is verified, so we don't log an incomplete login.
+    if not user.mfa_enabled:
+        log_event(db, actor=user.id, action="user.login", target=f"user:{user.id}")
     return user
 
 
@@ -137,3 +147,47 @@ def remove_team_member(db: Session, *, account_id: str, user_id: str, actor: str
         target=f"user:{user_id}",
         before={"user_id": user_id, "email": removed_email, "role": removed_role},
     )
+
+
+def start_mfa_setup(db: Session, user: User) -> tuple[str, str]:
+    """Generates a new pending TOTP secret (not yet enabled). Returns
+    (secret, otpauth_uri) for the caller to show as text/QR code."""
+    secret = generate_mfa_secret()
+    user.mfa_secret = secret
+    user.mfa_enabled = False  # any previous enabled state is cleared until re-confirmed
+    db.commit()
+    return secret, mfa_provisioning_uri(secret, user.email)
+
+
+def enable_mfa(db: Session, user: User, code: str, actor: str) -> None:
+    if not user.mfa_secret:
+        raise ValueError("Call /auth/mfa/setup first")
+    if not verify_totp_code(user.mfa_secret, code):
+        raise ValueError("Invalid code")
+
+    user.mfa_enabled = True
+    db.commit()
+    log_event(db, actor=actor, action="mfa.enabled", target=f"user:{user.id}")
+
+
+def disable_mfa(db: Session, user: User, code: str, actor: str) -> None:
+    if not user.mfa_enabled or not user.mfa_secret:
+        raise ValueError("MFA is not enabled")
+    if not verify_totp_code(user.mfa_secret, code):
+        raise ValueError("Invalid code")
+
+    user.mfa_secret = None
+    user.mfa_enabled = False
+    db.commit()
+    log_event(db, actor=actor, action="mfa.disabled", target=f"user:{user.id}")
+
+
+def complete_mfa_login(db: Session, user_id: str, code: str) -> User | None:
+    user = db.query(User).filter(User.id == user_id).first()
+    if user is None or not user.mfa_enabled or not user.mfa_secret:
+        return None
+    if not verify_totp_code(user.mfa_secret, code):
+        return None
+
+    log_event(db, actor=user.id, action="user.login", target=f"user:{user.id}", reason="mfa")
+    return user

@@ -11,6 +11,7 @@ python-jose[cryptography]==3.3.0
 email-validator==2.2.0
 google-auth==2.35.0
 requests==2.34.2  # google-auth's HTTP transport needs this separately, not a hard dependency
+pyotp==2.9.0
 
 # dev/test
 pytest==8.3.3
