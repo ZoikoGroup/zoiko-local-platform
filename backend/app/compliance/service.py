@@ -4,6 +4,14 @@ from sqlalchemy.orm import Session
 
 from app.audit.service import log_event
 from app.compliance.models import ComplianceCase, ComplianceCaseStatus, ComplianceRule
+from app.notifications.service import notify_compliance_case_approved, notify_compliance_case_rejected
+
+
+def _account_owner_email(db: Session, account_id: str) -> str | None:
+    from app.numbering.identity.models import User, UserRole
+
+    owner = db.query(User).filter(User.account_id == account_id, User.role == UserRole.OWNER).first()
+    return owner.email if owner else None
 
 
 def get_active_rules(db: Session, country: str) -> list[ComplianceRule]:
@@ -21,6 +29,20 @@ def is_requirement_active(db: Session, country: str, requirement_type: str) -> b
             ComplianceRule.country == country.upper(),
             ComplianceRule.requirement_type == requirement_type,
             ComplianceRule.is_active.is_(True),
+        )
+        .first()
+        is not None
+    )
+
+
+def has_approved_case(db: Session, *, account_id: str, jurisdiction: str, requirement_type: str) -> bool:
+    return (
+        db.query(ComplianceCase)
+        .filter(
+            ComplianceCase.account_id == account_id,
+            ComplianceCase.jurisdiction == jurisdiction.upper(),
+            ComplianceCase.requirement_type == requirement_type,
+            ComplianceCase.status == ComplianceCaseStatus.APPROVED,
         )
         .first()
         is not None
@@ -144,6 +166,11 @@ def approve_case(db: Session, case: ComplianceCase, *, actor: str) -> Compliance
         before={"status": before_status},
         after={"status": case.status},
     )
+
+    owner_email = _account_owner_email(db, case.account_id)
+    if owner_email:
+        notify_compliance_case_approved(owner_email, case.jurisdiction, case.requirement_type)
+
     return case
 
 
@@ -162,4 +189,9 @@ def reject_case(db: Session, case: ComplianceCase, *, actor: str, reason: str | 
         before={"status": before_status},
         after={"status": case.status},
     )
+
+    owner_email = _account_owner_email(db, case.account_id)
+    if owner_email:
+        notify_compliance_case_rejected(owner_email, case.jurisdiction, case.requirement_type, reason)
+
     return case

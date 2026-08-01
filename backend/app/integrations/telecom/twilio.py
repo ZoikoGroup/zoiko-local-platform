@@ -9,7 +9,7 @@ entitlement checks — that gets added once Stage 1/2 land properly.
 """
 
 import httpx
-from twilio.base.exceptions import TwilioRestException
+from twilio.base.exceptions import TwilioException, TwilioRestException
 from twilio.request_validator import RequestValidator
 from twilio.rest import Client
 from twilio.twiml.voice_response import VoiceResponse
@@ -45,8 +45,11 @@ def search_available_numbers(country: str, number_type: str = "local", area_code
     try:
         resource = getattr(_client().available_phone_numbers(country), _NUMBER_TYPE_PATH[number_type].lower())
         numbers = resource.list(**kwargs)
-    except TwilioRestException as e:
-        if e.status == 404:
+    except TwilioException as e:
+        # Twilio's SDK raises the bare base class (no .status) for some
+        # lower-level failures (e.g. missing/invalid credentials) rather
+        # than the TwilioRestException subclass this 404 check expects.
+        if isinstance(e, TwilioRestException) and e.status == 404:
             raise TelecomError(f"Twilio has no {number_type} numbering coverage for country '{country}'") from e
         raise TelecomError(str(e)) from e
 
@@ -65,7 +68,7 @@ def search_available_numbers(country: str, number_type: str = "local", area_code
 def list_owned_numbers() -> list[dict]:
     try:
         numbers = _client().incoming_phone_numbers.list()
-    except TwilioRestException as e:
+    except TwilioException as e:
         raise TelecomError(str(e)) from e
     return [{"sid": n.sid, "phone_number": n.phone_number, "capabilities": n.capabilities} for n in numbers]
 
@@ -86,7 +89,7 @@ def buy_number(phone_number: str) -> dict:
 
     try:
         number = _client().incoming_phone_numbers.create(**kwargs)
-    except TwilioRestException as e:
+    except TwilioException as e:
         raise TelecomError(str(e)) from e
     return {"sid": number.sid, "phone_number": number.phone_number, "capabilities": number.capabilities}
 
@@ -114,7 +117,7 @@ def place_call(
 
     try:
         call = _client().calls.create(**kwargs)
-    except TwilioRestException as e:
+    except TwilioException as e:
         raise TelecomError(str(e)) from e
     return {"sid": call.sid, "status": call.status, "to": call.to, "from": call.from_}
 
@@ -122,7 +125,7 @@ def place_call(
 def get_call(call_sid: str) -> dict:
     try:
         call = _client().calls(call_sid).fetch()
-    except TwilioRestException as e:
+    except TwilioException as e:
         raise TelecomError(str(e)) from e
     return {"sid": call.sid, "status": call.status, "to": call.to, "from": call.from_, "duration": call.duration}
 
@@ -133,7 +136,7 @@ def list_calls(limit: int = 20) -> list[dict]:
     """
     try:
         calls = _client().calls.list(limit=limit)
-    except TwilioRestException as e:
+    except TwilioException as e:
         raise TelecomError(str(e)) from e
     return [{"sid": c.sid, "status": c.status, "to": c.to, "from": c.from_} for c in calls]
 
@@ -147,16 +150,27 @@ def build_say_response(message: str) -> str:
     return str(response)
 
 
-def build_forward_response(forwarding_number: str, status_callback_url: str | None = None) -> str:
-    """Builds TwiML that forwards (dials out) the incoming call to another number."""
+def build_forward_response(
+    forwarding_number: str,
+    status_callback_url: str | None = None,
+    recording_callback_url: str | None = None,
+) -> str:
+    """Builds TwiML that forwards (dials out) the incoming call to another
+    number. When recording_callback_url is given, records the whole
+    two-way conversation from the moment it's answered (both legs mixed
+    into one track) and posts the finished recording there.
+    """
     response = VoiceResponse()
     dial_kwargs = {}
     if status_callback_url:
-        dial_kwargs = {
-            "action": status_callback_url,
-            "status_callback": status_callback_url,
-            "status_callback_event": "completed",
-        }
+        dial_kwargs["action"] = status_callback_url
+        dial_kwargs["status_callback"] = status_callback_url
+        dial_kwargs["status_callback_event"] = "completed"
+    if recording_callback_url:
+        dial_kwargs["record"] = "record-from-answer-dual"
+        dial_kwargs["recording_status_callback"] = recording_callback_url
+        dial_kwargs["recording_status_callback_method"] = "POST"
+        dial_kwargs["recording_status_callback_event"] = "completed"
     response.dial(forwarding_number, **dial_kwargs)
     return str(response)
 

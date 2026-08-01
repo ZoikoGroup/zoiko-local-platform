@@ -127,6 +127,74 @@ def test_incoming_call_forwards_when_configured(client, db_session):
     assert "+15551112222" in response.text
 
 
+def test_forwarded_call_twiml_requests_recording(client, db_session):
+    token = _signup_and_login(client, "voicerecord@example.com")
+    account_id = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"}).json()["account_id"]
+    number = PhoneNumber(
+        e164="+15550001234", country="US", status=PhoneNumberStatus.ACTIVE, account_id=account_id
+    )
+    db_session.add(number)
+    db_session.commit()
+
+    client.put(
+        "/numbers/+15550001234/routing",
+        json={"forwarding_number": "+15551112222"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    incoming_url = "http://testserver/media/voice/incoming"
+    incoming_params = {
+        "To": "+15550001234", "From": "+15559990000", "CallSid": "CArecord1", "CallStatus": "ringing",
+    }
+    signature = _twilio_signature(incoming_url, incoming_params)
+    response = client.post(
+        "/media/voice/incoming", data=incoming_params, headers={"X-Twilio-Signature": signature}
+    )
+    assert response.status_code == 200
+    assert 'record="record-from-answer-dual"' in response.text
+    assert "media/voice/recording-callback" in response.text
+
+
+def test_recording_callback_rejects_missing_signature(client):
+    response = client.post(
+        "/media/voice/recording-callback",
+        data={"CallSid": "CArecord2", "RecordingUrl": "https://example.com/rec.wav", "RecordingDuration": "30"},
+    )
+    assert response.status_code == 403
+
+
+def test_recording_callback_attaches_recording_to_the_call(client, db_session):
+    token = _signup_and_login(client, "voicerecordcb@example.com")
+    account_id = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"}).json()["account_id"]
+    number = PhoneNumber(
+        e164="+15550005678", country="US", status=PhoneNumberStatus.ACTIVE, account_id=account_id
+    )
+    db_session.add(number)
+    db_session.commit()
+
+    incoming_url = "http://testserver/media/voice/incoming"
+    incoming_params = {
+        "To": "+15550005678", "From": "+15559990000", "CallSid": "CArecord3", "CallStatus": "ringing",
+    }
+    incoming_signature = _twilio_signature(incoming_url, incoming_params)
+    client.post("/media/voice/incoming", data=incoming_params, headers={"X-Twilio-Signature": incoming_signature})
+
+    recording_url = "http://testserver/media/voice/recording-callback"
+    recording_params = {
+        "CallSid": "CArecord3", "RecordingUrl": "https://example.com/rec.wav", "RecordingDuration": "58",
+    }
+    recording_signature = _twilio_signature(recording_url, recording_params)
+    recording_response = client.post(
+        "/media/voice/recording-callback", data=recording_params,
+        headers={"X-Twilio-Signature": recording_signature},
+    )
+    assert recording_response.status_code == 204
+
+    calls = client.get("/media/voice/calls", headers={"Authorization": f"Bearer {token}"}).json()
+    assert calls[0]["recording_url"] == "https://example.com/rec.wav"
+    assert calls[0]["duration"] == 58
+
+
 def test_incoming_call_goes_to_voicemail_outside_business_hours(client, db_session):
     token = _signup_and_login(client, "voicehours@example.com")
     account_id = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"}).json()["account_id"]

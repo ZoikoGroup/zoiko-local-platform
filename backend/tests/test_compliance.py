@@ -1,3 +1,5 @@
+import logging
+
 from app.compliance.models import ComplianceRule
 
 
@@ -223,6 +225,38 @@ def test_staff_can_list_all_cases_with_account_context(client, db_session):
     match = next(c for c in response.json() if c["id"] == case_id)
     assert match["account_owner_email"] == "listall2@example.com"
     assert match["account_name"] == "Compliance Test Co"
+
+
+def test_approving_a_case_notifies_the_account_owner(client, db_session, caplog):
+    customer_token = _signup_and_login(client, "notifyapprove@example.com")
+    case_id = _open_case(client, {"Authorization": f"Bearer {customer_token}"})
+
+    staff_token = _create_and_login_staff(db_session, client, "staffnotify1@zoikolocal.com")
+    with caplog.at_level(logging.INFO, logger="zoiko.notifications"):
+        client.post(f"/compliance/cases/{case_id}/approve", headers={"Authorization": f"Bearer {staff_token}"})
+
+    assert any(
+        "notifyapprove@example.com" in record.message and "approved" in record.message
+        for record in caplog.records
+    )
+
+
+def test_rejecting_a_case_notifies_the_account_owner_with_reason(client, db_session, caplog):
+    customer_token = _signup_and_login(client, "notifyreject@example.com")
+    case_id = _open_case(client, {"Authorization": f"Bearer {customer_token}"})
+
+    staff_token = _create_and_login_staff(db_session, client, "staffnotify2@zoikolocal.com")
+    with caplog.at_level(logging.INFO, logger="zoiko.notifications"):
+        client.post(
+            f"/compliance/cases/{case_id}/reject",
+            json={"reason": "Document was blurry"},
+            headers={"Authorization": f"Bearer {staff_token}"},
+        )
+
+    assert any(
+        "notifyreject@example.com" in record.message and "Document was blurry" in record.message
+        for record in caplog.records
+    )
 
 
 def test_staff_can_filter_cases_by_status(client, db_session):

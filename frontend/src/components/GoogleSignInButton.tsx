@@ -29,16 +29,23 @@ export default function GoogleSignInButton({
   onCredential: (credential: string) => void;
 }) {
   const containerRef = useRef<HTMLDivElement>(null);
-  const [scriptLoaded, setScriptLoaded] = useState(false);
+  // Lazy-initialized from the actual DOM state at mount, rather than set
+  // via a synchronous setState call inside the effect below - avoids an
+  // extra render and a redundant initialize() call when the script (or a
+  // fully-initialized google.accounts.id) already exists from a prior mount.
+  const [scriptLoaded, setScriptLoaded] = useState(
+    () => typeof window !== "undefined" && !!window.google?.accounts?.id
+  );
+  // onCredential is re-created on every render of the parent (login/signup
+  // pages don't memoize it) - kept in a ref so the init effect below only
+  // depends on scriptLoaded, not on a prop that changes every keystroke.
+  const onCredentialRef = useRef(onCredential);
+  useEffect(() => {
+    onCredentialRef.current = onCredential;
+  });
 
   useEffect(() => {
-    if (!CLIENT_ID) return;
-
-    // Already fully loaded (e.g. from a prior mount) - don't re-add.
-    if (window.google?.accounts?.id) {
-      setScriptLoaded(true);
-      return;
-    }
+    if (!CLIENT_ID || scriptLoaded) return;
 
     // React Strict Mode runs this effect twice in dev - the tag may
     // already exist from the first run but not have finished loading
@@ -56,14 +63,14 @@ export default function GoogleSignInButton({
     const handleLoad = () => setScriptLoaded(true);
     script.addEventListener("load", handleLoad);
     return () => script?.removeEventListener("load", handleLoad);
-  }, []);
+  }, [scriptLoaded]);
 
   useEffect(() => {
     if (!scriptLoaded || !CLIENT_ID || !containerRef.current || !window.google) return;
 
     window.google.accounts.id.initialize({
       client_id: CLIENT_ID,
-      callback: (response) => onCredential(response.credential),
+      callback: (response) => onCredentialRef.current(response.credential),
     });
 
     window.google.accounts.id.renderButton(containerRef.current, {
@@ -72,7 +79,7 @@ export default function GoogleSignInButton({
       width: 320,
       text: "continue_with",
     });
-  }, [scriptLoaded, onCredential]);
+  }, [scriptLoaded]);
 
   if (!CLIENT_ID) {
     return (

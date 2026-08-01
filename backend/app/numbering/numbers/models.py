@@ -37,6 +37,14 @@ class PhoneNumber(Base):
     )
     reserved_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
+    # Roadmap "Team and RBAC ... number assignment" — which team member this
+    # number is handed to (e.g. a sales line given to one agent). NULL means
+    # unassigned: any Owner/Admin on the account can still manage it, but no
+    # plain Member can until an Owner/Admin assigns it to them.
+    assigned_user_id: Mapped[str | None] = mapped_column(
+        UUID(as_uuid=False), ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+
     # Basic routing (Roadmap §2 "Voice: ... call forwarding ... business-hours
     # routing"). No forwarding_number = always go to voicemail. A forwarding
     # number with no business hours set = always forward.

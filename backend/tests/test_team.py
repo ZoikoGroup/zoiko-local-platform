@@ -1,3 +1,6 @@
+import logging
+
+
 def _signup_and_login(client, email: str, account_name: str = "Team Test Co") -> str:
     client.post(
         "/auth/signup",
@@ -21,6 +24,20 @@ def test_owner_can_add_a_team_member(client):
     )
     assert response.status_code == 201
     assert response.json()["role"] == "member"
+
+
+def test_adding_a_member_notifies_them_by_email(client, caplog):
+    owner_token = _signup_and_login(client, "notifyowner@example.com", account_name="Notify Test Co")
+    with caplog.at_level(logging.INFO, logger="zoiko.notifications"):
+        client.post(
+            "/team/members",
+            json={"email": "notifymember@example.com", "password": "supersecret123", "role": "member"},
+            headers={"Authorization": f"Bearer {owner_token}"},
+        )
+    assert any(
+        "notifymember@example.com" in record.message and "Notify Test Co" in record.message
+        for record in caplog.records
+    )
 
 
 def test_new_member_belongs_to_the_same_account_as_the_owner(client):

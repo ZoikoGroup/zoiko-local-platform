@@ -9,38 +9,43 @@ from app.integrations.telecom.twilio import download_recording
 from app.integrations.transcription.groq import MODEL_VERSION as TRANSCRIPTION_MODEL_VERSION
 from app.integrations.transcription.groq import transcribe_audio
 from app.intelligence.models import ConversationSummary, SummarySourceType
-from app.media.models import Voicemail
+from app.media.models import CallRecord, Voicemail
 
 AI_DISCLAIMER = "AI-generated summary — may be inaccurate; not an authoritative record."
 
 
 class SummaryAuthorizationError(Exception):
-    """Raised when the caller's account doesn't own the voicemail being summarized."""
+    """Raised when the caller's account doesn't own the voicemail/call being summarized."""
 
 
 class ConsentRequiredError(Exception):
     """Raised when AI processing is attempted without active consent on file."""
 
 
-def summarize_voicemail(db: Session, account_id: str, voicemail_id: str) -> ConversationSummary:
-    voicemail = db.query(Voicemail).filter(Voicemail.id == voicemail_id).first()
-    if voicemail is None or voicemail.account_id != account_id:
-        raise SummaryAuthorizationError(f"{voicemail_id} is not a voicemail owned by your account")
+class NotRecordedError(Exception):
+    """Raised when summarizing a call that has no recording yet (still in
+    progress, wasn't forwarded, or the recording callback hasn't landed)."""
 
+
+def _require_consent(db: Session, account_id: str, action: str) -> None:
     if not has_active_consent(db, account_id, ConsentType.AI_PROCESSING):
         raise ConsentRequiredError(
-            "AI processing consent is required before summarizing voicemails — "
+            f"AI processing consent is required before summarizing {action} — "
             "grant it via POST /compliance/consent first"
         )
 
-    audio_bytes = download_recording(voicemail.recording_url)
+
+def _transcribe_and_store(
+    db: Session, *, account_id: str, source_type: SummarySourceType, source_id: str, recording_url: str
+) -> ConversationSummary:
+    audio_bytes = download_recording(recording_url)
     transcript = transcribe_audio(audio_bytes)
     summary_text = summarize_transcript(transcript)
 
     record = ConversationSummary(
         account_id=account_id,
-        source_type=SummarySourceType.VOICEMAIL,
-        source_id=voicemail.id,
+        source_type=source_type,
+        source_id=source_id,
         transcript=transcript,
         summary=summary_text,
         model_version=f"{TRANSCRIPTION_MODEL_VERSION};{LLM_MODEL_VERSION}",
@@ -51,9 +56,43 @@ def summarize_voicemail(db: Session, account_id: str, voicemail_id: str) -> Conv
     log_event(
         db, actor_id=account_id, action="intelligence.summary_created",
         target_type="conversation_summary", target_id=record.id,
-        metadata={"source_type": "voicemail", "source_id": voicemail.id},
+        metadata={"source_type": source_type.value, "source_id": source_id},
     )
     return record
+
+
+def summarize_voicemail(db: Session, account_id: str, voicemail_id: str) -> ConversationSummary:
+    voicemail = db.query(Voicemail).filter(Voicemail.id == voicemail_id).first()
+    if voicemail is None or voicemail.account_id != account_id:
+        raise SummaryAuthorizationError(f"{voicemail_id} is not a voicemail owned by your account")
+
+    _require_consent(db, account_id, "voicemails")
+
+    return _transcribe_and_store(
+        db,
+        account_id=account_id,
+        source_type=SummarySourceType.VOICEMAIL,
+        source_id=voicemail.id,
+        recording_url=voicemail.recording_url,
+    )
+
+
+def summarize_call(db: Session, account_id: str, call_id: str) -> ConversationSummary:
+    call = db.query(CallRecord).filter(CallRecord.id == call_id).first()
+    if call is None or call.account_id != account_id:
+        raise SummaryAuthorizationError(f"{call_id} is not a call owned by your account")
+    if not call.recording_url:
+        raise NotRecordedError(f"{call_id} has no recording yet — it may still be in progress")
+
+    _require_consent(db, account_id, "calls")
+
+    return _transcribe_and_store(
+        db,
+        account_id=account_id,
+        source_type=SummarySourceType.CALL,
+        source_id=call.id,
+        recording_url=call.recording_url,
+    )
 
 
 def qualify_caller(db: Session, account_id: str, transcript: str) -> tuple[dict | None, str | None]:

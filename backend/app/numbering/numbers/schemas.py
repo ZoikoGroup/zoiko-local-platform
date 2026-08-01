@@ -27,6 +27,10 @@ class PurchaseNumberRequest(BaseModel):
     e164: str
 
 
+class AssignNumberRequest(BaseModel):
+    user_id: str | None = None  # None unassigns the number
+
+
 class PhoneNumberResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -35,6 +39,7 @@ class PhoneNumberResponse(BaseModel):
     country: str
     status: str
     account_id: str
+    assigned_user_id: str | None
     reserved_until: datetime | None
     forwarding_number: str | None
     business_hours_start: time | None

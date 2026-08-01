@@ -47,7 +47,17 @@ summaries next.
 Built and tested end-to-end against real providers (not stubs): 1:1 video rooms via
 LiveKit (`backend/app/media/video.py`, `POST/GET /media/video/rooms*`), and AI voicemail
 summaries via Groq Whisper + Llama (`backend/app/intelligence/`, `POST
-/intelligence/voicemails/{id}/summarize`). AI call (not just voicemail) summaries are
-still out of scope — calls aren't recorded yet, only voicemails, so there's no audio to
-transcribe for a live call. Full AI Receptionist (answering, routing, escalation per the
-roadmap doc) is still not built — only summarization exists so far.
+/intelligence/voicemails/{id}/summarize`).
+
+**2026-08-01:** Forwarded inbound calls (the two-way conversation path — see
+`should_forward_call` in `backend/app/media/service.py`) are now recorded end-to-end via
+Twilio's `<Dial record="record-from-answer-dual">`, landing on `call_records.recording_url`
+via the new `/media/voice/recording-callback` webhook. AI call summaries reuse the same
+Groq Whisper + Llama pipeline as voicemail (`POST /intelligence/calls/{id}/summarize`),
+gated on the same AI-processing consent record. Not recorded: outbound calls (the
+`/media/voice/outbound` demo endpoint is a one-way canned `<Say>`, not a conversation) and
+calls handled by the AI Receptionist or plain voicemail branches (those already have their
+own dedicated capture — a receptionist transcript or a voicemail recording — so recording
+the outer call too would just duplicate audio already on file). Full AI Receptionist
+(answering, routing, escalation per the roadmap doc) is still not built — only
+summarization exists so far.

@@ -8,6 +8,7 @@ from app.core.security import (
     verify_password,
     verify_totp_code,
 )
+from app.notifications.service import notify_team_member_added
 from app.numbering.identity.models import Account, AccountType, User, UserRole
 
 
@@ -119,6 +120,11 @@ def add_team_member(
         target=f"user:{member.id}",
         after={"user_id": member.id, "email": member.email, "role": member.role},
     )
+
+    account = db.query(Account).filter(Account.id == account_id).first()
+    if account is not None:
+        notify_team_member_added(member.email, account.name, member.role)
+
     return member
 
 

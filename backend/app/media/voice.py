@@ -58,7 +58,8 @@ async def incoming_call(request: Request, db: Session = Depends(get_db)):
 
     if owner is not None and media_service.should_forward_call(owner):
         status_callback_url = str(request.base_url) + "media/voice/status-callback"
-        twiml = telecom.build_forward_response(owner.forwarding_number, status_callback_url)
+        recording_callback_url = str(request.base_url) + "media/voice/recording-callback"
+        twiml = telecom.build_forward_response(owner.forwarding_number, status_callback_url, recording_callback_url)
     elif owner is not None and owner.ai_receptionist_enabled:
         action_url = str(request.base_url) + "media/receptionist/respond"
         twiml = telecom.build_gather_response(
@@ -110,6 +111,22 @@ async def status_callback(request: Request, db: Session = Depends(get_db)):
     return Response(status_code=204)
 
 
+@router.post("/recording-callback")
+async def recording_callback(request: Request, db: Session = Depends(get_db)):
+    """Twilio posts here once a forwarded call's recording (see
+    build_forward_response's record="record-from-answer-dual") finishes
+    processing - separate from, and usually after, /status-callback."""
+    params = await media_service.verify_twilio_webhook(request)
+    duration_raw = params.get("RecordingDuration")
+    media_service.record_call_recording(
+        db,
+        provider_call_sid=params.get("CallSid", ""),
+        recording_url=params.get("RecordingUrl", ""),
+        duration=int(duration_raw) if duration_raw else None,
+    )
+    return Response(status_code=204)
+
+
 @router.get("/calls")
 async def list_calls(
     limit: int = 20,
@@ -125,12 +142,14 @@ async def list_calls(
     )
     return [
         {
+            "id": c.id,
             "sid": c.provider_call_sid,
             "status": c.status,
             "to": c.to_number,
             "from": c.from_number,
             "direction": c.direction.value,
             "duration": c.duration,
+            "recording_url": c.recording_url,
             "created_at": c.created_at,
         }
         for c in calls

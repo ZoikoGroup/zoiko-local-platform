@@ -2,18 +2,19 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
-from app.core.deps import get_current_user
+from app.core.deps import get_current_user, require_admin
 from app.integrations.telecom.twilio import TelecomError
 from app.numbering.identity.models import User
 from app.numbering.numbers import service
 from app.numbering.numbers.schemas import (
+    AssignNumberRequest,
     NumberSearchResult,
     PhoneNumberResponse,
     PurchaseNumberRequest,
     ReserveNumberRequest,
     RoutingConfigRequest,
 )
-from app.numbering.numbers.service import NumberConflictError
+from app.numbering.numbers.service import ComplianceRequiredError, NumberConflictError
 
 router = APIRouter(prefix="/numbers", tags=["numbers"])
 
@@ -53,6 +54,8 @@ def purchase_number(
         return service.purchase_number(db, current_user.account_id, payload.e164)
     except NumberConflictError as e:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e
+    except ComplianceRequiredError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e)) from e
     except TelecomError as e:
         raise HTTPException(status_code=502, detail=str(e)) from e
 
@@ -62,7 +65,23 @@ def list_numbers(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    return service.list_account_numbers(db, current_user.account_id)
+    return service.list_account_numbers(db, current_user.account_id, user=current_user)
+
+
+@router.put("/{e164}/assign", response_model=PhoneNumberResponse)
+def assign_number(
+    e164: str,
+    payload: AssignNumberRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin),
+):
+    try:
+        return service.assign_number(
+            db, account_id=current_user.account_id, e164=e164,
+            user_id=payload.user_id, actor=current_user.id,
+        )
+    except NumberConflictError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e
 
 
 @router.post("/{e164}/suspend", response_model=PhoneNumberResponse)
@@ -72,7 +91,7 @@ def suspend_number(
     current_user: User = Depends(get_current_user),
 ):
     try:
-        return service.suspend_number(db, current_user.account_id, e164)
+        return service.suspend_number(db, current_user, e164)
     except NumberConflictError as e:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e
 
@@ -84,7 +103,7 @@ def cancel_number(
     current_user: User = Depends(get_current_user),
 ):
     try:
-        return service.cancel_number(db, current_user.account_id, e164)
+        return service.cancel_number(db, current_user, e164)
     except NumberConflictError as e:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e
 
@@ -98,7 +117,7 @@ def configure_routing(
 ):
     try:
         return service.configure_routing(
-            db, current_user.account_id, e164,
+            db, current_user, e164,
             payload.forwarding_number, payload.business_hours_start,
             payload.business_hours_end, payload.business_hours_timezone,
             payload.ai_receptionist_enabled,

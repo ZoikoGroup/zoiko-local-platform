@@ -36,6 +36,13 @@ class CallRecord(Base):
     provider_call_sid: Mapped[str | None] = mapped_column(String(50), nullable=True, index=True)
     status: Mapped[str] = mapped_column(String(30), nullable=False)
     duration: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Only ever set for a forwarded inbound call (the two-way conversation
+    # path - see voice.py's should_forward_call branch) via Twilio's <Dial
+    # record="record-from-answer-dual">. The other branches (voicemail,
+    # receptionist, a bare unrecognized-number message) have their own
+    # separate recording rows already, so recording the whole outer call
+    # there would just duplicate audio that's already captured.
+    recording_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 

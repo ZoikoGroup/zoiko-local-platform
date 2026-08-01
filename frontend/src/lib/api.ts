@@ -205,3 +205,182 @@ export function staffRejectCase(
     body: JSON.stringify({ reason }),
   });
 }
+
+export type AccountOverview = {
+  id: string;
+  name: string;
+  account_type: string;
+  owner_email: string | null;
+  member_count: number;
+  number_count: number;
+  created_at: string;
+};
+
+export function listStaffAccounts(token: string): Promise<AccountOverview[]> {
+  return request<AccountOverview[]>("/staff/accounts", {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export type AuditEvent = {
+  id: string;
+  actor: string;
+  action: string;
+  target: string;
+  before_hash: string | null;
+  after_hash: string | null;
+  reason: string | null;
+  correlation_id: string | null;
+  created_at: string;
+};
+
+export function listStaffAuditEvents(token: string): Promise<AuditEvent[]> {
+  return request<AuditEvent[]>("/audit/events", {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+// --- Numbers ---
+
+export type MyPhoneNumber = {
+  id: string;
+  e164: string;
+  country: string;
+  status: string;
+  assigned_user_id: string | null;
+  reserved_until: string | null;
+  forwarding_number: string | null;
+  ai_receptionist_enabled: boolean;
+};
+
+export function listMyNumbers(token: string): Promise<MyPhoneNumber[]> {
+  return request<MyPhoneNumber[]>("/numbers", {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export type NumberSearchResult = {
+  phone_number: string;
+  locality: string | null;
+  region: string | null;
+  capabilities: Record<string, boolean> | null;
+};
+
+export function searchNumbers(
+  token: string,
+  input: { country: string; number_type?: string; area_code?: string }
+): Promise<NumberSearchResult[]> {
+  const params = new URLSearchParams({ country: input.country });
+  if (input.number_type) params.set("number_type", input.number_type);
+  if (input.area_code) params.set("area_code", input.area_code);
+  return request<NumberSearchResult[]>(`/numbers/search?${params.toString()}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export function reserveNumber(
+  token: string,
+  input: { e164: string; country: string }
+): Promise<MyPhoneNumber> {
+  return request<MyPhoneNumber>("/numbers/reserve", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify(input),
+  });
+}
+
+export function purchaseNumber(token: string, e164: string): Promise<MyPhoneNumber> {
+  return request<MyPhoneNumber>("/numbers/purchase", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ e164 }),
+  });
+}
+
+export function suspendNumber(token: string, e164: string): Promise<MyPhoneNumber> {
+  return request<MyPhoneNumber>(`/numbers/${encodeURIComponent(e164)}/suspend`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export function cancelNumber(token: string, e164: string): Promise<MyPhoneNumber> {
+  return request<MyPhoneNumber>(`/numbers/${encodeURIComponent(e164)}/cancel`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export type CallLogEntry = {
+  id: string;
+  sid: string | null;
+  status: string;
+  to: string;
+  from: string;
+  direction: "inbound" | "outbound";
+  duration: number | null;
+  recording_url: string | null;
+  created_at: string;
+};
+
+export function listCalls(token: string): Promise<CallLogEntry[]> {
+  return request<CallLogEntry[]>("/media/voice/calls", {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export function placeOutboundCall(
+  token: string,
+  input: { to: string; from: string; message?: string }
+): Promise<{ sid: string; status: string; to: string; from: string }> {
+  return request("/media/voice/outbound", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify(input),
+  });
+}
+
+export type VoicemailEntry = {
+  id: string;
+  from: string;
+  recording_url: string;
+  duration: number | null;
+  created_at: string;
+};
+
+export function listVoicemails(token: string): Promise<VoicemailEntry[]> {
+  return request<VoicemailEntry[]>("/media/voicemail", {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export type ConversationSummary = {
+  id: string;
+  source_type: string;
+  transcript: string;
+  summary: string;
+  model_version: string;
+  disclaimer: string;
+};
+
+export function summarizeCall(token: string, callId: string): Promise<ConversationSummary> {
+  return request<ConversationSummary>(`/intelligence/calls/${callId}/summarize`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export function summarizeVoicemail(token: string, voicemailId: string): Promise<ConversationSummary> {
+  return request<ConversationSummary>(`/intelligence/voicemails/${voicemailId}/summarize`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export function grantAiProcessingConsent(token: string): Promise<{ granted_at: string }> {
+  return request("/compliance/consent", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ consent_type: "ai_processing" }),
+  });
+}

@@ -139,6 +139,26 @@ def update_call_status(db: Session, provider_call_sid: str, status: str, duratio
     return call
 
 
+def record_call_recording(db: Session, provider_call_sid: str, recording_url: str, duration: int | None) -> CallRecord | None:
+    """Applies a Twilio <Dial record> callback (see build_forward_response)
+    to the CallRecord written at call time - arrives separately from, and
+    usually after, the status-callback that sets the final call status."""
+    call = db.query(CallRecord).filter(CallRecord.provider_call_sid == provider_call_sid).first()
+    if call is None:
+        return None
+
+    call.recording_url = recording_url
+    if duration is not None:
+        call.duration = duration
+    db.commit()
+    db.refresh(call)
+    log_event(
+        db, actor_id=call.account_id, action="call.recorded",
+        target_type="call_record", target_id=call.id, metadata={"duration": duration},
+    )
+    return call
+
+
 def record_voicemail(
     db: Session,
     *,

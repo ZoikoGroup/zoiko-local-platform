@@ -5,9 +5,10 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.audit.service import log_event
+from app.compliance.service import has_approved_case, is_requirement_active
 from app.integrations.telecom import twilio as telecom
-from app.notifications.service import notify_number_activated
-from app.numbering.identity.models import User, UserRole
+from app.notifications.service import notify_number_activated, notify_number_suspended
+from app.numbering.identity.models import Account, AccountType, User, UserRole
 from app.numbering.numbers.models import PhoneNumber, PhoneNumberStatus
 
 RESERVATION_TTL_MINUTES = 12
@@ -16,6 +17,17 @@ RESERVATION_TTL_MINUTES = 12
 class NumberConflictError(Exception):
     """Raised when a number can't be reserved/purchased because another
     account already holds it, or the caller's own reservation lapsed."""
+
+
+class ComplianceRequiredError(Exception):
+    """Raised when the number's country has an active KYC/KYB rule and the
+    account has no approved compliance case covering it yet — the docs'
+    "Compliance Pending" lifecycle state, enforced at the point of purchase."""
+
+
+def _kyc_requirement_type(db: Session, account_id: str) -> str:
+    account = db.query(Account).filter(Account.id == account_id).first()
+    return "kyc_individual" if account.account_type == AccountType.INDIVIDUAL else "kyc_business"
 
 
 def search_numbers(country: str, number_type: str = "local", area_code: str | None = None) -> list[dict]:
@@ -83,6 +95,15 @@ def purchase_number(db: Session, account_id: str, e164: str) -> PhoneNumber:
     if number.reserved_until is not None and number.reserved_until < now:
         raise NumberConflictError(f"Reservation for {e164} expired — reserve it again before purchasing")
 
+    requirement_type = _kyc_requirement_type(db, account_id)
+    if is_requirement_active(db, number.country, requirement_type) and not has_approved_case(
+        db, account_id=account_id, jurisdiction=number.country, requirement_type=requirement_type
+    ):
+        raise ComplianceRequiredError(
+            f"An approved {requirement_type} compliance case for {number.country} "
+            "is required before purchasing a number there"
+        )
+
     number.status = PhoneNumberStatus.PURCHASE_PENDING
     db.commit()
     log_event(
@@ -120,33 +141,40 @@ def purchase_number(db: Session, account_id: str, e164: str) -> PhoneNumber:
     return number
 
 
-def suspend_number(db: Session, account_id: str, e164: str, reason: str | None = None) -> PhoneNumber:
+def suspend_number(db: Session, user: User, e164: str, reason: str | None = None) -> PhoneNumber:
     number = db.query(PhoneNumber).filter(PhoneNumber.e164 == e164).with_for_update().first()
-    if number is None or number.account_id != account_id or number.status != PhoneNumberStatus.ACTIVE:
+    if number is None or number.account_id != user.account_id or number.status != PhoneNumberStatus.ACTIVE:
         raise NumberConflictError(f"{e164} must be an active number owned by your account to suspend")
+    _assert_member_can_manage(number, user)
 
     number.status = PhoneNumberStatus.SUSPENDED
     db.commit()
     db.refresh(number)
     log_event(
-        db, actor_id=account_id, action="number.suspended",
+        db, actor_id=user.id, action="number.suspended",
         target_type="phone_number", target_id=number.id, metadata={"e164": e164, "reason": reason},
     )
+
+    owner = db.query(User).filter(User.account_id == user.account_id, User.role == UserRole.OWNER).first()
+    if owner is not None:
+        notify_number_suspended(owner.email, e164, reason)
+
     return number
 
 
-def cancel_number(db: Session, account_id: str, e164: str) -> PhoneNumber:
+def cancel_number(db: Session, user: User, e164: str) -> PhoneNumber:
     number = db.query(PhoneNumber).filter(PhoneNumber.e164 == e164).with_for_update().first()
-    if number is None or number.account_id != account_id or number.status not in (
+    if number is None or number.account_id != user.account_id or number.status not in (
         PhoneNumberStatus.ACTIVE, PhoneNumberStatus.SUSPENDED,
     ):
         raise NumberConflictError(f"{e164} must be an active or suspended number owned by your account to cancel")
+    _assert_member_can_manage(number, user)
 
     number.status = PhoneNumberStatus.CANCELLED
     db.commit()
     db.refresh(number)
     log_event(
-        db, actor_id=account_id, action="number.cancelled",
+        db, actor_id=user.id, action="number.cancelled",
         target_type="phone_number", target_id=number.id, metadata={"e164": e164},
     )
     return number
@@ -154,7 +182,7 @@ def cancel_number(db: Session, account_id: str, e164: str) -> PhoneNumber:
 
 def configure_routing(
     db: Session,
-    account_id: str,
+    user: User,
     e164: str,
     forwarding_number: str | None,
     business_hours_start: time | None,
@@ -163,8 +191,9 @@ def configure_routing(
     ai_receptionist_enabled: bool = False,
 ) -> PhoneNumber:
     number = db.query(PhoneNumber).filter(PhoneNumber.e164 == e164).first()
-    if number is None or number.account_id != account_id:
+    if number is None or number.account_id != user.account_id:
         raise NumberConflictError(f"{e164} is not a number owned by your account")
+    _assert_member_can_manage(number, user)
 
     try:
         ZoneInfo(business_hours_timezone)
@@ -179,12 +208,49 @@ def configure_routing(
     db.commit()
     db.refresh(number)
     log_event(
-        db, actor_id=account_id, action="number.routing_configured",
+        db, actor_id=user.id, action="number.routing_configured",
         target_type="phone_number", target_id=number.id,
         metadata={"e164": e164, "forwarding_number": forwarding_number},
     )
     return number
 
 
-def list_account_numbers(db: Session, account_id: str) -> list[PhoneNumber]:
-    return db.query(PhoneNumber).filter(PhoneNumber.account_id == account_id).all()
+def list_account_numbers(db: Session, account_id: str, *, user: User) -> list[PhoneNumber]:
+    """Owner/Admin see every number on the account. A plain Member only sees
+    numbers assigned to them - unassigned numbers aren't theirs to manage
+    yet, they haven't been handed anything."""
+    query = db.query(PhoneNumber).filter(PhoneNumber.account_id == account_id)
+    if user.role == UserRole.MEMBER:
+        query = query.filter(PhoneNumber.assigned_user_id == user.id)
+    return query.all()
+
+
+def assign_number(db: Session, *, account_id: str, e164: str, user_id: str | None, actor: str) -> PhoneNumber:
+    number = db.query(PhoneNumber).filter(PhoneNumber.e164 == e164).first()
+    if number is None or number.account_id != account_id:
+        raise NumberConflictError(f"{e164} is not a number owned by your account")
+
+    if user_id is not None:
+        assignee = db.query(User).filter(User.id == user_id, User.account_id == account_id).first()
+        if assignee is None:
+            raise NumberConflictError(f"No team member with id {user_id} on this account")
+
+    before_assignee = number.assigned_user_id
+    number.assigned_user_id = user_id
+    db.commit()
+    db.refresh(number)
+
+    log_event(
+        db, actor=actor, action="number.assigned",
+        target=f"phone_number:{number.id}",
+        before={"assigned_user_id": before_assignee},
+        after={"assigned_user_id": user_id},
+    )
+    return number
+
+
+def _assert_member_can_manage(number: PhoneNumber, user: User) -> None:
+    """Owner/Admin can manage any number on their account. A Member can only
+    manage a number that's been assigned to them."""
+    if user.role == UserRole.MEMBER and number.assigned_user_id != user.id:
+        raise NumberConflictError(f"{number.e164} is not assigned to you")

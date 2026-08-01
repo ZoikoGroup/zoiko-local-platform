@@ -8,22 +8,3 @@ export const COUNTRIES = [
   { code: "KE", name: "Kenya", dial: "+254" },
   { code: "MX", name: "Mexico", dial: "+52" },
 ];
-
-function randomDigits(count: number): string {
-  return Array.from({ length: count }, () => Math.floor(Math.random() * 10)).join("");
-}
-
-/** Generates realistic-looking but entirely fake sample numbers for the
- * given country - NOT real inventory. There's no telecom provider (Twilio)
- * connected yet, so this only demonstrates the UI/UX of the search flow. */
-export function generateSampleNumbers(countryCode: string, count = 3): string[] {
-  const country = COUNTRIES.find((c) => c.code === countryCode);
-  const dial = country?.dial ?? "+1";
-
-  return Array.from({ length: count }, () => {
-    if (dial === "+1") {
-      return `${dial} (${randomDigits(3)}) ${randomDigits(3)}-${randomDigits(4)}`;
-    }
-    return `${dial} ${randomDigits(3)} ${randomDigits(3)} ${randomDigits(3)}`;
-  });
-}

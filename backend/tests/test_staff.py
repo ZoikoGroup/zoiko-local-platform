@@ -61,3 +61,60 @@ def test_staff_token_cannot_be_used_as_a_customer_token(client, db_session):
 
     response = client.get("/auth/me", headers={"Authorization": f"Bearer {staff_token}"})
     assert response.status_code == 401
+
+
+def test_list_accounts_requires_staff_auth(client):
+    response = client.get("/staff/accounts")
+    assert response.status_code == 401
+
+
+def test_customer_cannot_list_accounts(client):
+    client.post(
+        "/auth/signup",
+        json={
+            "account_name": "Overview Test Co",
+            "account_type": "business",
+            "email": "overviewcustomer@example.com",
+            "password": "supersecret123",
+        },
+    )
+    login = client.post(
+        "/auth/login", json={"email": "overviewcustomer@example.com", "password": "supersecret123"}
+    )
+    customer_token = login.json()["access_token"]
+
+    response = client.get("/staff/accounts", headers={"Authorization": f"Bearer {customer_token}"})
+    assert response.status_code == 401
+
+
+def test_staff_can_list_accounts_with_owner_and_counts(client, db_session):
+    signup = client.post(
+        "/auth/signup",
+        json={
+            "account_name": "Overview Owner Co",
+            "account_type": "business",
+            "email": "overviewowner@example.com",
+            "password": "supersecret123",
+        },
+    )
+    account_id = signup.json()["account_id"]
+    owner_token = client.post(
+        "/auth/login", json={"email": "overviewowner@example.com", "password": "supersecret123"}
+    ).json()["access_token"]
+    client.post(
+        "/team/members",
+        json={"email": "overviewteammate@example.com", "password": "supersecret123", "role": "member"},
+        headers={"Authorization": f"Bearer {owner_token}"},
+    )
+
+    _create_staff(db_session, "staff4@zoikolocal.com")
+    staff_token = client.post(
+        "/staff/login", json={"email": "staff4@zoikolocal.com", "password": "staffpass123"}
+    ).json()["access_token"]
+
+    response = client.get("/staff/accounts", headers={"Authorization": f"Bearer {staff_token}"})
+    assert response.status_code == 200
+    match = next(a for a in response.json() if a["id"] == account_id)
+    assert match["owner_email"] == "overviewowner@example.com"
+    assert match["member_count"] == 2
+    assert match["number_count"] == 0

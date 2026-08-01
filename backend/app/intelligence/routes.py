@@ -41,6 +41,32 @@ def summarize_voicemail(
     }
 
 
+@router.post("/calls/{call_id}/summarize", status_code=status.HTTP_201_CREATED)
+def summarize_call(
+    call_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    try:
+        record = service.summarize_call(db, current_user.account_id, call_id)
+    except service.SummaryAuthorizationError as e:
+        raise HTTPException(status_code=403, detail=str(e)) from e
+    except service.ConsentRequiredError as e:
+        raise HTTPException(status_code=403, detail=str(e)) from e
+    except service.NotRecordedError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+    except (TelecomError, TranscriptionError, LLMError) as e:
+        raise HTTPException(status_code=502, detail=str(e)) from e
+    return {
+        "id": record.id,
+        "source_type": record.source_type.value,
+        "transcript": record.transcript,
+        "summary": record.summary,
+        "model_version": record.model_version,
+        "disclaimer": service.AI_DISCLAIMER,
+    }
+
+
 @router.get("/summaries")
 def list_summaries(
     db: Session = Depends(get_db),
