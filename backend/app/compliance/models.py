@@ -35,15 +35,19 @@ class ComplianceRule(Base):
 
 
 class ComplianceCase(Base):
-    """Country-specific evidence and approvals.
+    """Country-specific evidence and approvals for number/KYC verification.
 
     Field shape matches the Backend Architecture doc's data model exactly:
     case_id, account_id, number_id, jurisdiction, requirement_type,
     status, documents, expires_at.
 
-    number_id is a plain string (not yet a foreign key) because the
-    numbering/numbers table doesn't exist yet (Stage 2) - convert this
-    to a real FK once it does.
+    Note: this is KYC/identity verification specifically. AI-processing
+    consent is a separate concern - see app/consent/ (merged from a
+    parallel branch, kept in its own module rather than sharing this
+    file, since the two are unrelated despite both being "compliance").
+
+    number_id is a plain string (not yet a foreign key) since the
+    numbering/numbers table's FK relationship hasn't been wired up here.
     """
 
     __tablename__ = "compliance_cases"

@@ -14,6 +14,12 @@ class AuditEvent(Base):
     Shape matches the Backend Architecture doc's data model exactly:
     audit_id, actor, action, target, before_hash, after_hash,
     timestamp, reason, correlation_id.
+
+    Note: kept this schema (over an alternative actor_id/target_type/
+    target_id/event_metadata design from a parallel branch) since more
+    modules already depend on it - see log_event()'s compatibility
+    parameters in service.py for how the other calling convention maps
+    onto this same table.
     """
 
     __tablename__ = "audit_events"
