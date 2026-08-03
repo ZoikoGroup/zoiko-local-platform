@@ -18,7 +18,9 @@ from app.intelligence import models as intelligence_models  # noqa: F401
 from app.media import models as media_models  # noqa: F401
 from app.numbering.identity import models as identity_models  # noqa: F401
 from app.numbering.numbers import models as numbers_models  # noqa: F401
+from app.risk import models as risk_models  # noqa: F401
 from app.staff import models as staff_models  # noqa: F401
+from app.usage import models as usage_models  # noqa: F401
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.

@@ -60,7 +60,7 @@ async def end_room(
     current_user: User = Depends(get_current_user),
 ):
     try:
-        session = await media_service.end_video_session(db, current_user.account_id, room_name)
+        session = await media_service.end_video_session(db, current_user, room_name)
     except media_service.VideoSessionAuthorizationError as e:
         raise HTTPException(status_code=403, detail=str(e)) from e
     except VideoError as e:
@@ -75,7 +75,7 @@ async def start_recording(
     current_user: User = Depends(get_current_user),
 ):
     try:
-        session = await media_service.start_video_recording(db, current_user.account_id, room_name)
+        session = await media_service.start_video_recording(db, current_user, room_name)
     except media_service.VideoSessionAuthorizationError as e:
         raise HTTPException(status_code=403, detail=str(e)) from e
     except media_service.RecordingConsentRequiredError as e:

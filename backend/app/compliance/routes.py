@@ -11,9 +11,9 @@ from app.compliance.schemas import (
     DocumentSubmit,
 )
 from app.core.database import get_db
-from app.core.deps import get_current_staff, get_current_user
+from app.core.deps import get_current_staff, get_current_user, require_admin, require_staff_role
 from app.numbering.identity.models import User
-from app.staff.models import PlatformStaff
+from app.staff.models import PlatformStaff, PlatformStaffRole
 
 router = APIRouter(prefix="/compliance", tags=["compliance"])
 
@@ -34,7 +34,7 @@ def list_rules(country: str, db: Session = Depends(get_db)):
 def create_case(
     payload: ComplianceCaseCreate,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_admin),
 ):
     return service.open_compliance_case(
         db,
@@ -68,7 +68,7 @@ def submit_document(
     case_id: str,
     payload: DocumentSubmit,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_admin),
 ):
     case = _get_case_or_404(db, case_id)
     if case.account_id != current_user.account_id:
@@ -83,7 +83,9 @@ def submit_document(
 def approve_case(
     case_id: str,
     db: Session = Depends(get_db),
-    staff: PlatformStaff = Depends(get_current_staff),
+    staff: PlatformStaff = Depends(
+        require_staff_role(PlatformStaffRole.COMPLIANCE_OFFICER, PlatformStaffRole.SUPER_ADMIN)
+    ),
 ):
     case = _get_case_or_404(db, case_id)
     return service.approve_case(db, case, actor=staff.id)
@@ -94,7 +96,9 @@ def reject_case(
     case_id: str,
     payload: CaseRejectRequest,
     db: Session = Depends(get_db),
-    staff: PlatformStaff = Depends(get_current_staff),
+    staff: PlatformStaff = Depends(
+        require_staff_role(PlatformStaffRole.COMPLIANCE_OFFICER, PlatformStaffRole.SUPER_ADMIN)
+    ),
 ):
     case = _get_case_or_404(db, case_id)
     return service.reject_case(db, case, actor=staff.id, reason=payload.reason)

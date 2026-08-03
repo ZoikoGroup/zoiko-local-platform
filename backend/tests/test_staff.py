@@ -1,8 +1,9 @@
 from app.staff import service as staff_service
+from app.staff.models import PlatformStaffRole
 
 
-def _create_staff(db_session, email: str, password: str = "staffpass123"):
-    return staff_service.create_staff(db_session, email=email, password=password)
+def _create_staff(db_session, email: str, password: str = "staffpass123", role=PlatformStaffRole.SUPER_ADMIN):
+    return staff_service.create_staff(db_session, email=email, password=password, role=role)
 
 
 def test_staff_login_succeeds_with_correct_credentials(client, db_session):

@@ -2,6 +2,7 @@ import hashlib
 import json
 from typing import Any
 
+import sqlalchemy as sa
 from sqlalchemy.orm import Session
 
 from app.audit.models import AuditEvent
@@ -58,3 +59,35 @@ def log_event(
     db.commit()
     db.refresh(event)
     return event
+
+
+def list_account_events(db: Session, account_id: str, limit: int = 200) -> list[AuditEvent]:
+    """Customer-facing subset of the audit trail (Owner/Admin only - see
+    require_admin on the route). AuditEvent.actor/target are free-text (see
+    log_event's docstring on the two calling conventions), so there's no
+    single account_id column to filter on. This covers the shapes actually
+    used in this codebase: actor=account_id (numbering/media/compliance
+    events), actor=user.id (signup/login/MFA/team events - resolved via the
+    account's own users), and target=f"compliance_case:{id}" (the one place
+    staff act on a customer's data - case approve/reject). It is not a
+    guaranteed-complete view of every possible action type.
+    """
+    from app.compliance.models import ComplianceCase
+    from app.numbering.identity.models import User
+
+    user_ids = [row[0] for row in db.query(User.id).filter(User.account_id == account_id).all()]
+    case_ids = [row[0] for row in db.query(ComplianceCase.id).filter(ComplianceCase.account_id == account_id).all()]
+    case_targets = [f"compliance_case:{case_id}" for case_id in case_ids]
+
+    return (
+        db.query(AuditEvent)
+        .filter(
+            sa.or_(
+                AuditEvent.actor.in_([account_id, *user_ids]),
+                AuditEvent.target.in_(case_targets),
+            )
+        )
+        .order_by(AuditEvent.created_at.desc())
+        .limit(limit)
+        .all()
+    )

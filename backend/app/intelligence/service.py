@@ -1,15 +1,19 @@
+import sqlalchemy as sa
 from sqlalchemy.orm import Session
 
 from app.audit.service import log_event
 from app.consent.models import ConsentType
 from app.consent.service import has_active_consent
 from app.integrations.llm.groq import MODEL_VERSION as LLM_MODEL_VERSION
-from app.integrations.llm.groq import extract_receptionist_qualification, summarize_transcript
+from app.integrations.llm.groq import extract_conversation_summary, extract_receptionist_qualification
 from app.integrations.telecom.twilio import download_recording
 from app.integrations.transcription.groq import MODEL_VERSION as TRANSCRIPTION_MODEL_VERSION
 from app.integrations.transcription.groq import transcribe_audio
 from app.intelligence.models import ConversationSummary, SummarySourceType
-from app.media.models import CallRecord, Voicemail
+from app.media.models import CallRecord, ReceptionistUrgency, Voicemail
+from app.numbering.identity.models import User
+from app.numbering.numbers.service import NumberConflictError, assert_number_access, assigned_number_ids
+from app.numbering.numbers.models import PhoneNumber
 
 AI_DISCLAIMER = "AI-generated summary — may be inaccurate; not an authoritative record."
 
@@ -40,14 +44,24 @@ def _transcribe_and_store(
 ) -> ConversationSummary:
     audio_bytes = download_recording(recording_url)
     transcript = transcribe_audio(audio_bytes)
-    summary_text = summarize_transcript(transcript)
+    analysis = extract_conversation_summary(transcript)
+
+    urgency_raw = analysis.get("urgency")
+    urgency = ReceptionistUrgency(urgency_raw) if urgency_raw in ("low", "medium", "high") else None
+    action_items = analysis.get("action_items")
+    if not isinstance(action_items, list):
+        action_items = None
 
     record = ConversationSummary(
         account_id=account_id,
         source_type=source_type,
         source_id=source_id,
         transcript=transcript,
-        summary=summary_text,
+        summary=analysis.get("summary", ""),
+        language=analysis.get("language"),
+        urgency=urgency,
+        action_items=action_items,
+        suggested_follow_up=analysis.get("suggested_follow_up"),
         model_version=f"{TRANSCRIPTION_MODEL_VERSION};{LLM_MODEL_VERSION}",
     )
     db.add(record)
@@ -56,39 +70,59 @@ def _transcribe_and_store(
     log_event(
         db, actor_id=account_id, action="intelligence.summary_created",
         target_type="conversation_summary", target_id=record.id,
-        metadata={"source_type": source_type.value, "source_id": source_id},
+        metadata={
+            "source_type": source_type.value,
+            "source_id": source_id,
+            "urgency": urgency.value if urgency else None,
+        },
     )
     return record
 
 
-def summarize_voicemail(db: Session, account_id: str, voicemail_id: str) -> ConversationSummary:
-    voicemail = db.query(Voicemail).filter(Voicemail.id == voicemail_id).first()
-    if voicemail is None or voicemail.account_id != account_id:
-        raise SummaryAuthorizationError(f"{voicemail_id} is not a voicemail owned by your account")
+def _assert_can_access_number(db: Session, user: User, phone_number_id: str | None) -> None:
+    """A Member may only summarize calls/voicemail on a number assigned to
+    them - same assignment boundary as direct number management."""
+    if phone_number_id is None:
+        return
+    number = db.query(PhoneNumber).filter(PhoneNumber.id == phone_number_id).first()
+    if number is None:
+        return
+    try:
+        assert_number_access(number, user)
+    except NumberConflictError as e:
+        raise SummaryAuthorizationError(str(e)) from e
 
-    _require_consent(db, account_id, "voicemails")
+
+def summarize_voicemail(db: Session, user: User, voicemail_id: str) -> ConversationSummary:
+    voicemail = db.query(Voicemail).filter(Voicemail.id == voicemail_id).first()
+    if voicemail is None or voicemail.account_id != user.account_id:
+        raise SummaryAuthorizationError(f"{voicemail_id} is not a voicemail owned by your account")
+    _assert_can_access_number(db, user, voicemail.phone_number_id)
+
+    _require_consent(db, user.account_id, "voicemails")
 
     return _transcribe_and_store(
         db,
-        account_id=account_id,
+        account_id=user.account_id,
         source_type=SummarySourceType.VOICEMAIL,
         source_id=voicemail.id,
         recording_url=voicemail.recording_url,
     )
 
 
-def summarize_call(db: Session, account_id: str, call_id: str) -> ConversationSummary:
+def summarize_call(db: Session, user: User, call_id: str) -> ConversationSummary:
     call = db.query(CallRecord).filter(CallRecord.id == call_id).first()
-    if call is None or call.account_id != account_id:
+    if call is None or call.account_id != user.account_id:
         raise SummaryAuthorizationError(f"{call_id} is not a call owned by your account")
     if not call.recording_url:
         raise NotRecordedError(f"{call_id} has no recording yet — it may still be in progress")
+    _assert_can_access_number(db, user, call.phone_number_id)
 
-    _require_consent(db, account_id, "calls")
+    _require_consent(db, user.account_id, "calls")
 
     return _transcribe_and_store(
         db,
-        account_id=account_id,
+        account_id=user.account_id,
         source_type=SummarySourceType.CALL,
         source_id=call.id,
         recording_url=call.recording_url,
@@ -106,10 +140,30 @@ def qualify_caller(db: Session, account_id: str, transcript: str) -> tuple[dict 
     return extract_receptionist_qualification(transcript), LLM_MODEL_VERSION
 
 
-def list_account_summaries(db: Session, account_id: str) -> list[ConversationSummary]:
-    return (
-        db.query(ConversationSummary)
-        .filter(ConversationSummary.account_id == account_id)
-        .order_by(ConversationSummary.created_at.desc())
-        .all()
-    )
+def list_account_summaries(db: Session, user: User) -> list[ConversationSummary]:
+    """Owner/Admin see every summary on the account. A plain Member only
+    sees summaries whose underlying call/voicemail is on a number assigned
+    to them."""
+    query = db.query(ConversationSummary).filter(ConversationSummary.account_id == user.account_id)
+
+    ids = assigned_number_ids(db, user)
+    if ids is not None:
+        allowed_call_ids = {
+            row[0] for row in db.query(CallRecord.id).filter(CallRecord.phone_number_id.in_(ids)).all()
+        }
+        allowed_voicemail_ids = {
+            row[0] for row in db.query(Voicemail.id).filter(Voicemail.phone_number_id.in_(ids)).all()
+        }
+        query = query.filter(
+            sa.or_(
+                sa.and_(
+                    ConversationSummary.source_type == SummarySourceType.CALL,
+                    ConversationSummary.source_id.in_(allowed_call_ids),
+                ),
+                sa.and_(
+                    ConversationSummary.source_type == SummarySourceType.VOICEMAIL,
+                    ConversationSummary.source_id.in_(allowed_voicemail_ids),
+                ),
+            )
+        )
+    return query.order_by(ConversationSummary.created_at.desc()).all()

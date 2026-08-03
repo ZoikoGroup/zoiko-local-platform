@@ -89,8 +89,9 @@ def test_opening_a_case_creates_an_audit_event(client, db_session):
 
 def _create_and_login_staff(db_session, client, email: str) -> str:
     from app.staff import service as staff_service
+    from app.staff.models import PlatformStaffRole
 
-    staff_service.create_staff(db_session, email=email, password="staffpass123")
+    staff_service.create_staff(db_session, email=email, password="staffpass123", role=PlatformStaffRole.SUPER_ADMIN)
     response = client.post("/staff/login", json={"email": email, "password": "staffpass123"})
     return response.json()["access_token"]
 
@@ -102,6 +103,100 @@ def _open_case(client, headers, jurisdiction="US") -> str:
         headers=headers,
     )
     return response.json()["id"]
+
+
+def _add_member(client, admin_headers, email: str) -> str:
+    response = client.post(
+        "/team/members",
+        json={"email": email, "password": "supersecret123", "role": "member"},
+        headers=admin_headers,
+    )
+    assert response.status_code == 201, response.text
+    return response.json()["id"]
+
+
+def test_plain_member_cannot_open_a_compliance_case(client):
+    """Opening a KYC case is an account-wide legal decision - Owner/Admin
+    only, same reasoning as AI-processing consent."""
+    owner_token = _signup_and_login(client, "membercompowner@example.com")
+    owner_headers = {"Authorization": f"Bearer {owner_token}"}
+    _add_member(client, owner_headers, "membercompmember@example.com")
+
+    member_token = client.post(
+        "/auth/login", json={"email": "membercompmember@example.com", "password": "supersecret123"}
+    ).json()["access_token"]
+
+    response = client.post(
+        "/compliance/cases",
+        json={"jurisdiction": "US", "requirement_type": "kyc_individual"},
+        headers={"Authorization": f"Bearer {member_token}"},
+    )
+    assert response.status_code == 403
+
+
+def test_support_staff_cannot_approve_a_case(client, db_session):
+    """Segregation of duties: SUPPORT is read-only, only COMPLIANCE_OFFICER
+    and SUPER_ADMIN can approve/reject KYC cases."""
+    from app.staff import service as staff_service
+    from app.staff.models import PlatformStaffRole
+
+    customer_token = _signup_and_login(client, "supportapprove@example.com")
+    case_id = _open_case(client, {"Authorization": f"Bearer {customer_token}"})
+
+    staff_service.create_staff(
+        db_session, email="staffsupport1@zoikolocal.com", password="staffpass123", role=PlatformStaffRole.SUPPORT
+    )
+    staff_token = client.post(
+        "/staff/login", json={"email": "staffsupport1@zoikolocal.com", "password": "staffpass123"}
+    ).json()["access_token"]
+
+    response = client.post(
+        f"/compliance/cases/{case_id}/approve", headers={"Authorization": f"Bearer {staff_token}"}
+    )
+    assert response.status_code == 403
+
+
+def test_support_staff_can_still_list_all_cases(client, db_session):
+    """Read-only ops actions (list/search) stay open to every staff tier."""
+    from app.staff import service as staff_service
+    from app.staff.models import PlatformStaffRole
+
+    customer_token = _signup_and_login(client, "supportlist@example.com")
+    _open_case(client, {"Authorization": f"Bearer {customer_token}"})
+
+    staff_service.create_staff(
+        db_session, email="staffsupport2@zoikolocal.com", password="staffpass123", role=PlatformStaffRole.SUPPORT
+    )
+    staff_token = client.post(
+        "/staff/login", json={"email": "staffsupport2@zoikolocal.com", "password": "staffpass123"}
+    ).json()["access_token"]
+
+    response = client.get("/compliance/cases", headers={"Authorization": f"Bearer {staff_token}"})
+    assert response.status_code == 200
+
+
+def test_compliance_officer_can_approve_a_case(client, db_session):
+    from app.staff import service as staff_service
+    from app.staff.models import PlatformStaffRole
+
+    customer_token = _signup_and_login(client, "officerapprove@example.com")
+    case_id = _open_case(client, {"Authorization": f"Bearer {customer_token}"})
+
+    staff_service.create_staff(
+        db_session,
+        email="staffofficer1@zoikolocal.com",
+        password="staffpass123",
+        role=PlatformStaffRole.COMPLIANCE_OFFICER,
+    )
+    staff_token = client.post(
+        "/staff/login", json={"email": "staffofficer1@zoikolocal.com", "password": "staffpass123"}
+    ).json()["access_token"]
+
+    response = client.post(
+        f"/compliance/cases/{case_id}/approve", headers={"Authorization": f"Bearer {staff_token}"}
+    )
+    assert response.status_code == 200
+    assert response.json()["status"] == "approved"
 
 
 def test_submit_document_adds_it_to_the_case(client):

@@ -8,9 +8,11 @@ import {
   mfaEnable,
   mfaDisable,
   listMyComplianceCases,
+  listMyAuditEvents,
   ApiError,
   type User,
   type MyComplianceCase,
+  type AuditEvent,
 } from "@/lib/api";
 import { getToken } from "@/lib/auth";
 
@@ -29,6 +31,10 @@ export default function SettingsPage() {
   const [cases, setCases] = useState<MyComplianceCase[]>([]);
   const [casesLoading, setCasesLoading] = useState(true);
 
+  const [auditEvents, setAuditEvents] = useState<AuditEvent[]>([]);
+  const [auditLoading, setAuditLoading] = useState(true);
+  const [auditForbidden, setAuditForbidden] = useState(false);
+
   const [setupState, setSetupState] = useState<SetupState>(null);
   const [code, setCode] = useState("");
   const [disableCode, setDisableCode] = useState("");
@@ -46,6 +52,12 @@ export default function SettingsPage() {
     listMyComplianceCases(token)
       .then(setCases)
       .finally(() => setCasesLoading(false));
+    listMyAuditEvents(token)
+      .then(setAuditEvents)
+      .catch((err) => {
+        if (err instanceof ApiError && err.status === 403) setAuditForbidden(true);
+      })
+      .finally(() => setAuditLoading(false));
   }, []);
 
   async function refreshUser() {

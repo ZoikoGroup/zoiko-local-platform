@@ -14,10 +14,15 @@ _MODEL = "llama-3.1-8b-instant"
 MODEL_VERSION = f"groq/{_MODEL}"
 
 _SUMMARY_SYSTEM_PROMPT = (
-    "You summarize voicemail and call transcripts for a business communications "
-    "platform. Write a concise 1-3 sentence summary capturing the caller's intent, "
-    "any action requested, and urgency if apparent. Do not invent details not in "
-    "the transcript."
+    "You analyze voicemail and call transcripts for a business communications "
+    'platform. Return ONLY a JSON object with these keys: "summary" (a concise '
+    '1-3 sentence summary of the caller\'s intent), "language" (the ISO 639-1 code '
+    'of the transcript\'s language, e.g. "en", or null if you cannot tell), '
+    '"urgency" (one of "low", "medium", "high"), "action_items" (a JSON array of '
+    "short strings, one per concrete action requested or implied - empty array if "
+    'none), "suggested_follow_up" (one sentence suggesting what the business should '
+    'do next, or null if nothing beyond acknowledging the message). Never invent '
+    "details not present in the transcript."
 )
 
 _QUALIFICATION_SYSTEM_PROMPT = (
@@ -35,7 +40,13 @@ class LLMError(Exception):
     """Raised instead of letting an httpx/vendor-specific exception escape this module."""
 
 
-def summarize_transcript(transcript: str) -> str:
+def extract_conversation_summary(transcript: str) -> dict:
+    """Structured call/voicemail intelligence (Architecture doc §2.3 Phase 1
+    AI: "language detection... AI-generated action extraction"; Roadmap §2:
+    "summary, language detection, suggested follow-up"). Returns a dict with
+    summary/language/urgency/action_items/suggested_follow_up - same
+    structured-JSON pattern as extract_receptionist_qualification, rather
+    than one prose blob."""
     if not settings.groq_api_key:
         raise LLMError("Groq API key is not configured")
 
@@ -50,6 +61,7 @@ def summarize_transcript(transcript: str) -> str:
                     {"role": "user", "content": transcript},
                 ],
                 "temperature": 0.2,
+                "response_format": {"type": "json_object"},
             },
             timeout=30.0,
         )
@@ -57,7 +69,11 @@ def summarize_transcript(transcript: str) -> str:
     except httpx.HTTPError as e:
         raise LLMError(f"Groq summarization request failed: {e}") from e
 
-    return response.json()["choices"][0]["message"]["content"]
+    content = response.json()["choices"][0]["message"]["content"]
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError as e:
+        raise LLMError(f"Groq returned non-JSON summary output: {content!r}") from e
 
 
 def extract_receptionist_qualification(transcript: str) -> dict:

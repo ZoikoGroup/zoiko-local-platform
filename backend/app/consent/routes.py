@@ -5,7 +5,7 @@ from sqlalchemy.orm import Session
 from app.consent import service
 from app.consent.models import ConsentType
 from app.core.database import get_db
-from app.core.deps import get_current_user
+from app.core.deps import get_current_user, require_admin
 from app.numbering.identity.models import User
 
 router = APIRouter(prefix="/compliance/consent", tags=["consent"])
@@ -19,7 +19,7 @@ class ConsentRequest(BaseModel):
 def grant_consent(
     payload: ConsentRequest,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_admin),
 ):
     record = service.grant_consent(db, current_user.account_id, payload.consent_type)
     return {"consent_type": record.consent_type.value, "granted_at": record.granted_at}
@@ -29,7 +29,7 @@ def grant_consent(
 def revoke_consent(
     consent_type: ConsentType,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_admin),
 ):
     try:
         record = service.revoke_consent(db, current_user.account_id, consent_type)

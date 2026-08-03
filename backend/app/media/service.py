@@ -21,7 +21,11 @@ from app.media.models import (
     VideoSessionStatus,
     Voicemail,
 )
+from app.numbering.identity.models import User, UserRole
 from app.numbering.numbers.models import PhoneNumber, PhoneNumberStatus
+from app.numbering.numbers.service import NumberConflictError, assert_number_access, assigned_number_ids
+from app.risk import service as risk_service
+from app.usage import service as usage_service
 
 
 class CallAuthorizationError(Exception):
@@ -68,6 +72,14 @@ def should_forward_call(owner: PhoneNumber) -> bool:
     return is_within_business_hours(owner.business_hours_start, owner.business_hours_end, owner.business_hours_timezone)
 
 
+def should_record_forwarded_call(db: Session, account_id: str) -> bool:
+    """Architecture doc §2.2: "Recording: off by default. Where enabled, it
+    must be consented..." - reuses the same AI_PROCESSING consent record the
+    video-recording feature gates on, rather than recording every forwarded
+    call unconditionally the moment forwarding_number is configured."""
+    return has_active_consent(db, account_id, ConsentType.AI_PROCESSING)
+
+
 def record_call(
     db: Session,
     *,
@@ -105,18 +117,27 @@ def record_call(
 
 
 def place_outbound_call(
-    db: Session, account_id: str, to: str, from_number: str, message: str, status_callback_url: str | None = None
+    db: Session, user: User, to: str, from_number: str, message: str, status_callback_url: str | None = None
 ) -> dict:
     owner = find_number_owner(db, from_number)
-    if owner is None or owner.account_id != account_id or owner.status != PhoneNumberStatus.ACTIVE:
+    if owner is None or owner.account_id != user.account_id or owner.status != PhoneNumberStatus.ACTIVE:
         raise CallAuthorizationError(f"{from_number} is not an active number owned by your account")
+    try:
+        assert_number_access(owner, user)
+    except NumberConflictError as e:
+        raise CallAuthorizationError(str(e)) from e
+
+    # Fraud/Risk gates (Architecture doc §5 "Fraud and Risk", §13 "blocked
+    # destinations; fraud thresholds") - checked before ever reaching Twilio.
+    risk_service.assert_destination_allowed(db, to)
+    risk_service.assert_outbound_velocity_ok(db, user.account_id)
 
     twiml = telecom.build_say_response(message)
     result = telecom.place_call(to=to, from_=from_number, twiml=twiml, status_callback_url=status_callback_url)
 
     record_call(
         db,
-        account_id=account_id,
+        account_id=user.account_id,
         phone_number_id=owner.id,
         direction=CallDirection.OUTBOUND,
         from_number=from_number,
@@ -143,6 +164,26 @@ def update_call_status(db: Session, provider_call_sid: str, status: str, duratio
         db, actor_id=call.account_id, action="call.status_updated",
         target_type="call_record", target_id=call.id, metadata={"status": status, "duration": duration},
     )
+
+    # Usage Metering (Roadmap §2 Voice scope; Architecture §7 "Usage Event"
+    # data model) - a completed call with a real duration and a known
+    # account is a ratable event, regardless of whether ZoikoNex exists yet
+    # to consume it.
+    if status == "completed" and duration is not None and call.account_id is not None:
+        country_band = None
+        if call.phone_number_id is not None:
+            number = db.query(PhoneNumber).filter(PhoneNumber.id == call.phone_number_id).first()
+            country_band = number.country if number is not None else None
+        usage_service.record_usage_event(
+            db,
+            account_id=call.account_id,
+            event_type="call_seconds",
+            quantity=duration,
+            unit="seconds",
+            country_band=country_band,
+            idempotency_key=f"call_seconds:{provider_call_sid}",
+        )
+
     return call
 
 
@@ -164,6 +205,16 @@ def record_call_recording(db: Session, provider_call_sid: str, recording_url: st
         target_type="call_record", target_id=call.id, metadata={"duration": duration},
     )
     return call
+
+
+def list_account_calls(db: Session, user: User, limit: int = 20) -> list[CallRecord]:
+    """Owner/Admin see every call on the account. A plain Member only sees
+    calls on numbers assigned to them - mirrors list_account_numbers."""
+    query = db.query(CallRecord).filter(CallRecord.account_id == user.account_id)
+    ids = assigned_number_ids(db, user)
+    if ids is not None:
+        query = query.filter(CallRecord.phone_number_id.in_(ids))
+    return query.order_by(CallRecord.created_at.desc()).limit(limit).all()
 
 
 def record_voicemail(
@@ -192,13 +243,14 @@ def record_voicemail(
     return voicemail
 
 
-def list_account_voicemails(db: Session, account_id: str) -> list[Voicemail]:
-    return (
-        db.query(Voicemail)
-        .filter(Voicemail.account_id == account_id)
-        .order_by(Voicemail.created_at.desc())
-        .all()
-    )
+def list_account_voicemails(db: Session, user: User) -> list[Voicemail]:
+    """Owner/Admin see every voicemail on the account. A plain Member only
+    sees voicemails on numbers assigned to them."""
+    query = db.query(Voicemail).filter(Voicemail.account_id == user.account_id)
+    ids = assigned_number_ids(db, user)
+    if ids is not None:
+        query = query.filter(Voicemail.phone_number_id.in_(ids))
+    return query.order_by(Voicemail.created_at.desc()).all()
 
 
 def _find_account_video_session(db: Session, account_id: str, room_name: str) -> VideoSession:
@@ -229,8 +281,10 @@ async def create_video_session(db: Session, account_id: str, host_user_id: str) 
     return session
 
 
-async def end_video_session(db: Session, account_id: str, room_name: str) -> VideoSession:
-    session = _find_account_video_session(db, account_id, room_name)
+async def end_video_session(db: Session, user: User, room_name: str) -> VideoSession:
+    session = _find_account_video_session(db, user.account_id, room_name)
+    if user.role == UserRole.MEMBER and session.host_user_id != user.id:
+        raise VideoSessionAuthorizationError(f"{room_name} was not started by you")
 
     # Stop any in-progress recording first - ending the room doesn't
     # automatically stop egress, and a dangling egress job would keep
@@ -245,19 +299,21 @@ async def end_video_session(db: Session, account_id: str, room_name: str) -> Vid
     db.commit()
     db.refresh(session)
     log_event(
-        db, actor_id=account_id, action="video.session.ended",
+        db, actor_id=user.account_id, action="video.session.ended",
         target_type="video_session", target_id=session.id, metadata={"room_name": room_name},
     )
     return session
 
 
-async def start_video_recording(db: Session, account_id: str, room_name: str) -> VideoSession:
-    session = _find_account_video_session(db, account_id, room_name)
+async def start_video_recording(db: Session, user: User, room_name: str) -> VideoSession:
+    session = _find_account_video_session(db, user.account_id, room_name)
+    if user.role == UserRole.MEMBER and session.host_user_id != user.id:
+        raise VideoSessionAuthorizationError(f"{room_name} was not started by you")
     if session.status != VideoSessionStatus.ACTIVE:
         raise VideoSessionAuthorizationError(f"{room_name} is not an active session")
     if session.recording_egress_id:
         raise VideoSessionAuthorizationError(f"{room_name} is already being recorded")
-    if not has_active_consent(db, account_id, ConsentType.AI_PROCESSING):
+    if not has_active_consent(db, user.account_id, ConsentType.AI_PROCESSING):
         raise RecordingConsentRequiredError(
             "AI processing consent is required before recording video calls — "
             "grant it via POST /compliance/consent first"
@@ -268,7 +324,7 @@ async def start_video_recording(db: Session, account_id: str, room_name: str) ->
     db.commit()
     db.refresh(session)
     log_event(
-        db, actor_id=account_id, action="video.recording_started",
+        db, actor_id=user.account_id, action="video.recording_started",
         target_type="video_session", target_id=session.id, metadata={"room_name": room_name},
     )
     return session
@@ -387,22 +443,26 @@ def capture_receptionist_call(
     return call
 
 
-def mark_receptionist_call_escalated(db: Session, receptionist_call_id: str) -> None:
+def mark_receptionist_call_escalated(db: Session, receptionist_call_id: str, escalated_to_user_id: str) -> None:
     call = db.query(ReceptionistCall).filter(ReceptionistCall.id == receptionist_call_id).first()
     if call is None:
         return
     call.escalated = True
     db.commit()
+    # Roadmap §7 Evidence: "escalation path" - who this specific urgent call
+    # was routed to, not just that some escalation happened.
     log_event(
         db, actor_id=call.account_id, action="receptionist.call_escalated",
-        target_type="receptionist_call", target_id=call.id, metadata={},
+        target_type="receptionist_call", target_id=call.id,
+        metadata={"escalated_to_user_id": escalated_to_user_id},
     )
 
 
-def list_account_receptionist_calls(db: Session, account_id: str) -> list[ReceptionistCall]:
-    return (
-        db.query(ReceptionistCall)
-        .filter(ReceptionistCall.account_id == account_id)
-        .order_by(ReceptionistCall.created_at.desc())
-        .all()
-    )
+def list_account_receptionist_calls(db: Session, user: User) -> list[ReceptionistCall]:
+    """Owner/Admin see every receptionist call on the account. A plain Member
+    only sees calls on numbers assigned to them."""
+    query = db.query(ReceptionistCall).filter(ReceptionistCall.account_id == user.account_id)
+    ids = assigned_number_ids(db, user)
+    if ids is not None:
+        query = query.filter(ReceptionistCall.phone_number_id.in_(ids))
+    return query.order_by(ReceptionistCall.created_at.desc()).all()

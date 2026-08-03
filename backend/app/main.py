@@ -14,7 +14,9 @@ from app.media.voicemail import router as voicemail_router
 from app.numbering.identity.routes import router as identity_router
 from app.numbering.identity.team_routes import router as team_router
 from app.numbering.numbers.routes import router as numbers_router
+from app.risk.routes import router as risk_router
 from app.staff.routes import router as staff_router
+from app.usage.routes import router as usage_router
 
 app = FastAPI(title="Zoiko Local API")
 
@@ -38,6 +40,8 @@ app.include_router(video_router)
 app.include_router(receptionist_router)
 app.include_router(numbers_router)
 app.include_router(intelligence_router)
+app.include_router(risk_router)
+app.include_router(usage_router)
 
 
 @app.get("/health")

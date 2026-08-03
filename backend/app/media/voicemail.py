@@ -39,7 +39,7 @@ async def list_voicemails(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    voicemails = media_service.list_account_voicemails(db, current_user.account_id)
+    voicemails = media_service.list_account_voicemails(db, current_user)
     return [
         {
             "id": v.id,

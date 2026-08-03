@@ -59,4 +59,14 @@ class PhoneNumber(Base):
     # straight to voicemail, same as before this feature existed.
     ai_receptionist_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
+    # Roadmap §7 "Routing: Escalate to nominated team member" — the specific
+    # team member urgent receptionist calls are escalated to, distinct from
+    # forwarding_number (which is also used for plain business-hours call
+    # forwarding, unrelated to receptionist urgency). NULL means no one is
+    # nominated, so urgent calls fall back to the polite-close/voicemail
+    # branch even if forwarding_number happens to be set for other reasons.
+    escalation_user_id: Mapped[str | None] = mapped_column(
+        UUID(as_uuid=False), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

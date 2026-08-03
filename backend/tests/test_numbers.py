@@ -81,7 +81,11 @@ def test_purchase_succeeds_once_compliance_case_is_approved(client, db_session, 
     )
     case_id = case_response.json()["id"]
 
-    staff_service.create_staff(db_session, email="staffbuyer3@zoikolocal.com", password="staffpass123")
+    from app.staff.models import PlatformStaffRole
+
+    staff_service.create_staff(
+        db_session, email="staffbuyer3@zoikolocal.com", password="staffpass123", role=PlatformStaffRole.SUPER_ADMIN
+    )
     staff_token = client.post(
         "/staff/login", json={"email": "staffbuyer3@zoikolocal.com", "password": "staffpass123"}
     ).json()["access_token"]
@@ -99,7 +103,10 @@ def test_suspending_a_number_notifies_the_account_owner(client, monkeypatch, cap
     _stub_buy_number(monkeypatch)
     token = _signup_and_login(client, "notifysuspend@example.com")
     headers = {"Authorization": f"Bearer {token}"}
-    _reserve(client, headers, "+15550006666")
+    # AU (not one of seed.py's seeded countries) - the shared dev DB has a
+    # standing kyc_individual rule for US/GB/CA/NG/ZA/GH/KE/MX, which would
+    # otherwise block purchase with 403 regardless of this test's own txn.
+    _reserve(client, headers, "+15550006666", country="AU")
     client.post("/numbers/purchase", json={"e164": "+15550006666"}, headers=headers)
 
     with caplog.at_level(logging.INFO, logger="zoiko.notifications"):
@@ -110,6 +117,24 @@ def test_suspending_a_number_notifies_the_account_owner(client, monkeypatch, cap
         "notifysuspend@example.com" in record.message and "+15550006666" in record.message
         for record in caplog.records
     )
+
+
+def test_suspending_a_number_with_a_reason_includes_it_in_the_notification(client, monkeypatch, caplog):
+    """Architecture doc §10 Business controls: 'manual override reasons' -
+    an Admin suspending a number must be able to record why."""
+    _stub_buy_number(monkeypatch)
+    token = _signup_and_login(client, "notifysuspendreason@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    _reserve(client, headers, "+15550006677", country="AU")
+    client.post("/numbers/purchase", json={"e164": "+15550006677"}, headers=headers)
+
+    with caplog.at_level(logging.INFO, logger="zoiko.notifications"):
+        response = client.post(
+            "/numbers/+15550006677/suspend", json={"reason": "Suspicious call volume"}, headers=headers
+        )
+    assert response.status_code == 200
+
+    assert any("Suspicious call volume" in record.message for record in caplog.records)
 
 
 def _add_member(client, admin_headers, email: str) -> str:

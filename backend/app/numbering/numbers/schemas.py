@@ -9,6 +9,11 @@ class RoutingConfigRequest(BaseModel):
     business_hours_end: time | None = None
     business_hours_timezone: str = "UTC"
     ai_receptionist_enabled: bool = False
+    escalation_user_id: str | None = None
+
+
+class SuspendNumberRequest(BaseModel):
+    reason: str | None = None
 
 
 class NumberSearchResult(BaseModel):
@@ -46,3 +51,4 @@ class PhoneNumberResponse(BaseModel):
     business_hours_end: time | None
     business_hours_timezone: str
     ai_receptionist_enabled: bool
+    escalation_user_id: str | None
