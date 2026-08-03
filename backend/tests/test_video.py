@@ -39,6 +39,18 @@ def test_create_room_requires_auth(client):
     assert response.status_code == 401
 
 
+def test_create_room_fails_cleanly_when_livekit_url_is_not_configured(client, monkeypatch):
+    """A missing LIVEKIT_URL makes the SDK's own client constructor raise a
+    plain ValueError (not a TwirpError) - must still surface as a clean 502,
+    not an unhandled 500."""
+    monkeypatch.setattr("app.integrations.video.livekit.settings.livekit_url", "")
+    token = _signup_and_login(client, "videonolivekit@example.com")
+
+    response = client.post("/media/video/rooms", headers={"Authorization": f"Bearer {token}"})
+    assert response.status_code == 502
+    assert "url must be set" in response.json()["detail"]
+
+
 def test_video_room_lifecycle(client):
     token = _signup_and_login(client, "videouser@example.com")
     headers = {"Authorization": f"Bearer {token}"}

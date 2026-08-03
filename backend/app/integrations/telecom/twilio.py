@@ -73,19 +73,49 @@ def list_owned_numbers() -> list[dict]:
     return [{"sid": n.sid, "phone_number": n.phone_number, "capabilities": n.capabilities} for n in numbers]
 
 
-def buy_number(phone_number: str) -> dict:
-    """Not yet exercised against a real purchase (see docs/stage2-twilio-numbering-notes.md
-    — deliberately skipped to avoid spending trial credit). Written directly
-    against the documented IncomingPhoneNumbers create contract.
+def set_voice_webhook(phone_number_sid: str, public_base_url: str) -> None:
+    """(Re)points an already-purchased number's voice webhook + status
+    callback at the given base URL - needed whenever PUBLIC_BASE_URL changes
+    (e.g. a new ngrok tunnel in dev), since buy_number() only sets these at
+    purchase time.
+    """
+    try:
+        _client().incoming_phone_numbers(phone_number_sid).update(
+            voice_url=f"{public_base_url}/media/voice/incoming",
+            voice_method="POST",
+            status_callback=f"{public_base_url}/media/voice/status-callback",
+            status_callback_method="POST",
+        )
+    except TwilioException as e:
+        raise TelecomError(str(e)) from e
 
-    Registers our own status-callback URL on the number (when a public base
-    URL is configured) so inbound calls to it get a final completed/duration
-    event, not just the initial ringing state from the voice webhook.
+
+def release_number(phone_number_sid: str) -> None:
+    """Actually releases a purchased number back to Twilio - without this,
+    cancelling a number in our own DB leaves it sitting active (and billing)
+    on the real Twilio account forever."""
+    try:
+        _client().incoming_phone_numbers(phone_number_sid).delete()
+    except TwilioException as e:
+        raise TelecomError(str(e)) from e
+
+
+def buy_number(phone_number: str) -> dict:
+    """Written directly against the documented IncomingPhoneNumbers create
+    contract. Confirmed live against a real Twilio trial account.
+
+    Registers our own voice webhook (the URL Twilio actually calls when
+    someone dials this number - without it, a purchased number never reaches
+    /media/voice/incoming at all) plus a status-callback URL for the final
+    completed/duration event, both only when a public base URL is configured
+    (nothing to point at otherwise, e.g. before ngrok is running in dev).
     """
     kwargs = {"phone_number": phone_number}
     if settings.public_base_url:
-        kwargs["voice_status_callback"] = f"{settings.public_base_url}/media/voice/status-callback"
-        kwargs["voice_status_callback_method"] = "POST"
+        kwargs["voice_url"] = f"{settings.public_base_url}/media/voice/incoming"
+        kwargs["voice_method"] = "POST"
+        kwargs["status_callback"] = f"{settings.public_base_url}/media/voice/status-callback"
+        kwargs["status_callback_method"] = "POST"
 
     try:
         number = _client().incoming_phone_numbers.create(**kwargs)

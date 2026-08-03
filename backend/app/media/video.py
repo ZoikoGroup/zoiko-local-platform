@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.core.database import get_db
 from app.core.deps import get_current_user
 from app.integrations.video.livekit import VideoError, verify_webhook_event
@@ -46,7 +47,10 @@ async def join_room(
         )
     except media_service.VideoSessionAuthorizationError as e:
         raise HTTPException(status_code=403, detail=str(e)) from e
-    return {"token": token}
+    # The LiveKit client SDK (browser) connects directly to this URL with the
+    # token above - returned here so the frontend doesn't need its own
+    # separate copy of the same LiveKit project URL configured.
+    return {"token": token, "url": settings.livekit_url}
 
 
 @router.post("/rooms/{room_name}/end")

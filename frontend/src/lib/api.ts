@@ -384,3 +384,44 @@ export function grantAiProcessingConsent(token: string): Promise<{ granted_at: s
     body: JSON.stringify({ consent_type: "ai_processing" }),
   });
 }
+
+// --- Video ---
+
+export type VideoRoom = {
+  room_name: string;
+  status: "created" | "active" | "ended";
+  started_at: string | null;
+  ended_at: string | null;
+};
+
+export function listVideoRooms(token: string): Promise<VideoRoom[]> {
+  return request<VideoRoom[]>("/media/video/rooms", {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export function createVideoRoom(token: string): Promise<{ room_name: string; status: string }> {
+  return request("/media/video/rooms", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export function joinVideoRoom(
+  token: string,
+  roomName: string,
+  displayName: string
+): Promise<{ token: string; url: string }> {
+  return request(`/media/video/rooms/${encodeURIComponent(roomName)}/token`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ display_name: displayName }),
+  });
+}
+
+export function endVideoRoom(token: string, roomName: string): Promise<{ room_name: string; status: string }> {
+  return request(`/media/video/rooms/${encodeURIComponent(roomName)}/end`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}

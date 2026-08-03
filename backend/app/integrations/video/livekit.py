@@ -24,7 +24,15 @@ def _client() -> livekit_api.LiveKitAPI:
 
 
 async def create_room(room_name: str) -> dict:
-    client = _client()
+    # _client() itself raises (a plain ValueError, not TwirpError) when
+    # LIVEKIT_URL/KEY/SECRET aren't configured - guarded separately so that
+    # case gets the same clean VideoError as a real API failure, instead of
+    # an unhandled 500.
+    try:
+        client = _client()
+    except ValueError as e:
+        raise VideoError(str(e)) from e
+
     try:
         room = await client.room.create_room(
             livekit_api.CreateRoomRequest(name=room_name, max_participants=MAX_PARTICIPANTS)
@@ -37,7 +45,11 @@ async def create_room(room_name: str) -> dict:
 
 
 async def end_room(room_name: str) -> None:
-    client = _client()
+    try:
+        client = _client()
+    except ValueError as e:
+        raise VideoError(str(e)) from e
+
     try:
         await client.room.delete_room(livekit_api.DeleteRoomRequest(room=room_name))
     except livekit_api.TwirpError as e:

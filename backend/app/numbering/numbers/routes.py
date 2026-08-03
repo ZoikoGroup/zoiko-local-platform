@@ -106,6 +106,22 @@ def cancel_number(
         return service.cancel_number(db, current_user, e164)
     except NumberConflictError as e:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e
+    except TelecomError as e:
+        raise HTTPException(status_code=502, detail=str(e)) from e
+
+
+@router.post("/{e164}/sync-webhook", response_model=PhoneNumberResponse)
+def sync_webhook(
+    e164: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    try:
+        return service.sync_webhook(db, current_user, e164)
+    except NumberConflictError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e
+    except TelecomError as e:
+        raise HTTPException(status_code=502, detail=str(e)) from e
 
 
 @router.put("/{e164}/routing", response_model=PhoneNumberResponse)

@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 
 from app.audit.service import log_event
 from app.compliance.service import has_approved_case, is_requirement_active
+from app.core.config import settings
 from app.integrations.telecom import twilio as telecom
 from app.notifications.service import notify_number_activated, notify_number_suspended
 from app.numbering.identity.models import Account, AccountType, User, UserRole
@@ -170,6 +171,12 @@ def cancel_number(db: Session, user: User, e164: str) -> PhoneNumber:
         raise NumberConflictError(f"{e164} must be an active or suspended number owned by your account to cancel")
     _assert_member_can_manage(number, user)
 
+    # Release on Twilio *before* marking cancelled locally - if this fails,
+    # the number stays ACTIVE/SUSPENDED here too, so the customer isn't left
+    # thinking it's cancelled while it's still live (and billing) for real.
+    if number.provider_sid:
+        telecom.release_number(number.provider_sid)
+
     number.status = PhoneNumberStatus.CANCELLED
     db.commit()
     db.refresh(number)
@@ -211,6 +218,28 @@ def configure_routing(
         db, actor_id=user.id, action="number.routing_configured",
         target_type="phone_number", target_id=number.id,
         metadata={"e164": e164, "forwarding_number": forwarding_number},
+    )
+    return number
+
+
+def sync_webhook(db: Session, user: User, e164: str) -> PhoneNumber:
+    """(Re)points this number's Twilio voice webhook at the current
+    PUBLIC_BASE_URL - needed whenever that URL changes (e.g. a fresh ngrok
+    tunnel in dev, since free-tier ngrok issues a new URL every restart and
+    buy_number() only wires this up once, at purchase time)."""
+    number = db.query(PhoneNumber).filter(PhoneNumber.e164 == e164).first()
+    if number is None or number.account_id != user.account_id or number.provider_sid is None:
+        raise NumberConflictError(f"{e164} must be a purchased number owned by your account")
+    _assert_member_can_manage(number, user)
+
+    if not settings.public_base_url:
+        raise NumberConflictError("PUBLIC_BASE_URL is not configured - nothing to point the webhook at")
+
+    telecom.set_voice_webhook(number.provider_sid, settings.public_base_url)
+    log_event(
+        db, actor_id=user.id, action="number.webhook_synced",
+        target_type="phone_number", target_id=number.id,
+        metadata={"e164": e164, "public_base_url": settings.public_base_url},
     )
     return number
 

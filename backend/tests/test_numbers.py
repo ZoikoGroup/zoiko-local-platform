@@ -226,3 +226,81 @@ def test_business_account_is_gated_on_kyc_business_not_kyc_individual(client, db
 
     response = client.post("/numbers/purchase", json={"e164": "+33140000001"}, headers=headers)
     assert response.status_code == 200, response.text
+
+
+def test_sync_webhook_requires_public_base_url_configured(client, monkeypatch):
+    _stub_buy_number(monkeypatch)
+    monkeypatch.setattr("app.numbering.numbers.service.settings.public_base_url", "")
+    token = _signup_and_login(client, "syncwebhook1@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    _reserve(client, headers, "+15550007777")
+    client.post("/numbers/purchase", json={"e164": "+15550007777"}, headers=headers)
+
+    response = client.post("/numbers/+15550007777/sync-webhook", headers=headers)
+    assert response.status_code == 409
+    assert "PUBLIC_BASE_URL" in response.json()["detail"]
+
+
+def test_sync_webhook_pushes_the_current_base_url_to_twilio(client, monkeypatch):
+    _stub_buy_number(monkeypatch)
+    monkeypatch.setattr("app.numbering.numbers.service.settings.public_base_url", "https://example.ngrok-free.dev")
+    calls = []
+    monkeypatch.setattr(
+        "app.numbering.numbers.service.telecom.set_voice_webhook",
+        lambda sid, base_url: calls.append((sid, base_url)),
+    )
+    token = _signup_and_login(client, "syncwebhook2@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    _reserve(client, headers, "+15550008888")
+    client.post("/numbers/purchase", json={"e164": "+15550008888"}, headers=headers)
+
+    response = client.post("/numbers/+15550008888/sync-webhook", headers=headers)
+    assert response.status_code == 200, response.text
+    assert calls == [("PN_fake_sid", "https://example.ngrok-free.dev")]
+
+
+def test_sync_webhook_rejects_a_number_that_was_never_purchased(client):
+    token = _signup_and_login(client, "syncwebhook3@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    _reserve(client, headers, "+15550009999")
+
+    response = client.post("/numbers/+15550009999/sync-webhook", headers=headers)
+    assert response.status_code == 409
+
+
+def test_cancel_releases_the_number_on_twilio(client, monkeypatch):
+    _stub_buy_number(monkeypatch)
+    released = []
+    monkeypatch.setattr(
+        "app.numbering.numbers.service.telecom.release_number", lambda sid: released.append(sid)
+    )
+    token = _signup_and_login(client, "cancelrelease1@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    _reserve(client, headers, "+15550001212")
+    client.post("/numbers/purchase", json={"e164": "+15550001212"}, headers=headers)
+
+    response = client.post("/numbers/+15550001212/cancel", headers=headers)
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "cancelled"
+    assert released == ["PN_fake_sid"]
+
+
+def test_cancel_leaves_number_active_when_twilio_release_fails(client, monkeypatch):
+    from app.integrations.telecom.twilio import TelecomError
+
+    _stub_buy_number(monkeypatch)
+
+    def _fail(sid):
+        raise TelecomError("boom")
+
+    monkeypatch.setattr("app.numbering.numbers.service.telecom.release_number", _fail)
+    token = _signup_and_login(client, "cancelrelease2@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    _reserve(client, headers, "+15550001313")
+    client.post("/numbers/purchase", json={"e164": "+15550001313"}, headers=headers)
+
+    response = client.post("/numbers/+15550001313/cancel", headers=headers)
+    assert response.status_code == 502
+
+    still_active = next(n for n in client.get("/numbers", headers=headers).json() if n["e164"] == "+15550001313")
+    assert still_active["status"] == "active"
