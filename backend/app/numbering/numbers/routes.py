@@ -13,6 +13,7 @@ from app.numbering.numbers.schemas import (
     PurchaseNumberRequest,
     ReserveNumberRequest,
     RoutingConfigRequest,
+    SuspendNumberRequest,
 )
 from app.numbering.numbers.service import ComplianceRequiredError, NumberConflictError
 
@@ -36,7 +37,7 @@ def search_numbers(
 def reserve_number(
     payload: ReserveNumberRequest,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_admin),
 ):
     try:
         return service.reserve_number(db, current_user.account_id, payload.e164, payload.country)
@@ -48,7 +49,7 @@ def reserve_number(
 def purchase_number(
     payload: PurchaseNumberRequest,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_admin),
 ):
     try:
         return service.purchase_number(db, current_user.account_id, payload.e164)
@@ -87,11 +88,12 @@ def assign_number(
 @router.post("/{e164}/suspend", response_model=PhoneNumberResponse)
 def suspend_number(
     e164: str,
+    payload: SuspendNumberRequest = SuspendNumberRequest(),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     try:
-        return service.suspend_number(db, current_user, e164)
+        return service.suspend_number(db, current_user, e164, reason=payload.reason)
     except NumberConflictError as e:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e
 
@@ -136,7 +138,7 @@ def configure_routing(
             db, current_user, e164,
             payload.forwarding_number, payload.business_hours_start,
             payload.business_hours_end, payload.business_hours_timezone,
-            payload.ai_receptionist_enabled,
+            payload.ai_receptionist_enabled, payload.escalation_user_id,
         )
     except NumberConflictError as e:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e

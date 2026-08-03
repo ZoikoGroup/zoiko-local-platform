@@ -17,6 +17,23 @@ from app.numbering.identity.models import User
 router = APIRouter(prefix="/intelligence", tags=["intelligence"])
 
 
+def _summary_response(record) -> dict:
+    return {
+        "id": record.id,
+        "source_type": record.source_type.value,
+        "source_id": record.source_id,
+        "transcript": record.transcript,
+        "summary": record.summary,
+        "language": record.language,
+        "urgency": record.urgency.value if record.urgency else None,
+        "action_items": record.action_items or [],
+        "suggested_follow_up": record.suggested_follow_up,
+        "model_version": record.model_version,
+        "created_at": record.created_at,
+        "disclaimer": service.AI_DISCLAIMER,
+    }
+
+
 @router.post("/voicemails/{voicemail_id}/summarize", status_code=status.HTTP_201_CREATED)
 def summarize_voicemail(
     voicemail_id: str,
@@ -24,21 +41,14 @@ def summarize_voicemail(
     current_user: User = Depends(get_current_user),
 ):
     try:
-        record = service.summarize_voicemail(db, current_user.account_id, voicemail_id)
+        record = service.summarize_voicemail(db, current_user, voicemail_id)
     except service.SummaryAuthorizationError as e:
         raise HTTPException(status_code=403, detail=str(e)) from e
     except service.ConsentRequiredError as e:
         raise HTTPException(status_code=403, detail=str(e)) from e
     except (TelecomError, TranscriptionError, LLMError) as e:
         raise HTTPException(status_code=502, detail=str(e)) from e
-    return {
-        "id": record.id,
-        "source_type": record.source_type.value,
-        "transcript": record.transcript,
-        "summary": record.summary,
-        "model_version": record.model_version,
-        "disclaimer": service.AI_DISCLAIMER,
-    }
+    return _summary_response(record)
 
 
 @router.post("/calls/{call_id}/summarize", status_code=status.HTTP_201_CREATED)
@@ -48,7 +58,7 @@ def summarize_call(
     current_user: User = Depends(get_current_user),
 ):
     try:
-        record = service.summarize_call(db, current_user.account_id, call_id)
+        record = service.summarize_call(db, current_user, call_id)
     except service.SummaryAuthorizationError as e:
         raise HTTPException(status_code=403, detail=str(e)) from e
     except service.ConsentRequiredError as e:
@@ -57,14 +67,7 @@ def summarize_call(
         raise HTTPException(status_code=409, detail=str(e)) from e
     except (TelecomError, TranscriptionError, LLMError) as e:
         raise HTTPException(status_code=502, detail=str(e)) from e
-    return {
-        "id": record.id,
-        "source_type": record.source_type.value,
-        "transcript": record.transcript,
-        "summary": record.summary,
-        "model_version": record.model_version,
-        "disclaimer": service.AI_DISCLAIMER,
-    }
+    return _summary_response(record)
 
 
 @router.get("/summaries")
@@ -72,16 +75,5 @@ def list_summaries(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    records = service.list_account_summaries(db, current_user.account_id)
-    return [
-        {
-            "id": r.id,
-            "source_type": r.source_type.value,
-            "source_id": r.source_id,
-            "summary": r.summary,
-            "model_version": r.model_version,
-            "created_at": r.created_at,
-            "disclaimer": service.AI_DISCLAIMER,
-        }
-        for r in records
-    ]
+    records = service.list_account_summaries(db, current_user)
+    return [_summary_response(r) for r in records]

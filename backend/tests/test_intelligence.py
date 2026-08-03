@@ -107,6 +107,12 @@ def test_summarize_call_success_path(client, db_session, monkeypatch):
     assert body["transcript"] == "Hi, calling about my order, can you call me back?"
     assert body["summary"]
     assert body["model_version"]
+    # real Groq call — structured fields, not just prose (the gap this
+    # feature closes: language/urgency/action_items/suggested_follow_up
+    # used to not exist at all).
+    assert body["urgency"] in ("low", "medium", "high")
+    assert isinstance(body["action_items"], list)
+    assert body["language"] is None or isinstance(body["language"], str)
 
 
 def test_summarize_voicemail_rejects_other_account(client, db_session):
@@ -150,7 +156,6 @@ def test_summarize_voicemail_succeeds_with_a_country_specific_consent_grant(clie
 
     monkeypatch.setattr("app.intelligence.service.download_recording", lambda url: b"fake-audio-bytes")
     monkeypatch.setattr("app.intelligence.service.transcribe_audio", lambda audio_bytes: "test transcript")
-    monkeypatch.setattr("app.intelligence.service.summarize_transcript", lambda transcript: "test summary")
 
     response = client.post(
         f"/intelligence/voicemails/{voicemail.id}/summarize",
@@ -204,6 +209,8 @@ def test_summarize_voicemail_success_path(client, db_session, monkeypatch):
     assert body["summary"]  # real Groq call — non-empty summary text
     assert body["model_version"]
     assert body["disclaimer"]
+    assert body["urgency"] in ("low", "medium", "high")
+    assert isinstance(body["action_items"], list)
 
     list_response = client.get("/intelligence/summaries", headers={"Authorization": f"Bearer {token}"})
     assert list_response.status_code == 200

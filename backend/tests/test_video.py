@@ -195,6 +195,37 @@ def _fake_stop_recording(sink: list | None = None):
     return _stop
 
 
+def test_member_cannot_start_recording_on_a_room_they_did_not_host(client, monkeypatch):
+    """Same host-only restriction as ending a room (Member scoping) -
+    recording is the more sensitive of the two actions, so it must not be
+    open to any account Member regardless of who hosted the call."""
+    monkeypatch.setattr("app.media.service.video.start_room_recording", _fake_start_recording)
+    monkeypatch.setattr("app.media.service.video.stop_room_recording", _fake_stop_recording())
+
+    owner_token = _signup_and_login(client, "videorecordhostowner@example.com")
+    owner_headers = {"Authorization": f"Bearer {owner_token}"}
+    client.post("/compliance/consent", json={"consent_type": "ai_processing"}, headers=owner_headers)
+    room_name = client.post("/media/video/rooms", headers=owner_headers).json()["room_name"]
+
+    client.post(
+        "/team/members",
+        json={"email": "videorecordhostmember@example.com", "password": "supersecret123", "role": "member"},
+        headers=owner_headers,
+    )
+    member_token = client.post(
+        "/auth/login", json={"email": "videorecordhostmember@example.com", "password": "supersecret123"}
+    ).json()["access_token"]
+
+    response = client.post(
+        f"/media/video/rooms/{room_name}/recording/start",
+        headers={"Authorization": f"Bearer {member_token}"},
+    )
+    assert response.status_code == 403
+    assert "not started by you" in response.json()["detail"].lower()
+
+    client.post(f"/media/video/rooms/{room_name}/end", headers=owner_headers)
+
+
 def test_start_recording_succeeds_with_consent(client, monkeypatch):
     monkeypatch.setattr("app.media.service.video.start_room_recording", _fake_start_recording)
     monkeypatch.setattr("app.media.service.video.stop_room_recording", _fake_stop_recording())

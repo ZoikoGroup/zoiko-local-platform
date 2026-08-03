@@ -5,7 +5,8 @@ Gather captures the caller's name/company/reason/urgency in one utterance
 for the account, Groq extracts structured qualification fields from that
 utterance. No conversational back-and-forth, no binding commitments, no
 pricing — pure message capture + optional enrichment + routing to a human
-(if urgent and a forwarding number is configured) or a polite close.
+(if urgent and a team member is nominated via escalation_user_id) or a
+polite close.
 """
 
 from fastapi import APIRouter, Depends, Request, Response
@@ -36,10 +37,17 @@ async def respond(request: Request, db: Session = Depends(get_db)):
         return Response(content=twiml, media_type="application/xml")
 
     owner = media_service.find_number_owner(db, to_number)
-    should_escalate = call.urgency == ReceptionistUrgency.HIGH and bool(owner.forwarding_number)
+    # Escalation requires a nominated team member (escalation_user_id), not
+    # just a forwarding_number - that field is also used for plain
+    # business-hours call forwarding, unrelated to receptionist urgency.
+    should_escalate = (
+        call.urgency == ReceptionistUrgency.HIGH
+        and bool(owner.escalation_user_id)
+        and bool(owner.forwarding_number)
+    )
 
     if should_escalate:
-        media_service.mark_receptionist_call_escalated(db, call.id)
+        media_service.mark_receptionist_call_escalated(db, call.id, owner.escalation_user_id)
         status_callback_url = str(request.base_url) + "media/voice/status-callback"
         twiml = telecom.build_receptionist_reply_response(
             "Thanks — this sounds urgent, connecting you to someone now.",
@@ -58,7 +66,7 @@ async def list_receptionist_calls(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    calls = media_service.list_account_receptionist_calls(db, current_user.account_id)
+    calls = media_service.list_account_receptionist_calls(db, current_user)
     return [
         {
             "id": c.id,

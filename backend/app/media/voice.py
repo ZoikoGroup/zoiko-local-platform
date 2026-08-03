@@ -17,8 +17,9 @@ from app.core.deps import get_current_user
 from app.integrations.telecom import twilio as telecom
 from app.integrations.telecom.twilio import TelecomError
 from app.media import service as media_service
-from app.media.models import CallDirection, CallRecord
+from app.media.models import CallDirection
 from app.numbering.identity.models import User
+from app.risk import service as risk_service
 
 router = APIRouter(prefix="/media/voice", tags=["voice"])
 
@@ -58,7 +59,11 @@ async def incoming_call(request: Request, db: Session = Depends(get_db)):
 
     if owner is not None and media_service.should_forward_call(owner):
         status_callback_url = str(request.base_url) + "media/voice/status-callback"
-        recording_callback_url = str(request.base_url) + "media/voice/recording-callback"
+        recording_callback_url = (
+            str(request.base_url) + "media/voice/recording-callback"
+            if media_service.should_record_forwarded_call(db, owner.account_id)
+            else None
+        )
         twiml = telecom.build_forward_response(owner.forwarding_number, status_callback_url, recording_callback_url)
     elif owner is not None and owner.ai_receptionist_enabled:
         action_url = str(request.base_url) + "media/receptionist/respond"
@@ -88,10 +93,14 @@ async def outbound_call(
     status_callback_url = str(request.base_url) + "media/voice/status-callback"
     try:
         return media_service.place_outbound_call(
-            db, current_user.account_id, body.to, body.from_number, body.message, status_callback_url
+            db, current_user, body.to, body.from_number, body.message, status_callback_url
         )
     except media_service.CallAuthorizationError as e:
         raise HTTPException(status_code=403, detail=str(e)) from e
+    except risk_service.DestinationBlockedError as e:
+        raise HTTPException(status_code=403, detail=str(e)) from e
+    except risk_service.VelocityLimitExceededError as e:
+        raise HTTPException(status_code=429, detail=str(e)) from e
     except TelecomError as e:
         raise HTTPException(status_code=502, detail=str(e)) from e
 
@@ -134,13 +143,7 @@ async def list_calls(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    calls = (
-        db.query(CallRecord)
-        .filter(CallRecord.account_id == current_user.account_id)
-        .order_by(CallRecord.created_at.desc())
-        .limit(limit)
-        .all()
-    )
+    calls = media_service.list_account_calls(db, current_user, limit)
     return [
         {
             "id": c.id,

@@ -9,6 +9,14 @@ export type User = {
   mfa_enabled: boolean;
 };
 
+export type TeamMember = {
+  id: string;
+  email: string;
+  role: string;
+  account_id: string;
+  mfa_enabled: boolean;
+};
+
 export class ApiError extends Error {
   status: number;
 
@@ -70,6 +78,12 @@ export function login(input: { email: string; password: string }): Promise<Login
 
 export function getCurrentUser(token: string): Promise<User> {
   return request<User>("/auth/me", {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export function listTeamMembers(token: string): Promise<TeamMember[]> {
+  return request<TeamMember[]>("/team/members", {
     headers: { Authorization: `Bearer ${token}` },
   });
 }
@@ -277,7 +291,11 @@ export type MyPhoneNumber = {
   assigned_user_id: string | null;
   reserved_until: string | null;
   forwarding_number: string | null;
+  business_hours_start: string | null;
+  business_hours_end: string | null;
+  business_hours_timezone: string;
   ai_receptionist_enabled: boolean;
+  escalation_user_id: string | null;
 };
 
 export function listMyNumbers(token: string): Promise<MyPhoneNumber[]> {
@@ -324,10 +342,11 @@ export function purchaseNumber(token: string, e164: string): Promise<MyPhoneNumb
   });
 }
 
-export function suspendNumber(token: string, e164: string): Promise<MyPhoneNumber> {
+export function suspendNumber(token: string, e164: string, reason?: string): Promise<MyPhoneNumber> {
   return request<MyPhoneNumber>(`/numbers/${encodeURIComponent(e164)}/suspend`, {
     method: "POST",
     headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ reason: reason || null }),
   });
 }
 
@@ -335,6 +354,25 @@ export function cancelNumber(token: string, e164: string): Promise<MyPhoneNumber
   return request<MyPhoneNumber>(`/numbers/${encodeURIComponent(e164)}/cancel`, {
     method: "POST",
     headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export function configureRouting(
+  token: string,
+  e164: string,
+  input: {
+    forwarding_number?: string | null;
+    business_hours_start?: string | null;
+    business_hours_end?: string | null;
+    business_hours_timezone?: string;
+    ai_receptionist_enabled?: boolean;
+    escalation_user_id?: string | null;
+  }
+): Promise<MyPhoneNumber> {
+  return request<MyPhoneNumber>(`/numbers/${encodeURIComponent(e164)}/routing`, {
+    method: "PUT",
+    headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify(input),
   });
 }
 
@@ -386,6 +424,10 @@ export type ConversationSummary = {
   source_type: string;
   transcript: string;
   summary: string;
+  language: string | null;
+  urgency: "low" | "medium" | "high" | null;
+  action_items: string[];
+  suggested_follow_up: string | null;
   model_version: string;
   disclaimer: string;
 };
@@ -480,6 +522,14 @@ export function listRetentionPolicies(token: string): Promise<RetentionPolicies>
   });
 }
 
+// --- Account audit log (Owner/Admin only, scoped to the caller's own account) ---
+
+export function listMyAuditEvents(token: string): Promise<AuditEvent[]> {
+  return request<AuditEvent[]>("/audit/events/me", {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
 export function setRetentionPolicy(
   token: string,
   artifactType: keyof RetentionPolicies,
@@ -528,5 +578,55 @@ export type ReceptionistCallEntry = {
 export function listReceptionistCalls(token: string): Promise<ReceptionistCallEntry[]> {
   return request<ReceptionistCallEntry[]>("/media/receptionist/calls", {
     headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+// --- Usage (Owner/Admin only) ---
+
+export type UsageEvent = {
+  id: string;
+  event_type: string;
+  quantity: number;
+  unit: string;
+  country_band: string | null;
+  created_at: string;
+};
+
+export function listUsage(token: string): Promise<UsageEvent[]> {
+  return request<UsageEvent[]>("/usage", {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+// --- Risk / blocked destinations (staff console) ---
+
+export type BlockedDestination = {
+  id: string;
+  prefix: string;
+  reason: string;
+  created_at: string;
+};
+
+export function listBlockedDestinations(staffToken: string): Promise<BlockedDestination[]> {
+  return request<BlockedDestination[]>("/risk/blocked-destinations", {
+    headers: { Authorization: `Bearer ${staffToken}` },
+  });
+}
+
+export function addBlockedDestination(
+  staffToken: string,
+  input: { prefix: string; reason: string }
+): Promise<BlockedDestination> {
+  return request<BlockedDestination>("/risk/blocked-destinations", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${staffToken}` },
+    body: JSON.stringify(input),
+  });
+}
+
+export function removeBlockedDestination(staffToken: string, ruleId: string): Promise<void> {
+  return request<void>(`/risk/blocked-destinations/${encodeURIComponent(ruleId)}`, {
+    method: "DELETE",
+    headers: { Authorization: `Bearer ${staffToken}` },
   });
 }

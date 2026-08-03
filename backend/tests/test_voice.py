@@ -127,7 +127,38 @@ def test_incoming_call_forwards_when_configured(client, db_session):
     assert "+15551112222" in response.text
 
 
-def test_forwarded_call_twiml_requests_recording(client, db_session):
+def test_forwarded_call_is_not_recorded_without_consent(client, db_session):
+    """Architecture doc §2.2: 'Recording: off by default... must be
+    consented.' A forwarding_number alone must not turn recording on."""
+    token = _signup_and_login(client, "voicenorecord@example.com")
+    account_id = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"}).json()["account_id"]
+    number = PhoneNumber(
+        e164="+15550001111", country="US", status=PhoneNumberStatus.ACTIVE, account_id=account_id
+    )
+    db_session.add(number)
+    db_session.commit()
+
+    client.put(
+        "/numbers/+15550001111/routing",
+        json={"forwarding_number": "+15551112222"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    incoming_url = "http://testserver/media/voice/incoming"
+    incoming_params = {
+        "To": "+15550001111", "From": "+15559990000", "CallSid": "CArecord0", "CallStatus": "ringing",
+    }
+    signature = _twilio_signature(incoming_url, incoming_params)
+    response = client.post(
+        "/media/voice/incoming", data=incoming_params, headers={"X-Twilio-Signature": signature}
+    )
+    assert response.status_code == 200
+    assert "<Dial" in response.text
+    assert "record=" not in response.text
+    assert "media/voice/recording-callback" not in response.text
+
+
+def test_forwarded_call_twiml_requests_recording_with_consent(client, db_session):
     token = _signup_and_login(client, "voicerecord@example.com")
     account_id = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"}).json()["account_id"]
     number = PhoneNumber(
@@ -141,6 +172,12 @@ def test_forwarded_call_twiml_requests_recording(client, db_session):
         json={"forwarding_number": "+15551112222"},
         headers={"Authorization": f"Bearer {token}"},
     )
+    consent_response = client.post(
+        "/compliance/consent",
+        json={"consent_type": "ai_processing"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert consent_response.status_code == 200
 
     incoming_url = "http://testserver/media/voice/incoming"
     incoming_params = {

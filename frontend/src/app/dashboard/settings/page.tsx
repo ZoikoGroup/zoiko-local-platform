@@ -12,11 +12,13 @@ import {
   listRetentionPolicies,
   setRetentionPolicy,
   listMyNotifications,
+  listMyAuditEvents,
   ApiError,
   type User,
   type MyComplianceCase,
   type RetentionPolicies,
   type NotificationDelivery,
+  type AuditEvent,
 } from "@/lib/api";
 import { getToken } from "@/lib/auth";
 
@@ -42,6 +44,10 @@ export default function SettingsPage() {
   const [casesLoading, setCasesLoading] = useState(true);
   const [verifyingCaseId, setVerifyingCaseId] = useState<string | null>(null);
   const [verifyError, setVerifyError] = useState<string | null>(null);
+
+  const [auditEvents, setAuditEvents] = useState<AuditEvent[]>([]);
+  const [auditLoading, setAuditLoading] = useState(true);
+  const [auditForbidden, setAuditForbidden] = useState(false);
 
   const [setupState, setSetupState] = useState<SetupState>(null);
   const [code, setCode] = useState("");
@@ -78,6 +84,12 @@ export default function SettingsPage() {
       .then(setNotifications)
       .catch(() => setNotificationsError("Couldn't load communications history."))
       .finally(() => setNotificationsLoading(false));
+    listMyAuditEvents(token)
+      .then(setAuditEvents)
+      .catch((err) => {
+        if (err instanceof ApiError && err.status === 403) setAuditForbidden(true);
+      })
+      .finally(() => setAuditLoading(false));
   }, []);
 
   async function handleStartVerification(caseId: string) {

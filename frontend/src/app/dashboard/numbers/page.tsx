@@ -11,10 +11,13 @@ import {
   purchaseNumber,
   suspendNumber,
   cancelNumber,
+  configureRouting,
+  listTeamMembers,
   ApiError,
   type ComplianceRule,
   type MyPhoneNumber,
   type NumberSearchResult,
+  type TeamMember,
 } from "@/lib/api";
 import { getToken } from "@/lib/auth";
 
@@ -38,6 +41,21 @@ export default function NumbersPage() {
   const [myNumbersError, setMyNumbersError] = useState<string | null>(null);
   const [actionBusyE164, setActionBusyE164] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
+
+  const [teamMembers, setTeamMembers] = useState<TeamMember[]>([]);
+
+  const [suspendingE164, setSuspendingE164] = useState<string | null>(null);
+  const [suspendReason, setSuspendReason] = useState("");
+
+  const [routingOpenE164, setRoutingOpenE164] = useState<string | null>(null);
+  const [routingForwarding, setRoutingForwarding] = useState("");
+  const [routingHoursStart, setRoutingHoursStart] = useState("");
+  const [routingHoursEnd, setRoutingHoursEnd] = useState("");
+  const [routingTimezone, setRoutingTimezone] = useState("UTC");
+  const [routingReceptionist, setRoutingReceptionist] = useState(false);
+  const [routingEscalationUserId, setRoutingEscalationUserId] = useState("");
+  const [routingBusy, setRoutingBusy] = useState(false);
+  const [routingError, setRoutingError] = useState<string | null>(null);
 
   const [step, setStep] = useState<Step>("search");
   const [countryCode, setCountryCode] = useState("US");
@@ -73,6 +91,15 @@ export default function NumbersPage() {
   useEffect(() => {
     loadMyNumbers();
   }, [loadMyNumbers]);
+
+  useEffect(() => {
+    if (!token) return;
+    // Best-effort: a plain Member gets a 403 here (team roster is Owner/Admin
+    // only) - that's fine, the escalation dropdown just stays empty for them.
+    listTeamMembers(token)
+      .then(setTeamMembers)
+      .catch(() => {});
+  }, [token]);
 
   async function handleSearch() {
     if (!token) return;
@@ -178,17 +205,56 @@ export default function NumbersPage() {
     setPurchasedNumber(null);
   }
 
-  async function handleSuspend(e164: string) {
+  async function handleConfirmSuspend(e164: string) {
     if (!token) return;
     setActionBusyE164(e164);
     setActionError(null);
     try {
-      await suspendNumber(token, e164);
+      await suspendNumber(token, e164, suspendReason || undefined);
+      setSuspendingE164(null);
+      setSuspendReason("");
       await loadMyNumbers();
     } catch (err) {
       setActionError(err instanceof ApiError ? err.message : "Couldn't suspend this number.");
     } finally {
       setActionBusyE164(null);
+    }
+  }
+
+  function handleToggleRouting(number: MyPhoneNumber) {
+    if (routingOpenE164 === number.e164) {
+      setRoutingOpenE164(null);
+      return;
+    }
+    setRoutingOpenE164(number.e164);
+    setRoutingError(null);
+    setRoutingForwarding(number.forwarding_number ?? "");
+    setRoutingHoursStart(number.business_hours_start ?? "");
+    setRoutingHoursEnd(number.business_hours_end ?? "");
+    setRoutingTimezone(number.business_hours_timezone || "UTC");
+    setRoutingReceptionist(number.ai_receptionist_enabled);
+    setRoutingEscalationUserId(number.escalation_user_id ?? "");
+  }
+
+  async function handleSaveRouting(e164: string) {
+    if (!token) return;
+    setRoutingBusy(true);
+    setRoutingError(null);
+    try {
+      await configureRouting(token, e164, {
+        forwarding_number: routingForwarding || null,
+        business_hours_start: routingHoursStart || null,
+        business_hours_end: routingHoursEnd || null,
+        business_hours_timezone: routingTimezone || "UTC",
+        ai_receptionist_enabled: routingReceptionist,
+        escalation_user_id: routingEscalationUserId || null,
+      });
+      setRoutingOpenE164(null);
+      await loadMyNumbers();
+    } catch (err) {
+      setRoutingError(err instanceof ApiError ? err.message : "Couldn't save routing settings.");
+    } finally {
+      setRoutingBusy(false);
     }
   }
 
@@ -228,40 +294,157 @@ export default function NumbersPage() {
 
         <div className="space-y-2">
           {myNumbers.map((n) => (
-            <div
-              key={n.id}
-              className="flex items-center justify-between rounded-lg border border-slate-200 px-4 py-3"
-            >
-              <div>
-                <span className="font-mono text-slate-800">{n.e164}</span>
-                <span
-                  className={`ml-3 text-xs font-medium rounded-full px-2 py-0.5 capitalize ${
-                    STATUS_STYLES[n.status] ?? "bg-slate-100 text-slate-600"
-                  }`}
-                >
-                  {n.status.replaceAll("_", " ")}
-                </span>
-              </div>
-              <div className="flex items-center gap-3">
-                {n.status === "active" && (
-                  <button
-                    onClick={() => handleSuspend(n.e164)}
-                    disabled={actionBusyE164 === n.e164}
-                    className="text-xs font-medium text-slate-500 hover:text-slate-800 disabled:opacity-60"
+            <div key={n.id} className="rounded-lg border border-slate-200 px-4 py-3 space-y-3">
+              <div className="flex items-center justify-between">
+                <div>
+                  <span className="font-mono text-slate-800">{n.e164}</span>
+                  <span
+                    className={`ml-3 text-xs font-medium rounded-full px-2 py-0.5 capitalize ${
+                      STATUS_STYLES[n.status] ?? "bg-slate-100 text-slate-600"
+                    }`}
                   >
-                    Suspend
-                  </button>
-                )}
-                {(n.status === "active" || n.status === "suspended") && (
+                    {n.status.replaceAll("_", " ")}
+                  </span>
+                </div>
+                <div className="flex items-center gap-3">
+                  {n.status === "active" && (
+                    <button
+                      onClick={() => handleToggleRouting(n)}
+                      className="text-xs font-medium text-indigo-600 hover:text-indigo-800"
+                    >
+                      {routingOpenE164 === n.e164 ? "Close routing" : "Routing"}
+                    </button>
+                  )}
+                  {n.status === "active" && (
+                    <button
+                      onClick={() => setSuspendingE164(suspendingE164 === n.e164 ? null : n.e164)}
+                      disabled={actionBusyE164 === n.e164}
+                      className="text-xs font-medium text-slate-500 hover:text-slate-800 disabled:opacity-60"
+                    >
+                      Suspend
+                    </button>
+                  )}
+                  {(n.status === "active" || n.status === "suspended") && (
+                    <button
+                      onClick={() => handleCancel(n.e164)}
+                      disabled={actionBusyE164 === n.e164}
+                      className="text-xs font-medium text-red-600 hover:text-red-800 disabled:opacity-60"
+                    >
+                      Cancel
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              {suspendingE164 === n.e164 && (
+                <div className="flex items-center gap-2 bg-slate-50 rounded-lg px-3 py-2">
+                  <input
+                    value={suspendReason}
+                    onChange={(e) => setSuspendReason(e.target.value)}
+                    placeholder="Reason (optional)"
+                    className="flex-1 rounded-lg border border-slate-300 px-3 py-1.5 text-sm placeholder:text-slate-400"
+                  />
                   <button
-                    onClick={() => handleCancel(n.e164)}
+                    onClick={() => handleConfirmSuspend(n.e164)}
                     disabled={actionBusyE164 === n.e164}
-                    className="text-xs font-medium text-red-600 hover:text-red-800 disabled:opacity-60"
+                    className="text-xs font-medium bg-slate-800 hover:bg-slate-900 disabled:opacity-60 text-white rounded-lg px-3 py-1.5"
+                  >
+                    Confirm suspend
+                  </button>
+                  <button
+                    onClick={() => {
+                      setSuspendingE164(null);
+                      setSuspendReason("");
+                    }}
+                    className="text-xs text-slate-400 hover:text-slate-600"
                   >
                     Cancel
                   </button>
-                )}
-              </div>
+                </div>
+              )}
+
+              {routingOpenE164 === n.e164 && (
+                <div className="bg-slate-50 rounded-lg p-4 space-y-3">
+                  {routingError && <p className="text-xs text-red-600">{routingError}</p>}
+
+                  <div className="grid grid-cols-2 gap-3">
+                    <div>
+                      <label className="block text-xs font-medium text-slate-500 mb-1">Forwarding number</label>
+                      <input
+                        value={routingForwarding}
+                        onChange={(e) => setRoutingForwarding(e.target.value)}
+                        placeholder="+15551234567"
+                        className="w-full rounded-lg border border-slate-300 px-3 py-1.5 text-sm font-mono placeholder:text-slate-400"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-xs font-medium text-slate-500 mb-1">Timezone</label>
+                      <input
+                        value={routingTimezone}
+                        onChange={(e) => setRoutingTimezone(e.target.value)}
+                        placeholder="UTC"
+                        className="w-full rounded-lg border border-slate-300 px-3 py-1.5 text-sm placeholder:text-slate-400"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-xs font-medium text-slate-500 mb-1">Business hours start</label>
+                      <input
+                        type="time"
+                        value={routingHoursStart}
+                        onChange={(e) => setRoutingHoursStart(e.target.value)}
+                        className="w-full rounded-lg border border-slate-300 px-3 py-1.5 text-sm"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-xs font-medium text-slate-500 mb-1">Business hours end</label>
+                      <input
+                        type="time"
+                        value={routingHoursEnd}
+                        onChange={(e) => setRoutingHoursEnd(e.target.value)}
+                        className="w-full rounded-lg border border-slate-300 px-3 py-1.5 text-sm"
+                      />
+                    </div>
+                  </div>
+
+                  <label className="flex items-center gap-2 text-sm text-slate-700">
+                    <input
+                      type="checkbox"
+                      checked={routingReceptionist}
+                      onChange={(e) => setRoutingReceptionist(e.target.checked)}
+                    />
+                    Enable AI receptionist outside forwarding
+                  </label>
+
+                  <div>
+                    <label className="block text-xs font-medium text-slate-500 mb-1">
+                      Escalate urgent calls to
+                    </label>
+                    <select
+                      value={routingEscalationUserId}
+                      onChange={(e) => setRoutingEscalationUserId(e.target.value)}
+                      className="w-full rounded-lg border border-slate-300 px-3 py-1.5 text-sm"
+                    >
+                      <option value="">No one nominated</option>
+                      {teamMembers.map((m) => (
+                        <option key={m.id} value={m.id}>
+                          {m.email} ({m.role})
+                        </option>
+                      ))}
+                    </select>
+                    <p className="text-xs text-slate-400 mt-1">
+                      Only a nominated team member triggers live escalation for urgent receptionist calls.
+                    </p>
+                  </div>
+
+                  <button
+                    onClick={() => handleSaveRouting(n.e164)}
+                    disabled={routingBusy}
+                    className="bg-indigo-600 hover:bg-indigo-700 disabled:opacity-60 text-white text-sm font-medium rounded-lg px-4 py-2"
+                  >
+                    {routingBusy ? "Saving..." : "Save routing"}
+                  </button>
+                </div>
+              )}
             </div>
           ))}
         </div>

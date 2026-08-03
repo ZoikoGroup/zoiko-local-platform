@@ -4,15 +4,18 @@ from sqlalchemy.orm import Session
 from app.core.security import hash_password, verify_password
 from app.numbering.identity.models import Account, User, UserRole
 from app.numbering.numbers.models import PhoneNumber
-from app.staff.models import PlatformStaff
+from app.staff.models import PlatformStaff, PlatformStaffRole
 
 
-def create_staff(db: Session, email: str, password: str) -> PlatformStaff:
+def create_staff(db: Session, email: str, password: str, role: PlatformStaffRole) -> PlatformStaff:
+    """role has no default - there's no public staff signup endpoint (staff
+    are provisioned internally, see app/seed.py), so every call site must
+    consciously pick a role rather than silently inheriting a default."""
     existing = db.query(PlatformStaff).filter(PlatformStaff.email == email).first()
     if existing:
         raise ValueError("A staff account with this email already exists")
 
-    staff = PlatformStaff(email=email, hashed_password=hash_password(password))
+    staff = PlatformStaff(email=email, hashed_password=hash_password(password), role=role)
     db.add(staff)
     db.commit()
     db.refresh(staff)

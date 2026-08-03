@@ -5,7 +5,7 @@ from sqlalchemy.orm import Session
 from app.core.database import get_db
 from app.core.security import decode_access_token
 from app.numbering.identity.models import User, UserRole
-from app.staff.models import PlatformStaff
+from app.staff.models import PlatformStaff, PlatformStaffRole
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
 
@@ -62,3 +62,20 @@ def get_current_staff(token: str = Depends(oauth2_scheme), db: Session = Depends
         raise credentials_error
 
     return staff
+
+
+def require_staff_role(*roles: PlatformStaffRole):
+    """Segregation of duties within the ops console - e.g. only
+    COMPLIANCE_OFFICER/SUPER_ADMIN can approve/reject KYC cases; SUPPORT
+    staff are read-only. Returns a dependency, not a dependency itself -
+    use as Depends(require_staff_role(PlatformStaffRole.SUPER_ADMIN))."""
+
+    def dependency(staff: PlatformStaff = Depends(get_current_staff)) -> PlatformStaff:
+        if staff.role not in roles:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Requires one of: {', '.join(r.value for r in roles)}",
+            )
+        return staff
+
+    return dependency

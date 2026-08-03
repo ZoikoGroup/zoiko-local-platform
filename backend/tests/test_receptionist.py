@@ -77,9 +77,12 @@ def test_respond_without_consent_captures_raw_transcript_only(client, db_session
 
 def test_respond_with_consent_extracts_qualification_and_escalates_high_urgency(client, db_session):
     token, account_id = _signup_and_login(client, "receptionistconsent@example.com")
+    me = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"})
+    owner_user_id = me.json()["id"]
+
     number = PhoneNumber(
         e164="+15550033333", country="US", status=PhoneNumberStatus.ACTIVE, account_id=account_id,
-        ai_receptionist_enabled=True, forwarding_number="+15551119999",
+        ai_receptionist_enabled=True, forwarding_number="+15551119999", escalation_user_id=owner_user_id,
     )
     db_session.add(number)
     db_session.commit()
@@ -114,6 +117,47 @@ def test_respond_with_consent_extracts_qualification_and_escalates_high_urgency(
     assert calls[0]["urgency"] == "high"
     assert calls[0]["escalated"] is True
     assert calls[0]["model_version"]
+
+
+def test_high_urgency_does_not_escalate_without_a_nominated_team_member(client, db_session):
+    """forwarding_number alone (used for plain business-hours forwarding)
+    must not trigger receptionist escalation - only a nominated
+    escalation_user_id does (Roadmap §7: "Escalate to nominated team
+    member")."""
+    token, account_id = _signup_and_login(client, "receptionistnonominee@example.com")
+    number = PhoneNumber(
+        e164="+15550044444", country="US", status=PhoneNumberStatus.ACTIVE, account_id=account_id,
+        ai_receptionist_enabled=True, forwarding_number="+15551119999",
+    )
+    db_session.add(number)
+    db_session.commit()
+
+    client.post(
+        "/compliance/consent",
+        json={"consent_type": "ai_processing"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    url = "http://testserver/media/receptionist/respond"
+    params = {
+        "CallSid": "CArecep4", "To": "+15550044444", "From": "+15559994444",
+        "SpeechResult": (
+            "Hi my name is Sam Rivera, our production system is down and this is "
+            "extremely urgent, please call me back right away"
+        ),
+    }
+    signature = _twilio_signature(url, params)
+    response = client.post("/media/receptionist/respond", data=params, headers={"X-Twilio-Signature": signature})
+    assert response.status_code == 200
+    assert "<Dial" not in response.text
+
+    calls_response = client.get(
+        "/media/receptionist/calls", headers={"Authorization": f"Bearer {token}"}
+    )
+    calls = calls_response.json()
+    assert len(calls) == 1
+    assert calls[0]["urgency"] == "high"
+    assert calls[0]["escalated"] is False
 
 
 def test_receptionist_calls_requires_auth(client):

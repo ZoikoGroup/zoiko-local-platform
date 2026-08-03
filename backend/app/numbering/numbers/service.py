@@ -182,7 +182,7 @@ def suspend_number(db: Session, user: User, e164: str, reason: str | None = None
     number = db.query(PhoneNumber).filter(PhoneNumber.e164 == e164).with_for_update().first()
     if number is None or number.account_id != user.account_id or number.status != PhoneNumberStatus.ACTIVE:
         raise NumberConflictError(f"{e164} must be an active number owned by your account to suspend")
-    _assert_member_can_manage(number, user)
+    assert_number_access(number, user)
 
     number.status = PhoneNumberStatus.SUSPENDED
     db.commit()
@@ -205,7 +205,7 @@ def cancel_number(db: Session, user: User, e164: str) -> PhoneNumber:
         PhoneNumberStatus.ACTIVE, PhoneNumberStatus.SUSPENDED,
     ):
         raise NumberConflictError(f"{e164} must be an active or suspended number owned by your account to cancel")
-    _assert_member_can_manage(number, user)
+    assert_number_access(number, user)
 
     # Release on Twilio *before* marking cancelled locally - if this fails,
     # the number stays ACTIVE/SUSPENDED here too, so the customer isn't left
@@ -233,28 +233,39 @@ def configure_routing(
     business_hours_end: time | None,
     business_hours_timezone: str,
     ai_receptionist_enabled: bool = False,
+    escalation_user_id: str | None = None,
 ) -> PhoneNumber:
     number = db.query(PhoneNumber).filter(PhoneNumber.e164 == e164).first()
     if number is None or number.account_id != user.account_id:
         raise NumberConflictError(f"{e164} is not a number owned by your account")
-    _assert_member_can_manage(number, user)
+    assert_number_access(number, user)
 
     try:
         ZoneInfo(business_hours_timezone)
     except ZoneInfoNotFoundError as e:
         raise ValueError(f"Unknown timezone: {business_hours_timezone}") from e
 
+    if escalation_user_id is not None:
+        nominee = db.query(User).filter(User.id == escalation_user_id, User.account_id == user.account_id).first()
+        if nominee is None:
+            raise NumberConflictError(f"No team member with id {escalation_user_id} on this account")
+
     number.forwarding_number = forwarding_number
     number.business_hours_start = business_hours_start
     number.business_hours_end = business_hours_end
     number.business_hours_timezone = business_hours_timezone
     number.ai_receptionist_enabled = ai_receptionist_enabled
+    number.escalation_user_id = escalation_user_id
     db.commit()
     db.refresh(number)
     log_event(
         db, actor_id=user.id, action="number.routing_configured",
         target_type="phone_number", target_id=number.id,
-        metadata={"e164": e164, "forwarding_number": forwarding_number},
+        metadata={
+            "e164": e164,
+            "forwarding_number": forwarding_number,
+            "escalation_user_id": escalation_user_id,
+        },
     )
     return number
 
@@ -267,7 +278,7 @@ def sync_webhook(db: Session, user: User, e164: str) -> PhoneNumber:
     number = db.query(PhoneNumber).filter(PhoneNumber.e164 == e164).first()
     if number is None or number.account_id != user.account_id or number.provider_sid is None:
         raise NumberConflictError(f"{e164} must be a purchased number owned by your account")
-    _assert_member_can_manage(number, user)
+    assert_number_access(number, user)
 
     if not settings.public_base_url:
         raise NumberConflictError("PUBLIC_BASE_URL is not configured - nothing to point the webhook at")
@@ -289,6 +300,21 @@ def list_account_numbers(db: Session, account_id: str, *, user: User) -> list[Ph
     if user.role == UserRole.MEMBER:
         query = query.filter(PhoneNumber.assigned_user_id == user.id)
     return query.all()
+
+
+def assigned_number_ids(db: Session, user: User) -> list[str] | None:
+    """Number IDs a Member is scoped to across calls/voicemail/video/AI
+    summaries - the same assignment boundary `assert_number_access` enforces
+    for direct number management. Returns None for Owner/Admin, meaning
+    "no restriction" rather than "empty list" (which would hide everything)."""
+    if user.role != UserRole.MEMBER:
+        return None
+    rows = (
+        db.query(PhoneNumber.id)
+        .filter(PhoneNumber.account_id == user.account_id, PhoneNumber.assigned_user_id == user.id)
+        .all()
+    )
+    return [r[0] for r in rows]
 
 
 def assign_number(db: Session, *, account_id: str, e164: str, user_id: str | None, actor: str) -> PhoneNumber:
@@ -315,8 +341,10 @@ def assign_number(db: Session, *, account_id: str, e164: str, user_id: str | Non
     return number
 
 
-def _assert_member_can_manage(number: PhoneNumber, user: User) -> None:
+def assert_number_access(number: PhoneNumber, user: User) -> None:
     """Owner/Admin can manage any number on their account. A Member can only
-    manage a number that's been assigned to them."""
+    manage a number that's been assigned to them. Shared by every module
+    (calls, voicemail, AI summaries, routing) that gates a per-number action
+    on the same assignment boundary."""
     if user.role == UserRole.MEMBER and number.assigned_user_id != user.id:
         raise NumberConflictError(f"{number.e164} is not assigned to you")

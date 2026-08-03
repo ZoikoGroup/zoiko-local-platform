@@ -20,8 +20,9 @@ def _signup_and_login(client, email: str, account_type: str = "individual") -> s
 
 def _create_and_login_staff(db_session, client, email: str) -> str:
     from app.staff import service as staff_service
+    from app.staff.models import PlatformStaffRole
 
-    staff_service.create_staff(db_session, email=email, password="staffpass123")
+    staff_service.create_staff(db_session, email=email, password="staffpass123", role=PlatformStaffRole.SUPER_ADMIN)
     response = client.post("/staff/login", json={"email": email, "password": "staffpass123"})
     return response.json()["access_token"]
 
