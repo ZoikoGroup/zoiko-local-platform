@@ -63,8 +63,9 @@ async def incoming_call(request: Request, db: Session = Depends(get_db)):
     elif owner is not None and owner.ai_receptionist_enabled:
         action_url = str(request.base_url) + "media/receptionist/respond"
         twiml = telecom.build_gather_response(
-            "Thanks for calling. Please tell us your name, company, the reason for "
-            "your call, and whether it's urgent, after the tone.",
+            "Thanks for calling. You're speaking with an automated assistant, not a person. "
+            "Please tell us your name, company, the reason for your call, and whether "
+            "it's urgent, after the tone.",
             action_url,
         )
     elif owner is not None:

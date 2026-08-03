@@ -382,6 +382,9 @@ export default function VideoPage() {
             >
               <span className="font-mono text-sm text-slate-800">{r.room_name}</span>
               <div className="flex items-center gap-3">
+                {r.participant_minutes > 0 && (
+                  <span className="text-xs text-slate-400">{r.participant_minutes} participant-min</span>
+                )}
                 {r.recording_url && (
                   <a
                     href={r.recording_url}

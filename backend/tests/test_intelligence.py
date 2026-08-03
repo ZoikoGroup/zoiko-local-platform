@@ -17,8 +17,8 @@ def _signup_and_login(client, email: str, account_name: str) -> tuple[str, str]:
     return login.json()["access_token"], account_id
 
 
-def _make_voicemail(db_session, account_id: str, e164: str) -> Voicemail:
-    number = PhoneNumber(e164=e164, country="US", status=PhoneNumberStatus.ACTIVE, account_id=account_id)
+def _make_voicemail(db_session, account_id: str, e164: str, country: str = "US") -> Voicemail:
+    number = PhoneNumber(e164=e164, country=country, status=PhoneNumberStatus.ACTIVE, account_id=account_id)
     db_session.add(number)
     db_session.commit()
 
@@ -125,6 +125,49 @@ def test_summarize_voicemail_rejects_other_account(client, db_session):
 def test_summarize_voicemail_rejects_without_consent(client, db_session):
     token, account_id = _signup_and_login(client, "intelnoconsent@example.com", "Intel No Consent Co")
     voicemail = _make_voicemail(db_session, account_id, "+15550006666")
+
+    response = client.post(
+        f"/intelligence/voicemails/{voicemail.id}/summarize",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert response.status_code == 403
+    assert "consent" in response.json()["detail"].lower()
+
+
+def test_summarize_voicemail_succeeds_with_a_country_specific_consent_grant(client, db_session, monkeypatch):
+    """Consent scoped to the voicemail's own number's country (not GLOBAL)
+    must be enough - jurisdiction is derived from the number, not just a
+    single account-wide flag."""
+    token, account_id = _signup_and_login(client, "inteljurisus@example.com", "Intel Jurisdiction US Co")
+    voicemail = _make_voicemail(db_session, account_id, "+15550007777", country="US")
+
+    consent_response = client.post(
+        "/compliance/consent",
+        json={"consent_type": "ai_processing", "jurisdiction": "US"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert consent_response.status_code == 200
+
+    monkeypatch.setattr("app.intelligence.service.download_recording", lambda url: b"fake-audio-bytes")
+    monkeypatch.setattr("app.intelligence.service.transcribe_audio", lambda audio_bytes: "test transcript")
+    monkeypatch.setattr("app.intelligence.service.summarize_transcript", lambda transcript: "test summary")
+
+    response = client.post(
+        f"/intelligence/voicemails/{voicemail.id}/summarize",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert response.status_code == 201, response.text
+
+
+def test_summarize_voicemail_country_specific_consent_does_not_cover_a_different_country(client, db_session):
+    token, account_id = _signup_and_login(client, "inteljurisgb@example.com", "Intel Jurisdiction GB Co")
+    voicemail = _make_voicemail(db_session, account_id, "+442079460001", country="GB")
+
+    client.post(
+        "/compliance/consent",
+        json={"consent_type": "ai_processing", "jurisdiction": "US"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
 
     response = client.post(
         f"/intelligence/voicemails/{voicemail.id}/summarize",

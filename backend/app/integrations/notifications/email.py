@@ -1,39 +1,42 @@
 """
-Provider Gateway for outbound email (notifications category). No SMTP
-provider has been chosen yet, so this sends via SMTP when credentials are
-configured and otherwise logs to the console — keeps the interface real
-without blocking on picking a vendor (Stage 8 stub, per the roadmap).
+Provider Gateway for outbound email (notifications category). Only file
+allowed to call Resend's API directly. Falls back to logging when no API
+key is configured, so the interface stays real without ever blocking
+local dev on real credentials.
 """
 
 import logging
-import smtplib
-from email.message import EmailMessage
+
+import httpx
 
 from app.core.config import settings
 
 logger = logging.getLogger("zoiko.notifications")
 
+_RESEND_API_URL = "https://api.resend.com/emails"
+
 
 class EmailError(Exception):
-    """Raised instead of letting an smtplib-specific exception escape this module."""
+    """Raised instead of letting an httpx/Resend-specific exception escape this module."""
 
 
 def send_email(to: str, subject: str, body: str) -> None:
-    if not settings.smtp_host:
-        logger.info("EMAIL (no SMTP configured) to=%s subject=%r body=%r", to, subject, body)
+    if not settings.resend_api_key:
+        logger.info("EMAIL (no Resend API key configured) to=%s subject=%r body=%r", to, subject, body)
         return
 
-    message = EmailMessage()
-    message["From"] = settings.smtp_from_email
-    message["To"] = to
-    message["Subject"] = subject
-    message.set_content(body)
-
     try:
-        with smtplib.SMTP(settings.smtp_host, settings.smtp_port) as smtp:
-            smtp.starttls()
-            if settings.smtp_username:
-                smtp.login(settings.smtp_username, settings.smtp_password)
-            smtp.send_message(message)
-    except smtplib.SMTPException as e:
-        raise EmailError(str(e)) from e
+        response = httpx.post(
+            _RESEND_API_URL,
+            headers={"Authorization": f"Bearer {settings.resend_api_key}"},
+            json={
+                "from": settings.email_from_address,
+                "to": [to],
+                "subject": subject,
+                "text": body,
+            },
+            timeout=15.0,
+        )
+        response.raise_for_status()
+    except httpx.HTTPError as e:
+        raise EmailError(f"Resend send failed: {e}") from e

@@ -39,6 +39,9 @@ def test_incoming_call_uses_receptionist_when_enabled(client, db_session):
     assert response.status_code == 200
     assert "<Gather" in response.text
     assert "/media/receptionist/respond" in response.text
+    # Real gap flagged and fixed: the caller must be told this is an
+    # automated assistant, not a person, before anything is captured.
+    assert "automated assistant" in response.text
 
 
 def test_respond_without_consent_captures_raw_transcript_only(client, db_session):

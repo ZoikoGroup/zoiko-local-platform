@@ -67,3 +67,9 @@ class ComplianceCase(Base):
     documents: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    # Real KYC/KYB provider verification (Stripe Identity) - nullable because
+    # a case can still be opened and manually reviewed by staff without ever
+    # starting a provider-side session (e.g. a market where Stripe Identity
+    # isn't configured yet, or a manual/paper-document review path).
+    kyc_inquiry_id: Mapped[str | None] = mapped_column(String(255), nullable=True)

@@ -23,7 +23,11 @@ _SUMMARY_SYSTEM_PROMPT = (
 _QUALIFICATION_SYSTEM_PROMPT = (
     "Extract caller qualification data from a business phone receptionist transcript. "
     'Return ONLY a JSON object with these keys: "name" (string or null), "company" '
-    '(string or null), "reason" (string summarizing why they called, or null), '
+    '(string or null), "reason" (short string, a few words, summarizing why they '
+    'called, or null), "summary" (a single, complete, natural-language sentence '
+    "narrating the call for a business owner reading a call log — e.g. \"Jordan Lee "
+    "from Acme Corp called about a delayed shipment and asked for a callback today.\" "
+    'Always a full sentence, never a fragment, or null if there is nothing to summarize), '
     '"urgency" (one of "low", "medium", "high"), "callback_preference" (string or '
     "null, e.g. a phone number or \"email\" if mentioned). Never invent information "
     "not present in the transcript. Never make commitments, quote prices, or give "

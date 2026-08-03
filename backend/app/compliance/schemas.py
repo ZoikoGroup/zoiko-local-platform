@@ -40,8 +40,14 @@ class ComplianceCaseResponse(BaseModel):
     documents: list
     expires_at: datetime | None
     created_at: datetime
+    kyc_inquiry_id: str | None
 
 
 class ComplianceCaseStaffResponse(ComplianceCaseResponse):
     account_name: str
     account_owner_email: str
+
+
+class KYCVerificationStart(BaseModel):
+    inquiry_id: str
+    verification_url: str

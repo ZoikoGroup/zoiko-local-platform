@@ -1,4 +1,8 @@
+import hashlib
+import hmac
+import json
 import logging
+import time
 
 from app.compliance.models import ComplianceRule
 
@@ -227,7 +231,8 @@ def test_staff_can_list_all_cases_with_account_context(client, db_session):
     assert match["account_name"] == "Compliance Test Co"
 
 
-def test_approving_a_case_notifies_the_account_owner(client, db_session, caplog):
+def test_approving_a_case_notifies_the_account_owner(client, db_session, monkeypatch, caplog):
+    monkeypatch.setattr("app.core.config.settings.resend_api_key", "")
     customer_token = _signup_and_login(client, "notifyapprove@example.com")
     case_id = _open_case(client, {"Authorization": f"Bearer {customer_token}"})
 
@@ -241,7 +246,8 @@ def test_approving_a_case_notifies_the_account_owner(client, db_session, caplog)
     )
 
 
-def test_rejecting_a_case_notifies_the_account_owner_with_reason(client, db_session, caplog):
+def test_rejecting_a_case_notifies_the_account_owner_with_reason(client, db_session, monkeypatch, caplog):
+    monkeypatch.setattr("app.core.config.settings.resend_api_key", "")
     customer_token = _signup_and_login(client, "notifyreject@example.com")
     case_id = _open_case(client, {"Authorization": f"Bearer {customer_token}"})
 
@@ -257,6 +263,245 @@ def test_rejecting_a_case_notifies_the_account_owner_with_reason(client, db_sess
         "notifyreject@example.com" in record.message and "Document was blurry" in record.message
         for record in caplog.records
     )
+
+
+def _stripe_identity_webhook_body_and_signature(
+    secret: str, session_id: str, status: str, last_error: dict | None = None
+) -> tuple[bytes, str]:
+    body = json.dumps(
+        {
+            "id": "evt_test",
+            "object": "event",
+            "type": f"identity.verification_session.{status}",
+            "data": {
+                "object": {
+                    "id": session_id,
+                    "object": "identity.verification_session",
+                    "status": status,
+                    "last_error": last_error,
+                }
+            },
+        }
+    ).encode()
+    # Stripe's construct_event enforces a tolerance against the real wall
+    # clock (default 300s) - a fixed/fake timestamp fails verification
+    # once enough real time has passed, so this must use the current time.
+    timestamp = str(int(time.time()))
+    signed_payload = f"{timestamp}.{body.decode()}"
+    signature = hmac.new(secret.encode(), signed_payload.encode(), hashlib.sha256).hexdigest()
+    return body, f"t={timestamp},v1={signature}"
+
+
+def test_start_kyc_requires_auth(client):
+    response = client.post("/compliance/cases/does-not-exist/kyc/start")
+    assert response.status_code == 401
+
+
+def test_start_kyc_on_someone_elses_case_is_forbidden(client):
+    token_a = _signup_and_login(client, "kycowner@example.com")
+    case_id = _open_case(client, {"Authorization": f"Bearer {token_a}"})
+
+    token_b = _signup_and_login(client, "kycintruder@example.com")
+    response = client.post(
+        f"/compliance/cases/{case_id}/kyc/start", headers={"Authorization": f"Bearer {token_b}"}
+    )
+    assert response.status_code == 403
+
+
+def test_start_kyc_fails_cleanly_when_stripe_is_not_configured(client, monkeypatch):
+    monkeypatch.setattr("app.core.config.settings.stripe_secret_key", "")
+    token = _signup_and_login(client, "kycnoconfig@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    case_id = _open_case(client, headers)
+
+    response = client.post(f"/compliance/cases/{case_id}/kyc/start", headers=headers)
+    assert response.status_code == 502
+
+
+def test_start_kyc_success_stores_inquiry_id_and_returns_verification_url(client, db_session, monkeypatch):
+    monkeypatch.setattr("app.core.config.settings.stripe_secret_key", "sk_test_fake")
+    monkeypatch.setattr(
+        "app.compliance.service.stripe_identity.create_verification_session",
+        lambda reference_id: {"id": "vs_test123", "url": "https://verify.stripe.com/start/test_abc"},
+    )
+
+    token = _signup_and_login(client, "kycsuccess@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    case_id = _open_case(client, headers)
+
+    response = client.post(f"/compliance/cases/{case_id}/kyc/start", headers=headers)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["inquiry_id"] == "vs_test123"
+    assert body["verification_url"] == "https://verify.stripe.com/start/test_abc"
+
+
+def test_start_kyc_is_blocked_once_the_case_is_approved(client, db_session, monkeypatch):
+    monkeypatch.setattr("app.core.config.settings.stripe_secret_key", "sk_test_fake")
+
+    token = _signup_and_login(client, "kycretryapproved@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    case_id = _open_case(client, headers)
+
+    staff_token = _create_and_login_staff(db_session, client, "staffkycretry1@zoikolocal.com")
+    client.post(f"/compliance/cases/{case_id}/approve", headers={"Authorization": f"Bearer {staff_token}"})
+
+    response = client.post(f"/compliance/cases/{case_id}/kyc/start", headers=headers)
+    assert response.status_code == 409
+
+
+def test_start_kyc_retry_resets_a_rejected_case_back_to_pending(client, db_session, monkeypatch):
+    """The self-service gap: a rejected customer must be able to retry
+    without staff intervention, and the stale "rejected" verdict must not
+    keep showing while a fresh attempt is in progress."""
+    monkeypatch.setattr("app.core.config.settings.stripe_secret_key", "sk_test_fake")
+    monkeypatch.setattr(
+        "app.compliance.service.stripe_identity.create_verification_session",
+        lambda reference_id: {"id": "vs_retry123", "url": "https://verify.stripe.com/start/test_retry"},
+    )
+
+    token = _signup_and_login(client, "kycretryafterreject@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    case_id = _open_case(client, headers)
+
+    staff_token = _create_and_login_staff(db_session, client, "staffkycretry2@zoikolocal.com")
+    client.post(
+        f"/compliance/cases/{case_id}/reject",
+        json={"reason": "Document was blurry"},
+        headers={"Authorization": f"Bearer {staff_token}"},
+    )
+
+    response = client.post(f"/compliance/cases/{case_id}/kyc/start", headers=headers)
+    assert response.status_code == 200
+    assert response.json()["inquiry_id"] == "vs_retry123"
+
+    case_response = client.get("/compliance/cases/me", headers=headers)
+    body = case_response.json()[0]
+    assert body["status"] == "pending"
+    assert body["kyc_inquiry_id"] == "vs_retry123"
+
+
+def test_stripe_identity_webhook_rejects_invalid_signature(client, monkeypatch):
+    monkeypatch.setattr("app.core.config.settings.stripe_identity_webhook_secret", "whsec_test")
+    body, _ = _stripe_identity_webhook_body_and_signature("whsec_test", "vs_x", "verified")
+    response = client.post(
+        "/compliance/webhooks/stripe-identity", content=body, headers={"Stripe-Signature": "t=123,v1=not-real"}
+    )
+    assert response.status_code == 403
+
+
+def test_stripe_identity_webhook_approves_the_matching_case(client, db_session, monkeypatch):
+    monkeypatch.setattr("app.core.config.settings.stripe_identity_webhook_secret", "whsec_test")
+
+    token = _signup_and_login(client, "kycwebhookapprove@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    case_id = _open_case(client, headers)
+
+    from app.compliance.models import ComplianceCase
+
+    case = db_session.query(ComplianceCase).filter(ComplianceCase.id == case_id).first()
+    case.kyc_inquiry_id = "vs_approve_test"
+    db_session.commit()
+
+    body, signature = _stripe_identity_webhook_body_and_signature("whsec_test", "vs_approve_test", "verified")
+    response = client.post(
+        "/compliance/webhooks/stripe-identity", content=body, headers={"Stripe-Signature": signature}
+    )
+    assert response.status_code == 204
+
+    case_response = client.get("/compliance/cases/me", headers=headers)
+    assert case_response.json()[0]["status"] == "approved"
+
+
+def test_stripe_identity_webhook_rejects_the_matching_case_on_cancel(client, db_session, monkeypatch):
+    monkeypatch.setattr("app.core.config.settings.stripe_identity_webhook_secret", "whsec_test")
+
+    token = _signup_and_login(client, "kycwebhookreject@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    case_id = _open_case(client, headers)
+
+    from app.compliance.models import ComplianceCase
+
+    case = db_session.query(ComplianceCase).filter(ComplianceCase.id == case_id).first()
+    case.kyc_inquiry_id = "vs_decline_test"
+    db_session.commit()
+
+    body, signature = _stripe_identity_webhook_body_and_signature("whsec_test", "vs_decline_test", "canceled")
+    response = client.post(
+        "/compliance/webhooks/stripe-identity", content=body, headers={"Stripe-Signature": signature}
+    )
+    assert response.status_code == 204
+
+    case_response = client.get("/compliance/cases/me", headers=headers)
+    assert case_response.json()[0]["status"] == "rejected"
+
+
+def test_stripe_identity_webhook_requires_input_with_no_error_is_a_noop(client, db_session, monkeypatch):
+    """requires_input with no last_error is the session's initial state
+    right after creation (confirmed live against the real Stripe API) -
+    it must never be treated as a rejection."""
+    monkeypatch.setattr("app.core.config.settings.stripe_identity_webhook_secret", "whsec_test")
+
+    token = _signup_and_login(client, "kycwebhookpending@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    case_id = _open_case(client, headers)
+
+    from app.compliance.models import ComplianceCase
+
+    case = db_session.query(ComplianceCase).filter(ComplianceCase.id == case_id).first()
+    case.kyc_inquiry_id = "vs_pending_test"
+    db_session.commit()
+
+    body, signature = _stripe_identity_webhook_body_and_signature("whsec_test", "vs_pending_test", "requires_input")
+    response = client.post(
+        "/compliance/webhooks/stripe-identity", content=body, headers={"Stripe-Signature": signature}
+    )
+    assert response.status_code == 204
+
+    case_response = client.get("/compliance/cases/me", headers=headers)
+    assert case_response.json()[0]["status"] == "pending"
+
+
+def test_stripe_identity_webhook_requires_input_with_last_error_rejects_the_case(client, db_session, monkeypatch):
+    """Confirmed live against a real submission: Stripe testmode auto-marks
+    document submissions unverified, and that failure surfaces as
+    requires_input + a last_error, not as its own terminal status. Without
+    checking last_error, a genuinely failed verification would silently
+    stay pending forever."""
+    monkeypatch.setattr("app.core.config.settings.stripe_identity_webhook_secret", "whsec_test")
+
+    token = _signup_and_login(client, "kycwebhookrealfail@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    case_id = _open_case(client, headers)
+
+    from app.compliance.models import ComplianceCase
+
+    case = db_session.query(ComplianceCase).filter(ComplianceCase.id == case_id).first()
+    case.kyc_inquiry_id = "vs_realfail_test"
+    db_session.commit()
+
+    body, signature = _stripe_identity_webhook_body_and_signature(
+        "whsec_test",
+        "vs_realfail_test",
+        "requires_input",
+        last_error={"code": "document_unverified_other", "reason": "The provided document was not verified."},
+    )
+    response = client.post(
+        "/compliance/webhooks/stripe-identity", content=body, headers={"Stripe-Signature": signature}
+    )
+    assert response.status_code == 204
+
+    case_response = client.get("/compliance/cases/me", headers=headers)
+    assert case_response.json()[0]["status"] == "rejected"
+
+
+def test_stripe_identity_webhook_with_unknown_session_id_is_a_noop(client, monkeypatch):
+    monkeypatch.setattr("app.core.config.settings.stripe_identity_webhook_secret", "whsec_test")
+    body, signature = _stripe_identity_webhook_body_and_signature("whsec_test", "vs_unknown", "verified")
+    response = client.post(
+        "/compliance/webhooks/stripe-identity", content=body, headers={"Stripe-Signature": signature}
+    )
+    assert response.status_code == 204
 
 
 def test_staff_can_filter_cases_by_status(client, db_session):

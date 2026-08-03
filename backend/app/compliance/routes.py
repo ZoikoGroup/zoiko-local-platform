@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.orm import Session
 
 from app.compliance import service
@@ -9,9 +9,11 @@ from app.compliance.schemas import (
     ComplianceCaseStaffResponse,
     ComplianceRuleResponse,
     DocumentSubmit,
+    KYCVerificationStart,
 )
 from app.core.database import get_db
 from app.core.deps import get_current_staff, get_current_user
+from app.integrations.kyc.stripe_identity import KYCError, construct_webhook_event
 from app.numbering.identity.models import User
 from app.staff.models import PlatformStaff
 
@@ -77,6 +79,46 @@ def submit_document(
     return service.submit_document(
         db, case, document_type=payload.document_type, reference=payload.reference, actor=current_user.id
     )
+
+
+@router.post("/cases/{case_id}/kyc/start", response_model=KYCVerificationStart)
+def start_kyc(
+    case_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    case = _get_case_or_404(db, case_id)
+    if case.account_id != current_user.account_id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not your case")
+
+    try:
+        return service.start_kyc_verification(db, case, actor=current_user.id)
+    except service.KYCAlreadyApprovedError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e
+    except KYCError as e:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(e)) from e
+
+
+@router.post("/webhooks/stripe-identity", status_code=204)
+async def stripe_identity_webhook(request: Request, db: Session = Depends(get_db)):
+    body = await request.body()
+    signature = request.headers.get("Stripe-Signature", "")
+
+    try:
+        event = construct_webhook_event(body, signature)
+    except KYCError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e)) from e
+
+    if event["type"].startswith("identity.verification_session."):
+        session = event["data"]["object"]
+        last_error = session["last_error"]
+        service.handle_stripe_identity_webhook(
+            db,
+            session_id=session["id"],
+            status=session["status"],
+            last_error_reason=last_error["reason"] if last_error else None,
+        )
+    return None
 
 
 @router.post("/cases/{case_id}/approve", response_model=ComplianceCaseResponse)

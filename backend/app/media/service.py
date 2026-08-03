@@ -1,5 +1,5 @@
 import uuid
-from datetime import datetime, time, timezone
+from datetime import datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from fastapi import HTTPException, Request
@@ -9,6 +9,7 @@ from app.audit.service import log_event
 from app.consent.models import ConsentType
 from app.consent.service import has_active_consent
 from app.integrations.llm.groq import LLMError
+from app.integrations.storage.s3 import StorageError, generate_presigned_url
 from app.integrations.telecom import twilio as telecom
 from app.integrations.video import livekit as video
 from app.intelligence.service import qualify_caller
@@ -17,11 +18,13 @@ from app.media.models import (
     CallRecord,
     ReceptionistCall,
     ReceptionistUrgency,
+    VideoParticipantSession,
     VideoSession,
     VideoSessionStatus,
     Voicemail,
 )
 from app.numbering.numbers.models import PhoneNumber, PhoneNumberStatus
+from app.retention.service import PURGED_MARKER
 
 
 class CallAuthorizationError(Exception):
@@ -292,6 +295,14 @@ def list_account_video_sessions(db: Session, account_id: str) -> list[VideoSessi
     )
 
 
+def get_account_video_usage_minutes(db: Session, account_id: str) -> float:
+    """Total participant-minutes across every video session this account
+    has ever had - the account-level rollup the roadmap doc's usage-metering
+    requirement is ultimately for (future ZoikoNex rating input)."""
+    session_ids = [s.id for s in db.query(VideoSession.id).filter(VideoSession.account_id == account_id).all()]
+    return round(sum(get_participant_minutes(db, sid) for sid in session_ids), 2)
+
+
 def handle_video_webhook_event(db: Session, event) -> None:
     """Syncs real LiveKit room state back into VideoSession — without this,
     a room that closes because everyone left (rather than an explicit
@@ -304,21 +315,90 @@ def handle_video_webhook_event(db: Session, event) -> None:
     if session is None:
         return
 
-    if event.event == "room_finished" and session.status != VideoSessionStatus.ENDED:
-        session.status = VideoSessionStatus.ENDED
-        session.ended_at = datetime.now(timezone.utc)
+    now = datetime.now(timezone.utc)
+
+    if event.event == "room_finished":
+        if session.status != VideoSessionStatus.ENDED:
+            session.status = VideoSessionStatus.ENDED
+            session.ended_at = now
+            db.commit()
+            log_event(
+                db, actor_id=session.account_id, action="video.session.ended",
+                target_type="video_session", target_id=session.id,
+                metadata={"room_name": event.room.name, "source": "livekit_webhook"},
+            )
+        # Close out anyone whose participant_left event never arrived (e.g.
+        # an abrupt disconnect) - otherwise their usage would count as
+        # still-open/unbounded forever.
+        dangling = (
+            db.query(VideoParticipantSession)
+            .filter(VideoParticipantSession.video_session_id == session.id, VideoParticipantSession.left_at.is_(None))
+            .all()
+        )
+        for row in dangling:
+            row.left_at = session.ended_at or now
+        if dangling:
+            db.commit()
+    elif event.event == "participant_joined":
+        db.add(
+            VideoParticipantSession(
+                video_session_id=session.id, participant_identity=event.participant.identity, joined_at=now
+            )
+        )
         db.commit()
         log_event(
-            db, actor_id=session.account_id, action="video.session.ended",
-            target_type="video_session", target_id=session.id,
-            metadata={"room_name": event.room.name, "source": "livekit_webhook"},
-        )
-    elif event.event in ("participant_joined", "participant_left"):
-        log_event(
-            db, actor_id=session.account_id, action=f"video.{event.event}",
+            db, actor_id=session.account_id, action="video.participant_joined",
             target_type="video_session", target_id=session.id,
             metadata={"room_name": event.room.name, "participant_identity": event.participant.identity},
         )
+    elif event.event == "participant_left":
+        open_row = (
+            db.query(VideoParticipantSession)
+            .filter(
+                VideoParticipantSession.video_session_id == session.id,
+                VideoParticipantSession.participant_identity == event.participant.identity,
+                VideoParticipantSession.left_at.is_(None),
+            )
+            .order_by(VideoParticipantSession.joined_at.desc())
+            .first()
+        )
+        if open_row:
+            open_row.left_at = now
+            db.commit()
+        log_event(
+            db, actor_id=session.account_id, action="video.participant_left",
+            target_type="video_session", target_id=session.id,
+            metadata={"room_name": event.room.name, "participant_identity": event.participant.identity},
+        )
+
+
+def get_recording_download_url(session: VideoSession) -> str | None:
+    """The bucket is private (no public-read policy) - the permanent URL
+    stored in recording_url 403s/UnauthorizedAccess's in a browser. Generate
+    a fresh short-lived signed URL each time instead of ever serving that
+    stored URL directly. Returns None if there's no recording, or it's
+    already been purged by retention policy."""
+    if not session.recording_url or session.recording_url == PURGED_MARKER:
+        return None
+    try:
+        return generate_presigned_url(f"recordings/{session.room_name}.mp4")
+    except StorageError:
+        return None
+
+
+def get_participant_minutes(db: Session, video_session_id: str) -> float:
+    """Sum of every participant's time in the room - a 3-person, 10-minute
+    call is 30 participant-minutes, not 10. Still-open rows (participant
+    hasn't left / room hasn't ended) count up to now, so usage is visible
+    even mid-call."""
+    rows = (
+        db.query(VideoParticipantSession)
+        .filter(VideoParticipantSession.video_session_id == video_session_id)
+        .all()
+    )
+    now = datetime.now(timezone.utc)
+    total_duration = sum(((row.left_at or now) - row.joined_at for row in rows), timedelta())
+    return round(total_duration.total_seconds() / 60, 2)
 
 
 def _handle_egress_ended(db: Session, event) -> None:
@@ -331,13 +411,26 @@ def _handle_egress_ended(db: Session, event) -> None:
     if session is None:
         return
 
-    if egress_info.file_results:
-        session.recording_url = egress_info.file_results[0].location
+    # Some LiveKit server versions populate the repeated `file_results` list;
+    # this deployment still only sets the deprecated singular `file` field
+    # for a single-output RoomComposite egress - confirmed live, two
+    # recordings completed and uploaded fine but never got a recording_url
+    # because only `file_results` was checked. Check both, newer field first.
+    location = egress_info.file_results[0].location if egress_info.file_results else egress_info.file.location
+
+    if location:
+        session.recording_url = location
         db.commit()
         log_event(
             db, actor_id=session.account_id, action="video.recording_completed",
             target_type="video_session", target_id=session.id,
             metadata={"room_name": session.room_name, "egress_status": egress_info.status},
+        )
+    else:
+        log_event(
+            db, actor_id=session.account_id, action="video.recording_failed",
+            target_type="video_session", target_id=session.id,
+            metadata={"room_name": session.room_name, "egress_status": egress_info.status, "error": egress_info.error},
         )
 
 
@@ -356,7 +449,7 @@ def capture_receptionist_call(
 
     qualification, model_version = None, None
     try:
-        qualification, model_version = qualify_caller(db, owner.account_id, transcript)
+        qualification, model_version = qualify_caller(db, owner.account_id, transcript, owner.country)
     except LLMError:
         pass
 
@@ -373,6 +466,7 @@ def capture_receptionist_call(
         caller_name=qualification.get("name"),
         caller_company=qualification.get("company"),
         reason=qualification.get("reason"),
+        summary=qualification.get("summary"),
         urgency=urgency,
         model_version=model_version,
     )

@@ -113,7 +113,19 @@ async def list_rooms(
             "started_at": s.started_at,
             "ended_at": s.ended_at,
             "recording_in_progress": s.recording_egress_id is not None and s.recording_url is None,
-            "recording_url": s.recording_url,
+            "recording_url": media_service.get_recording_download_url(s),
+            "participant_minutes": media_service.get_participant_minutes(db, s.id),
         }
         for s in sessions
     ]
+
+
+@router.get("/usage")
+async def get_usage(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Roadmap doc's usage-metering requirement: total participant-minutes
+    across every video session this account has had - a future ZoikoNex
+    rating input, not itself a billing charge."""
+    return {"participant_minutes": media_service.get_account_video_usage_minutes(db, current_user.account_id)}

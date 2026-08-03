@@ -21,12 +21,51 @@ def _livekit_webhook_body_and_token(event: str, room_name: str) -> tuple[bytes, 
     return body, token
 
 
+def _participant_webhook_body_and_token(event: str, room_name: str, identity: str) -> tuple[bytes, str]:
+    body = MessageToJson(
+        webhook_pb.WebhookEvent(
+            event=event, room=models_pb.Room(name=room_name), participant=models_pb.ParticipantInfo(identity=identity)
+        )
+    ).encode()
+    digest = base64.b64encode(hashlib.sha256(body).digest()).decode()
+    token = (
+        livekit_api.AccessToken(settings.livekit_api_key, settings.livekit_api_secret)
+        .with_sha256(digest)
+        .to_jwt()
+    )
+    return body, token
+
+
 def _egress_ended_webhook_body_and_token(egress_id: str, room_name: str, file_location: str) -> tuple[bytes, str]:
     egress_info = egress_pb.EgressInfo(
         egress_id=egress_id,
         room_name=room_name,
         status=egress_pb.EgressStatus.EGRESS_COMPLETE,
         file_results=[egress_pb.FileInfo(location=file_location)],
+    )
+    body = MessageToJson(webhook_pb.WebhookEvent(event="egress_ended", egress_info=egress_info)).encode()
+    digest = base64.b64encode(hashlib.sha256(body).digest()).decode()
+    token = (
+        livekit_api.AccessToken(settings.livekit_api_key, settings.livekit_api_secret)
+        .with_sha256(digest)
+        .to_jwt()
+    )
+    return body, token
+
+
+def _egress_ended_webhook_body_and_token_legacy_file_field(
+    egress_id: str, room_name: str, file_location: str
+) -> tuple[bytes, str]:
+    """Some LiveKit server versions populate only the deprecated singular
+    `file` field (not the repeated `file_results` list) for a single-output
+    RoomComposite egress - confirmed against a real deployment where two
+    completed recordings never got a recording_url because only
+    `file_results` was checked."""
+    egress_info = egress_pb.EgressInfo(
+        egress_id=egress_id,
+        room_name=room_name,
+        status=egress_pb.EgressStatus.EGRESS_COMPLETE,
+        file=egress_pb.FileInfo(location=file_location),
     )
     body = MessageToJson(webhook_pb.WebhookEvent(event="egress_ended", egress_info=egress_info)).encode()
     digest = base64.b64encode(hashlib.sha256(body).digest()).decode()
@@ -228,8 +267,50 @@ def test_webhook_egress_ended_attaches_recording_url(client, db_session):
 
     list_response = client.get("/media/video/rooms", headers=headers)
     matching = next(r for r in list_response.json() if r["room_name"] == room_name)
-    assert matching["recording_url"] == "https://example.com/recordings/fake.mp4"
+    # The bucket is private, so what's served is a freshly generated
+    # presigned download URL keyed off room_name, not the literal webhook
+    # value - see get_recording_download_url.
+    assert matching["recording_url"].startswith(
+        f"https://s3.us-east-005.backblazeb2.com/zoiko-local-video-recordings/recordings/{room_name}.mp4"
+    )
+    assert "X-Amz-Signature" in matching["recording_url"]
     assert matching["recording_in_progress"] is False
+
+    db_session.refresh(session)
+    assert session.recording_url == "https://example.com/recordings/fake.mp4"
+
+    client.post(f"/media/video/rooms/{room_name}/end", headers=headers)
+
+
+def test_webhook_egress_ended_attaches_recording_url_from_legacy_file_field(client, db_session):
+    token = _signup_and_login(client, "videorecordwebhooklegacy@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    room_name = client.post("/media/video/rooms", headers=headers).json()["room_name"]
+
+    from app.media.models import VideoSession
+
+    session = db_session.query(VideoSession).filter(VideoSession.room_name == room_name).first()
+    session.recording_egress_id = "EG_legacy_test_id"
+    db_session.commit()
+
+    body, auth_token = _egress_ended_webhook_body_and_token_legacy_file_field(
+        "EG_legacy_test_id", room_name, "https://example.com/recordings/legacy.mp4"
+    )
+    webhook_response = client.post(
+        "/media/video/webhook", content=body, headers={"Authorization": auth_token}
+    )
+    assert webhook_response.status_code == 204
+
+    list_response = client.get("/media/video/rooms", headers=headers)
+    matching = next(r for r in list_response.json() if r["room_name"] == room_name)
+    assert matching["recording_url"].startswith(
+        f"https://s3.us-east-005.backblazeb2.com/zoiko-local-video-recordings/recordings/{room_name}.mp4"
+    )
+    assert "X-Amz-Signature" in matching["recording_url"]
+    assert matching["recording_in_progress"] is False
+
+    db_session.refresh(session)
+    assert session.recording_url == "https://example.com/recordings/legacy.mp4"
 
     client.post(f"/media/video/rooms/{room_name}/end", headers=headers)
 
@@ -263,3 +344,157 @@ def test_webhook_room_finished_marks_session_ended(client):
     # cleanup on the LiveKit side (DB already reflects "ended" via the webhook,
     # but the real room object may still exist until LiveKit's own timeout)
     client.post(f"/media/video/rooms/{room_name}/end", headers=headers)
+
+
+def test_participant_joined_creates_an_open_participant_session(client, db_session):
+    from app.media.models import VideoParticipantSession
+
+    token = _signup_and_login(client, "videoparticipant1@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    room_name = client.post("/media/video/rooms", headers=headers).json()["room_name"]
+
+    body, auth_token = _participant_webhook_body_and_token("participant_joined", room_name, "user-abc")
+    response = client.post("/media/video/webhook", content=body, headers={"Authorization": auth_token})
+    assert response.status_code == 204
+
+    row = (
+        db_session.query(VideoParticipantSession)
+        .filter(VideoParticipantSession.participant_identity == "user-abc")
+        .first()
+    )
+    assert row is not None
+    assert row.joined_at is not None
+    assert row.left_at is None
+
+    client.post(f"/media/video/rooms/{room_name}/end", headers=headers)
+
+
+def test_participant_left_closes_the_matching_open_session(client, db_session):
+    from app.media.models import VideoParticipantSession
+
+    token = _signup_and_login(client, "videoparticipant2@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    room_name = client.post("/media/video/rooms", headers=headers).json()["room_name"]
+
+    joined_body, joined_token = _participant_webhook_body_and_token("participant_joined", room_name, "user-xyz")
+    client.post("/media/video/webhook", content=joined_body, headers={"Authorization": joined_token})
+
+    left_body, left_token = _participant_webhook_body_and_token("participant_left", room_name, "user-xyz")
+    response = client.post("/media/video/webhook", content=left_body, headers={"Authorization": left_token})
+    assert response.status_code == 204
+
+    row = (
+        db_session.query(VideoParticipantSession)
+        .filter(VideoParticipantSession.participant_identity == "user-xyz")
+        .first()
+    )
+    assert row.left_at is not None
+
+    list_response = client.get("/media/video/rooms", headers=headers)
+    matching = next(r for r in list_response.json() if r["room_name"] == room_name)
+    assert matching["participant_minutes"] >= 0
+
+    client.post(f"/media/video/rooms/{room_name}/end", headers=headers)
+
+
+def test_room_finished_closes_any_dangling_open_participant_sessions(client, db_session):
+    from app.media.models import VideoParticipantSession
+
+    token = _signup_and_login(client, "videoparticipant3@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    room_name = client.post("/media/video/rooms", headers=headers).json()["room_name"]
+
+    joined_body, joined_token = _participant_webhook_body_and_token("participant_joined", room_name, "user-nolev")
+    client.post("/media/video/webhook", content=joined_body, headers={"Authorization": joined_token})
+
+    # no participant_left ever arrives (abrupt disconnect) - room_finished
+    # must still close the row out, not leave it open forever
+    finished_body, finished_token = _livekit_webhook_body_and_token("room_finished", room_name)
+    client.post("/media/video/webhook", content=finished_body, headers={"Authorization": finished_token})
+
+    row = (
+        db_session.query(VideoParticipantSession)
+        .filter(VideoParticipantSession.participant_identity == "user-nolev")
+        .first()
+    )
+    assert row.left_at is not None
+
+    client.post(f"/media/video/rooms/{room_name}/end", headers=headers)
+
+
+def test_get_participant_minutes_sums_every_participants_time(db_session):
+    from datetime import datetime, timedelta, timezone
+
+    from app.media.models import VideoParticipantSession, VideoSession, VideoSessionStatus
+    from app.media.service import get_participant_minutes
+    from app.numbering.identity.models import Account, AccountType, User, UserRole
+
+    account = Account(name="Usage Unit Test Co", account_type=AccountType.INDIVIDUAL)
+    db_session.add(account)
+    db_session.flush()
+    user = User(account_id=account.id, email="usageunit@example.com", role=UserRole.OWNER)
+    db_session.add(user)
+    db_session.flush()
+
+    session = VideoSession(
+        account_id=account.id, host_user_id=user.id, room_name="zl-usagetest1", status=VideoSessionStatus.ENDED
+    )
+    db_session.add(session)
+    db_session.flush()
+
+    base = datetime.now(timezone.utc)
+    db_session.add_all(
+        [
+            VideoParticipantSession(
+                video_session_id=session.id, participant_identity="a",
+                joined_at=base, left_at=base + timedelta(minutes=10),
+            ),
+            VideoParticipantSession(
+                video_session_id=session.id, participant_identity="b",
+                joined_at=base, left_at=base + timedelta(minutes=4),
+            ),
+        ]
+    )
+    db_session.commit()
+
+    assert get_participant_minutes(db_session, session.id) == 14.0
+
+
+def test_usage_endpoint_sums_across_all_of_an_accounts_sessions(client, db_session):
+    from datetime import datetime, timedelta, timezone
+
+    from app.media.models import VideoParticipantSession, VideoSession, VideoSessionStatus
+
+    token = _signup_and_login(client, "videousage1@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    me = client.get("/auth/me", headers=headers).json()
+
+    session1 = VideoSession(
+        account_id=me["account_id"], host_user_id=me["id"], room_name="zl-usageacct1",
+        status=VideoSessionStatus.ENDED,
+    )
+    session2 = VideoSession(
+        account_id=me["account_id"], host_user_id=me["id"], room_name="zl-usageacct2",
+        status=VideoSessionStatus.ENDED,
+    )
+    db_session.add_all([session1, session2])
+    db_session.flush()
+
+    base = datetime.now(timezone.utc)
+    db_session.add_all(
+        [
+            VideoParticipantSession(
+                video_session_id=session1.id, participant_identity="a",
+                joined_at=base, left_at=base + timedelta(minutes=5),
+            ),
+            VideoParticipantSession(
+                video_session_id=session2.id, participant_identity="a",
+                joined_at=base, left_at=base + timedelta(minutes=7),
+            ),
+        ]
+    )
+    db_session.commit()
+
+    response = client.get("/media/video/usage", headers=headers)
+    assert response.status_code == 200
+    assert response.json()["participant_minutes"] == 12.0

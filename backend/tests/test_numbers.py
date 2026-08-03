@@ -96,6 +96,7 @@ def test_purchase_succeeds_once_compliance_case_is_approved(client, db_session, 
 
 
 def test_suspending_a_number_notifies_the_account_owner(client, monkeypatch, caplog):
+    monkeypatch.setattr("app.core.config.settings.resend_api_key", "")
     _stub_buy_number(monkeypatch)
     token = _signup_and_login(client, "notifysuspend@example.com")
     headers = {"Authorization": f"Bearer {token}"}
@@ -304,3 +305,105 @@ def test_cancel_leaves_number_active_when_twilio_release_fails(client, monkeypat
 
     still_active = next(n for n in client.get("/numbers", headers=headers).json() if n["e164"] == "+15550001313")
     assert still_active["status"] == "active"
+
+
+def test_purchase_blocked_by_compliance_persists_compliance_pending_status(client, db_session, monkeypatch):
+    """The docs' "Compliance Pending" lifecycle state must be a real,
+    visible, persisted state - not just a one-off error response - so the
+    customer/admin can see this specific number is blocked on KYC/KYB
+    rather than it looking like an abandoned reservation."""
+    _stub_buy_number(monkeypatch)
+    db_session.add(
+        ComplianceRule(country="GB", requirement_type="kyc_individual", required_documents=["government_id"])
+    )
+    db_session.commit()
+
+    token = _signup_and_login(client, "compliancepending1@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    _reserve(client, headers, "+442079460011", country="GB")
+
+    response = client.post("/numbers/purchase", json={"e164": "+442079460011"}, headers=headers)
+    assert response.status_code == 403
+
+    numbers = client.get("/numbers", headers=headers).json()
+    number = next(n for n in numbers if n["e164"] == "+442079460011")
+    assert number["status"] == "compliance_pending"
+
+
+def test_purchase_retries_successfully_from_compliance_pending_after_approval(client, db_session, monkeypatch):
+    """A number stuck in Compliance Pending must be retryable via the same
+    purchase endpoint once the case is approved - the customer's only
+    self-service path forward, without having to reserve the number again."""
+    _stub_buy_number(monkeypatch)
+    db_session.add(
+        ComplianceRule(country="GB", requirement_type="kyc_individual", required_documents=["government_id"])
+    )
+    db_session.commit()
+
+    token = _signup_and_login(client, "compliancepending2@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    _reserve(client, headers, "+442079460012", country="GB")
+
+    blocked = client.post("/numbers/purchase", json={"e164": "+442079460012"}, headers=headers)
+    assert blocked.status_code == 403
+
+    case_response = client.post(
+        "/compliance/cases", json={"jurisdiction": "GB", "requirement_type": "kyc_individual"}, headers=headers
+    )
+    case_id = case_response.json()["id"]
+
+    from app.staff import service as staff_service
+
+    staff_service.create_staff(db_session, email="staffcompliancepending2@zoikolocal.com", password="staffpass123")
+    staff_token = client.post(
+        "/staff/login", json={"email": "staffcompliancepending2@zoikolocal.com", "password": "staffpass123"}
+    ).json()["access_token"]
+    client.post(f"/compliance/cases/{case_id}/approve", headers={"Authorization": f"Bearer {staff_token}"})
+
+    retry = client.post("/numbers/purchase", json={"e164": "+442079460012"}, headers=headers)
+    assert retry.status_code == 200, retry.text
+    assert retry.json()["status"] == "active"
+
+
+def test_cancelled_number_is_quarantined_from_reservation(client, monkeypatch):
+    """Docs' "Quarantine period before reuse, default 90 days" - a just-
+    cancelled number must not be immediately re-reservable, by the same
+    account or anyone else."""
+    _stub_buy_number(monkeypatch)
+    monkeypatch.setattr("app.numbering.numbers.service.telecom.release_number", lambda sid: None)
+    token = _signup_and_login(client, "quarantine1@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    _reserve(client, headers, "+15550002222")
+    client.post("/numbers/purchase", json={"e164": "+15550002222"}, headers=headers)
+    cancel = client.post("/numbers/+15550002222/cancel", headers=headers)
+    assert cancel.status_code == 200, cancel.text
+
+    response = client.post(
+        "/numbers/reserve", json={"e164": "+15550002222", "country": "US"}, headers=headers
+    )
+    assert response.status_code == 409
+    assert "quarantine" in response.json()["detail"].lower()
+
+
+def test_cancelled_number_can_be_reserved_after_quarantine_period(client, db_session, monkeypatch):
+    from datetime import datetime, timedelta, timezone
+
+    from app.numbering.numbers.models import PhoneNumber
+
+    _stub_buy_number(monkeypatch)
+    monkeypatch.setattr("app.numbering.numbers.service.telecom.release_number", lambda sid: None)
+    token = _signup_and_login(client, "quarantine2@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    _reserve(client, headers, "+15550002233")
+    client.post("/numbers/purchase", json={"e164": "+15550002233"}, headers=headers)
+    cancel = client.post("/numbers/+15550002233/cancel", headers=headers)
+    assert cancel.status_code == 200, cancel.text
+
+    number = db_session.query(PhoneNumber).filter(PhoneNumber.e164 == "+15550002233").first()
+    number.cancelled_at = datetime.now(timezone.utc) - timedelta(days=91)
+    db_session.commit()
+
+    response = client.post(
+        "/numbers/reserve", json={"e164": "+15550002233", "country": "US"}, headers=headers
+    )
+    assert response.status_code == 201, response.text

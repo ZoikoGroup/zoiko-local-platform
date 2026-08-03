@@ -22,7 +22,9 @@ type Step = "search" | "reserved" | "compliance" | "checkout" | "purchased";
 
 const STATUS_STYLES: Record<string, string> = {
   reserved: "bg-amber-50 text-amber-700",
+  compliance_pending: "bg-orange-50 text-orange-700",
   purchase_pending: "bg-amber-50 text-amber-700",
+  provisioning: "bg-amber-50 text-amber-700",
   active: "bg-emerald-50 text-emerald-700",
   suspended: "bg-slate-100 text-slate-600",
   cancelled: "bg-red-50 text-red-700",
@@ -147,6 +149,7 @@ export default function NumbersPage() {
           "This number's country needs an approved identity verification case before it can be purchased — " +
             "your case is still pending staff review."
         );
+        await loadMyNumbers();
       } else if (err instanceof ApiError && err.status === 409) {
         setPurchaseError(`${err.message} — go back and reserve a number again.`);
       } else {

@@ -26,7 +26,8 @@ def test_owner_can_add_a_team_member(client):
     assert response.json()["role"] == "member"
 
 
-def test_adding_a_member_notifies_them_by_email(client, caplog):
+def test_adding_a_member_notifies_them_by_email(client, monkeypatch, caplog):
+    monkeypatch.setattr("app.core.config.settings.resend_api_key", "")
     owner_token = _signup_and_login(client, "notifyowner@example.com", account_name="Notify Test Co")
     with caplog.at_level(logging.INFO, logger="zoiko.notifications"):
         client.post(

@@ -15,7 +15,9 @@ def new_uuid() -> str:
 
 class PhoneNumberStatus(str, enum.Enum):
     RESERVED = "reserved"
+    COMPLIANCE_PENDING = "compliance_pending"
     PURCHASE_PENDING = "purchase_pending"
+    PROVISIONING = "provisioning"
     ACTIVE = "active"
     SUSPENDED = "suspended"
     CANCELLED = "cancelled"
@@ -36,6 +38,12 @@ class PhoneNumber(Base):
         UUID(as_uuid=False), ForeignKey("accounts.id", ondelete="CASCADE"), nullable=False, index=True
     )
     reserved_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    # Roadmap §6 number lifecycle - "Quarantine period before reuse, default
+    # 90 days." Set when the number moves to CANCELLED; checked by
+    # reserve_number() before letting anyone (including the same account)
+    # grab it again.
+    cancelled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     # Roadmap "Team and RBAC ... number assignment" — which team member this
     # number is handed to (e.g. a sales line given to one agent). NULL means

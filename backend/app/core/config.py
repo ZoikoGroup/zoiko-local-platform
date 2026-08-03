@@ -32,10 +32,14 @@ class Settings(BaseSettings):
 
     groq_api_key: str = ""
 
-    smtp_host: str = ""
-    smtp_port: int = 587
-    smtp_username: str = ""
-    smtp_password: str = ""
-    smtp_from_email: str = "no-reply@zoikolocal.test"
+    stripe_secret_key: str = ""
+    stripe_identity_webhook_secret: str = ""
+
+    # Resend (integrations/notifications) - real transactional email sending.
+    # email_from_address must be on a domain verified in Resend once one is
+    # set up; Resend's shared onboarding@resend.dev address works
+    # immediately with no domain verification, for testing before that.
+    resend_api_key: str = ""
+    email_from_address: str = "onboarding@resend.dev"
 
 settings = Settings()

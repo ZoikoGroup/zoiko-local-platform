@@ -259,6 +259,23 @@ def download_recording(recording_url: str) -> bytes:
     return response.content
 
 
+def delete_recording(recording_sid: str) -> None:
+    """Actually removes a recording from Twilio's storage - used once a
+    voicemail/call recording is past its retention window, so the audio
+    doesn't just sit there forever after we stop linking to it."""
+    try:
+        _client().recordings(recording_sid).delete()
+    except TwilioException as e:
+        raise TelecomError(str(e)) from e
+
+
+def recording_sid_from_url(recording_url: str) -> str:
+    """Twilio's RecordingUrl webhook value is the resource URL itself
+    (.../Recordings/{sid}, no file extension) - the SID is just the last
+    path segment."""
+    return recording_url.rstrip("/").rsplit("/", 1)[-1]
+
+
 def validate_webhook_signature(url: str, params: dict, signature: str | None) -> bool:
     """Verifies a Twilio webhook actually came from Twilio (HMAC-SHA1 over the
     callback URL + POST params, per Twilio's X-Twilio-Signature scheme) —

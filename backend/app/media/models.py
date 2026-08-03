@@ -82,6 +82,27 @@ class VideoSession(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
+class VideoParticipantSession(Base):
+    """Roadmap doc §8/§Usage Metering: 'video participant-minutes metered
+    for future pricing' - one row per participant's time in a room, from
+    LiveKit's participant_joined/left webhook events. Usage is the sum of
+    (left_at or now) - joined_at across every row for a session, not just
+    the room's own started_at/ended_at, since a session with 3 people for
+    10 minutes each is 30 participant-minutes, not 10.
+    """
+
+    __tablename__ = "video_participant_sessions"
+
+    id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=new_uuid)
+    video_session_id: Mapped[str] = mapped_column(
+        UUID(as_uuid=False), ForeignKey("video_sessions.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    participant_identity: Mapped[str] = mapped_column(String(200), nullable=False)
+    joined_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    left_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
 class Voicemail(Base):
     __tablename__ = "voicemails"
 
@@ -128,6 +149,9 @@ class ReceptionistCall(Base):
     caller_name: Mapped[str | None] = mapped_column(String(200), nullable=True)
     caller_company: Mapped[str | None] = mapped_column(String(200), nullable=True)
     reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    summary: Mapped[str | None] = mapped_column(
+        Text, nullable=True
+    )  # full narrated sentence for display - reason stays a short fragment for internal use
     urgency: Mapped[ReceptionistUrgency | None] = mapped_column(
         Enum(ReceptionistUrgency, name="receptionist_urgency_enum"), nullable=True
     )

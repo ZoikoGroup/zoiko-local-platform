@@ -1,7 +1,7 @@
 from sqlalchemy.orm import Session
 
 from app.audit.service import log_event
-from app.consent.models import ConsentType
+from app.consent.models import GLOBAL_JURISDICTION, ConsentType
 from app.consent.service import has_active_consent
 from app.integrations.llm.groq import MODEL_VERSION as LLM_MODEL_VERSION
 from app.integrations.llm.groq import extract_receptionist_qualification, summarize_transcript
@@ -10,6 +10,7 @@ from app.integrations.transcription.groq import MODEL_VERSION as TRANSCRIPTION_M
 from app.integrations.transcription.groq import transcribe_audio
 from app.intelligence.models import ConversationSummary, SummarySourceType
 from app.media.models import CallRecord, Voicemail
+from app.numbering.numbers.models import PhoneNumber
 
 AI_DISCLAIMER = "AI-generated summary — may be inaccurate; not an authoritative record."
 
@@ -27,12 +28,23 @@ class NotRecordedError(Exception):
     progress, wasn't forwarded, or the recording callback hasn't landed)."""
 
 
-def _require_consent(db: Session, account_id: str, action: str) -> None:
-    if not has_active_consent(db, account_id, ConsentType.AI_PROCESSING):
+def _require_consent(db: Session, account_id: str, action: str, jurisdiction: str) -> None:
+    if not has_active_consent(db, account_id, ConsentType.AI_PROCESSING, jurisdiction):
         raise ConsentRequiredError(
             f"AI processing consent is required before summarizing {action} — "
             "grant it via POST /compliance/consent first"
         )
+
+
+def _phone_number_country(db: Session, phone_number_id: str | None) -> str:
+    """Recording/AI-processing consent requirements genuinely differ by
+    country, so consent is checked against the jurisdiction of the number
+    involved - falling back to GLOBAL (the "applies everywhere" grant) when
+    there's no number to derive one from."""
+    if phone_number_id is None:
+        return GLOBAL_JURISDICTION
+    number = db.query(PhoneNumber).filter(PhoneNumber.id == phone_number_id).first()
+    return number.country if number else GLOBAL_JURISDICTION
 
 
 def _transcribe_and_store(
@@ -66,7 +78,8 @@ def summarize_voicemail(db: Session, account_id: str, voicemail_id: str) -> Conv
     if voicemail is None or voicemail.account_id != account_id:
         raise SummaryAuthorizationError(f"{voicemail_id} is not a voicemail owned by your account")
 
-    _require_consent(db, account_id, "voicemails")
+    jurisdiction = _phone_number_country(db, voicemail.phone_number_id)
+    _require_consent(db, account_id, "voicemails", jurisdiction)
 
     return _transcribe_and_store(
         db,
@@ -84,7 +97,8 @@ def summarize_call(db: Session, account_id: str, call_id: str) -> ConversationSu
     if not call.recording_url:
         raise NotRecordedError(f"{call_id} has no recording yet — it may still be in progress")
 
-    _require_consent(db, account_id, "calls")
+    jurisdiction = _phone_number_country(db, call.phone_number_id)
+    _require_consent(db, account_id, "calls", jurisdiction)
 
     return _transcribe_and_store(
         db,
@@ -95,13 +109,15 @@ def summarize_call(db: Session, account_id: str, call_id: str) -> ConversationSu
     )
 
 
-def qualify_caller(db: Session, account_id: str, transcript: str) -> tuple[dict | None, str | None]:
+def qualify_caller(
+    db: Session, account_id: str, transcript: str, jurisdiction: str = GLOBAL_JURISDICTION
+) -> tuple[dict | None, str | None]:
     """Returns (qualification, model_version) — qualification is None when
     AI-processing consent hasn't been granted, rather than raising. Live
     call-handling code must always produce a TwiML response, so missing
     consent here means 'skip AI enrichment', not a hard failure.
     """
-    if not has_active_consent(db, account_id, ConsentType.AI_PROCESSING):
+    if not has_active_consent(db, account_id, ConsentType.AI_PROCESSING, jurisdiction):
         return None, None
     return extract_receptionist_qualification(transcript), LLM_MODEL_VERSION
 

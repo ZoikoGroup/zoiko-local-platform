@@ -4,7 +4,20 @@ from sqlalchemy.orm import Session
 
 from app.audit.service import log_event
 from app.compliance.models import ComplianceCase, ComplianceCaseStatus, ComplianceRule
+from app.integrations.kyc import stripe_identity
 from app.notifications.service import notify_compliance_case_approved, notify_compliance_case_rejected
+
+# Stripe Identity VerificationSession status -> our case status. "requires_input"
+# is overloaded - confirmed live against a real submission: it's BOTH the
+# session's initial status right after creation (nothing submitted yet) AND
+# where a session lands after a genuine failed verification (Stripe's
+# testmode auto-marks document submissions "unverified" unless you force a
+# specific outcome, and that failure surfaces as requires_input + last_error,
+# not as its own terminal status). handle_stripe_identity_webhook treats
+# requires_input as a rejection ONLY when a last_error reason is attached -
+# a bare requires_input with no error is genuinely "not submitted yet".
+_APPROVING_STATUSES = {"verified"}
+_REJECTING_STATUSES = {"canceled"}
 
 
 def _account_owner_email(db: Session, account_id: str) -> str | None:
@@ -115,6 +128,7 @@ def list_all_cases(db: Session, status: str | None = None) -> list[dict]:
             "documents": case.documents,
             "expires_at": case.expires_at,
             "created_at": case.created_at,
+            "kyc_inquiry_id": case.kyc_inquiry_id,
         }
         for case, account_name, owner_email in rows
     ]
@@ -169,7 +183,13 @@ def approve_case(db: Session, case: ComplianceCase, *, actor: str) -> Compliance
 
     owner_email = _account_owner_email(db, case.account_id)
     if owner_email:
-        notify_compliance_case_approved(owner_email, case.jurisdiction, case.requirement_type)
+        notify_compliance_case_approved(
+            db,
+            account_id=case.account_id,
+            account_email=owner_email,
+            jurisdiction=case.jurisdiction,
+            requirement_type=case.requirement_type,
+        )
 
     return case
 
@@ -192,6 +212,74 @@ def reject_case(db: Session, case: ComplianceCase, *, actor: str, reason: str | 
 
     owner_email = _account_owner_email(db, case.account_id)
     if owner_email:
-        notify_compliance_case_rejected(owner_email, case.jurisdiction, case.requirement_type, reason)
+        notify_compliance_case_rejected(
+            db,
+            account_id=case.account_id,
+            account_email=owner_email,
+            jurisdiction=case.jurisdiction,
+            requirement_type=case.requirement_type,
+            reason=reason,
+        )
 
+    return case
+
+
+class KYCAlreadyApprovedError(Exception):
+    """Raised when someone tries to restart verification on a case that's
+    already passed - re-verifying an approved case is pointless and risks
+    a flaky retry overwriting a correct decision with a worse one."""
+
+
+def start_kyc_verification(db: Session, case: ComplianceCase, *, actor: str) -> dict:
+    """Kicks off a real Stripe Identity VerificationSession for this case
+    and returns the hosted-flow link the customer opens to complete it.
+    The Stripe webhook (handle_stripe_identity_webhook) is what actually
+    approves/rejects the case - this call only starts the process.
+
+    Allowed from PENDING (first attempt or resuming an unfinished one) and
+    REJECTED (retry after a real failure - the gap a customer would
+    otherwise be stuck on with no self-service way forward). Blocked from
+    APPROVED."""
+    if case.status == ComplianceCaseStatus.APPROVED:
+        raise KYCAlreadyApprovedError(f"Case {case.id} is already approved - verification cannot be restarted")
+
+    session = stripe_identity.create_verification_session(reference_id=case.id)
+    inquiry_id = session["id"]
+    verification_url = session["url"]
+
+    case.kyc_inquiry_id = inquiry_id
+    if case.status == ComplianceCaseStatus.REJECTED:
+        # A retry in progress isn't accurately "rejected" anymore - leaving
+        # the old status would show a stale verdict in the UI while the
+        # new attempt is still pending a fresh decision.
+        case.status = ComplianceCaseStatus.PENDING
+    db.commit()
+
+    log_event(
+        db,
+        actor=actor,
+        action="compliance.kyc_started",
+        target=f"compliance_case:{case.id}",
+        after={"inquiry_id": inquiry_id},
+    )
+    return {"inquiry_id": inquiry_id, "verification_url": verification_url}
+
+
+def handle_stripe_identity_webhook(
+    db: Session, session_id: str, status: str, last_error_reason: str | None = None
+) -> ComplianceCase | None:
+    """Maps a real Stripe Identity verification decision back onto our
+    compliance case. "processing", and "requires_input" with no error yet,
+    are no-ops - left for the customer to retry or a human reviewer via the
+    existing manual approve/reject endpoints."""
+    case = db.query(ComplianceCase).filter(ComplianceCase.kyc_inquiry_id == session_id).first()
+    if case is None:
+        return None
+
+    if status in _APPROVING_STATUSES:
+        return approve_case(db, case, actor="stripe_identity_webhook")
+    if status in _REJECTING_STATUSES:
+        return reject_case(db, case, actor="stripe_identity_webhook", reason=f"Stripe Identity verification {status}")
+    if status == "requires_input" and last_error_reason:
+        return reject_case(db, case, actor="stripe_identity_webhook", reason=last_error_reason)
     return case

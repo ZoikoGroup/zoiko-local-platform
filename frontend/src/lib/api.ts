@@ -131,6 +131,7 @@ export type ComplianceCase = {
   status: string;
   jurisdiction: string;
   requirement_type: string;
+  kyc_inquiry_id: string | null;
 };
 
 export function openComplianceCase(
@@ -151,6 +152,32 @@ export type MyComplianceCase = ComplianceCase & {
 
 export function listMyComplianceCases(token: string): Promise<MyComplianceCase[]> {
   return request<MyComplianceCase[]>("/compliance/cases/me", {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export function startKycVerification(
+  token: string,
+  caseId: string
+): Promise<{ inquiry_id: string; verification_url: string }> {
+  return request(`/compliance/cases/${caseId}/kyc/start`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export type NotificationDelivery = {
+  id: string;
+  event_name: string;
+  recipient_email: string;
+  subject: string;
+  status: "sent" | "failed";
+  error: string | null;
+  created_at: string;
+};
+
+export function listMyNotifications(token: string): Promise<NotificationDelivery[]> {
+  return request<NotificationDelivery[]>("/notifications/me", {
     headers: { Authorization: `Bearer ${token}` },
   });
 }
@@ -394,6 +421,7 @@ export type VideoRoom = {
   ended_at: string | null;
   recording_in_progress: boolean;
   recording_url: string | null;
+  participant_minutes: number;
 };
 
 export function listVideoRooms(token: string): Promise<VideoRoom[]> {
@@ -434,6 +462,71 @@ export function startVideoRecording(
 ): Promise<{ room_name: string; recording: boolean }> {
   return request(`/media/video/rooms/${encodeURIComponent(roomName)}/recording/start`, {
     method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+// --- Data retention ---
+
+export type RetentionPolicies = {
+  voicemail: number;
+  call_recording: number;
+  video_recording: number;
+};
+
+export function listRetentionPolicies(token: string): Promise<RetentionPolicies> {
+  return request<RetentionPolicies>("/retention/policies", {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export function setRetentionPolicy(
+  token: string,
+  artifactType: keyof RetentionPolicies,
+  retentionDays: number
+): Promise<{ artifact_type: string; retention_days: number }> {
+  return request(`/retention/policies/${artifactType}`, {
+    method: "PUT",
+    headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ retention_days: retentionDays }),
+  });
+}
+
+// --- AI Insights ---
+
+export type SummaryListEntry = {
+  id: string;
+  source_type: string;
+  source_id: string;
+  summary: string;
+  model_version: string;
+  created_at: string;
+  disclaimer: string;
+};
+
+export function listSummaries(token: string): Promise<SummaryListEntry[]> {
+  return request<SummaryListEntry[]>("/intelligence/summaries", {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export type ReceptionistCallEntry = {
+  id: string;
+  call_sid: string;
+  caller_number: string;
+  raw_transcript: string;
+  caller_name: string | null;
+  caller_company: string | null;
+  reason: string | null;
+  summary: string | null;
+  urgency: "low" | "medium" | "high" | null;
+  escalated: boolean;
+  model_version: string | null;
+  created_at: string;
+};
+
+export function listReceptionistCalls(token: string): Promise<ReceptionistCallEntry[]> {
+  return request<ReceptionistCallEntry[]>("/media/receptionist/calls", {
     headers: { Authorization: `Bearer ${token}` },
   });
 }

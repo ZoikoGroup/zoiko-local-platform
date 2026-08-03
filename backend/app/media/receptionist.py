@@ -68,6 +68,7 @@ async def list_receptionist_calls(
             "caller_name": c.caller_name,
             "caller_company": c.caller_company,
             "reason": c.reason,
+            "summary": c.summary,
             "urgency": c.urgency.value if c.urgency else None,
             "escalated": c.escalated,
             "model_version": c.model_version,

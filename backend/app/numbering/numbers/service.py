@@ -13,6 +13,7 @@ from app.numbering.identity.models import Account, AccountType, User, UserRole
 from app.numbering.numbers.models import PhoneNumber, PhoneNumberStatus
 
 RESERVATION_TTL_MINUTES = 12
+QUARANTINE_DAYS = 90
 
 
 class NumberConflictError(Exception):
@@ -53,18 +54,26 @@ def reserve_number(db: Session, account_id: str, e164: str, country: str) -> Pho
             reserved_until=now + timedelta(minutes=RESERVATION_TTL_MINUTES),
         )
         db.add(number)
+    elif number.status == PhoneNumberStatus.CANCELLED and number.cancelled_at is not None and (
+        number.cancelled_at > now - timedelta(days=QUARANTINE_DAYS)
+    ):
+        raise NumberConflictError(
+            f"{e164} was recently cancelled and is in a {QUARANTINE_DAYS}-day quarantine period"
+        )
     elif number.status == PhoneNumberStatus.RESERVED and number.account_id != account_id and (
         number.reserved_until is not None and number.reserved_until > now
     ):
         raise NumberConflictError(f"{e164} is already reserved by another account")
     elif number.status in (
+        PhoneNumberStatus.COMPLIANCE_PENDING,
         PhoneNumberStatus.PURCHASE_PENDING,
+        PhoneNumberStatus.PROVISIONING,
         PhoneNumberStatus.ACTIVE,
         PhoneNumberStatus.SUSPENDED,
     ):
         raise NumberConflictError(f"{e164} is not available")
     else:
-        # own expired-or-active reservation, or a released/cancelled row: re-reserve it
+        # own expired-or-active reservation, or a released/cancelled row past quarantine: re-reserve it
         number.status = PhoneNumberStatus.RESERVED
         number.account_id = account_id
         number.reserved_until = now + timedelta(minutes=RESERVATION_TTL_MINUTES)
@@ -91,15 +100,30 @@ def purchase_number(db: Session, account_id: str, e164: str) -> PhoneNumber:
     now = datetime.now(timezone.utc)
     number = db.query(PhoneNumber).filter(PhoneNumber.e164 == e164).with_for_update().first()
 
-    if number is None or number.account_id != account_id or number.status != PhoneNumberStatus.RESERVED:
+    if number is None or number.account_id != account_id or number.status not in (
+        PhoneNumberStatus.RESERVED, PhoneNumberStatus.COMPLIANCE_PENDING,
+    ):
         raise NumberConflictError(f"{e164} must be reserved by your account before purchase")
-    if number.reserved_until is not None and number.reserved_until < now:
+    if number.status == PhoneNumberStatus.RESERVED and (
+        number.reserved_until is not None and number.reserved_until < now
+    ):
         raise NumberConflictError(f"Reservation for {e164} expired — reserve it again before purchasing")
 
     requirement_type = _kyc_requirement_type(db, account_id)
     if is_requirement_active(db, number.country, requirement_type) and not has_approved_case(
         db, account_id=account_id, jurisdiction=number.country, requirement_type=requirement_type
     ):
+        # Doc's "Compliance Pending" lifecycle state - persisted, not just an
+        # error, so the customer/admin can see this number is specifically
+        # blocked on KYC/KYB rather than it looking abandoned in Reserved.
+        # purchase_number can be retried from here once the case is approved.
+        number.status = PhoneNumberStatus.COMPLIANCE_PENDING
+        db.commit()
+        log_event(
+            db, actor_id=account_id, action="number.compliance_pending",
+            target_type="phone_number", target_id=number.id,
+            metadata={"e164": e164, "requirement_type": requirement_type},
+        )
         raise ComplianceRequiredError(
             f"An approved {requirement_type} compliance case for {number.country} "
             "is required before purchasing a number there"
@@ -109,6 +133,18 @@ def purchase_number(db: Session, account_id: str, e164: str) -> PhoneNumber:
     db.commit()
     log_event(
         db, actor_id=account_id, action="number.purchase_pending",
+        target_type="phone_number", target_id=number.id, metadata={"e164": e164},
+    )
+
+    # Doc's "Provisioning" lifecycle state - "Provider activation in
+    # progress," distinct from Purchase Pending's checkout/confirmation step
+    # (no real billing gateway exists yet, so these happen back-to-back, but
+    # the state is still real - visible if buy_number is slow, and a real
+    # payment step can be inserted before this later without a model change).
+    number.status = PhoneNumberStatus.PROVISIONING
+    db.commit()
+    log_event(
+        db, actor_id=account_id, action="number.provisioning",
         target_type="phone_number", target_id=number.id, metadata={"e164": e164},
     )
 
@@ -137,7 +173,7 @@ def purchase_number(db: Session, account_id: str, e164: str) -> PhoneNumber:
 
     owner = db.query(User).filter(User.account_id == account_id, User.role == UserRole.OWNER).first()
     if owner is not None:
-        notify_number_activated(owner.email, e164)
+        notify_number_activated(db, account_id=account_id, account_email=owner.email, e164=e164)
 
     return number
 
@@ -158,7 +194,7 @@ def suspend_number(db: Session, user: User, e164: str, reason: str | None = None
 
     owner = db.query(User).filter(User.account_id == user.account_id, User.role == UserRole.OWNER).first()
     if owner is not None:
-        notify_number_suspended(owner.email, e164, reason)
+        notify_number_suspended(db, account_id=user.account_id, account_email=owner.email, e164=e164, reason=reason)
 
     return number
 
@@ -178,6 +214,7 @@ def cancel_number(db: Session, user: User, e164: str) -> PhoneNumber:
         telecom.release_number(number.provider_sid)
 
     number.status = PhoneNumberStatus.CANCELLED
+    number.cancelled_at = datetime.now(timezone.utc)
     db.commit()
     db.refresh(number)
     log_event(

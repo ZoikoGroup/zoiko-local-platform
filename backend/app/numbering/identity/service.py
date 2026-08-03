@@ -123,7 +123,9 @@ def add_team_member(
 
     account = db.query(Account).filter(Account.id == account_id).first()
     if account is not None:
-        notify_team_member_added(member.email, account.name, member.role)
+        notify_team_member_added(
+            db, account_id=account_id, member_email=member.email, account_name=account.name, role=member.role
+        )
 
     return member
 
