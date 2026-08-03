@@ -68,6 +68,23 @@ async def end_room(
     return {"room_name": session.room_name, "status": session.status.value}
 
 
+@router.post("/rooms/{room_name}/recording/start")
+async def start_recording(
+    room_name: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    try:
+        session = await media_service.start_video_recording(db, current_user.account_id, room_name)
+    except media_service.VideoSessionAuthorizationError as e:
+        raise HTTPException(status_code=403, detail=str(e)) from e
+    except media_service.RecordingConsentRequiredError as e:
+        raise HTTPException(status_code=403, detail=str(e)) from e
+    except VideoError as e:
+        raise HTTPException(status_code=502, detail=str(e)) from e
+    return {"room_name": session.room_name, "recording": True}
+
+
 @router.post("/webhook")
 async def livekit_webhook(request: Request, db: Session = Depends(get_db)):
     """Requires the webhook URL to be configured in the LiveKit Cloud project
@@ -95,6 +112,8 @@ async def list_rooms(
             "status": s.status.value,
             "started_at": s.started_at,
             "ended_at": s.ended_at,
+            "recording_in_progress": s.recording_egress_id is not None and s.recording_url is None,
+            "recording_url": s.recording_url,
         }
         for s in sessions
     ]

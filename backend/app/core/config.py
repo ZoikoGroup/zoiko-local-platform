@@ -20,6 +20,16 @@ class Settings(BaseSettings):
     livekit_api_key: str = ""
     livekit_api_secret: str = ""
 
+    # S3-compatible storage for video call recordings (LiveKit Egress has no
+    # free built-in storage - every recording request must specify a real
+    # bucket). Works with real AWS S3 (leave s3_endpoint empty) or any
+    # S3-compatible provider like Cloudflare R2 (set s3_endpoint + s3_region).
+    s3_access_key_id: str = ""
+    s3_secret_access_key: str = ""
+    s3_bucket: str = ""
+    s3_endpoint: str = ""
+    s3_region: str = "auto"
+
     groq_api_key: str = ""
 
     smtp_host: str = ""

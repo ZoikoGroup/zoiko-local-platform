@@ -392,6 +392,8 @@ export type VideoRoom = {
   status: "created" | "active" | "ended";
   started_at: string | null;
   ended_at: string | null;
+  recording_in_progress: boolean;
+  recording_url: string | null;
 };
 
 export function listVideoRooms(token: string): Promise<VideoRoom[]> {
@@ -421,6 +423,16 @@ export function joinVideoRoom(
 
 export function endVideoRoom(token: string, roomName: string): Promise<{ room_name: string; status: string }> {
   return request(`/media/video/rooms/${encodeURIComponent(roomName)}/end`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export function startVideoRecording(
+  token: string,
+  roomName: string
+): Promise<{ room_name: string; recording: boolean }> {
+  return request(`/media/video/rooms/${encodeURIComponent(roomName)}/recording/start`, {
     method: "POST",
     headers: { Authorization: `Bearer ${token}` },
   });

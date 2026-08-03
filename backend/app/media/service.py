@@ -6,6 +6,8 @@ from fastapi import HTTPException, Request
 from sqlalchemy.orm import Session
 
 from app.audit.service import log_event
+from app.consent.models import ConsentType
+from app.consent.service import has_active_consent
 from app.integrations.llm.groq import LLMError
 from app.integrations.telecom import twilio as telecom
 from app.integrations.video import livekit as video
@@ -28,6 +30,11 @@ class CallAuthorizationError(Exception):
 
 class VideoSessionAuthorizationError(Exception):
     """Raised when the caller's account doesn't own the given video session."""
+
+
+class RecordingConsentRequiredError(Exception):
+    """Raised when starting a video recording without active AI-processing
+    consent on file - recording is opt-in and consent-gated, never automatic."""
 
 
 async def verify_twilio_webhook(request: Request) -> dict:
@@ -224,6 +231,13 @@ async def create_video_session(db: Session, account_id: str, host_user_id: str) 
 
 async def end_video_session(db: Session, account_id: str, room_name: str) -> VideoSession:
     session = _find_account_video_session(db, account_id, room_name)
+
+    # Stop any in-progress recording first - ending the room doesn't
+    # automatically stop egress, and a dangling egress job would keep
+    # recording nothing useful (or error out) once the room is gone.
+    if session.recording_egress_id:
+        await video.stop_room_recording(session.recording_egress_id)
+
     await video.end_room(room_name)
 
     session.status = VideoSessionStatus.ENDED
@@ -232,6 +246,29 @@ async def end_video_session(db: Session, account_id: str, room_name: str) -> Vid
     db.refresh(session)
     log_event(
         db, actor_id=account_id, action="video.session.ended",
+        target_type="video_session", target_id=session.id, metadata={"room_name": room_name},
+    )
+    return session
+
+
+async def start_video_recording(db: Session, account_id: str, room_name: str) -> VideoSession:
+    session = _find_account_video_session(db, account_id, room_name)
+    if session.status != VideoSessionStatus.ACTIVE:
+        raise VideoSessionAuthorizationError(f"{room_name} is not an active session")
+    if session.recording_egress_id:
+        raise VideoSessionAuthorizationError(f"{room_name} is already being recorded")
+    if not has_active_consent(db, account_id, ConsentType.AI_PROCESSING):
+        raise RecordingConsentRequiredError(
+            "AI processing consent is required before recording video calls — "
+            "grant it via POST /compliance/consent first"
+        )
+
+    egress_id = await video.start_room_recording(room_name)
+    session.recording_egress_id = egress_id
+    db.commit()
+    db.refresh(session)
+    log_event(
+        db, actor_id=account_id, action="video.recording_started",
         target_type="video_session", target_id=session.id, metadata={"room_name": room_name},
     )
     return session
@@ -259,6 +296,10 @@ def handle_video_webhook_event(db: Session, event) -> None:
     """Syncs real LiveKit room state back into VideoSession — without this,
     a room that closes because everyone left (rather than an explicit
     POST /rooms/{name}/end call) stays "active" in our DB forever."""
+    if event.event == "egress_ended":
+        _handle_egress_ended(db, event)
+        return
+
     session = db.query(VideoSession).filter(VideoSession.room_name == event.room.name).first()
     if session is None:
         return
@@ -277,6 +318,26 @@ def handle_video_webhook_event(db: Session, event) -> None:
             db, actor_id=session.account_id, action=f"video.{event.event}",
             target_type="video_session", target_id=session.id,
             metadata={"room_name": event.room.name, "participant_identity": event.participant.identity},
+        )
+
+
+def _handle_egress_ended(db: Session, event) -> None:
+    """Attaches the finished recording's file location once LiveKit's egress
+    job completes - arrives asynchronously, well after the call itself ends."""
+    egress_info = event.egress_info
+    session = (
+        db.query(VideoSession).filter(VideoSession.recording_egress_id == egress_info.egress_id).first()
+    )
+    if session is None:
+        return
+
+    if egress_info.file_results:
+        session.recording_url = egress_info.file_results[0].location
+        db.commit()
+        log_event(
+            db, actor_id=session.account_id, action="video.recording_completed",
+            target_type="video_session", target_id=session.id,
+            metadata={"room_name": session.room_name, "egress_status": egress_info.status},
         )
 
 

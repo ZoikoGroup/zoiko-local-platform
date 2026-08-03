@@ -8,12 +8,15 @@ import {
   createVideoRoom,
   joinVideoRoom,
   endVideoRoom,
+  startVideoRecording,
+  grantAiProcessingConsent,
   ApiError,
   type VideoRoom,
 } from "@/lib/api";
 import { getToken } from "@/lib/auth";
 
 type CallState = "idle" | "connecting" | "in-call";
+type RecordingState = "idle" | "busy" | "consent_required" | "active";
 
 export default function VideoPage() {
   const [token] = useState<string | null>(() => getToken());
@@ -30,6 +33,8 @@ export default function VideoPage() {
   const [micOn, setMicOn] = useState(true);
   const [screenSharing, setScreenSharing] = useState(false);
   const [participantCount, setParticipantCount] = useState(0);
+  const [recordingState, setRecordingState] = useState<RecordingState>("idle");
+  const [recordingError, setRecordingError] = useState<string | null>(null);
 
   const roomRef = useRef<Room | null>(null);
   const localVideoRef = useRef<HTMLVideoElement>(null);
@@ -86,6 +91,8 @@ export default function VideoPage() {
     if (!token) return;
     setCallError(null);
     setCallState("connecting");
+    setRecordingState("idle");
+    setRecordingError(null);
     try {
       const me = await getCurrentUser(token);
       const targetRoomName = existingRoomName ?? (await createVideoRoom(token)).room_name;
@@ -135,6 +142,7 @@ export default function VideoPage() {
     setCallState("idle");
     setRoomName(null);
     setScreenSharing(false);
+    setRecordingState("idle");
     try {
       await endVideoRoom(token, endingRoomName);
     } catch {
@@ -153,6 +161,34 @@ export default function VideoPage() {
     const next = !micOn;
     setMicOn(next);
     roomRef.current?.localParticipant.setMicrophoneEnabled(next);
+  }
+
+  async function handleStartRecording() {
+    if (!token || !roomName) return;
+    setRecordingState("busy");
+    setRecordingError(null);
+    try {
+      await startVideoRecording(token, roomName);
+      setRecordingState("active");
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 403 && err.message.toLowerCase().includes("consent")) {
+        setRecordingState("consent_required");
+        return;
+      }
+      setRecordingState("idle");
+      const message = err instanceof ApiError || err instanceof Error ? err.message : "Unknown error.";
+      setRecordingError(`Couldn't start recording: ${message}`);
+    }
+  }
+
+  async function handleGrantConsentAndRecord() {
+    if (!token) return;
+    try {
+      await grantAiProcessingConsent(token);
+      await handleStartRecording();
+    } catch {
+      setRecordingError("Couldn't grant recording consent.");
+    }
   }
 
   async function handleToggleScreenShare() {
@@ -240,8 +276,28 @@ export default function VideoPage() {
         <div className="bg-slate-900 rounded-xl border border-slate-800 p-4 space-y-3">
           <div className="flex items-center justify-between text-xs text-slate-400 px-1">
             <span className="font-mono">{roomName}</span>
-            <span>{participantCount} other participant{participantCount === 1 ? "" : "s"}</span>
+            <div className="flex items-center gap-3">
+              {recordingState === "active" && (
+                <span className="flex items-center gap-1.5 text-red-400">
+                  <span className="w-1.5 h-1.5 rounded-full bg-red-500 animate-pulse" />
+                  Recording
+                </span>
+              )}
+              <span>{participantCount} other participant{participantCount === 1 ? "" : "s"}</span>
+            </div>
           </div>
+
+          {recordingState === "consent_required" && (
+            <div className="text-xs bg-amber-950 text-amber-400 rounded-lg px-3 py-2 flex items-center justify-between gap-3">
+              <span>Recording this call needs your consent first.</span>
+              <button onClick={handleGrantConsentAndRecord} className="font-medium underline shrink-0">
+                Grant consent &amp; record
+              </button>
+            </div>
+          )}
+          {recordingError && (
+            <p className="text-xs text-red-400 bg-red-950/50 rounded-lg px-3 py-2">{recordingError}</p>
+          )}
 
           {screenSharing && (
             <div className="relative aspect-video bg-black rounded-lg overflow-hidden">
@@ -290,6 +346,15 @@ export default function VideoPage() {
             >
               {screenSharing ? "Stop Sharing" : "Share Screen"}
             </button>
+            {recordingState !== "active" && (
+              <button
+                onClick={handleStartRecording}
+                disabled={recordingState === "busy"}
+                className="text-xs font-medium rounded-lg px-3 py-2 bg-slate-800 text-white disabled:opacity-60"
+              >
+                {recordingState === "busy" ? "Starting..." : "Record"}
+              </button>
+            )}
             <button
               onClick={handleEndCall}
               className="text-xs font-medium rounded-lg px-4 py-2 bg-red-700 hover:bg-red-600 text-white"
@@ -317,6 +382,19 @@ export default function VideoPage() {
             >
               <span className="font-mono text-sm text-slate-800">{r.room_name}</span>
               <div className="flex items-center gap-3">
+                {r.recording_url && (
+                  <a
+                    href={r.recording_url}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="text-xs font-medium text-indigo-600 hover:text-indigo-800"
+                  >
+                    Play recording
+                  </a>
+                )}
+                {r.recording_in_progress && (
+                  <span className="text-xs font-medium text-red-600">Recording processing…</span>
+                )}
                 <span
                   className={`text-xs font-medium rounded-full px-2 py-0.5 capitalize ${
                     r.status === "active"

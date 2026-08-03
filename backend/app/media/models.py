@@ -70,6 +70,15 @@ class VideoSession(Base):
     )
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    # Roadmap "Recording: off by default... must be consented" - recording is
+    # opt-in per session (never automatic like the voice-forwarding path),
+    # gated on the same AI-processing consent record used for call/voicemail
+    # summaries. egress_id correlates the LiveKit webhook's egress_ended
+    # event back to this session once the file finishes processing.
+    recording_egress_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    recording_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
+
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 

@@ -58,6 +58,70 @@ async def end_room(room_name: str) -> None:
         await client.aclose()
 
 
+async def start_room_recording(room_name: str) -> str:
+    """Starts a composite (mixed) recording of the whole room, uploaded to
+    the configured S3-compatible bucket - LiveKit's Egress API has no free
+    built-in storage, every request must specify a real destination. Returns
+    the egress_id, needed to stop it later and to correlate the webhook's
+    egress_ended event back to this session.
+    """
+    if not (settings.s3_bucket and settings.s3_access_key_id and settings.s3_secret_access_key):
+        raise VideoError(
+            "Recording storage is not configured — set S3_BUCKET, S3_ACCESS_KEY_ID and "
+            "S3_SECRET_ACCESS_KEY (any S3-compatible provider, e.g. Cloudflare R2)"
+        )
+
+    try:
+        client = _client()
+    except ValueError as e:
+        raise VideoError(str(e)) from e
+
+    s3_upload = livekit_api.S3Upload(
+        access_key=settings.s3_access_key_id,
+        secret=settings.s3_secret_access_key,
+        bucket=settings.s3_bucket,
+        region=settings.s3_region,
+        endpoint=settings.s3_endpoint or None,
+        force_path_style=bool(settings.s3_endpoint),
+    )
+
+    try:
+        egress = await client.egress.start_room_composite_egress(
+            livekit_api.RoomCompositeEgressRequest(
+                room_name=room_name,
+                file_outputs=[
+                    livekit_api.EncodedFileOutput(
+                        file_type=livekit_api.EncodedFileType.MP4,
+                        # room_name is already globally unique (zl-<uuid hex>)
+                        # and a room is only ever recorded once in this design,
+                        # so no need for LiveKit's {time}-style filepath templates.
+                        filepath=f"recordings/{room_name}.mp4",
+                        s3=s3_upload,
+                    )
+                ],
+            )
+        )
+    except livekit_api.TwirpError as e:
+        raise VideoError(str(e)) from e
+    finally:
+        await client.aclose()
+    return egress.egress_id
+
+
+async def stop_room_recording(egress_id: str) -> None:
+    try:
+        client = _client()
+    except ValueError as e:
+        raise VideoError(str(e)) from e
+
+    try:
+        await client.egress.stop_egress(livekit_api.StopEgressRequest(egress_id=egress_id))
+    except livekit_api.TwirpError as e:
+        raise VideoError(str(e)) from e
+    finally:
+        await client.aclose()
+
+
 def verify_webhook_event(body: str, auth_token: str) -> livekit_api.WebhookEvent:
     """Verifies and parses a LiveKit webhook (room_started/room_finished/
     participant_joined/left). Requires the webhook URL to be configured in
