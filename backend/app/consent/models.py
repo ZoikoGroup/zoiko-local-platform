@@ -18,6 +18,12 @@ GLOBAL_JURISDICTION = "GLOBAL"
 
 class ConsentType(str, enum.Enum):
     AI_PROCESSING = "ai_processing"
+    # Roadmap doc doctrine: "Zoiko Local is not: an emergency-service
+    # operator" - Phase 1 scope is disclosure + acknowledgment (matching
+    # how real VoIP providers handle FCC/Ofcom emergency-calling rules),
+    # NOT real E911 location registration/routing. Required before a
+    # number can be purchased - see numbering/numbers/service.py.
+    EMERGENCY_CALLING_ACKNOWLEDGED = "emergency_calling_acknowledged"
 
 
 class ConsentRecord(Base):

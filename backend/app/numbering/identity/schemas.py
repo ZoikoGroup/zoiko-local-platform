@@ -43,6 +43,10 @@ class MfaLoginRequest(BaseModel):
     code: str
 
 
+class SetPhoneNumberRequest(BaseModel):
+    phone_number: str | None  # None clears it - opts back out of SMS notifications
+
+
 class UserResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -51,6 +55,7 @@ class UserResponse(BaseModel):
     role: str
     account_id: str
     mfa_enabled: bool
+    phone_number: str | None
 
 
 class TeamMemberAdd(BaseModel):

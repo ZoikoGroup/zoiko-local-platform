@@ -6,8 +6,10 @@ import { clearStaffToken } from "@/lib/staffAuth";
 
 const NAV_ITEMS = [
   { href: "/staff/cases", label: "Compliance Cases" },
+  { href: "/staff/porting", label: "Number Porting" },
   { href: "/staff/accounts", label: "Accounts" },
   { href: "/staff/audit", label: "Audit Log" },
+  { href: "/staff/providers", label: "Provider Status" },
 ];
 
 export default function StaffConsoleLayout({ children }: { children: React.ReactNode }) {

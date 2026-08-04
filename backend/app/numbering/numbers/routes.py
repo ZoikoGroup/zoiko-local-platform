@@ -15,7 +15,11 @@ from app.numbering.numbers.schemas import (
     RoutingConfigRequest,
     SuspendNumberRequest,
 )
-from app.numbering.numbers.service import ComplianceRequiredError, NumberConflictError
+from app.numbering.numbers.service import (
+    ComplianceRequiredError,
+    EmergencyDisclosureRequiredError,
+    NumberConflictError,
+)
 
 router = APIRouter(prefix="/numbers", tags=["numbers"])
 
@@ -55,7 +59,7 @@ def purchase_number(
         return service.purchase_number(db, current_user.account_id, payload.e164)
     except NumberConflictError as e:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e
-    except ComplianceRequiredError as e:
+    except (ComplianceRequiredError, EmergencyDisclosureRequiredError) as e:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e)) from e
     except TelecomError as e:
         raise HTTPException(status_code=502, detail=str(e)) from e

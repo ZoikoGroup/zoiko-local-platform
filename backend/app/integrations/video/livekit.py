@@ -23,6 +23,22 @@ def _client() -> livekit_api.LiveKitAPI:
     )
 
 
+async def health_check() -> dict:
+    """Real reachability check - lists rooms (empty result is fine, this
+    is just confirming the credentials and endpoint are live)."""
+    if not (settings.livekit_url and settings.livekit_api_key and settings.livekit_api_secret):
+        return {"configured": False, "ok": False, "detail": None}
+    try:
+        client = _client()
+        try:
+            await client.room.list_rooms(livekit_api.ListRoomsRequest())
+            return {"configured": True, "ok": True, "detail": None}
+        finally:
+            await client.aclose()
+    except livekit_api.TwirpError as e:
+        return {"configured": True, "ok": False, "detail": str(e)}
+
+
 async def create_room(room_name: str) -> dict:
     # _client() itself raises (a plain ValueError, not TwirpError) when
     # LIVEKIT_URL/KEY/SECRET aren't configured - guarded separately so that

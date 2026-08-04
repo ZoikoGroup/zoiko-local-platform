@@ -9,14 +9,14 @@ import {
   ApiError,
   type StaffComplianceCase,
 } from "@/lib/api";
-import { getStaffToken, clearStaffToken } from "@/lib/staffAuth";
+import { clearStaffToken, useStaffToken } from "@/lib/staffAuth";
 
 const STATUS_TABS = ["pending", "approved", "rejected", "all"] as const;
 type StatusTab = (typeof STATUS_TABS)[number];
 
 export default function StaffCasesPage() {
   const router = useRouter();
-  const [token] = useState<string | null>(() => getStaffToken());
+  const { token, ready } = useStaffToken();
   const [tab, setTab] = useState<StatusTab>("pending");
   const [cases, setCases] = useState<StaffComplianceCase[]>([]);
   const [loading, setLoading] = useState(true);
@@ -26,8 +26,8 @@ export default function StaffCasesPage() {
   const [busyId, setBusyId] = useState<string | null>(null);
 
   useEffect(() => {
-    if (!token) router.replace("/staff/login");
-  }, [token, router]);
+    if (ready && !token) router.replace("/staff/login");
+  }, [ready, token, router]);
 
   const loadCases = useCallback(() => {
     if (!token) return;

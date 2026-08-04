@@ -1,11 +1,13 @@
 import logging
 
 from app.notifications.service import (
+    SmsTemplateMissingError,
     notify_compliance_case_approved,
     notify_compliance_case_rejected,
     notify_number_activated,
     notify_number_suspended,
     notify_team_member_added,
+    send_sms_notification,
 )
 
 
@@ -83,6 +85,81 @@ def test_notification_missing_template_raises(db_session):
         assert False, "expected NotificationTemplateMissingError"
     except NotificationTemplateMissingError:
         pass
+
+
+def test_send_sms_notification_sends_via_twilio_when_configured(db_session, monkeypatch):
+    sent = []
+    monkeypatch.setattr(
+        "app.notifications.service.send_sms",
+        lambda to, body: sent.append((to, body)) or {"sid": "SMfake", "status": "queued"},
+    )
+
+    delivery = send_sms_notification(
+        db_session,
+        event_name="number.suspended",
+        recipient_phone="+15551234567",
+        context={"e164": "+15550001111", "reason_line": " Reason: Non-payment"},
+    )
+
+    assert delivery.status == "sent"
+    assert delivery.channel == "sms"
+    assert delivery.recipient_phone == "+15551234567"
+    assert sent == [("+15551234567", "Zoiko Local: +15550001111 has been suspended. Reason: Non-payment")]
+
+
+def test_send_sms_notification_raises_for_an_email_only_template(db_session):
+    try:
+        send_sms_notification(
+            db_session, event_name="number.activated", recipient_phone="+15551234567", context={"e164": "+1555"}
+        )
+        assert False, "expected SmsTemplateMissingError"
+    except SmsTemplateMissingError:
+        pass
+
+
+def test_send_sms_notification_records_failure_without_raising(db_session, monkeypatch):
+    from app.integrations.telecom.twilio import TelecomError
+
+    def _raise(to, body):
+        raise TelecomError("no notification number configured")
+
+    monkeypatch.setattr("app.notifications.service.send_sms", _raise)
+
+    delivery = send_sms_notification(
+        db_session, event_name="number.suspended", recipient_phone="+15551234567",
+        context={"e164": "+15550001111", "reason_line": ""},
+    )
+    assert delivery.status == "failed"
+    assert delivery.error == "no notification number configured"
+
+
+def test_notify_number_suspended_also_sends_sms_when_phone_provided(db_session, monkeypatch):
+    monkeypatch.setattr("app.core.config.settings.resend_api_key", "")
+    sent = []
+    monkeypatch.setattr(
+        "app.notifications.service.send_sms",
+        lambda to, body: sent.append((to, body)) or {"sid": "SMfake", "status": "queued"},
+    )
+
+    notify_number_suspended(
+        db_session, account_id=None, account_email="owner@example.com", e164="+15550001111",
+        reason="Non-payment", account_phone="+15551234567",
+    )
+
+    assert len(sent) == 1
+    assert sent[0][0] == "+15551234567"
+
+
+def test_notify_number_suspended_without_a_phone_number_only_sends_email(db_session, monkeypatch):
+    monkeypatch.setattr("app.core.config.settings.resend_api_key", "")
+    sent = []
+    monkeypatch.setattr("app.notifications.service.send_sms", lambda to, body: sent.append((to, body)))
+
+    notify_number_suspended(
+        db_session, account_id=None, account_email="owner@example.com", e164="+15550001111", reason="Non-payment",
+    )
+
+    assert sent == []
 
 
 def test_notification_delivery_is_recorded_and_listable(client, db_session, monkeypatch):

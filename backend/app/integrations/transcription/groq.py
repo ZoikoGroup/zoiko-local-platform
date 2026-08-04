@@ -15,7 +15,7 @@ class TranscriptionError(Exception):
     """Raised instead of letting an httpx/vendor-specific exception escape this module."""
 
 
-def transcribe_audio(audio_bytes: bytes, filename: str = "recording.wav") -> str:
+def transcribe_audio(audio_bytes: bytes, filename: str = "recording.wav", content_type: str = "audio/wav") -> str:
     if not settings.groq_api_key:
         raise TranscriptionError("Groq API key is not configured")
 
@@ -24,7 +24,7 @@ def transcribe_audio(audio_bytes: bytes, filename: str = "recording.wav") -> str
             _TRANSCRIPTIONS_URL,
             headers={"Authorization": f"Bearer {settings.groq_api_key}"},
             data={"model": "whisper-large-v3"},  # keep literal in sync with MODEL_VERSION above
-            files={"file": (filename, audio_bytes, "audio/wav")},
+            files={"file": (filename, audio_bytes, content_type)},
             timeout=60.0,
         )
         response.raise_for_status()

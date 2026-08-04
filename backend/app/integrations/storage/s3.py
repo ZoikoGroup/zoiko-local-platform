@@ -31,12 +31,36 @@ def _client():
     )
 
 
+def health_check() -> dict:
+    """Real reachability check - head_bucket, the cheapest authenticated
+    call that confirms both credentials and bucket access."""
+    if not (settings.s3_bucket and settings.s3_access_key_id and settings.s3_secret_access_key):
+        return {"configured": False, "ok": False, "detail": None}
+    try:
+        _client().head_bucket(Bucket=settings.s3_bucket)
+        return {"configured": True, "ok": True, "detail": None}
+    except (BotoCoreError, ClientError) as e:
+        return {"configured": True, "ok": False, "detail": str(e)}
+
+
 def delete_object(key: str) -> None:
     """Deletes one object from the configured bucket — used to actually
     remove a recording's file once it's past its retention window, not just
     unlink it in our own database."""
     try:
         _client().delete_object(Bucket=settings.s3_bucket, Key=key)
+    except (BotoCoreError, ClientError) as e:
+        raise StorageError(str(e)) from e
+
+
+def download_object(key: str) -> bytes:
+    """Fetches an object's raw bytes directly from the bucket - used to hand
+    a stored recording (e.g. a video call's egress output) to another
+    provider (Groq transcription) rather than serving it to a browser, so a
+    presigned URL isn't the right shape here."""
+    try:
+        response = _client().get_object(Bucket=settings.s3_bucket, Key=key)
+        return response["Body"].read()
     except (BotoCoreError, ClientError) as e:
         raise StorageError(str(e)) from e
 

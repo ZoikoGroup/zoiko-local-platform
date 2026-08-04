@@ -2,7 +2,7 @@ import enum
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, Integer, String, Text, func
+from sqlalchemy import JSON, Boolean, DateTime, Enum, ForeignKey, Integer, String, Text, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -156,5 +156,20 @@ class ReceptionistCall(Base):
         Enum(ReceptionistUrgency, name="receptionist_urgency_enum"), nullable=True
     )
     escalated: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # Distinct from `escalated` above: escalation is an automatic, live-call
+    # action (forwarding an urgent call to escalation_user_id while the
+    # caller is still on the line). This is a post-hoc, human decision -
+    # routing the already-captured summary card to a team member for
+    # follow-up, set any time after the call ends via POST .../assign.
+    assigned_user_id: Mapped[str | None] = mapped_column(
+        UUID(as_uuid=False), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    # Output guardrail (Roadmap §7: "no pricing/legal/medical commitments") -
+    # the system prompt tells the model not to do this, but this is what
+    # actually checks whether it complied: categories the AI's OWN generated
+    # summary/reason text was flagged for (see
+    # app/intelligence/guardrails.py), empty when clean. Never derived from
+    # raw_transcript - a caller mentioning a price or a lawsuit is normal.
+    guardrail_flags: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
     model_version: Mapped[str | None] = mapped_column(String(100), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

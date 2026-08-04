@@ -1,16 +1,32 @@
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+# The literal default below - never a real secret to guard against, since it's
+# only ever compared against itself. Exists so app/main.py can refuse to boot
+# with it outside development, instead of silently signing real JWTs with a
+# value anyone can read in this repo's own .env.example.
+PLACEHOLDER_JWT_SECRET_KEY = "change-me-in-real-env"
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file="../.env")
 
     database_url: str = "postgresql+psycopg2://zoiko:zoiko@localhost:5433/zoiko_local"
-    jwt_secret_key: str = "change-me-in-real-env"
+    jwt_secret_key: str = PLACEHOLDER_JWT_SECRET_KEY
     environment: str = "development"
+    # Comma-separated allowed CORS origins - the deployed frontend's real
+    # origin(s) in production, localhost for dev. A literal "*" is rejected in
+    # main.py's startup check when allow_credentials=True is also set (the
+    # browser forbids that combination anyway - wildcard + credentials is
+    # never valid CORS, so failing fast beats a confusing browser-side error).
+    allowed_origins: str = "http://localhost:3000"
     google_client_id: str = ""
 
     twilio_account_sid: str = ""
     twilio_auth_token: str = ""
+    # The number system SMS notifications (not customer calls) are sent
+    # from - a Zoiko-owned number, distinct from any customer's purchased
+    # number. Blank until a real number is provisioned for this purpose.
+    twilio_trial_number: str = ""
     # public HTTPS URL this API is reachable at (e.g. an ngrok tunnel in dev,
     # or the real deployed origin) — used to register Twilio webhook URLs
     # (call status callbacks) that can't be constructed from a request object

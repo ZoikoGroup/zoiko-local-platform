@@ -13,6 +13,7 @@ from app.numbering.identity.schemas import (
     MfaCodeRequest,
     MfaLoginRequest,
     MfaSetupResponse,
+    SetPhoneNumberRequest,
     SignupRequest,
     TokenResponse,
     UserResponse,
@@ -107,3 +108,12 @@ def google_auth(payload: GoogleAuthRequest, db: Session = Depends(get_db)):
 @router.get("/me", response_model=UserResponse)
 def me(current_user: User = Depends(get_current_user)):
     return current_user
+
+
+@router.put("/me/phone", response_model=UserResponse)
+def set_phone_number(
+    payload: SetPhoneNumberRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    return service.set_phone_number(db, current_user, payload.phone_number)

@@ -67,24 +67,30 @@ def list_account_events(db: Session, account_id: str, limit: int = 200) -> list[
     log_event's docstring on the two calling conventions), so there's no
     single account_id column to filter on. This covers the shapes actually
     used in this codebase: actor=account_id (numbering/media/compliance
-    events), actor=user.id (signup/login/MFA/team events - resolved via the
-    account's own users), and target=f"compliance_case:{id}" (the one place
-    staff act on a customer's data - case approve/reject). It is not a
-    guaranteed-complete view of every possible action type.
+    events), actor=user.id (signup/login/MFA/team/porting events - resolved
+    via the account's own users), and target=f"compliance_case:{id}" /
+    f"porting_request:{id}" (the places staff act on a customer's data -
+    case or porting request approve/reject). It is not a guaranteed-complete
+    view of every possible action type.
     """
     from app.compliance.models import ComplianceCase
     from app.numbering.identity.models import User
+    from app.porting.models import PortingRequest
 
     user_ids = [row[0] for row in db.query(User.id).filter(User.account_id == account_id).all()]
     case_ids = [row[0] for row in db.query(ComplianceCase.id).filter(ComplianceCase.account_id == account_id).all()]
     case_targets = [f"compliance_case:{case_id}" for case_id in case_ids]
+    porting_ids = [
+        row[0] for row in db.query(PortingRequest.id).filter(PortingRequest.account_id == account_id).all()
+    ]
+    porting_targets = [f"porting_request:{request_id}" for request_id in porting_ids]
 
     return (
         db.query(AuditEvent)
         .filter(
             sa.or_(
                 AuditEvent.actor.in_([account_id, *user_ids]),
-                AuditEvent.target.in_(case_targets),
+                AuditEvent.target.in_([*case_targets, *porting_targets]),
             )
         )
         .order_by(AuditEvent.created_at.desc())

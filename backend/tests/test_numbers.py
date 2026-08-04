@@ -14,7 +14,15 @@ def _signup_and_login(client, email: str, account_type: str = "individual") -> s
         },
     )
     response = client.post("/auth/login", json={"email": email, "password": "supersecret123"})
-    return response.json()["access_token"]
+    token = response.json()["access_token"]
+    # Baseline for every test account here - the emergency-calling
+    # disclosure gate is tested explicitly in its own tests below.
+    client.post(
+        "/compliance/consent",
+        json={"consent_type": "emergency_calling_acknowledged"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    return token
 
 
 def _reserve(client, headers, e164: str, country: str = "US"):
@@ -437,3 +445,53 @@ def test_cancelled_number_can_be_reserved_after_quarantine_period(client, db_ses
         "/numbers/reserve", json={"e164": "+15550002233", "country": "US"}, headers=headers
     )
     assert response.status_code == 201, response.text
+
+
+def test_purchase_is_blocked_without_the_emergency_calling_disclosure_acknowledged(client, monkeypatch):
+    """Roadmap doctrine: "Zoiko Local is not an emergency-service operator" -
+    every account must acknowledge that 911/999 calling may not work
+    reliably before buying any number, in every country, no exceptions."""
+    _stub_buy_number(monkeypatch)
+
+    client.post(
+        "/auth/signup",
+        json={
+            "account_name": "No Disclosure Co", "account_type": "individual",
+            "email": "nodisclosure@example.com", "password": "supersecret123",
+        },
+    )
+    token = client.post(
+        "/auth/login", json={"email": "nodisclosure@example.com", "password": "supersecret123"}
+    ).json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    _reserve(client, headers, "+15550009911")
+    response = client.post("/numbers/purchase", json={"e164": "+15550009911"}, headers=headers)
+    assert response.status_code == 403
+    assert "emergency" in response.json()["detail"].lower()
+
+
+def test_purchase_succeeds_once_emergency_calling_disclosure_is_acknowledged(client, monkeypatch):
+    _stub_buy_number(monkeypatch)
+
+    client.post(
+        "/auth/signup",
+        json={
+            "account_name": "Disclosure Co", "account_type": "individual",
+            "email": "disclosureok@example.com", "password": "supersecret123",
+        },
+    )
+    token = client.post(
+        "/auth/login", json={"email": "disclosureok@example.com", "password": "supersecret123"}
+    ).json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    _reserve(client, headers, "+15550009922")
+    blocked = client.post("/numbers/purchase", json={"e164": "+15550009922"}, headers=headers)
+    assert blocked.status_code == 403
+
+    client.post(
+        "/compliance/consent", json={"consent_type": "emergency_calling_acknowledged"}, headers=headers
+    )
+    response = client.post("/numbers/purchase", json={"e164": "+15550009922"}, headers=headers)
+    assert response.status_code == 200, response.text

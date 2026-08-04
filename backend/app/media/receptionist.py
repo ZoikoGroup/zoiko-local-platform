@@ -9,7 +9,8 @@ pricing — pure message capture + optional enrichment + routing to a human
 polite close.
 """
 
-from fastapi import APIRouter, Depends, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
@@ -20,6 +21,10 @@ from app.media.models import ReceptionistUrgency
 from app.numbering.identity.models import User
 
 router = APIRouter(prefix="/media/receptionist", tags=["receptionist"])
+
+
+class RouteReceptionistCallRequest(BaseModel):
+    assigned_user_id: str | None = None
 
 
 @router.post("/respond")
@@ -67,6 +72,10 @@ async def list_receptionist_calls(
     current_user: User = Depends(get_current_user),
 ):
     calls = media_service.list_account_receptionist_calls(db, current_user)
+    # One lookup for the whole list rather than per-row - assignee email is
+    # display-only (the frontend already knows ids from /team/members), so
+    # this avoids an N+1 without needing a relationship/join on the model.
+    user_emails = {u.id: u.email for u in db.query(User).filter(User.account_id == current_user.account_id).all()}
     return [
         {
             "id": c.id,
@@ -79,8 +88,25 @@ async def list_receptionist_calls(
             "summary": c.summary,
             "urgency": c.urgency.value if c.urgency else None,
             "escalated": c.escalated,
+            "guardrail_flags": c.guardrail_flags,
+            "assigned_user_id": c.assigned_user_id,
+            "assigned_user_email": user_emails.get(c.assigned_user_id) if c.assigned_user_id else None,
             "model_version": c.model_version,
             "created_at": c.created_at,
         }
         for c in calls
     ]
+
+
+@router.post("/calls/{call_id}/assign")
+async def assign_receptionist_call(
+    call_id: str,
+    payload: RouteReceptionistCallRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    try:
+        call = media_service.route_receptionist_call(db, current_user, call_id, payload.assigned_user_id)
+    except media_service.ReceptionistCallAuthorizationError as e:
+        raise HTTPException(status_code=403, detail=str(e)) from e
+    return {"id": call.id, "assigned_user_id": call.assigned_user_id}

@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 from app.core.database import get_db
 from app.core.deps import get_current_user
 from app.integrations.llm.groq import LLMError
+from app.integrations.storage.s3 import StorageError
 from app.integrations.telecom.twilio import TelecomError
 from app.integrations.transcription.groq import TranscriptionError
 from app.intelligence import service
@@ -70,10 +71,41 @@ def summarize_call(
     return _summary_response(record)
 
 
+@router.post("/video-sessions/{room_name}/summarize", status_code=status.HTTP_201_CREATED)
+def summarize_video_session(
+    room_name: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    try:
+        record = service.summarize_video_session(db, current_user, room_name)
+    except service.SummaryAuthorizationError as e:
+        raise HTTPException(status_code=403, detail=str(e)) from e
+    except service.ConsentRequiredError as e:
+        raise HTTPException(status_code=403, detail=str(e)) from e
+    except service.NotRecordedError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+    except (StorageError, TranscriptionError, LLMError) as e:
+        raise HTTPException(status_code=502, detail=str(e)) from e
+    return _summary_response(record)
+
+
 @router.get("/summaries")
 def list_summaries(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     records = service.list_account_summaries(db, current_user)
+    return [_summary_response(r) for r in records]
+
+
+@router.get("/summaries/search")
+def search_summaries(
+    q: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    if not q.strip():
+        return []
+    records = service.search_account_summaries(db, current_user, q)
     return [_summary_response(r) for r in records]

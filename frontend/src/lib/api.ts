@@ -7,6 +7,7 @@ export type User = {
   role: string;
   account_id: string;
   mfa_enabled: boolean;
+  phone_number: string | null;
 };
 
 export type TeamMember = {
@@ -79,6 +80,14 @@ export function login(input: { email: string; password: string }): Promise<Login
 export function getCurrentUser(token: string): Promise<User> {
   return request<User>("/auth/me", {
     headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export function setPhoneNumber(token: string, phoneNumber: string | null): Promise<User> {
+  return request<User>("/auth/me/phone", {
+    method: "PUT",
+    headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ phone_number: phoneNumber }),
   });
 }
 
@@ -281,6 +290,32 @@ export function listStaffAuditEvents(token: string): Promise<AuditEvent[]> {
   });
 }
 
+// --- Provider status (staff console) ---
+
+export type ProviderStatus = {
+  name: string;
+  configured: boolean;
+  ok: boolean;
+  detail: string | null;
+};
+
+export function listProviderStatuses(staffToken: string): Promise<{ providers: ProviderStatus[] }> {
+  return request<{ providers: ProviderStatus[] }>("/ops/provider-status", {
+    headers: { Authorization: `Bearer ${staffToken}` },
+  });
+}
+
+// --- Public status page (no auth) ---
+
+export type PublicStatus = {
+  overall: "operational" | "degraded";
+  components: { name: string; status: "operational" | "degraded" }[];
+};
+
+export function getPublicStatus(): Promise<PublicStatus> {
+  return request<PublicStatus>("/ops/status");
+}
+
 // --- Numbers ---
 
 export type MyPhoneNumber = {
@@ -446,11 +481,26 @@ export function summarizeVoicemail(token: string, voicemailId: string): Promise<
   });
 }
 
+export function summarizeVideoSession(token: string, roomName: string): Promise<ConversationSummary> {
+  return request<ConversationSummary>(`/intelligence/video-sessions/${encodeURIComponent(roomName)}/summarize`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
 export function grantAiProcessingConsent(token: string): Promise<{ granted_at: string }> {
   return request("/compliance/consent", {
     method: "POST",
     headers: { Authorization: `Bearer ${token}` },
     body: JSON.stringify({ consent_type: "ai_processing" }),
+  });
+}
+
+export function acknowledgeEmergencyCallingLimitation(token: string): Promise<{ granted_at: string }> {
+  return request("/compliance/consent", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ consent_type: "emergency_calling_acknowledged" }),
   });
 }
 
@@ -548,7 +598,12 @@ export type SummaryListEntry = {
   id: string;
   source_type: string;
   source_id: string;
+  transcript: string;
   summary: string;
+  language: string | null;
+  urgency: "low" | "medium" | "high" | null;
+  action_items: string[];
+  suggested_follow_up: string | null;
   model_version: string;
   created_at: string;
   disclaimer: string;
@@ -556,6 +611,12 @@ export type SummaryListEntry = {
 
 export function listSummaries(token: string): Promise<SummaryListEntry[]> {
   return request<SummaryListEntry[]>("/intelligence/summaries", {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export function searchSummaries(token: string, q: string): Promise<SummaryListEntry[]> {
+  return request<SummaryListEntry[]>(`/intelligence/summaries/search?q=${encodeURIComponent(q)}`, {
     headers: { Authorization: `Bearer ${token}` },
   });
 }
@@ -571,6 +632,9 @@ export type ReceptionistCallEntry = {
   summary: string | null;
   urgency: "low" | "medium" | "high" | null;
   escalated: boolean;
+  guardrail_flags: string[];
+  assigned_user_id: string | null;
+  assigned_user_email: string | null;
   model_version: string | null;
   created_at: string;
 };
@@ -578,6 +642,18 @@ export type ReceptionistCallEntry = {
 export function listReceptionistCalls(token: string): Promise<ReceptionistCallEntry[]> {
   return request<ReceptionistCallEntry[]>("/media/receptionist/calls", {
     headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export function assignReceptionistCall(
+  token: string,
+  callId: string,
+  assignedUserId: string | null
+): Promise<{ id: string; assigned_user_id: string | null }> {
+  return request(`/media/receptionist/calls/${callId}/assign`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ assigned_user_id: assignedUserId }),
   });
 }
 
@@ -595,6 +671,101 @@ export type UsageEvent = {
 export function listUsage(token: string): Promise<UsageEvent[]> {
   return request<UsageEvent[]>("/usage", {
     headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+// --- Number Porting ---
+
+export type PortingRequest = {
+  id: string;
+  account_id: string;
+  phone_number: string;
+  country: string;
+  current_carrier: string;
+  carrier_account_number: string;
+  billing_name: string;
+  billing_address: string;
+  status: "submitted" | "approved" | "rejected" | "completed" | "canceled";
+  rejection_reason: string | null;
+  twilio_incoming_number_sid: string | null;
+  created_number_id: string | null;
+  created_at: string;
+};
+
+export type StaffPortingRequest = PortingRequest & {
+  account_name: string;
+  account_owner_email: string;
+};
+
+export function createPortingRequest(
+  token: string,
+  input: {
+    phone_number: string;
+    country: string;
+    current_carrier: string;
+    carrier_account_number: string;
+    billing_name: string;
+    billing_address: string;
+  }
+): Promise<PortingRequest> {
+  return request<PortingRequest>("/porting/requests", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify(input),
+  });
+}
+
+export function listMyPortingRequests(token: string): Promise<PortingRequest[]> {
+  return request<PortingRequest[]>("/porting/requests/me", {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export function cancelPortingRequest(token: string, requestId: string): Promise<PortingRequest> {
+  return request<PortingRequest>(`/porting/requests/${requestId}/cancel`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export function listStaffPortingRequests(
+  staffToken: string,
+  status?: string
+): Promise<StaffPortingRequest[]> {
+  const query = status ? `?status=${status}` : "";
+  return request<StaffPortingRequest[]>(`/porting/requests${query}`, {
+    headers: { Authorization: `Bearer ${staffToken}` },
+  });
+}
+
+export function staffApprovePortingRequest(staffToken: string, requestId: string): Promise<StaffPortingRequest> {
+  return request<StaffPortingRequest>(`/porting/requests/${requestId}/approve`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${staffToken}` },
+  });
+}
+
+export function staffRejectPortingRequest(
+  staffToken: string,
+  requestId: string,
+  reason?: string
+): Promise<StaffPortingRequest> {
+  return request<StaffPortingRequest>(`/porting/requests/${requestId}/reject`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${staffToken}` },
+    body: JSON.stringify({ reason }),
+  });
+}
+
+export function staffCompletePortingRequest(
+  staffToken: string,
+  requestId: string,
+  twilioIncomingNumberSid: string
+): Promise<StaffPortingRequest> {
+  return request<StaffPortingRequest>(`/porting/requests/${requestId}/complete`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${staffToken}` },
+    body: JSON.stringify({ twilio_incoming_number_sid: twilioIncomingNumberSid }),
   });
 }
 

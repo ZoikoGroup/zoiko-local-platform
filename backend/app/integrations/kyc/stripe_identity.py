@@ -14,6 +14,18 @@ class KYCError(Exception):
     """Raised instead of letting a stripe SDK exception escape this module."""
 
 
+def health_check() -> dict:
+    """Real reachability check - retrieves the account resource, the
+    cheapest authenticated call Stripe offers."""
+    if not settings.stripe_secret_key:
+        return {"configured": False, "ok": False, "detail": None}
+    try:
+        stripe.Account.retrieve(api_key=settings.stripe_secret_key)
+        return {"configured": True, "ok": True, "detail": None}
+    except stripe.error.StripeError as e:
+        return {"configured": True, "ok": False, "detail": str(e)}
+
+
 def create_verification_session(reference_id: str) -> dict:
     """Starts a verification for one compliance case. reference_id is our
     own compliance_case.id, stored in metadata so the webhook can

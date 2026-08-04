@@ -17,6 +17,7 @@ def new_uuid() -> str:
 class SummarySourceType(str, enum.Enum):
     VOICEMAIL = "voicemail"
     CALL = "call"
+    VIDEO = "video"
 
 
 class ConversationSummary(Base):

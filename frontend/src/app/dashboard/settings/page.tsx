@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import { QRCodeSVG } from "qrcode.react";
 import {
   getCurrentUser,
+  setPhoneNumber,
   mfaSetup,
   mfaEnable,
   mfaDisable,
@@ -67,11 +68,19 @@ export default function SettingsPage() {
   const [notificationsLoading, setNotificationsLoading] = useState(true);
   const [notificationsError, setNotificationsError] = useState<string | null>(null);
 
+  const [phoneDraft, setPhoneDraft] = useState("");
+  const [phoneBusy, setPhoneBusy] = useState(false);
+  const [phoneError, setPhoneError] = useState<string | null>(null);
+  const [phoneMessage, setPhoneMessage] = useState<string | null>(null);
+
   useEffect(() => {
     const token = getToken();
     if (!token) return;
     getCurrentUser(token)
-      .then(setUser)
+      .then((u) => {
+        setUser(u);
+        setPhoneDraft(u.phone_number ?? "");
+      })
       .finally(() => setLoading(false));
     listMyComplianceCases(token)
       .then(setCases)
@@ -136,6 +145,23 @@ export default function SettingsPage() {
     const token = getToken();
     if (!token) return;
     setUser(await getCurrentUser(token));
+  }
+
+  async function handleSavePhone() {
+    const token = getToken();
+    if (!token) return;
+    setPhoneBusy(true);
+    setPhoneError(null);
+    setPhoneMessage(null);
+    try {
+      const updated = await setPhoneNumber(token, phoneDraft || null);
+      setUser(updated);
+      setPhoneMessage("Phone number saved.");
+    } catch (err) {
+      setPhoneError(err instanceof ApiError ? err.message : "Couldn't save phone number.");
+    } finally {
+      setPhoneBusy(false);
+    }
   }
 
   async function handleStartSetup() {
@@ -325,6 +351,35 @@ export default function SettingsPage() {
 
       <div className="bg-white rounded-xl border border-slate-200 p-6 space-y-4">
         <div>
+          <h3 className="font-semibold text-slate-900">Phone Number</h3>
+          <p className="text-xs text-slate-500 mt-0.5">
+            Used for SMS alerts on safety-critical events (e.g. a number being suspended). Optional.
+          </p>
+        </div>
+        {phoneError && <p className="text-sm text-red-600 bg-red-50 rounded-lg px-3 py-2">{phoneError}</p>}
+        {phoneMessage && (
+          <p className="text-sm text-emerald-700 bg-emerald-50 rounded-lg px-3 py-2">{phoneMessage}</p>
+        )}
+        <div className="flex gap-2">
+          <input
+            type="tel"
+            value={phoneDraft}
+            onChange={(e) => setPhoneDraft(e.target.value)}
+            placeholder="+15551234567"
+            className="flex-1 rounded-lg border border-slate-300 px-3.5 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/40 focus:border-indigo-500 transition"
+          />
+          <button
+            onClick={handleSavePhone}
+            disabled={phoneBusy || phoneDraft === (user?.phone_number ?? "")}
+            className="bg-indigo-600 hover:bg-indigo-700 disabled:opacity-60 text-white text-sm font-medium rounded-lg px-4 py-2 transition"
+          >
+            {phoneBusy ? "Saving..." : "Save"}
+          </button>
+        </div>
+      </div>
+
+      <div className="bg-white rounded-xl border border-slate-200 p-6 space-y-4">
+        <div>
           <h3 className="font-semibold text-slate-900">Identity verification</h3>
           <p className="text-xs text-slate-500 mt-0.5">
             Status of any ID verification requests on your account.
@@ -475,6 +530,41 @@ export default function SettingsPage() {
           </ul>
         )}
       </div>
+
+      {!auditForbidden && (
+        <div className="bg-white rounded-xl border border-slate-200 p-6 space-y-4">
+          <div>
+            <h3 className="font-semibold text-slate-900">Audit Log</h3>
+            <p className="text-xs text-slate-500 mt-0.5">
+              Every state-changing action on this account — Owner/Admin only.
+            </p>
+          </div>
+
+          {auditLoading && <p className="text-sm text-slate-500">Loading...</p>}
+
+          {!auditLoading && auditEvents.length === 0 && (
+            <p className="text-sm text-slate-500">No audit events yet.</p>
+          )}
+
+          {!auditLoading && auditEvents.length > 0 && (
+            <ul className="divide-y divide-slate-100">
+              {auditEvents.map((event) => (
+                <li key={event.id} className="py-3 flex items-center justify-between gap-4">
+                  <div>
+                    <div className="text-sm font-medium text-slate-800">{event.action}</div>
+                    <div className="text-xs text-slate-500 mt-0.5 font-mono">{event.target}</div>
+                    {event.reason && <div className="text-xs text-slate-500 mt-0.5">{event.reason}</div>}
+                  </div>
+                  <div className="text-xs text-slate-400 text-right shrink-0">
+                    <div>{event.actor}</div>
+                    <div>{new Date(event.created_at).toLocaleString()}</div>
+                  </div>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
     </div>
   );
 }

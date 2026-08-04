@@ -9,9 +9,11 @@ import {
   joinVideoRoom,
   endVideoRoom,
   startVideoRecording,
+  summarizeVideoSession,
   grantAiProcessingConsent,
   ApiError,
   type VideoRoom,
+  type ConversationSummary,
 } from "@/lib/api";
 import { getToken } from "@/lib/auth";
 
@@ -35,6 +37,10 @@ export default function VideoPage() {
   const [participantCount, setParticipantCount] = useState(0);
   const [recordingState, setRecordingState] = useState<RecordingState>("idle");
   const [recordingError, setRecordingError] = useState<string | null>(null);
+
+  const [summaries, setSummaries] = useState<Record<string, ConversationSummary>>({});
+  const [summarizingRoom, setSummarizingRoom] = useState<string | null>(null);
+  const [summaryErrors, setSummaryErrors] = useState<Record<string, string>>({});
 
   const roomRef = useRef<Room | null>(null);
   const localVideoRef = useRef<HTMLVideoElement>(null);
@@ -188,6 +194,32 @@ export default function VideoPage() {
       await handleStartRecording();
     } catch {
       setRecordingError("Couldn't grant recording consent.");
+    }
+  }
+
+  async function handleSummarize(targetRoomName: string) {
+    if (!token) return;
+    setSummarizingRoom(targetRoomName);
+    setSummaryErrors((prev) => ({ ...prev, [targetRoomName]: "" }));
+    try {
+      const summary = await summarizeVideoSession(token, targetRoomName);
+      setSummaries((prev) => ({ ...prev, [targetRoomName]: summary }));
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 403 && err.message.toLowerCase().includes("consent")) {
+        try {
+          await grantAiProcessingConsent(token);
+          const summary = await summarizeVideoSession(token, targetRoomName);
+          setSummaries((prev) => ({ ...prev, [targetRoomName]: summary }));
+        } catch (retryErr) {
+          const message = retryErr instanceof ApiError || retryErr instanceof Error ? retryErr.message : "Couldn't summarize this call.";
+          setSummaryErrors((prev) => ({ ...prev, [targetRoomName]: message }));
+        }
+      } else {
+        const message = err instanceof ApiError || err instanceof Error ? err.message : "Couldn't summarize this call.";
+        setSummaryErrors((prev) => ({ ...prev, [targetRoomName]: message }));
+      }
+    } finally {
+      setSummarizingRoom(null);
     }
   }
 
@@ -375,51 +407,100 @@ export default function VideoPage() {
         )}
 
         <div className="space-y-2">
-          {rooms.map((r) => (
-            <div
-              key={r.room_name}
-              className="flex items-center justify-between rounded-lg border border-slate-200 px-4 py-3"
-            >
-              <span className="font-mono text-sm text-slate-800">{r.room_name}</span>
-              <div className="flex items-center gap-3">
-                {r.participant_minutes > 0 && (
-                  <span className="text-xs text-slate-400">{r.participant_minutes} participant-min</span>
-                )}
-                {r.recording_url && (
-                  <a
-                    href={r.recording_url}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="text-xs font-medium text-indigo-600 hover:text-indigo-800"
-                  >
-                    Play recording
-                  </a>
-                )}
-                {r.recording_in_progress && (
-                  <span className="text-xs font-medium text-red-600">Recording processing…</span>
-                )}
-                <span
-                  className={`text-xs font-medium rounded-full px-2 py-0.5 capitalize ${
-                    r.status === "active"
-                      ? "bg-emerald-50 text-emerald-700"
-                      : r.status === "ended"
-                        ? "bg-slate-100 text-slate-600"
-                        : "bg-amber-50 text-amber-700"
-                  }`}
-                >
-                  {r.status}
-                </span>
-                {r.status === "active" && callState === "idle" && (
-                  <button
-                    onClick={() => connectToRoom(r.room_name)}
-                    className="text-xs font-medium text-indigo-600 hover:text-indigo-800"
-                  >
-                    Join
-                  </button>
+          {rooms.map((r) => {
+            const summary = summaries[r.room_name];
+            const summaryError = summaryErrors[r.room_name];
+            return (
+              <div key={r.room_name} className="rounded-lg border border-slate-200 px-4 py-3 space-y-2">
+                <div className="flex items-center justify-between">
+                  <span className="font-mono text-sm text-slate-800">{r.room_name}</span>
+                  <div className="flex items-center gap-3">
+                    {r.participant_minutes > 0 && (
+                      <span className="text-xs text-slate-400">{r.participant_minutes} participant-min</span>
+                    )}
+                    {r.recording_url && (
+                      <a
+                        href={r.recording_url}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="text-xs font-medium text-indigo-600 hover:text-indigo-800"
+                      >
+                        Play recording
+                      </a>
+                    )}
+                    {r.recording_url && !summary && (
+                      <button
+                        onClick={() => handleSummarize(r.room_name)}
+                        disabled={summarizingRoom === r.room_name}
+                        className="text-xs font-medium text-indigo-600 hover:text-indigo-800 disabled:opacity-60"
+                      >
+                        {summarizingRoom === r.room_name ? "Summarizing…" : "Summarize with AI"}
+                      </button>
+                    )}
+                    {r.recording_in_progress && (
+                      <span className="text-xs font-medium text-red-600">Recording processing…</span>
+                    )}
+                    <span
+                      className={`text-xs font-medium rounded-full px-2 py-0.5 capitalize ${
+                        r.status === "active"
+                          ? "bg-emerald-50 text-emerald-700"
+                          : r.status === "ended"
+                            ? "bg-slate-100 text-slate-600"
+                            : "bg-amber-50 text-amber-700"
+                      }`}
+                    >
+                      {r.status}
+                    </span>
+                    {r.status === "active" && callState === "idle" && (
+                      <button
+                        onClick={() => connectToRoom(r.room_name)}
+                        className="text-xs font-medium text-indigo-600 hover:text-indigo-800"
+                      >
+                        Join
+                      </button>
+                    )}
+                  </div>
+                </div>
+
+                {summaryError && <p className="text-xs text-red-600">{summaryError}</p>}
+
+                {summary && (
+                  <div className="bg-slate-50 rounded-lg border border-slate-200 p-3 space-y-1.5">
+                    <div className="flex items-center gap-2">
+                      {summary.urgency && (
+                        <span
+                          className={`text-[10px] font-semibold uppercase tracking-wide rounded-full px-2 py-0.5 ${
+                            summary.urgency === "high"
+                              ? "bg-red-100 text-red-700"
+                              : summary.urgency === "medium"
+                                ? "bg-amber-100 text-amber-700"
+                                : "bg-slate-200 text-slate-600"
+                          }`}
+                        >
+                          {summary.urgency} urgency
+                        </span>
+                      )}
+                      {summary.language && (
+                        <span className="text-[10px] text-slate-400 uppercase">{summary.language}</span>
+                      )}
+                    </div>
+                    <p className="text-sm text-slate-700">{summary.summary}</p>
+                    {summary.action_items.length > 0 && (
+                      <ul className="text-xs text-slate-500 list-disc list-inside">
+                        {summary.action_items.map((item, i) => (
+                          <li key={i}>{item}</li>
+                        ))}
+                      </ul>
+                    )}
+                    {summary.suggested_follow_up && (
+                      <p className="text-xs text-slate-500">Follow-up: {summary.suggested_follow_up}</p>
+                    )}
+                    <p className="text-[10px] text-slate-400">{summary.disclaimer}</p>
+                  </div>
                 )}
               </div>
-            </div>
-          ))}
+            );
+          })}
         </div>
       </div>
     </div>

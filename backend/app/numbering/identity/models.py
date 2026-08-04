@@ -43,6 +43,9 @@ class User(Base):
         UUID(as_uuid=False), ForeignKey("accounts.id", ondelete="CASCADE"), nullable=False, index=True
     )
     email: Mapped[str] = mapped_column(String(255), unique=True, nullable=False, index=True)
+    # Nullable - only needed for the SMS notification channel; most users
+    # will never set this, and email-only notifications work fine without it.
+    phone_number: Mapped[str | None] = mapped_column(String(20), nullable=True)
     # Nullable: a Google-only account has no password to check - only ever
     # log in via /auth/google for that user, never /auth/login.
     hashed_password: Mapped[str | None] = mapped_column(String(255), nullable=True)

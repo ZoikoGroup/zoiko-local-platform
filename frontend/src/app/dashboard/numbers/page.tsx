@@ -13,11 +13,16 @@ import {
   cancelNumber,
   configureRouting,
   listTeamMembers,
+  acknowledgeEmergencyCallingLimitation,
+  createPortingRequest,
+  listMyPortingRequests,
+  cancelPortingRequest,
   ApiError,
   type ComplianceRule,
   type MyPhoneNumber,
   type NumberSearchResult,
   type TeamMember,
+  type PortingRequest,
 } from "@/lib/api";
 import { getToken } from "@/lib/auth";
 
@@ -31,6 +36,23 @@ const STATUS_STYLES: Record<string, string> = {
   active: "bg-emerald-50 text-emerald-700",
   suspended: "bg-slate-100 text-slate-600",
   cancelled: "bg-red-50 text-red-700",
+};
+
+const PORTING_STATUS_STYLES: Record<string, string> = {
+  submitted: "bg-amber-50 text-amber-700",
+  approved: "bg-indigo-50 text-indigo-700",
+  completed: "bg-emerald-50 text-emerald-700",
+  rejected: "bg-red-50 text-red-700",
+  canceled: "bg-slate-100 text-slate-600",
+};
+
+const EMPTY_PORTING_FORM = {
+  phone_number: "",
+  country: "US",
+  current_carrier: "",
+  carrier_account_number: "",
+  billing_name: "",
+  billing_address: "",
 };
 
 export default function NumbersPage() {
@@ -76,6 +98,15 @@ export default function NumbersPage() {
   const [purchaseBusy, setPurchaseBusy] = useState(false);
   const [purchaseError, setPurchaseError] = useState<string | null>(null);
   const [purchasedNumber, setPurchasedNumber] = useState<MyPhoneNumber | null>(null);
+  const [emergencyAcknowledged, setEmergencyAcknowledged] = useState(false);
+
+  const [portingRequests, setPortingRequests] = useState<PortingRequest[]>([]);
+  const [portingLoading, setPortingLoading] = useState(true);
+  const [portingFormOpen, setPortingFormOpen] = useState(false);
+  const [portingForm, setPortingForm] = useState(EMPTY_PORTING_FORM);
+  const [portingBusy, setPortingBusy] = useState(false);
+  const [portingError, setPortingError] = useState<string | null>(null);
+  const [portingActionBusyId, setPortingActionBusyId] = useState<string | null>(null);
 
   const loadMyNumbers = useCallback(() => {
     if (!token) return;
@@ -91,6 +122,48 @@ export default function NumbersPage() {
   useEffect(() => {
     loadMyNumbers();
   }, [loadMyNumbers]);
+
+  const loadPortingRequests = useCallback(() => {
+    if (!token) return;
+    return listMyPortingRequests(token)
+      .then(setPortingRequests)
+      .catch(() => {})
+      .finally(() => setPortingLoading(false));
+  }, [token]);
+
+  useEffect(() => {
+    loadPortingRequests();
+  }, [loadPortingRequests]);
+
+  async function handleSubmitPortingRequest(e: React.FormEvent) {
+    e.preventDefault();
+    if (!token) return;
+    setPortingBusy(true);
+    setPortingError(null);
+    try {
+      await createPortingRequest(token, portingForm);
+      setPortingForm(EMPTY_PORTING_FORM);
+      setPortingFormOpen(false);
+      await loadPortingRequests();
+    } catch (err) {
+      setPortingError(err instanceof ApiError ? err.message : "Couldn't submit this porting request.");
+    } finally {
+      setPortingBusy(false);
+    }
+  }
+
+  async function handleCancelPortingRequest(requestId: string) {
+    if (!token) return;
+    setPortingActionBusyId(requestId);
+    try {
+      await cancelPortingRequest(token, requestId);
+      await loadPortingRequests();
+    } catch (err) {
+      setPortingError(err instanceof ApiError ? err.message : "Couldn't cancel this request.");
+    } finally {
+      setPortingActionBusyId(null);
+    }
+  }
 
   useEffect(() => {
     if (!token) return;
@@ -162,10 +235,11 @@ export default function NumbersPage() {
   }
 
   async function handlePurchase() {
-    if (!token || !reservedNumber) return;
+    if (!token || !reservedNumber || !emergencyAcknowledged) return;
     setPurchaseBusy(true);
     setPurchaseError(null);
     try {
+      await acknowledgeEmergencyCallingLimitation(token);
       const number = await purchaseNumber(token, reservedNumber.e164);
       setPurchasedNumber(number);
       setStep("purchased");
@@ -203,6 +277,7 @@ export default function NumbersPage() {
     setComplianceError(null);
     setPurchaseError(null);
     setPurchasedNumber(null);
+    setEmergencyAcknowledged(false);
   }
 
   async function handleConfirmSuspend(e164: string) {
@@ -623,13 +698,32 @@ export default function NumbersPage() {
             <span className="text-slate-800">$5.00 / month</span>
           </div>
 
+          <div className="bg-amber-50 border border-amber-200 rounded-lg p-3 space-y-2">
+            <p className="text-xs text-amber-900 font-medium">Emergency calling notice</p>
+            <p className="text-xs text-amber-800">
+              This service is not a replacement for a traditional phone line. Emergency calling (911, 999,
+              or your local equivalent) may not work reliably, may not transmit your location, or may not
+              work at all during a power or internet outage. Do not rely on this number for emergency
+              calls.
+            </p>
+            <label className="flex items-start gap-2 text-xs text-amber-900 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={emergencyAcknowledged}
+                onChange={(e) => setEmergencyAcknowledged(e.target.checked)}
+                className="mt-0.5"
+              />
+              I understand and accept this limitation.
+            </label>
+          </div>
+
           {purchaseError && (
             <p className="text-sm text-red-600 bg-red-50 rounded-lg px-3 py-2">{purchaseError}</p>
           )}
 
           <button
             onClick={handlePurchase}
-            disabled={purchaseBusy}
+            disabled={purchaseBusy || !emergencyAcknowledged}
             className="bg-indigo-600 hover:bg-indigo-700 disabled:opacity-60 text-white text-sm font-medium rounded-lg px-4 py-2"
           >
             {purchaseBusy ? "Purchasing..." : "Confirm Purchase"}
@@ -650,6 +744,156 @@ export default function NumbersPage() {
           </button>
         </div>
       )}
+
+      {/* Port an existing number */}
+      <div>
+        <h3 className="text-lg font-semibold text-slate-900">Already Have a Number?</h3>
+        <p className="text-sm text-slate-500">
+          Port a number you own with another carrier over to Zoiko Local.
+        </p>
+      </div>
+
+      <div className="bg-white rounded-xl border border-slate-200 p-6 space-y-4">
+        <p className="text-xs text-slate-500 bg-slate-50 rounded-lg px-3 py-2">
+          Porting moves a real number between carriers, so it's reviewed by our team and coordinated with
+          your current carrier by hand — it isn't instant like a new number purchase. We'll email you at
+          each step.
+        </p>
+
+        {portingLoading && <p className="text-sm text-slate-500">Loading...</p>}
+        {portingError && <p className="text-sm text-red-600 bg-red-50 rounded-lg px-3 py-2">{portingError}</p>}
+
+        {portingRequests.length > 0 && (
+          <div className="space-y-2">
+            {portingRequests.map((r) => (
+              <div
+                key={r.id}
+                className="flex items-center justify-between rounded-lg border border-slate-200 px-4 py-3"
+              >
+                <div>
+                  <span className="font-mono text-slate-800">{r.phone_number}</span>
+                  <span
+                    className={`ml-3 text-xs font-medium rounded-full px-2 py-0.5 capitalize ${
+                      PORTING_STATUS_STYLES[r.status] ?? "bg-slate-100 text-slate-600"
+                    }`}
+                  >
+                    {r.status}
+                  </span>
+                  {r.status === "rejected" && r.rejection_reason && (
+                    <p className="text-xs text-red-600 mt-1">{r.rejection_reason}</p>
+                  )}
+                </div>
+                {(r.status === "submitted" || r.status === "approved") && (
+                  <button
+                    onClick={() => handleCancelPortingRequest(r.id)}
+                    disabled={portingActionBusyId === r.id}
+                    className="text-xs font-medium text-slate-500 hover:text-slate-800 disabled:opacity-60"
+                  >
+                    Cancel
+                  </button>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+
+        {!portingFormOpen ? (
+          <button
+            onClick={() => setPortingFormOpen(true)}
+            className="text-sm font-medium text-indigo-600 hover:text-indigo-800"
+          >
+            + Request a number port
+          </button>
+        ) : (
+          <form onSubmit={handleSubmitPortingRequest} className="space-y-3">
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <label className="block text-xs font-medium text-slate-500 mb-1">Phone number</label>
+                <input
+                  required
+                  value={portingForm.phone_number}
+                  onChange={(e) => setPortingForm({ ...portingForm, phone_number: e.target.value })}
+                  placeholder="+15551234567"
+                  className="w-full rounded-lg border border-slate-300 px-3 py-1.5 text-sm font-mono placeholder:text-slate-400"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-slate-500 mb-1">Country</label>
+                <select
+                  value={portingForm.country}
+                  onChange={(e) => setPortingForm({ ...portingForm, country: e.target.value })}
+                  className="w-full rounded-lg border border-slate-300 px-3 py-1.5 text-sm"
+                >
+                  {COUNTRIES.map((c) => (
+                    <option key={c.code} value={c.code}>
+                      {c.name}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-slate-500 mb-1">Current carrier</label>
+                <input
+                  required
+                  value={portingForm.current_carrier}
+                  onChange={(e) => setPortingForm({ ...portingForm, current_carrier: e.target.value })}
+                  className="w-full rounded-lg border border-slate-300 px-3 py-1.5 text-sm"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-slate-500 mb-1">
+                  Account number with current carrier
+                </label>
+                <input
+                  required
+                  value={portingForm.carrier_account_number}
+                  onChange={(e) => setPortingForm({ ...portingForm, carrier_account_number: e.target.value })}
+                  className="w-full rounded-lg border border-slate-300 px-3 py-1.5 text-sm"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-slate-500 mb-1">Billing name</label>
+                <input
+                  required
+                  value={portingForm.billing_name}
+                  onChange={(e) => setPortingForm({ ...portingForm, billing_name: e.target.value })}
+                  className="w-full rounded-lg border border-slate-300 px-3 py-1.5 text-sm"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-slate-500 mb-1">Billing address</label>
+                <input
+                  required
+                  value={portingForm.billing_address}
+                  onChange={(e) => setPortingForm({ ...portingForm, billing_address: e.target.value })}
+                  className="w-full rounded-lg border border-slate-300 px-3 py-1.5 text-sm"
+                />
+              </div>
+            </div>
+
+            <div className="flex gap-2">
+              <button
+                type="submit"
+                disabled={portingBusy}
+                className="bg-indigo-600 hover:bg-indigo-700 disabled:opacity-60 text-white text-sm font-medium rounded-lg px-4 py-2"
+              >
+                {portingBusy ? "Submitting..." : "Submit Porting Request"}
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setPortingFormOpen(false);
+                  setPortingForm(EMPTY_PORTING_FORM);
+                  setPortingError(null);
+                }}
+                className="text-sm text-slate-500 hover:text-slate-700 px-2"
+              >
+                Cancel
+              </button>
+            </div>
+          </form>
+        )}
+      </div>
     </div>
   );
 }

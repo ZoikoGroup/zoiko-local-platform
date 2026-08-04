@@ -3,9 +3,14 @@
 import { useEffect, useState, useCallback } from "react";
 import {
   listSummaries,
+  searchSummaries,
   listReceptionistCalls,
+  assignReceptionistCall,
+  listTeamMembers,
+  ApiError,
   type SummaryListEntry,
   type ReceptionistCallEntry,
+  type TeamMember,
 } from "@/lib/api";
 import { getToken } from "@/lib/auth";
 
@@ -98,9 +103,19 @@ export default function AIInsightsPage() {
   const [summariesLoading, setSummariesLoading] = useState(true);
   const [summariesError, setSummariesError] = useState<string | null>(null);
 
+  const [searchInput, setSearchInput] = useState("");
+  const [searchActive, setSearchActive] = useState(false);
+  const [searching, setSearching] = useState(false);
+
   const [receptionistCalls, setReceptionistCalls] = useState<ReceptionistCallEntry[]>([]);
   const [receptionistLoading, setReceptionistLoading] = useState(true);
   const [receptionistError, setReceptionistError] = useState<string | null>(null);
+
+  const [teamMembers, setTeamMembers] = useState<TeamMember[]>([]);
+  const [routingCallId, setRoutingCallId] = useState<string | null>(null);
+  const [routingSelection, setRoutingSelection] = useState<Record<string, string>>({});
+  const [routingError, setRoutingError] = useState<Record<string, string>>({});
+  const [routedNotice, setRoutedNotice] = useState<string | null>(null);
 
   const load = useCallback(() => {
     if (!token) return;
@@ -118,11 +133,76 @@ export default function AIInsightsPage() {
       })
       .catch(() => setReceptionistError("Couldn't load AI Receptionist calls."))
       .finally(() => setReceptionistLoading(false));
+    listTeamMembers(token)
+      .then(setTeamMembers)
+      .catch(() => {
+        // Members without team-management access still see receptionist
+        // calls, just without the ability to route them - not worth
+        // surfacing as an error.
+      });
   }, [token]);
+
+  async function handleRouteCall(callId: string) {
+    if (!token) return;
+    const assignedUserId = routingSelection[callId];
+    if (!assignedUserId) return;
+    setRoutingError((prev) => ({ ...prev, [callId]: "" }));
+    try {
+      await assignReceptionistCall(token, callId, assignedUserId);
+      const assignee = teamMembers.find((m) => m.id === assignedUserId);
+      setReceptionistCalls((prev) =>
+        prev.map((c) =>
+          c.id === callId
+            ? { ...c, assigned_user_id: assignedUserId, assigned_user_email: assignee?.email ?? null }
+            : c
+        )
+      );
+      setRoutingCallId(null);
+      setRoutedNotice(`Routed to ${assignee?.email ?? "team member"} successfully`);
+      setTimeout(() => setRoutedNotice(null), 4000);
+    } catch (err) {
+      const message = err instanceof ApiError ? err.message : "Couldn't route this call.";
+      setRoutingError((prev) => ({ ...prev, [callId]: message }));
+    }
+  }
+
+  async function handleUnassignCall(callId: string) {
+    if (!token) return;
+    try {
+      await assignReceptionistCall(token, callId, null);
+      setReceptionistCalls((prev) =>
+        prev.map((c) => (c.id === callId ? { ...c, assigned_user_id: null, assigned_user_email: null } : c))
+      );
+    } catch {
+      setRoutingError((prev) => ({ ...prev, [callId]: "Couldn't unassign this call." }));
+    }
+  }
 
   useEffect(() => {
     load();
   }, [load]);
+
+  async function handleSearchSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    if (!token || !searchInput.trim()) return;
+    setSearching(true);
+    setSummariesError(null);
+    try {
+      setSummaries(await searchSummaries(token, searchInput.trim()));
+      setSearchActive(true);
+    } catch {
+      setSummariesError("Search failed.");
+    } finally {
+      setSearching(false);
+    }
+  }
+
+  function handleClearSearch() {
+    setSearchInput("");
+    setSearchActive(false);
+    setSummariesLoading(true);
+    load();
+  }
 
   return (
     <div className="max-w-3xl mx-auto space-y-6">
@@ -137,17 +217,50 @@ export default function AIInsightsPage() {
       </div>
 
       <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
-        <div className="px-6 py-5 border-b border-slate-100">
-          <h3 className="font-semibold text-slate-900">Call &amp; Voicemail Summaries</h3>
-          <p className="text-xs text-slate-400 mt-0.5">
-            AI-generated — may be inaccurate, not an authoritative record.
-          </p>
+        <div className="px-6 py-5 border-b border-slate-100 space-y-3">
+          <div>
+            <h3 className="font-semibold text-slate-900">Call &amp; Voicemail Summaries</h3>
+            <p className="text-xs text-slate-400 mt-0.5">
+              AI-generated — may be inaccurate, not an authoritative record.
+            </p>
+          </div>
+          <form onSubmit={handleSearchSubmit} className="flex gap-2">
+            <input
+              type="search"
+              value={searchInput}
+              onChange={(e) => setSearchInput(e.target.value)}
+              placeholder="Search summaries and transcripts…"
+              className="flex-1 text-sm rounded-lg border border-slate-200 px-3 py-1.5 focus:outline-none focus:ring-2 focus:ring-indigo-500/40 focus:border-indigo-500 transition"
+            />
+            <button
+              type="submit"
+              disabled={searching || !searchInput.trim()}
+              className="text-xs font-medium text-white bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 rounded-lg px-3.5 py-1.5 transition"
+            >
+              {searching ? "Searching…" : "Search"}
+            </button>
+            {searchActive && (
+              <button
+                type="button"
+                onClick={handleClearSearch}
+                className="text-xs font-medium text-slate-500 hover:text-slate-700 px-2"
+              >
+                Clear
+              </button>
+            )}
+          </form>
         </div>
 
         {summariesLoading && <p className="text-sm text-slate-500 px-6 py-5">Loading...</p>}
         {summariesError && <p className="text-sm text-red-600 px-6 py-5">{summariesError}</p>}
         {!summariesLoading && summaries.length === 0 && (
-          <EmptyState label="No AI summaries yet — summarize a voicemail or call from the Calls page to see it here." />
+          <EmptyState
+            label={
+              searchActive
+                ? "No summaries matched that search."
+                : "No AI summaries yet — summarize a voicemail or call from the Calls page to see it here."
+            }
+          />
         )}
 
         <ul className="divide-y divide-slate-100">
@@ -164,17 +277,47 @@ export default function AIInsightsPage() {
                   <PhoneSmallIcon className="w-4 h-4" />
                 )}
               </div>
-              <div className="flex-1 min-w-0 space-y-1">
+              <div className="flex-1 min-w-0 space-y-1.5">
                 <div className="flex items-center justify-between gap-4">
-                  <span className="text-xs font-medium text-slate-500 capitalize">
-                    {s.source_type.replaceAll("_", " ")}
-                  </span>
-                  <span className="text-xs text-slate-400 shrink-0 flex items-center gap-1">
-                    <ClockSmallIcon />
-                    {new Date(s.created_at).toLocaleString()}
-                  </span>
+                  <div className="flex items-center gap-2">
+                    <span className="text-xs font-medium text-slate-500 capitalize">
+                      {s.source_type.replaceAll("_", " ")}
+                    </span>
+                    {s.language && (
+                      <span className="text-[10px] font-medium text-slate-400 uppercase border border-slate-200 rounded px-1">
+                        {s.language}
+                      </span>
+                    )}
+                  </div>
+                  <div className="flex items-center gap-2 shrink-0">
+                    {s.urgency && (
+                      <span
+                        className={`text-xs font-medium rounded-full px-2 py-0.5 capitalize ${
+                          URGENCY_STYLES[s.urgency]?.badge ?? "bg-slate-100 text-slate-600"
+                        }`}
+                      >
+                        {s.urgency}
+                      </span>
+                    )}
+                    <span className="text-xs text-slate-400 flex items-center gap-1">
+                      <ClockSmallIcon />
+                      {new Date(s.created_at).toLocaleString()}
+                    </span>
+                  </div>
                 </div>
                 <p className="text-sm text-slate-800 leading-relaxed">{s.summary}</p>
+                {s.suggested_follow_up && (
+                  <p className="text-xs text-indigo-700 bg-indigo-50 rounded-lg px-2.5 py-1.5">
+                    Suggested: {s.suggested_follow_up}
+                  </p>
+                )}
+                {s.action_items.length > 0 && (
+                  <ul className="text-xs text-slate-500 list-disc pl-4 space-y-0.5">
+                    {s.action_items.map((item, i) => (
+                      <li key={i}>{item}</li>
+                    ))}
+                  </ul>
+                )}
                 <p className="text-[11px] text-slate-400 font-mono">{s.model_version}</p>
               </div>
             </li>
@@ -188,6 +331,11 @@ export default function AIInsightsPage() {
           <p className="text-xs text-slate-400 mt-0.5">
             Caller qualification captured when a number has the AI Receptionist enabled.
           </p>
+          {routedNotice && (
+            <p className="text-xs font-medium text-emerald-700 bg-emerald-50 rounded-lg px-2.5 py-1.5 mt-2 w-fit">
+              {routedNotice}
+            </p>
+          )}
         </div>
 
         {receptionistLoading && <p className="text-sm text-slate-500 px-6 py-5">Loading...</p>}
@@ -238,6 +386,14 @@ export default function AIInsightsPage() {
                       {c.summary ?? c.reason ?? "No summary available for this call."}
                     </p>
 
+                    {c.guardrail_flags.length > 0 && (
+                      <p className="text-xs font-medium text-red-700 bg-red-50 rounded-lg px-2.5 py-1.5">
+                        Review before acting — the AI's summary above may contain a{" "}
+                        {c.guardrail_flags.map((f) => f.replaceAll("_", " ")).join(" and ")} that was never
+                        actually authorized.
+                      </p>
+                    )}
+
                     <div className="flex items-center gap-4 text-xs text-slate-400">
                       <span className="flex items-center gap-1">
                         <PhoneSmallIcon />
@@ -248,6 +404,61 @@ export default function AIInsightsPage() {
                         {new Date(c.created_at).toLocaleString()}
                       </span>
                     </div>
+
+                    <div className="flex items-center gap-2 flex-wrap">
+                      {c.assigned_user_id ? (
+                        <>
+                          <span className="text-xs font-medium text-emerald-700 bg-emerald-50 rounded-full px-2.5 py-1">
+                            Routed to {c.assigned_user_email ?? "team member"}
+                          </span>
+                          <button
+                            onClick={() => handleUnassignCall(c.id)}
+                            className="text-xs text-slate-400 hover:text-slate-600"
+                          >
+                            Unassign
+                          </button>
+                        </>
+                      ) : routingCallId === c.id ? (
+                        <>
+                          <select
+                            value={routingSelection[c.id] ?? ""}
+                            onChange={(e) =>
+                              setRoutingSelection((prev) => ({ ...prev, [c.id]: e.target.value }))
+                            }
+                            className="text-xs rounded-lg border border-slate-200 px-2 py-1 focus:outline-none focus:ring-2 focus:ring-indigo-500/40"
+                          >
+                            <option value="">Choose team member…</option>
+                            {teamMembers.map((m) => (
+                              <option key={m.id} value={m.id}>
+                                {m.email} ({m.role})
+                              </option>
+                            ))}
+                          </select>
+                          <button
+                            onClick={() => handleRouteCall(c.id)}
+                            disabled={!routingSelection[c.id]}
+                            className="text-xs font-medium text-white bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 rounded-lg px-3 py-1"
+                          >
+                            Approve &amp; route
+                          </button>
+                          <button
+                            onClick={() => setRoutingCallId(null)}
+                            className="text-xs text-slate-400 hover:text-slate-600"
+                          >
+                            Cancel
+                          </button>
+                        </>
+                      ) : (
+                        <button
+                          onClick={() => setRoutingCallId(c.id)}
+                          disabled={teamMembers.length === 0}
+                          className="text-xs font-medium text-indigo-600 hover:text-indigo-800 disabled:opacity-50 disabled:cursor-not-allowed"
+                        >
+                          Route to team member
+                        </button>
+                      )}
+                    </div>
+                    {routingError[c.id] && <p className="text-xs text-red-600">{routingError[c.id]}</p>}
 
                     <details className="group text-xs">
                       <summary className="cursor-pointer list-none flex items-center gap-1 text-slate-500 hover:text-slate-700 w-fit">

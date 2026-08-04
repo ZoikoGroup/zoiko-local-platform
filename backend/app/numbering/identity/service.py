@@ -190,6 +190,18 @@ def disable_mfa(db: Session, user: User, code: str, actor: str) -> None:
     log_event(db, actor=actor, action="mfa.disabled", target=f"user:{user.id}")
 
 
+def set_phone_number(db: Session, user: User, phone_number: str | None) -> User:
+    before = user.phone_number
+    user.phone_number = phone_number
+    db.commit()
+    db.refresh(user)
+    log_event(
+        db, actor=user.id, action="user.phone_number_updated", target=f"user:{user.id}",
+        before={"phone_number": before}, after={"phone_number": phone_number},
+    )
+    return user
+
+
 def complete_mfa_login(db: Session, user_id: str, code: str) -> User | None:
     user = db.query(User).filter(User.id == user_id).first()
     if user is None or not user.mfa_enabled or not user.mfa_secret:

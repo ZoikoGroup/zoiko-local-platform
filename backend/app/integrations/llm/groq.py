@@ -10,8 +10,24 @@ import httpx
 from app.core.config import settings
 
 _CHAT_COMPLETIONS_URL = "https://api.groq.com/openai/v1/chat/completions"
+_MODELS_URL = "https://api.groq.com/openai/v1/models"
 _MODEL = "llama-3.1-8b-instant"
 MODEL_VERSION = f"groq/{_MODEL}"
+
+
+def health_check() -> dict:
+    """Real reachability check - lists available models, the cheapest
+    authenticated call Groq offers (no completion tokens spent)."""
+    if not settings.groq_api_key:
+        return {"configured": False, "ok": False, "detail": None}
+    try:
+        response = httpx.get(
+            _MODELS_URL, headers={"Authorization": f"Bearer {settings.groq_api_key}"}, timeout=10.0
+        )
+        response.raise_for_status()
+        return {"configured": True, "ok": True, "detail": None}
+    except httpx.HTTPError as e:
+        return {"configured": True, "ok": False, "detail": str(e)}
 
 _SUMMARY_SYSTEM_PROMPT = (
     "You analyze voicemail and call transcripts for a business communications "

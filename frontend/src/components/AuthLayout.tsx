@@ -47,7 +47,10 @@ export default function AuthLayout({
         </div>
 
         <p className="relative text-xs text-indigo-300">
-          &copy; {new Date().getFullYear()} Zoiko Group Inc.
+          &copy; {new Date().getFullYear()} Zoiko Group Inc. &middot;{" "}
+          <a href="/status" className="hover:text-white underline underline-offset-2">
+            System status
+          </a>
         </p>
       </div>
 

@@ -73,6 +73,8 @@ def test_respond_without_consent_captures_raw_transcript_only(client, db_session
     assert calls[0]["caller_name"] is None
     assert calls[0]["urgency"] is None
     assert calls[0]["model_version"] is None
+    # No AI-generated summary at all without consent - nothing to flag.
+    assert calls[0]["guardrail_flags"] == []
 
 
 def test_respond_with_consent_extracts_qualification_and_escalates_high_urgency(client, db_session):
@@ -117,6 +119,96 @@ def test_respond_with_consent_extracts_qualification_and_escalates_high_urgency(
     assert calls[0]["urgency"] == "high"
     assert calls[0]["escalated"] is True
     assert calls[0]["model_version"]
+    # Real Groq output on an ordinary message - nothing here should trip
+    # the pricing/legal/medical guardrail.
+    assert calls[0]["guardrail_flags"] == []
+
+
+def test_receptionist_call_flags_a_pricing_commitment_in_the_generated_summary(client, db_session, monkeypatch):
+    """The system prompt already tells the model never to quote prices -
+    this proves the guardrail catches it anyway if the model does it,
+    rather than trusting the prompt alone."""
+    token, account_id = _signup_and_login(client, "receptionistguardrail1@example.com")
+    number = PhoneNumber(
+        e164="+15550055555", country="US", status=PhoneNumberStatus.ACTIVE, account_id=account_id,
+        ai_receptionist_enabled=True,
+    )
+    db_session.add(number)
+    db_session.commit()
+
+    client.post(
+        "/compliance/consent", json={"consent_type": "ai_processing"}, headers={"Authorization": f"Bearer {token}"}
+    )
+    monkeypatch.setattr(
+        "app.media.service.qualify_caller",
+        lambda db, account_id, transcript, jurisdiction=None: (
+            {
+                "name": "Sam",
+                "company": None,
+                "reason": "asked for a repair quote",
+                "summary": "Sam called and was told the repair would cost $75.",
+                "urgency": "low",
+                "callback_preference": None,
+            },
+            "groq/test",
+        ),
+    )
+
+    url = "http://testserver/media/receptionist/respond"
+    params = {
+        "CallSid": "CArecguard1", "To": "+15550055555", "From": "+15559995555",
+        "SpeechResult": "Hi, how much would a repair cost?",
+    }
+    signature = _twilio_signature(url, params)
+    client.post("/media/receptionist/respond", data=params, headers={"X-Twilio-Signature": signature})
+
+    calls = client.get(
+        "/media/receptionist/calls", headers={"Authorization": f"Bearer {token}"}
+    ).json()
+    assert len(calls) == 1
+    assert calls[0]["guardrail_flags"] == ["pricing_commitment"]
+
+
+def test_receptionist_call_has_no_guardrail_flags_when_summary_is_clean(client, db_session, monkeypatch):
+    token, account_id = _signup_and_login(client, "receptionistguardrail2@example.com")
+    number = PhoneNumber(
+        e164="+15550066666", country="US", status=PhoneNumberStatus.ACTIVE, account_id=account_id,
+        ai_receptionist_enabled=True,
+    )
+    db_session.add(number)
+    db_session.commit()
+
+    client.post(
+        "/compliance/consent", json={"consent_type": "ai_processing"}, headers={"Authorization": f"Bearer {token}"}
+    )
+    monkeypatch.setattr(
+        "app.media.service.qualify_caller",
+        lambda db, account_id, transcript, jurisdiction=None: (
+            {
+                "name": "Sam",
+                "company": None,
+                "reason": "asked for a repair quote",
+                "summary": "Sam called asking about repair pricing and would like a callback.",
+                "urgency": "low",
+                "callback_preference": None,
+            },
+            "groq/test",
+        ),
+    )
+
+    url = "http://testserver/media/receptionist/respond"
+    params = {
+        "CallSid": "CArecguard2", "To": "+15550066666", "From": "+15559996666",
+        "SpeechResult": "Hi, how much would a repair cost?",
+    }
+    signature = _twilio_signature(url, params)
+    client.post("/media/receptionist/respond", data=params, headers={"X-Twilio-Signature": signature})
+
+    calls = client.get(
+        "/media/receptionist/calls", headers={"Authorization": f"Bearer {token}"}
+    ).json()
+    assert len(calls) == 1
+    assert calls[0]["guardrail_flags"] == []
 
 
 def test_high_urgency_does_not_escalate_without_a_nominated_team_member(client, db_session):
@@ -162,3 +254,110 @@ def test_high_urgency_does_not_escalate_without_a_nominated_team_member(client, 
 
 def test_receptionist_calls_requires_auth(client):
     assert client.get("/media/receptionist/calls").status_code == 401
+
+
+def _capture_a_call(client, db_session, account_id: str, *, e164: str, call_sid: str) -> str:
+    number = PhoneNumber(
+        e164=e164, country="US", status=PhoneNumberStatus.ACTIVE, account_id=account_id,
+        ai_receptionist_enabled=True,
+    )
+    db_session.add(number)
+    db_session.commit()
+
+    url = "http://testserver/media/receptionist/respond"
+    params = {
+        "CallSid": call_sid, "To": e164, "From": "+15559990000",
+        "SpeechResult": "Hi, calling about a quote, please call back.",
+    }
+    signature = _twilio_signature(url, params)
+    client.post("/media/receptionist/respond", data=params, headers={"X-Twilio-Signature": signature})
+    return number.id
+
+
+def test_assign_receptionist_call_routes_it_to_a_team_member(client, db_session):
+    owner_token, account_id = _signup_and_login(client, "receptionistroute1@example.com")
+    owner_headers = {"Authorization": f"Bearer {owner_token}"}
+    _capture_a_call(client, db_session, account_id, e164="+15550055555", call_sid="CArecroute1")
+
+    client.post(
+        "/team/members",
+        json={"email": "receptionistrouteteammate1@example.com", "password": "supersecret123", "role": "member"},
+        headers=owner_headers,
+    )
+    members = client.get("/team/members", headers=owner_headers).json()
+    teammate_id = next(m["id"] for m in members if m["email"] == "receptionistrouteteammate1@example.com")
+
+    calls = client.get("/media/receptionist/calls", headers=owner_headers).json()
+    call_id = calls[0]["id"]
+    assert calls[0]["assigned_user_id"] is None
+
+    response = client.post(
+        f"/media/receptionist/calls/{call_id}/assign",
+        json={"assigned_user_id": teammate_id},
+        headers=owner_headers,
+    )
+    assert response.status_code == 200
+    assert response.json()["assigned_user_id"] == teammate_id
+
+    calls_after = client.get("/media/receptionist/calls", headers=owner_headers).json()
+    assert calls_after[0]["assigned_user_id"] == teammate_id
+    assert calls_after[0]["assigned_user_email"] == "receptionistrouteteammate1@example.com"
+
+
+def test_assign_receptionist_call_rejects_a_nominee_outside_the_account(client, db_session):
+    owner_token, account_id = _signup_and_login(client, "receptionistroute2@example.com")
+    owner_headers = {"Authorization": f"Bearer {owner_token}"}
+    _capture_a_call(client, db_session, account_id, e164="+15550066666", call_sid="CArecroute2")
+
+    other_token, _ = _signup_and_login(client, "receptionistroute2b@example.com")
+    other_user_id = client.get("/auth/me", headers={"Authorization": f"Bearer {other_token}"}).json()["id"]
+
+    calls = client.get("/media/receptionist/calls", headers=owner_headers).json()
+    call_id = calls[0]["id"]
+
+    response = client.post(
+        f"/media/receptionist/calls/{call_id}/assign",
+        json={"assigned_user_id": other_user_id},
+        headers=owner_headers,
+    )
+    assert response.status_code == 403
+    assert "no team member" in response.json()["detail"].lower()
+
+
+def test_assign_receptionist_call_rejects_other_accounts_call(client, db_session):
+    owner_token, account_id = _signup_and_login(client, "receptionistroute3@example.com")
+    owner_headers = {"Authorization": f"Bearer {owner_token}"}
+    _capture_a_call(client, db_session, account_id, e164="+15550077777", call_sid="CArecroute3")
+    calls = client.get("/media/receptionist/calls", headers=owner_headers).json()
+    call_id = calls[0]["id"]
+
+    intruder_token, _ = _signup_and_login(client, "receptionistroute3b@example.com")
+    response = client.post(
+        f"/media/receptionist/calls/{call_id}/assign",
+        json={"assigned_user_id": None},
+        headers={"Authorization": f"Bearer {intruder_token}"},
+    )
+    assert response.status_code == 403
+
+
+def test_assign_receptionist_call_can_unassign(client, db_session):
+    owner_token, account_id = _signup_and_login(client, "receptionistroute4@example.com")
+    owner_headers = {"Authorization": f"Bearer {owner_token}"}
+    _capture_a_call(client, db_session, account_id, e164="+15550088888", call_sid="CArecroute4")
+
+    owner_me = client.get("/auth/me", headers=owner_headers).json()
+    calls = client.get("/media/receptionist/calls", headers=owner_headers).json()
+    call_id = calls[0]["id"]
+
+    client.post(
+        f"/media/receptionist/calls/{call_id}/assign",
+        json={"assigned_user_id": owner_me["id"]},
+        headers=owner_headers,
+    )
+    response = client.post(
+        f"/media/receptionist/calls/{call_id}/assign",
+        json={"assigned_user_id": None},
+        headers=owner_headers,
+    )
+    assert response.status_code == 200
+    assert response.json()["assigned_user_id"] is None

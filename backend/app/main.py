@@ -5,7 +5,9 @@ from sqlalchemy import text
 from app.audit.routes import router as audit_router
 from app.compliance.routes import router as compliance_router
 from app.consent.routes import router as consent_router
+from app.core.config import settings
 from app.core.database import engine
+from app.core.startup_checks import assert_jwt_secret_is_configured, parse_allowed_origins
 from app.intelligence.routes import router as intelligence_router
 from app.media.receptionist import router as receptionist_router
 from app.media.video import router as video_router
@@ -15,6 +17,8 @@ from app.numbering.identity.routes import router as identity_router
 from app.numbering.identity.team_routes import router as team_router
 from app.numbering.numbers.routes import router as numbers_router
 from app.notifications.routes import router as notifications_router
+from app.ops.routes import router as ops_router
+from app.porting.routes import router as porting_router
 from app.retention.routes import router as retention_router
 from app.risk.routes import router as risk_router
 from app.staff.routes import router as staff_router
@@ -22,9 +26,12 @@ from app.usage.routes import router as usage_router
 
 app = FastAPI(title="Zoiko Local API")
 
+# Fail fast rather than boot insecurely - see app/core/startup_checks.py.
+assert_jwt_secret_is_configured(settings.environment, settings.jwt_secret_key)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=parse_allowed_origins(settings.allowed_origins),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -46,6 +53,8 @@ app.include_router(retention_router)
 app.include_router(notifications_router)
 app.include_router(risk_router)
 app.include_router(usage_router)
+app.include_router(ops_router)
+app.include_router(porting_router)
 
 
 @app.get("/health")

@@ -29,6 +29,31 @@ def _client() -> Client:
     return Client(settings.twilio_account_sid, settings.twilio_auth_token)
 
 
+def health_check() -> dict:
+    """Real reachability check, not just "is a key present" - fetches the
+    account resource, the cheapest authenticated call Twilio offers."""
+    if not (settings.twilio_account_sid and settings.twilio_auth_token):
+        return {"configured": False, "ok": False, "detail": None}
+    try:
+        _client().api.accounts(settings.twilio_account_sid).fetch()
+        return {"configured": True, "ok": True, "detail": None}
+    except TwilioException as e:
+        return {"configured": True, "ok": False, "detail": str(e)}
+
+
+def send_sms(to: str, body: str) -> dict:
+    """Sends a system SMS notification from Zoiko's own notification
+    number - NOT tied to any customer's purchased number. Distinct from
+    voice.py's customer-facing calling features."""
+    if not settings.twilio_trial_number:
+        raise TelecomError("No Twilio notification number configured (TWILIO_TRIAL_NUMBER)")
+    try:
+        message = _client().messages.create(to=to, from_=settings.twilio_trial_number, body=body)
+    except TwilioException as e:
+        raise TelecomError(str(e)) from e
+    return {"sid": message.sid, "status": message.status}
+
+
 def search_available_numbers(country: str, number_type: str = "local", area_code: str | None = None,
                               contains: str | None = None, limit: int = 10) -> list[dict]:
     """See docs/stage2-twilio-numbering-notes.md for the behavior this wraps:

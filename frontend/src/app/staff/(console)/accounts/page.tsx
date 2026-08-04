@@ -3,18 +3,18 @@
 import { useEffect, useState, useCallback } from "react";
 import { useRouter } from "next/navigation";
 import { listStaffAccounts, ApiError, type AccountOverview } from "@/lib/api";
-import { getStaffToken, clearStaffToken } from "@/lib/staffAuth";
+import { clearStaffToken, useStaffToken } from "@/lib/staffAuth";
 
 export default function StaffAccountsPage() {
   const router = useRouter();
-  const [token] = useState<string | null>(() => getStaffToken());
+  const { token, ready } = useStaffToken();
   const [accounts, setAccounts] = useState<AccountOverview[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    if (!token) router.replace("/staff/login");
-  }, [token, router]);
+    if (ready && !token) router.replace("/staff/login");
+  }, [ready, token, router]);
 
   const loadAccounts = useCallback(() => {
     if (!token) return;

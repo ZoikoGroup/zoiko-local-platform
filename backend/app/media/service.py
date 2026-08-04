@@ -12,6 +12,7 @@ from app.integrations.llm.groq import LLMError
 from app.integrations.storage.s3 import StorageError, generate_presigned_url
 from app.integrations.telecom import twilio as telecom
 from app.integrations.video import livekit as video
+from app.intelligence.guardrails import check_for_disallowed_commitments
 from app.intelligence.service import qualify_caller
 from app.media.models import (
     CallDirection,
@@ -37,6 +38,11 @@ class CallAuthorizationError(Exception):
 
 class VideoSessionAuthorizationError(Exception):
     """Raised when the caller's account doesn't own the given video session."""
+
+
+class ReceptionistCallAuthorizationError(Exception):
+    """Raised when routing a receptionist call the caller can't access, or
+    to a user who isn't a team member on the same account."""
 
 
 class RecordingConsentRequiredError(Exception):
@@ -512,6 +518,9 @@ def capture_receptionist_call(
     qualification = qualification or {}
     urgency_raw = qualification.get("urgency")
     urgency = ReceptionistUrgency(urgency_raw) if urgency_raw in ("low", "medium", "high") else None
+    # Guardrail check on the AI's OWN generated text, not the caller's raw
+    # transcript - see app/intelligence/guardrails.py.
+    guardrail_flags = check_for_disallowed_commitments(qualification.get("summary"), qualification.get("reason"))
 
     call = ReceptionistCall(
         account_id=owner.account_id,
@@ -524,6 +533,7 @@ def capture_receptionist_call(
         reason=qualification.get("reason"),
         summary=qualification.get("summary"),
         urgency=urgency,
+        guardrail_flags=guardrail_flags,
         model_version=model_version,
     )
     db.add(call)
@@ -532,7 +542,7 @@ def capture_receptionist_call(
     log_event(
         db, actor_id=owner.account_id, action="receptionist.call_captured",
         target_type="receptionist_call", target_id=call.id,
-        metadata={"urgency": urgency.value if urgency else None},
+        metadata={"urgency": urgency.value if urgency else None, "guardrail_flags": guardrail_flags},
     )
     return call
 
@@ -550,6 +560,42 @@ def mark_receptionist_call_escalated(db: Session, receptionist_call_id: str, esc
         target_type="receptionist_call", target_id=call.id,
         metadata={"escalated_to_user_id": escalated_to_user_id},
     )
+
+
+def route_receptionist_call(
+    db: Session, user: User, receptionist_call_id: str, assigned_user_id: str | None
+) -> ReceptionistCall:
+    """The human-decision counterpart to mark_receptionist_call_escalated -
+    routes an already-captured call's summary to a team member for
+    follow-up (Roadmap §7 / marketing site's "Approve & route" flow), not a
+    live-call action. Passing assigned_user_id=None un-assigns it."""
+    call = db.query(ReceptionistCall).filter(ReceptionistCall.id == receptionist_call_id).first()
+    if call is None or call.account_id != user.account_id:
+        raise ReceptionistCallAuthorizationError(
+            f"{receptionist_call_id} is not a receptionist call owned by your account"
+        )
+    if call.phone_number_id is not None:
+        number = db.query(PhoneNumber).filter(PhoneNumber.id == call.phone_number_id).first()
+        if number is not None:
+            try:
+                assert_number_access(number, user)
+            except NumberConflictError as e:
+                raise ReceptionistCallAuthorizationError(str(e)) from e
+
+    if assigned_user_id is not None:
+        nominee = db.query(User).filter(User.id == assigned_user_id, User.account_id == user.account_id).first()
+        if nominee is None:
+            raise ReceptionistCallAuthorizationError(f"No team member with id {assigned_user_id} on this account")
+
+    call.assigned_user_id = assigned_user_id
+    db.commit()
+    db.refresh(call)
+    log_event(
+        db, actor_id=user.id, action="receptionist.call_routed",
+        target_type="receptionist_call", target_id=call.id,
+        metadata={"assigned_user_id": assigned_user_id},
+    )
+    return call
 
 
 def list_account_receptionist_calls(db: Session, user: User) -> list[ReceptionistCall]:

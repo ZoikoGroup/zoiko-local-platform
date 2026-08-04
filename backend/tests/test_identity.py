@@ -67,3 +67,36 @@ def test_me_rejects_missing_token(client):
 def test_me_rejects_invalid_token(client):
     response = client.get("/auth/me", headers={"Authorization": "Bearer not-a-real-token"})
     assert response.status_code == 401
+
+
+def test_set_phone_number_requires_auth(client):
+    response = client.put("/auth/me/phone", json={"phone_number": "+15551234567"})
+    assert response.status_code == 401
+
+
+def test_set_phone_number_saves_and_is_reflected_in_me(client):
+    client.post("/auth/signup", json=_signup_payload("phoneuser@example.com"))
+    token = client.post(
+        "/auth/login", json={"email": "phoneuser@example.com", "password": "supersecret123"}
+    ).json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    response = client.put("/auth/me/phone", json={"phone_number": "+15551234567"}, headers=headers)
+    assert response.status_code == 200
+    assert response.json()["phone_number"] == "+15551234567"
+
+    me = client.get("/auth/me", headers=headers)
+    assert me.json()["phone_number"] == "+15551234567"
+
+
+def test_set_phone_number_can_clear_it(client):
+    client.post("/auth/signup", json=_signup_payload("phoneclear@example.com"))
+    token = client.post(
+        "/auth/login", json={"email": "phoneclear@example.com", "password": "supersecret123"}
+    ).json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    client.put("/auth/me/phone", json={"phone_number": "+15551234567"}, headers=headers)
+    response = client.put("/auth/me/phone", json={"phone_number": None}, headers=headers)
+    assert response.status_code == 200
+    assert response.json()["phone_number"] is None

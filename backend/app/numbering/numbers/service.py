@@ -6,6 +6,8 @@ from sqlalchemy.orm import Session
 
 from app.audit.service import log_event
 from app.compliance.service import has_approved_case, is_requirement_active
+from app.consent.models import ConsentType
+from app.consent.service import has_active_consent
 from app.core.config import settings
 from app.integrations.telecom import twilio as telecom
 from app.notifications.service import notify_number_activated, notify_number_suspended
@@ -25,6 +27,15 @@ class ComplianceRequiredError(Exception):
     """Raised when the number's country has an active KYC/KYB rule and the
     account has no approved compliance case covering it yet — the docs'
     "Compliance Pending" lifecycle state, enforced at the point of purchase."""
+
+
+class EmergencyDisclosureRequiredError(Exception):
+    """Raised when the account hasn't acknowledged the emergency-calling
+    limitation disclosure yet - required before ANY number purchase, every
+    country, no exceptions (unlike the KYC gate, which is country-specific).
+    Roadmap doctrine: "Zoiko Local is not... an emergency-service operator" -
+    this is the disclosure/acknowledgment Phase 1 actually calls for, not
+    real E911 routing."""
 
 
 def _kyc_requirement_type(db: Session, account_id: str) -> str:
@@ -108,6 +119,12 @@ def purchase_number(db: Session, account_id: str, e164: str) -> PhoneNumber:
         number.reserved_until is not None and number.reserved_until < now
     ):
         raise NumberConflictError(f"Reservation for {e164} expired — reserve it again before purchasing")
+
+    if not has_active_consent(db, account_id, ConsentType.EMERGENCY_CALLING_ACKNOWLEDGED):
+        raise EmergencyDisclosureRequiredError(
+            "You must acknowledge that emergency (911/999) calling may not work reliably through "
+            "this service before purchasing a number — grant it via POST /compliance/consent first"
+        )
 
     requirement_type = _kyc_requirement_type(db, account_id)
     if is_requirement_active(db, number.country, requirement_type) and not has_approved_case(
@@ -194,7 +211,10 @@ def suspend_number(db: Session, user: User, e164: str, reason: str | None = None
 
     owner = db.query(User).filter(User.account_id == user.account_id, User.role == UserRole.OWNER).first()
     if owner is not None:
-        notify_number_suspended(db, account_id=user.account_id, account_email=owner.email, e164=e164, reason=reason)
+        notify_number_suspended(
+            db, account_id=user.account_id, account_email=owner.email, e164=e164, reason=reason,
+            account_phone=owner.phone_number,
+        )
 
     return number
 

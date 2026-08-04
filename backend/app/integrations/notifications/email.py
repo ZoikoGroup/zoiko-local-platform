@@ -20,6 +20,19 @@ class EmailError(Exception):
     """Raised instead of letting an httpx/Resend-specific exception escape this module."""
 
 
+def health_check() -> dict:
+    """Confirmed live: a properly-scoped "sending access" API key (the
+    least-privilege, recommended kind) gets a 401 from /domains - Resend
+    has no lightweight endpoint that a sending-only key can call, and a
+    401 from that key is indistinguishable from an actually-invalid one.
+    Rather than report a false "broken" signal for the more secure key
+    type, this only checks presence - the send path itself is exercised
+    for real every time an email actually goes out."""
+    if not settings.resend_api_key:
+        return {"configured": False, "ok": False, "detail": None}
+    return {"configured": True, "ok": True, "detail": None}
+
+
 def send_email(to: str, subject: str, body: str) -> None:
     if not settings.resend_api_key:
         logger.info("EMAIL (no Resend API key configured) to=%s subject=%r body=%r", to, subject, body)

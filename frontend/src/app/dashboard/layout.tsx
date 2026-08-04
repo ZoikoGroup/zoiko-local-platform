@@ -4,7 +4,7 @@ import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import Sidebar from "@/components/Sidebar";
 import Topbar from "@/components/Topbar";
-import { getCurrentUser, type User } from "@/lib/api";
+import { ApiError, getCurrentUser, type User } from "@/lib/api";
 import { getToken, clearToken } from "@/lib/auth";
 
 export default function DashboardLayout({
@@ -25,9 +25,15 @@ export default function DashboardLayout({
 
     getCurrentUser(token)
       .then(setUser)
-      .catch(() => {
-        clearToken();
-        router.replace("/login");
+      .catch((err) => {
+        // Only a real 401 means the token is actually invalid. Anything
+        // else (a network hiccup, or React Strict Mode's dev-only double
+        // effect invocation racing/aborting the first call) must not log
+        // out someone who is genuinely still authenticated.
+        if (err instanceof ApiError && err.status === 401) {
+          clearToken();
+          router.replace("/login");
+        }
       })
       .finally(() => setChecking(false));
   }, [router]);

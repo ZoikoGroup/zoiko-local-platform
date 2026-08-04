@@ -6,14 +6,16 @@ from app.consent.models import GLOBAL_JURISDICTION, ConsentType
 from app.consent.service import has_active_consent
 from app.integrations.llm.groq import MODEL_VERSION as LLM_MODEL_VERSION
 from app.integrations.llm.groq import extract_conversation_summary, extract_receptionist_qualification
+from app.integrations.storage.s3 import download_object
 from app.integrations.telecom.twilio import download_recording
 from app.integrations.transcription.groq import MODEL_VERSION as TRANSCRIPTION_MODEL_VERSION
 from app.integrations.transcription.groq import transcribe_audio
 from app.intelligence.models import ConversationSummary, SummarySourceType
-from app.media.models import CallRecord, ReceptionistUrgency, Voicemail
-from app.numbering.identity.models import User
+from app.media.models import CallRecord, ReceptionistUrgency, Voicemail, VideoSession
+from app.numbering.identity.models import User, UserRole
 from app.numbering.numbers.service import NumberConflictError, assert_number_access, assigned_number_ids
 from app.numbering.numbers.models import PhoneNumber
+from app.retention.service import PURGED_MARKER
 
 AI_DISCLAIMER = "AI-generated summary — may be inaccurate; not an authoritative record."
 
@@ -50,11 +52,24 @@ def _phone_number_country(db: Session, phone_number_id: str | None) -> str:
     return number.country if number else GLOBAL_JURISDICTION
 
 
-def _transcribe_and_store(
-    db: Session, *, account_id: str, source_type: SummarySourceType, source_id: str, recording_url: str
-) -> ConversationSummary:
+def _download_and_transcribe(recording_url: str) -> str:
     audio_bytes = download_recording(recording_url)
-    transcript = transcribe_audio(audio_bytes)
+    return transcribe_audio(audio_bytes)
+
+
+def _download_and_transcribe_video(room_name: str) -> str:
+    """Video recordings live in object storage as the room's egress output,
+    not behind a Twilio-authenticated URL like calls/voicemail - fetched by
+    bucket key instead, and handed to Whisper with a video content-type
+    (Groq's transcription endpoint accepts mp4 directly, no audio
+    extraction step needed)."""
+    audio_bytes = download_object(f"recordings/{room_name}.mp4")
+    return transcribe_audio(audio_bytes, filename=f"{room_name}.mp4", content_type="video/mp4")
+
+
+def _analyze_and_store(
+    db: Session, *, account_id: str, source_type: SummarySourceType, source_id: str, transcript: str
+) -> ConversationSummary:
     analysis = extract_conversation_summary(transcript)
 
     urgency_raw = analysis.get("urgency")
@@ -113,12 +128,12 @@ def summarize_voicemail(db: Session, user: User, voicemail_id: str) -> Conversat
     jurisdiction = _phone_number_country(db, voicemail.phone_number_id)
     _require_consent(db, user.account_id, "voicemails", jurisdiction)
 
-    return _transcribe_and_store(
+    return _analyze_and_store(
         db,
         account_id=user.account_id,
         source_type=SummarySourceType.VOICEMAIL,
         source_id=voicemail.id,
-        recording_url=voicemail.recording_url,
+        transcript=_download_and_transcribe(voicemail.recording_url),
     )
 
 
@@ -133,12 +148,35 @@ def summarize_call(db: Session, user: User, call_id: str) -> ConversationSummary
     jurisdiction = _phone_number_country(db, call.phone_number_id)
     _require_consent(db, user.account_id, "calls", jurisdiction)
 
-    return _transcribe_and_store(
+    return _analyze_and_store(
         db,
         account_id=user.account_id,
         source_type=SummarySourceType.CALL,
         source_id=call.id,
-        recording_url=call.recording_url,
+        transcript=_download_and_transcribe(call.recording_url),
+    )
+
+
+def summarize_video_session(db: Session, user: User, room_name: str) -> ConversationSummary:
+    """Keyed by room_name, not id - matches every other video action
+    (join/end/recording), which are all addressed by room_name in the API,
+    so the frontend never needs to know a session's internal id."""
+    session = db.query(VideoSession).filter(VideoSession.room_name == room_name).first()
+    if session is None or session.account_id != user.account_id:
+        raise SummaryAuthorizationError(f"{room_name} is not a video session owned by your account")
+    if user.role == UserRole.MEMBER and session.host_user_id != user.id:
+        raise SummaryAuthorizationError(f"{room_name} was not hosted by you")
+    if not session.recording_url or session.recording_url == PURGED_MARKER:
+        raise NotRecordedError(f"{room_name} has no finished recording yet — it may still be in progress")
+
+    _require_consent(db, user.account_id, "video calls", GLOBAL_JURISDICTION)
+
+    return _analyze_and_store(
+        db,
+        account_id=user.account_id,
+        source_type=SummarySourceType.VIDEO,
+        source_id=session.id,
+        transcript=_download_and_transcribe_video(session.room_name),
     )
 
 
@@ -155,10 +193,12 @@ def qualify_caller(
     return extract_receptionist_qualification(transcript), LLM_MODEL_VERSION
 
 
-def list_account_summaries(db: Session, user: User) -> list[ConversationSummary]:
+def _account_summaries_query(db: Session, user: User):
     """Owner/Admin see every summary on the account. A plain Member only
     sees summaries whose underlying call/voicemail is on a number assigned
-    to them."""
+    to them, or - for video - whose session they personally hosted (video
+    sessions aren't tied to a number). Shared base query for both listing
+    and search."""
     query = db.query(ConversationSummary).filter(ConversationSummary.account_id == user.account_id)
 
     ids = assigned_number_ids(db, user)
@@ -169,8 +209,18 @@ def list_account_summaries(db: Session, user: User) -> list[ConversationSummary]
         allowed_voicemail_ids = {
             row[0] for row in db.query(Voicemail.id).filter(Voicemail.phone_number_id.in_(ids)).all()
         }
+        allowed_video_ids = {
+            row[0]
+            for row in db.query(VideoSession.id)
+            .filter(VideoSession.account_id == user.account_id, VideoSession.host_user_id == user.id)
+            .all()
+        }
         query = query.filter(
             sa.or_(
+                sa.and_(
+                    ConversationSummary.source_type == SummarySourceType.VIDEO,
+                    ConversationSummary.source_id.in_(allowed_video_ids),
+                ),
                 sa.and_(
                     ConversationSummary.source_type == SummarySourceType.CALL,
                     ConversationSummary.source_id.in_(allowed_call_ids),
@@ -181,4 +231,33 @@ def list_account_summaries(db: Session, user: User) -> list[ConversationSummary]
                 ),
             )
         )
-    return query.order_by(ConversationSummary.created_at.desc()).all()
+    return query
+
+
+def list_account_summaries(db: Session, user: User) -> list[ConversationSummary]:
+    return _account_summaries_query(db, user).order_by(ConversationSummary.created_at.desc()).all()
+
+
+def search_account_summaries(db: Session, user: User, search_query: str) -> list[ConversationSummary]:
+    """Real Postgres full-text search over each summary's transcript +
+    summary + suggested follow-up, ranked by relevance - not true
+    meaning-based (ML embedding) search, but genuinely searches by content
+    rather than just scrolling a chronological list. websearch_to_tsquery
+    parses natural free-text input (quotes, "or", "-exclude") the way a
+    search engine would, rather than requiring tsquery's own operator syntax.
+    """
+    document = sa.func.to_tsvector(
+        "english",
+        sa.func.concat(
+            ConversationSummary.summary, " ", ConversationSummary.transcript, " ",
+            sa.func.coalesce(ConversationSummary.suggested_follow_up, ""),
+        ),
+    )
+    tsquery = sa.func.websearch_to_tsquery("english", search_query)
+
+    return (
+        _account_summaries_query(db, user)
+        .filter(document.op("@@")(tsquery))
+        .order_by(sa.func.ts_rank(document, tsquery).desc())
+        .all()
+    )
