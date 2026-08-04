@@ -4,6 +4,7 @@ generates a short summary (Groq LLM). Every state change is audited.
 """
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
@@ -16,6 +17,10 @@ from app.intelligence import service
 from app.numbering.identity.models import User
 
 router = APIRouter(prefix="/intelligence", tags=["intelligence"])
+
+
+class EditSummaryRequest(BaseModel):
+    summary: str
 
 
 def _summary_response(record) -> dict:
@@ -32,6 +37,9 @@ def _summary_response(record) -> dict:
         "model_version": record.model_version,
         "created_at": record.created_at,
         "disclaimer": service.AI_DISCLAIMER,
+        "original_summary": record.original_summary,
+        "edited_at": record.edited_at,
+        "edited_by_user_id": record.edited_by_user_id,
     }
 
 
@@ -87,6 +95,20 @@ def summarize_video_session(
         raise HTTPException(status_code=409, detail=str(e)) from e
     except (StorageError, TranscriptionError, LLMError) as e:
         raise HTTPException(status_code=502, detail=str(e)) from e
+    return _summary_response(record)
+
+
+@router.patch("/summaries/{summary_id}")
+def edit_summary(
+    summary_id: str,
+    payload: EditSummaryRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    try:
+        record = service.edit_summary(db, current_user, summary_id, payload.summary)
+    except service.SummaryAuthorizationError as e:
+        raise HTTPException(status_code=403, detail=str(e)) from e
     return _summary_response(record)
 
 

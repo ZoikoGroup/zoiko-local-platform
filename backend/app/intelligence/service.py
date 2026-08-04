@@ -1,3 +1,5 @@
+from datetime import datetime, timezone
+
 import sqlalchemy as sa
 from sqlalchemy.orm import Session
 
@@ -178,6 +180,44 @@ def summarize_video_session(db: Session, user: User, room_name: str) -> Conversa
         source_id=session.id,
         transcript=_download_and_transcribe_video(session.room_name),
     )
+
+
+def edit_summary(db: Session, user: User, summary_id: str, new_summary: str) -> ConversationSummary:
+    """AI governance requires "human-editable outputs," not just a
+    disclaimer - this is that edit path. Access boundary mirrors whatever
+    boundary applied when the summary was first created: a Member can only
+    edit a summary whose underlying call/voicemail is on a number assigned
+    to them, or a video session they hosted."""
+    summary = db.query(ConversationSummary).filter(ConversationSummary.id == summary_id).first()
+    if summary is None or summary.account_id != user.account_id:
+        raise SummaryAuthorizationError(f"{summary_id} is not a summary owned by your account")
+
+    if summary.source_type == SummarySourceType.CALL:
+        call = db.query(CallRecord).filter(CallRecord.id == summary.source_id).first()
+        if call is not None:
+            _assert_can_access_number(db, user, call.phone_number_id)
+    elif summary.source_type == SummarySourceType.VOICEMAIL:
+        voicemail = db.query(Voicemail).filter(Voicemail.id == summary.source_id).first()
+        if voicemail is not None:
+            _assert_can_access_number(db, user, voicemail.phone_number_id)
+    elif summary.source_type == SummarySourceType.VIDEO:
+        session = db.query(VideoSession).filter(VideoSession.id == summary.source_id).first()
+        if session is not None and user.role == UserRole.MEMBER and session.host_user_id != user.id:
+            raise SummaryAuthorizationError(f"{summary_id} was not hosted by you")
+
+    if summary.original_summary is None:
+        summary.original_summary = summary.summary
+    summary.summary = new_summary
+    summary.edited_at = datetime.now(timezone.utc)
+    summary.edited_by_user_id = user.id
+    db.commit()
+    db.refresh(summary)
+
+    log_event(
+        db, actor=user.id, action="intelligence.summary_edited",
+        target=f"conversation_summary:{summary.id}", after={"edited": True},
+    )
+    return summary
 
 
 def qualify_caller(

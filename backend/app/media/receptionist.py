@@ -27,6 +27,10 @@ class RouteReceptionistCallRequest(BaseModel):
     assigned_user_id: str | None = None
 
 
+class EditReceptionistCallSummaryRequest(BaseModel):
+    summary: str
+
+
 @router.post("/respond")
 async def respond(request: Request, db: Session = Depends(get_db)):
     params = await media_service.verify_twilio_webhook(request)
@@ -91,6 +95,8 @@ async def list_receptionist_calls(
             "guardrail_flags": c.guardrail_flags,
             "assigned_user_id": c.assigned_user_id,
             "assigned_user_email": user_emails.get(c.assigned_user_id) if c.assigned_user_id else None,
+            "original_summary": c.original_summary,
+            "edited_at": c.edited_at,
             "model_version": c.model_version,
             "created_at": c.created_at,
         }
@@ -110,3 +116,17 @@ async def assign_receptionist_call(
     except media_service.ReceptionistCallAuthorizationError as e:
         raise HTTPException(status_code=403, detail=str(e)) from e
     return {"id": call.id, "assigned_user_id": call.assigned_user_id}
+
+
+@router.patch("/calls/{call_id}")
+async def edit_receptionist_call(
+    call_id: str,
+    payload: EditReceptionistCallSummaryRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    try:
+        call = media_service.edit_receptionist_call_summary(db, current_user, call_id, payload.summary)
+    except media_service.ReceptionistCallAuthorizationError as e:
+        raise HTTPException(status_code=403, detail=str(e)) from e
+    return {"id": call.id, "summary": call.summary, "original_summary": call.original_summary, "edited_at": call.edited_at}

@@ -50,3 +50,15 @@ class ConversationSummary(Base):
     # must be explainable/traceable to the exact model version that produced them
     model_version: Mapped[str] = mapped_column(String(100), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    # AI governance: outputs must be "human-editable" (Architecture doc
+    # §2.3), not just labelled non-authoritative. original_summary is only
+    # ever populated on the FIRST edit (preserves what the model actually
+    # said, for evidence/traceability), never touched again on subsequent
+    # edits - `summary` above always holds the current, possibly
+    # human-corrected text that's actually shown.
+    original_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    edited_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    edited_by_user_id: Mapped[str | None] = mapped_column(
+        UUID(as_uuid=False), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )

@@ -4,8 +4,10 @@ import { useEffect, useState, useCallback } from "react";
 import {
   listSummaries,
   searchSummaries,
+  editSummary,
   listReceptionistCalls,
   assignReceptionistCall,
+  editReceptionistCallSummary,
   listTeamMembers,
   ApiError,
   type SummaryListEntry,
@@ -117,6 +119,16 @@ export default function AIInsightsPage() {
   const [routingError, setRoutingError] = useState<Record<string, string>>({});
   const [routedNotice, setRoutedNotice] = useState<string | null>(null);
 
+  const [editingSummaryId, setEditingSummaryId] = useState<string | null>(null);
+  const [editText, setEditText] = useState("");
+  const [editBusy, setEditBusy] = useState(false);
+  const [editError, setEditError] = useState<string | null>(null);
+
+  const [editingCallId, setEditingCallId] = useState<string | null>(null);
+  const [editCallText, setEditCallText] = useState("");
+  const [editCallBusy, setEditCallBusy] = useState(false);
+  const [editCallError, setEditCallError] = useState<string | null>(null);
+
   const load = useCallback(() => {
     if (!token) return;
     listSummaries(token)
@@ -202,6 +214,54 @@ export default function AIInsightsPage() {
     setSearchActive(false);
     setSummariesLoading(true);
     load();
+  }
+
+  function startEditingSummary(entry: SummaryListEntry) {
+    setEditingSummaryId(entry.id);
+    setEditText(entry.summary);
+    setEditError(null);
+  }
+
+  async function handleSaveSummaryEdit(summaryId: string) {
+    if (!token || !editText.trim()) return;
+    setEditBusy(true);
+    setEditError(null);
+    try {
+      const updated = await editSummary(token, summaryId, editText.trim());
+      setSummaries((prev) => prev.map((s) => (s.id === summaryId ? updated : s)));
+      setEditingSummaryId(null);
+    } catch (err) {
+      setEditError(err instanceof ApiError ? err.message : "Couldn't save this edit.");
+    } finally {
+      setEditBusy(false);
+    }
+  }
+
+  function startEditingCall(call: ReceptionistCallEntry) {
+    setEditingCallId(call.id);
+    setEditCallText(call.summary ?? "");
+    setEditCallError(null);
+  }
+
+  async function handleSaveCallEdit(callId: string) {
+    if (!token || !editCallText.trim()) return;
+    setEditCallBusy(true);
+    setEditCallError(null);
+    try {
+      const updated = await editReceptionistCallSummary(token, callId, editCallText.trim());
+      setReceptionistCalls((prev) =>
+        prev.map((c) =>
+          c.id === callId
+            ? { ...c, summary: updated.summary, original_summary: updated.original_summary, edited_at: updated.edited_at }
+            : c
+        )
+      );
+      setEditingCallId(null);
+    } catch (err) {
+      setEditCallError(err instanceof ApiError ? err.message : "Couldn't save this edit.");
+    } finally {
+      setEditCallBusy(false);
+    }
   }
 
   return (
@@ -305,7 +365,49 @@ export default function AIInsightsPage() {
                     </span>
                   </div>
                 </div>
-                <p className="text-sm text-slate-800 leading-relaxed">{s.summary}</p>
+                {editingSummaryId === s.id ? (
+                  <div className="space-y-1.5">
+                    <textarea
+                      value={editText}
+                      onChange={(e) => setEditText(e.target.value)}
+                      rows={3}
+                      className="w-full text-sm rounded-lg border border-indigo-300 px-2.5 py-1.5 focus:outline-none focus:ring-2 focus:ring-indigo-500/40"
+                    />
+                    {editError && <p className="text-xs text-red-600">{editError}</p>}
+                    <div className="flex gap-2">
+                      <button
+                        onClick={() => handleSaveSummaryEdit(s.id)}
+                        disabled={editBusy || !editText.trim()}
+                        className="text-xs font-medium text-white bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 rounded-lg px-3 py-1"
+                      >
+                        {editBusy ? "Saving…" : "Save correction"}
+                      </button>
+                      <button
+                        onClick={() => setEditingSummaryId(null)}
+                        className="text-xs text-slate-400 hover:text-slate-600"
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                  </div>
+                ) : (
+                  <>
+                    <p className="text-sm text-slate-800 leading-relaxed">{s.summary}</p>
+                    <div className="flex items-center gap-2">
+                      <button
+                        onClick={() => startEditingSummary(s)}
+                        className="text-xs font-medium text-indigo-600 hover:text-indigo-800"
+                      >
+                        Correct this
+                      </button>
+                      {s.edited_at && (
+                        <span className="text-[10px] text-slate-400">
+                          Edited {new Date(s.edited_at).toLocaleString()}
+                        </span>
+                      )}
+                    </div>
+                  </>
+                )}
                 {s.suggested_follow_up && (
                   <p className="text-xs text-indigo-700 bg-indigo-50 rounded-lg px-2.5 py-1.5">
                     Suggested: {s.suggested_follow_up}
@@ -382,9 +484,51 @@ export default function AIInsightsPage() {
                       </div>
                     </div>
 
-                    <p className="text-sm text-slate-700 leading-relaxed">
-                      {c.summary ?? c.reason ?? "No summary available for this call."}
-                    </p>
+                    {editingCallId === c.id ? (
+                      <div className="space-y-1.5">
+                        <textarea
+                          value={editCallText}
+                          onChange={(e) => setEditCallText(e.target.value)}
+                          rows={3}
+                          className="w-full text-sm rounded-lg border border-indigo-300 px-2.5 py-1.5 focus:outline-none focus:ring-2 focus:ring-indigo-500/40"
+                        />
+                        {editCallError && <p className="text-xs text-red-600">{editCallError}</p>}
+                        <div className="flex gap-2">
+                          <button
+                            onClick={() => handleSaveCallEdit(c.id)}
+                            disabled={editCallBusy || !editCallText.trim()}
+                            className="text-xs font-medium text-white bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 rounded-lg px-3 py-1"
+                          >
+                            {editCallBusy ? "Saving…" : "Save correction"}
+                          </button>
+                          <button
+                            onClick={() => setEditingCallId(null)}
+                            className="text-xs text-slate-400 hover:text-slate-600"
+                          >
+                            Cancel
+                          </button>
+                        </div>
+                      </div>
+                    ) : (
+                      <>
+                        <p className="text-sm text-slate-700 leading-relaxed">
+                          {c.summary ?? c.reason ?? "No summary available for this call."}
+                        </p>
+                        <div className="flex items-center gap-2">
+                          <button
+                            onClick={() => startEditingCall(c)}
+                            className="text-xs font-medium text-indigo-600 hover:text-indigo-800"
+                          >
+                            Correct this
+                          </button>
+                          {c.edited_at && (
+                            <span className="text-[10px] text-slate-400">
+                              Edited {new Date(c.edited_at).toLocaleString()}
+                            </span>
+                          )}
+                        </div>
+                      </>
+                    )}
 
                     {c.guardrail_flags.length > 0 && (
                       <p className="text-xs font-medium text-red-700 bg-red-50 rounded-lg px-2.5 py-1.5">

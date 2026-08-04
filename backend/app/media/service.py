@@ -598,6 +598,41 @@ def route_receptionist_call(
     return call
 
 
+def edit_receptionist_call_summary(
+    db: Session, user: User, receptionist_call_id: str, new_summary: str
+) -> ReceptionistCall:
+    """AI governance's "human-editable outputs" requirement, applied to the
+    receptionist's narrated summary - same access boundary as routing it
+    (assert_number_access), and never re-runs the guardrail check: a human
+    correcting the wording is a deliberate decision, not unvetted model
+    output."""
+    call = db.query(ReceptionistCall).filter(ReceptionistCall.id == receptionist_call_id).first()
+    if call is None or call.account_id != user.account_id:
+        raise ReceptionistCallAuthorizationError(
+            f"{receptionist_call_id} is not a receptionist call owned by your account"
+        )
+    if call.phone_number_id is not None:
+        number = db.query(PhoneNumber).filter(PhoneNumber.id == call.phone_number_id).first()
+        if number is not None:
+            try:
+                assert_number_access(number, user)
+            except NumberConflictError as e:
+                raise ReceptionistCallAuthorizationError(str(e)) from e
+
+    if call.original_summary is None:
+        call.original_summary = call.summary
+    call.summary = new_summary
+    call.edited_at = datetime.now(timezone.utc)
+    call.edited_by_user_id = user.id
+    db.commit()
+    db.refresh(call)
+    log_event(
+        db, actor_id=user.id, action="receptionist.call_summary_edited",
+        target_type="receptionist_call", target_id=call.id, metadata={"edited": True},
+    )
+    return call
+
+
 def list_account_receptionist_calls(db: Session, user: User) -> list[ReceptionistCall]:
     """Owner/Admin see every receptionist call on the account. A plain Member
     only sees calls on numbers assigned to them."""

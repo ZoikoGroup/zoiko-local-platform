@@ -1,0 +1,43 @@
+# Fly.io deploy config for the backend. Uses backend/Dockerfile as-is.
+#
+# Setup (one-time, on your machine, after installing flyctl from fly.io/docs/flyctl):
+#   fly auth login
+#   cd backend
+#   fly launch --no-deploy   # detects this file, asks to confirm/rename the app
+#   fly secrets set DATABASE_URL=... JWT_SECRET_KEY=... ALLOWED_ORIGINS=... \
+#       TWILIO_ACCOUNT_SID=... TWILIO_AUTH_TOKEN=... GROQ_API_KEY=... \
+#       STRIPE_SECRET_KEY=... STRIPE_IDENTITY_WEBHOOK_SECRET=... \
+#       RESEND_API_KEY=... LIVEKIT_URL=... LIVEKIT_API_KEY=... LIVEKIT_API_SECRET=... \
+#       S3_ACCESS_KEY_ID=... S3_SECRET_ACCESS_KEY=... S3_BUCKET=... S3_REGION=... \
+#       PUBLIC_BASE_URL=https://<this-app-name>.fly.dev
+#   fly deploy
+#
+# app name below is a placeholder - `fly launch` will prompt you to pick a
+# real, globally-unique one; update it here to match once chosen.
+app = "zoiko-local-api"
+primary_region = "iad"
+
+[build]
+
+[env]
+  ENVIRONMENT = "production"
+
+[http_service]
+  internal_port = 8000
+  force_https = true
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  min_machines_running = 1
+
+[[http_service.checks]]
+  interval = "30s"
+  timeout = "5s"
+  grace_period = "10s"
+  method = "GET"
+  path = "/health"
+  protocol = "http"
+
+[[vm]]
+  memory = "512mb"
+  cpu_kind = "shared"
+  cpus = 1

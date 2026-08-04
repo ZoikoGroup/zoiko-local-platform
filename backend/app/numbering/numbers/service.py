@@ -147,6 +147,7 @@ def purchase_number(db: Session, account_id: str, e164: str) -> PhoneNumber:
         )
 
     number.status = PhoneNumberStatus.PURCHASE_PENDING
+    number.provisioning_started_at = now
     db.commit()
     log_event(
         db, actor_id=account_id, action="number.purchase_pending",
@@ -171,6 +172,7 @@ def purchase_number(db: Session, account_id: str, e164: str) -> PhoneNumber:
         # payment/provisioning failure must not strand the number silently —
         # release it back to Reserved so the customer can retry or it can expire
         number.status = PhoneNumberStatus.RESERVED
+        number.provisioning_started_at = None
         db.commit()
         log_event(
             db, actor_id=account_id, action="number.purchase_failed",
@@ -181,6 +183,7 @@ def purchase_number(db: Session, account_id: str, e164: str) -> PhoneNumber:
     number.status = PhoneNumberStatus.ACTIVE
     number.provider_sid = bought["sid"]
     number.reserved_until = None
+    number.provisioning_started_at = None
     db.commit()
     db.refresh(number)
     log_event(
@@ -192,6 +195,111 @@ def purchase_number(db: Session, account_id: str, e164: str) -> PhoneNumber:
     if owner is not None:
         notify_number_activated(db, account_id=account_id, account_email=owner.email, e164=e164)
 
+    return number
+
+
+# purchase_number is entirely synchronous - it never returns to the caller
+# with a number still sitting in PURCHASE_PENDING/PROVISIONING. A row
+# observed in either state some time later means the process died mid-flight
+# (crash, restart, OOM-kill) - a real, if rare, operational scenario the
+# Architecture doc's "Provisioning Job... retry_count, error_code" concept is
+# for. Threshold avoids a staff member racing a request that's still
+# genuinely, legitimately in-flight this very second.
+STUCK_PROVISIONING_THRESHOLD_MINUTES = 2
+
+
+class NoStuckProvisioningError(Exception):
+    """Raised when trying to recover a number that isn't actually stuck -
+    either it's not in PURCHASE_PENDING/PROVISIONING at all, or it entered
+    that state too recently to safely assume the original request died."""
+
+
+def list_stuck_provisioning(db: Session) -> list[PhoneNumber]:
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=STUCK_PROVISIONING_THRESHOLD_MINUTES)
+    return (
+        db.query(PhoneNumber)
+        .filter(
+            PhoneNumber.status.in_([PhoneNumberStatus.PURCHASE_PENDING, PhoneNumberStatus.PROVISIONING]),
+            (PhoneNumber.provisioning_started_at.is_(None)) | (PhoneNumber.provisioning_started_at < cutoff),
+        )
+        .order_by(PhoneNumber.provisioning_started_at.asc().nulls_first())
+        .all()
+    )
+
+
+def _assert_is_stuck(number: PhoneNumber | None, number_id: str) -> PhoneNumber:
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=STUCK_PROVISIONING_THRESHOLD_MINUTES)
+    if (
+        number is None
+        or number.status not in (PhoneNumberStatus.PURCHASE_PENDING, PhoneNumberStatus.PROVISIONING)
+        or (number.provisioning_started_at is not None and number.provisioning_started_at >= cutoff)
+    ):
+        raise NoStuckProvisioningError(f"{number_id} is not a stuck provisioning attempt")
+    return number
+
+
+def retry_provisioning(db: Session, staff_id: str, number_id: str) -> PhoneNumber:
+    """Staff recovery action - re-attempts the provider purchase for a
+    number stranded mid-flight. Reuses the exact same success/failure
+    transitions as purchase_number's tail, just actor-attributed to staff."""
+    number = db.query(PhoneNumber).filter(PhoneNumber.id == number_id).with_for_update().first()
+    number = _assert_is_stuck(number, number_id)
+
+    number.status = PhoneNumberStatus.PROVISIONING
+    db.commit()
+    log_event(
+        db, actor_id=staff_id, action="number.provisioning_retried",
+        target_type="phone_number", target_id=number.id, metadata={"e164": number.e164},
+    )
+
+    try:
+        bought = telecom.buy_number(number.e164)
+    except telecom.TelecomError:
+        number.status = PhoneNumberStatus.RESERVED
+        number.provisioning_started_at = None
+        db.commit()
+        log_event(
+            db, actor_id=staff_id, action="number.purchase_failed",
+            target_type="phone_number", target_id=number.id, metadata={"e164": number.e164, "retried_by_staff": True},
+        )
+        raise
+
+    number.status = PhoneNumberStatus.ACTIVE
+    number.provider_sid = bought["sid"]
+    number.reserved_until = None
+    number.provisioning_started_at = None
+    db.commit()
+    db.refresh(number)
+    log_event(
+        db, actor_id=staff_id, action="number.activated",
+        target_type="phone_number", target_id=number.id,
+        metadata={"e164": number.e164, "provider_sid": bought["sid"], "retried_by_staff": True},
+    )
+
+    owner = db.query(User).filter(User.account_id == number.account_id, User.role == UserRole.OWNER).first()
+    if owner is not None:
+        notify_number_activated(db, account_id=number.account_id, account_email=owner.email, e164=number.e164)
+
+    return number
+
+
+def release_stuck_provisioning(db: Session, staff_id: str, number_id: str) -> PhoneNumber:
+    """Unsticks a number without immediately retrying the provider purchase
+    - e.g. staff suspects a provider-side outage and wants to investigate
+    before hitting it again. Reverts to Reserved with a fresh TTL, same as a
+    natural purchase failure, so the customer can retry themselves too."""
+    number = db.query(PhoneNumber).filter(PhoneNumber.id == number_id).with_for_update().first()
+    number = _assert_is_stuck(number, number_id)
+
+    number.status = PhoneNumberStatus.RESERVED
+    number.reserved_until = datetime.now(timezone.utc) + timedelta(minutes=RESERVATION_TTL_MINUTES)
+    number.provisioning_started_at = None
+    db.commit()
+    db.refresh(number)
+    log_event(
+        db, actor_id=staff_id, action="number.provisioning_released",
+        target_type="phone_number", target_id=number.id, metadata={"e164": number.e164},
+    )
     return number
 
 

@@ -421,3 +421,78 @@ def test_search_summaries_with_blank_query_returns_empty(client, db_session):
     )
     assert response.status_code == 200
     assert response.json() == []
+
+
+def _seed_call_summary(db_session, account_id: str, *, summary: str = "Original AI summary."):
+    from app.intelligence.models import ConversationSummary, SummarySourceType
+
+    call = CallRecord(
+        account_id=account_id, phone_number_id=None, direction=CallDirection.INBOUND,
+        from_number="+15559990000", to_number="+15550001111", provider_call_sid="CAeditsum1",
+        status="completed", duration=60, recording_url="https://example.com/call.wav",
+    )
+    db_session.add(call)
+    db_session.commit()
+
+    record = ConversationSummary(
+        account_id=account_id, source_type=SummarySourceType.CALL, source_id=call.id,
+        transcript="Hi, calling about my order.", summary=summary, model_version="groq/test",
+    )
+    db_session.add(record)
+    db_session.commit()
+    return record
+
+
+def test_edit_summary_updates_text_and_preserves_the_original(client, db_session):
+    token, account_id = _signup_and_login(client, "editsum1@example.com", "Edit Summary Co 1")
+    record = _seed_call_summary(db_session, account_id, summary="Original AI summary.")
+
+    response = client.patch(
+        f"/intelligence/summaries/{record.id}", json={"summary": "Corrected: caller wants a refund, not a repair."},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["summary"] == "Corrected: caller wants a refund, not a repair."
+    assert body["original_summary"] == "Original AI summary."
+    assert body["edited_at"] is not None
+
+
+def test_edit_summary_twice_keeps_the_first_original(client, db_session):
+    token, account_id = _signup_and_login(client, "editsum2@example.com", "Edit Summary Co 2")
+    record = _seed_call_summary(db_session, account_id, summary="First AI summary.")
+
+    client.patch(
+        f"/intelligence/summaries/{record.id}", json={"summary": "First correction."},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    response = client.patch(
+        f"/intelligence/summaries/{record.id}", json={"summary": "Second correction."},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["summary"] == "Second correction."
+    # original_summary must still be the very first AI output, not the
+    # first edit - it's only ever set once.
+    assert body["original_summary"] == "First AI summary."
+
+
+def test_edit_summary_rejects_other_account(client, db_session):
+    _, owner_account_id = _signup_and_login(client, "editsum3owner@example.com", "Edit Summary Co 3")
+    record = _seed_call_summary(db_session, owner_account_id)
+
+    intruder_token, _ = _signup_and_login(client, "editsum3intruder@example.com", "Edit Summary Co 3 Intruder")
+    response = client.patch(
+        f"/intelligence/summaries/{record.id}", json={"summary": "Hijacked."},
+        headers={"Authorization": f"Bearer {intruder_token}"},
+    )
+    assert response.status_code == 403
+
+
+def test_edit_summary_requires_auth(client, db_session):
+    _, account_id = _signup_and_login(client, "editsum4@example.com", "Edit Summary Co 4")
+    record = _seed_call_summary(db_session, account_id)
+
+    response = client.patch(f"/intelligence/summaries/{record.id}", json={"summary": "x"})
+    assert response.status_code == 401
