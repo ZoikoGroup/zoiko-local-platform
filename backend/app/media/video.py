@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.core.database import get_db
-from app.core.deps import get_current_user
+from app.core.deps import get_current_user, require_writer
 from app.integrations.video.livekit import VideoError, verify_webhook_event
 from app.media import service as media_service
 from app.numbering.identity.models import User
@@ -25,7 +25,7 @@ class JoinTokenRequest(BaseModel):
 @router.post("/rooms", status_code=status.HTTP_201_CREATED)
 async def create_room(
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_writer),
 ):
     try:
         session = await media_service.create_video_session(db, current_user.account_id, current_user.id)
@@ -39,7 +39,7 @@ async def join_room(
     room_name: str,
     body: JoinTokenRequest,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_writer),
 ):
     try:
         token = media_service.generate_video_join_token(
@@ -57,7 +57,7 @@ async def join_room(
 async def end_room(
     room_name: str,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_writer),
 ):
     try:
         session = await media_service.end_video_session(db, current_user, room_name)
@@ -72,7 +72,7 @@ async def end_room(
 async def start_recording(
     room_name: str,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_writer),
 ):
     try:
         session = await media_service.start_video_recording(db, current_user, room_name)

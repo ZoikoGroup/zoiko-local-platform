@@ -96,8 +96,8 @@ def add_team_member(
 ) -> User:
     if role == UserRole.OWNER.value:
         raise ValueError("Cannot add a second owner - there is exactly one owner per account")
-    if role not in (UserRole.ADMIN.value, UserRole.MEMBER.value):
-        raise ValueError("role must be 'admin' or 'member'")
+    if role not in (UserRole.ADMIN.value, UserRole.MEMBER.value, UserRole.VIEWER.value):
+        raise ValueError("role must be 'admin', 'member', or 'viewer'")
 
     existing = db.query(User).filter(User.email == email).first()
     if existing:

@@ -8,7 +8,7 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
-from app.core.deps import get_current_user
+from app.core.deps import get_current_user, require_writer
 from app.integrations.llm.groq import LLMError
 from app.integrations.storage.s3 import StorageError
 from app.integrations.telecom.twilio import TelecomError
@@ -47,7 +47,7 @@ def _summary_response(record) -> dict:
 def summarize_voicemail(
     voicemail_id: str,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_writer),
 ):
     try:
         record = service.summarize_voicemail(db, current_user, voicemail_id)
@@ -64,7 +64,7 @@ def summarize_voicemail(
 def summarize_call(
     call_id: str,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_writer),
 ):
     try:
         record = service.summarize_call(db, current_user, call_id)
@@ -83,7 +83,7 @@ def summarize_call(
 def summarize_video_session(
     room_name: str,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_writer),
 ):
     try:
         record = service.summarize_video_session(db, current_user, room_name)
@@ -103,7 +103,7 @@ def edit_summary(
     summary_id: str,
     payload: EditSummaryRequest,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_writer),
 ):
     try:
         record = service.edit_summary(db, current_user, summary_id, payload.summary)

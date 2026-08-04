@@ -44,6 +44,19 @@ def require_admin(current_user: User = Depends(get_current_user)) -> User:
     return current_user
 
 
+def require_writer(current_user: User = Depends(get_current_user)) -> User:
+    """Any account role EXCEPT Viewer - use on every write endpoint that
+    isn't already Owner/Admin-only via require_admin. A Viewer has full
+    read access account-wide (see UserRole.VIEWER's docstring) but must
+    never be able to change anything."""
+    if current_user.role == UserRole.VIEWER:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Viewer role is read-only",
+        )
+    return current_user
+
+
 def get_current_staff(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
     """A logged-in Zoiko platform staff member. Rejects customer tokens -
     no customer, including an account Owner, can act as staff."""

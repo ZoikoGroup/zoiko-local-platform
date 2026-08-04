@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
-from app.core.deps import get_current_user, require_admin
+from app.core.deps import get_current_user, require_admin, require_writer
 from app.integrations.telecom.twilio import TelecomError
 from app.numbering.identity.models import User
 from app.numbering.numbers import service
@@ -94,7 +94,7 @@ def suspend_number(
     e164: str,
     payload: SuspendNumberRequest = SuspendNumberRequest(),
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_writer),
 ):
     try:
         return service.suspend_number(db, current_user, e164, reason=payload.reason)
@@ -106,7 +106,7 @@ def suspend_number(
 def cancel_number(
     e164: str,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_writer),
 ):
     try:
         return service.cancel_number(db, current_user, e164)
@@ -120,7 +120,7 @@ def cancel_number(
 def sync_webhook(
     e164: str,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_writer),
 ):
     try:
         return service.sync_webhook(db, current_user, e164)
@@ -135,7 +135,7 @@ def configure_routing(
     e164: str,
     payload: RoutingConfigRequest,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_writer),
 ):
     try:
         return service.configure_routing(

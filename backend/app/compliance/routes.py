@@ -12,7 +12,7 @@ from app.compliance.schemas import (
     KYCVerificationStart,
 )
 from app.core.database import get_db
-from app.core.deps import get_current_staff, get_current_user, require_admin, require_staff_role
+from app.core.deps import get_current_staff, get_current_user, require_admin, require_staff_role, require_writer
 from app.integrations.kyc.stripe_identity import KYCError, construct_webhook_event
 from app.numbering.identity.models import User
 from app.staff.models import PlatformStaff, PlatformStaffRole
@@ -85,7 +85,7 @@ def submit_document(
 def start_kyc(
     case_id: str,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_writer),
 ):
     case = _get_case_or_404(db, case_id)
     if case.account_id != current_user.account_id:

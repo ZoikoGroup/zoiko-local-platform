@@ -67,4 +67,4 @@ class UserResponse(BaseModel):
 class TeamMemberAdd(BaseModel):
     email: EmailStr
     password: str = _PasswordField
-    role: str  # "admin" or "member" - never "owner", there is exactly one per account
+    role: str  # "admin", "member", or "viewer" - never "owner", there is exactly one per account

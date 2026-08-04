@@ -13,7 +13,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
-from app.core.deps import get_current_user
+from app.core.deps import get_current_user, require_writer
 from app.integrations.telecom import twilio as telecom
 from app.integrations.telecom.twilio import TelecomError
 from app.media import service as media_service
@@ -88,7 +88,7 @@ async def outbound_call(
     body: OutboundCallRequest,
     request: Request,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_writer),
 ):
     status_callback_url = str(request.base_url) + "media/voice/status-callback"
     try:
