@@ -10,7 +10,11 @@ jobs:
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: postgres:16
+        # pgvector/pgvector:pg16, not plain postgres:16 - the semantic
+        # search migration runs `CREATE EXTENSION vector`, which only
+        # exists on an image that ships the extension binaries. Must match
+        # docker-compose.yml's local dev image for the same reason.
+        image: pgvector/pgvector:pg16
         env:
           POSTGRES_USER: zoiko
           POSTGRES_PASSWORD: zoiko
