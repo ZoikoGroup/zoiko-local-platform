@@ -339,18 +339,23 @@ def test_summarize_video_session_success_path(client, db_session, monkeypatch):
     assert isinstance(body["action_items"], list)
 
 
-def _seed_summary(db_session, account_id: str, *, summary: str, transcript: str) -> None:
+def _seed_summary(
+    db_session, account_id: str, *, summary: str, transcript: str, with_embedding: bool = True
+) -> None:
+    from app.integrations.embeddings.cohere import generate_embedding
     from app.intelligence.models import ConversationSummary, SummarySourceType
 
-    db_session.add(
-        ConversationSummary(
-            account_id=account_id, source_type=SummarySourceType.VOICEMAIL, source_id=account_id,
-            transcript=transcript, summary=summary, model_version="groq/test",
-        )
+    record = ConversationSummary(
+        account_id=account_id, source_type=SummarySourceType.VOICEMAIL, source_id=account_id,
+        transcript=transcript, summary=summary, model_version="groq/test",
     )
+    if with_embedding:
+        record.embedding = generate_embedding(f"{summary} {transcript}", input_type="search_document")
+    db_session.add(record)
     db_session.commit()
 
 
+@pytest.mark.live
 def test_search_summaries_finds_a_matching_record_by_content(client, db_session):
     token, account_id = _signup_and_login(client, "search1@example.com", "Search Test Co")
     _seed_summary(
@@ -374,6 +379,31 @@ def test_search_summaries_finds_a_matching_record_by_content(client, db_session)
     assert "billing" in results[0]["summary"].lower()
 
 
+@pytest.mark.live
+def test_search_summaries_finds_a_match_by_meaning_not_exact_words(client, db_session):
+    """The actual point of upgrading from keyword to semantic search - the
+    seeded summary never uses the words "connectivity" or "issue", but real
+    Cohere embeddings still recognize they mean the same thing. Calibrated
+    live against real cosine-distance measurements (see
+    _SEMANTIC_DISTANCE_THRESHOLD's docstring in intelligence/service.py)."""
+    token, account_id = _signup_and_login(client, "search5@example.com", "Search Test Co 5")
+    _seed_summary(
+        db_session, account_id,
+        summary="The internet is down and customer cannot get online.",
+        transcript="My wifi isn't working and I can't connect to anything.",
+    )
+
+    response = client.get(
+        "/intelligence/summaries/search", params={"q": "connectivity issue"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert response.status_code == 200
+    results = response.json()
+    assert len(results) == 1
+    assert "internet" in results[0]["summary"].lower()
+
+
+@pytest.mark.live
 def test_search_summaries_returns_empty_for_no_match(client, db_session):
     token, account_id = _signup_and_login(client, "search2@example.com", "Search Test Co 2")
     _seed_summary(
@@ -390,6 +420,7 @@ def test_search_summaries_returns_empty_for_no_match(client, db_session):
     assert response.json() == []
 
 
+@pytest.mark.live
 def test_search_summaries_is_scoped_to_the_callers_own_account(client, db_session):
     token_a, account_a = _signup_and_login(client, "search3a@example.com", "Search Test Co 3A")
     _, account_b = _signup_and_login(client, "search3b@example.com", "Search Test Co 3B")
@@ -414,7 +445,7 @@ def test_search_summaries_requires_auth(client):
 
 def test_search_summaries_with_blank_query_returns_empty(client, db_session):
     token, account_id = _signup_and_login(client, "search4@example.com", "Search Test Co 4")
-    _seed_summary(db_session, account_id, summary="Anything", transcript="Anything at all")
+    _seed_summary(db_session, account_id, summary="Anything", transcript="Anything at all", with_embedding=False)
 
     response = client.get(
         "/intelligence/summaries/search", params={"q": "   "}, headers={"Authorization": f"Bearer {token}"}

@@ -48,6 +48,12 @@ class Settings(BaseSettings):
 
     groq_api_key: str = ""
 
+    # Cohere (integrations/embeddings) - real semantic search over AI
+    # summaries. Free trial key, rate-limited, no billing account needed
+    # (unlike enabling Google's Generative Language API via Cloud Console,
+    # which requires linking billing to the project even for free usage).
+    cohere_api_key: str = ""
+
     stripe_secret_key: str = ""
     stripe_identity_webhook_secret: str = ""
 

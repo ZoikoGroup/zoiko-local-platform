@@ -18,6 +18,7 @@ livekit-api==1.2.0
 tzdata==2024.2
 boto3==1.35.36  # S3-compatible object storage (recordings) - see app/integrations/storage/s3.py
 stripe==15.4.0  # Identity verification (KYC/KYB) - see app/integrations/kyc/stripe_identity.py
+pgvector==0.5.0  # SQLAlchemy Vector column type - semantic search over AI summaries
 
 # dev/test
 pytest==8.3.3

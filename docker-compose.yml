@@ -1,6 +1,9 @@
 services:
   postgres:
-    image: postgres:16
+    # pgvector/pgvector:pg16 - same as postgres:16, plus the pgvector
+    # extension binaries (needed for semantic search over AI summaries).
+    # Matches Neon, which has pgvector available natively.
+    image: pgvector/pgvector:pg16
     restart: unless-stopped
     environment:
       POSTGRES_USER: zoiko

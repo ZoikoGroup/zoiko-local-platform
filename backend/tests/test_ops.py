@@ -39,13 +39,16 @@ def test_provider_status_reports_not_configured_when_no_credentials(client, db_s
     monkeypatch.setattr("app.integrations.notifications.email.settings.resend_api_key", "")
     monkeypatch.setattr("app.integrations.storage.s3.settings.s3_bucket", "")
     monkeypatch.setattr("app.integrations.video.livekit.settings.livekit_url", "")
+    monkeypatch.setattr("app.integrations.embeddings.cohere.settings.cohere_api_key", "")
 
     token = _create_and_login_staff(db_session, client, "opssupport1@zoikolocal.com")
     response = client.get("/ops/provider-status", headers={"Authorization": f"Bearer {token}"})
     assert response.status_code == 200
 
     providers = {p["name"]: p for p in response.json()["providers"]}
-    assert set(providers.keys()) == {"twilio", "livekit", "groq", "stripe_identity", "resend", "storage_s3"}
+    assert set(providers.keys()) == {
+        "twilio", "livekit", "groq", "stripe_identity", "resend", "storage_s3", "cohere",
+    }
     for provider in providers.values():
         assert provider["configured"] is False
         assert provider["ok"] is False
@@ -61,13 +64,14 @@ def test_provider_status_reports_ok_when_health_checks_succeed(client, db_sessio
     monkeypatch.setattr("app.integrations.notifications.email.health_check", lambda: {"configured": True, "ok": True, "detail": None})
     monkeypatch.setattr("app.integrations.storage.s3.health_check", lambda: {"configured": True, "ok": True, "detail": None})
     monkeypatch.setattr("app.integrations.video.livekit.health_check", _async_ok)
+    monkeypatch.setattr("app.integrations.embeddings.cohere.health_check", lambda: {"configured": True, "ok": True, "detail": None})
 
     token = _create_and_login_staff(db_session, client, "opssupport2@zoikolocal.com")
     response = client.get("/ops/provider-status", headers={"Authorization": f"Bearer {token}"})
     assert response.status_code == 200
 
     providers = response.json()["providers"]
-    assert len(providers) == 6
+    assert len(providers) == 7
     assert all(p["ok"] is True for p in providers)
 
 
@@ -95,7 +99,7 @@ def test_public_status_requires_no_auth(client):
     assert response.status_code == 200
     body = response.json()
     assert body["overall"] in {"operational", "degraded"}
-    assert len(body["components"]) == 6
+    assert len(body["components"]) == 7
 
 
 def test_public_status_never_leaks_provider_names_or_error_detail(client, monkeypatch):
@@ -121,6 +125,7 @@ def test_public_status_never_leaks_provider_names_or_error_detail(client, monkey
         "Identity Verification",
         "Email Notifications",
         "Recording Storage",
+        "Semantic Search",
     }
     assert body["overall"] == "degraded"
     calling = next(c for c in body["components"] if c["name"] == "Calling & SMS")
