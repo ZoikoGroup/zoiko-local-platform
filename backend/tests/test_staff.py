@@ -24,6 +24,19 @@ def test_staff_login_fails_with_wrong_password(client, db_session):
     assert response.status_code == 401
 
 
+def test_staff_login_is_rate_limited_after_repeated_attempts(client, db_session):
+    _create_staff(db_session, "staffratelimited@zoikolocal.com")
+    responses = [
+        client.post(
+            "/staff/login", json={"email": "staffratelimited@zoikolocal.com", "password": "wrong-on-purpose"}
+        )
+        for _ in range(6)
+    ]
+    statuses = [r.status_code for r in responses]
+    assert statuses[:5] == [401, 401, 401, 401, 401]
+    assert statuses[5] == 429
+
+
 def test_there_is_no_public_staff_signup_endpoint(client):
     response = client.post(
         "/staff/signup", json={"email": "hacker@example.com", "password": "whatever123"}

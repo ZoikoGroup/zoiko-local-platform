@@ -1,8 +1,9 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.core.deps import get_current_user
+from app.core.rate_limit import limiter
 from app.core.security import create_access_token, decode_access_token, verify_google_id_token
 from app.numbering.identity import service
 from app.numbering.identity.models import User
@@ -35,7 +36,8 @@ def signup(payload: SignupRequest, db: Session = Depends(get_db)):
 
 
 @router.post("/login", response_model=LoginResponse)
-def login(payload: LoginRequest, db: Session = Depends(get_db)):
+@limiter.limit("5/minute")
+def login(request: Request, payload: LoginRequest, db: Session = Depends(get_db)):
     user = service.authenticate_user(db, payload.email, payload.password)
     if not user:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid email or password")
@@ -51,7 +53,8 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)):
 
 
 @router.post("/mfa/login", response_model=TokenResponse)
-def mfa_login(payload: MfaLoginRequest, db: Session = Depends(get_db)):
+@limiter.limit("5/minute")
+def mfa_login(request: Request, payload: MfaLoginRequest, db: Session = Depends(get_db)):
     claims = decode_access_token(payload.mfa_token)
     if claims is None or claims.get("scope") != "mfa_pending":
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired MFA session")

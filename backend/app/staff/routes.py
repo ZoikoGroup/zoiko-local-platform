@@ -1,8 +1,9 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.core.deps import get_current_staff, require_staff_role
+from app.core.rate_limit import limiter
 from app.core.security import create_access_token
 from app.integrations.telecom.twilio import TelecomError
 from app.numbering.numbers.service import NoStuckProvisioningError, release_stuck_provisioning, retry_provisioning
@@ -17,7 +18,8 @@ router = APIRouter(prefix="/staff", tags=["staff"])
 
 
 @router.post("/login", response_model=StaffTokenResponse)
-def login(payload: StaffLoginRequest, db: Session = Depends(get_db)):
+@limiter.limit("5/minute")
+def login(request: Request, payload: StaffLoginRequest, db: Session = Depends(get_db)):
     staff = service.authenticate_staff(db, payload.email, payload.password)
     if not staff:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid email or password")

@@ -6,6 +6,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy.orm import sessionmaker
 
 from app.core.database import Base, engine, get_db
+from app.core.rate_limit import limiter
 from app.main import app
 
 if sys.platform == "win32":
@@ -19,6 +20,18 @@ if sys.platform == "win32":
 @pytest.fixture(scope="session", autouse=True)
 def create_schema():
     Base.metadata.create_all(bind=engine)
+    yield
+
+
+@pytest.fixture(autouse=True)
+def reset_rate_limiter():
+    """The login rate limiter's storage is process-wide, not per-request -
+    without this, hundreds of tests logging in from the same TestClient IP
+    would trip each other's limits well within the 5/minute window. Real
+    rate limiting itself is verified in its own dedicated test, which
+    exhausts the limit deliberately rather than relying on this leaking
+    from an unrelated test."""
+    limiter.reset()
     yield
 
 

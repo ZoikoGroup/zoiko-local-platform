@@ -47,6 +47,22 @@ def test_login_unknown_email_fails(client):
     assert response.status_code == 401
 
 
+def test_login_is_rate_limited_after_repeated_attempts(client):
+    """Security-review fix: unlimited login attempts were previously
+    possible - this proves the 5/minute limit actually engages."""
+    client.post("/auth/signup", json=_signup_payload("ratelimited@example.com"))
+
+    responses = [
+        client.post(
+            "/auth/login", json={"email": "ratelimited@example.com", "password": "wrong-on-purpose"}
+        )
+        for _ in range(6)
+    ]
+    statuses = [r.status_code for r in responses]
+    assert statuses[:5] == [401, 401, 401, 401, 401]
+    assert statuses[5] == 429
+
+
 def test_me_returns_current_user_with_valid_token(client):
     client.post("/auth/signup", json=_signup_payload("me@example.com"))
     login_response = client.post(

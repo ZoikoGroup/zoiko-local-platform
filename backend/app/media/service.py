@@ -226,6 +226,21 @@ def list_account_calls(db: Session, user: User, limit: int = 20) -> list[CallRec
     return query.order_by(CallRecord.created_at.desc()).limit(limit).all()
 
 
+def assert_can_access_call(db: Session, user: User, call_sid: str) -> None:
+    """Security-review fix: GET /media/voice/calls/{call_sid} used to proxy
+    straight to Twilio with no ownership check at all - any authenticated
+    user on the platform could look up any other account's call metadata
+    (phone numbers, duration, status) by SID. This enforces the same
+    account/assignment boundary list_account_calls already uses, before the
+    route is allowed to query the provider."""
+    call = db.query(CallRecord).filter(CallRecord.provider_call_sid == call_sid).first()
+    if call is None or call.account_id != user.account_id:
+        raise CallAuthorizationError(f"{call_sid} is not a call owned by your account")
+    ids = assigned_number_ids(db, user)
+    if ids is not None and call.phone_number_id not in ids:
+        raise CallAuthorizationError(f"{call_sid} is not a call owned by your account")
+
+
 def record_voicemail(
     db: Session,
     *,

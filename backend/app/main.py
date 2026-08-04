@@ -1,5 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from slowapi import _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
 from sqlalchemy import text
 
 from app.audit.routes import router as audit_router
@@ -7,6 +9,7 @@ from app.compliance.routes import router as compliance_router
 from app.consent.routes import router as consent_router
 from app.core.config import settings
 from app.core.database import engine
+from app.core.rate_limit import limiter
 from app.core.startup_checks import assert_jwt_secret_is_configured, parse_allowed_origins
 from app.intelligence.routes import router as intelligence_router
 from app.media.receptionist import router as receptionist_router
@@ -25,6 +28,8 @@ from app.staff.routes import router as staff_router
 from app.usage.routes import router as usage_router
 
 app = FastAPI(title="Zoiko Local API")
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # Fail fast rather than boot insecurely - see app/core/startup_checks.py.
 assert_jwt_secret_is_configured(settings.environment, settings.jwt_secret_key)
