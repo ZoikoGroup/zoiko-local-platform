@@ -272,6 +272,24 @@ export function listStaffAccounts(token: string): Promise<AccountOverview[]> {
   });
 }
 
+export type StaffNumberSearchResult = {
+  id: string;
+  e164: string;
+  country: string;
+  status: string;
+  provider_sid: string | null;
+  account_id: string;
+  account_name: string | null;
+  account_owner_email: string | null;
+  created_at: string;
+};
+
+export function searchStaffNumbers(staffToken: string, q: string): Promise<StaffNumberSearchResult[]> {
+  return request<StaffNumberSearchResult[]>(`/staff/numbers/search?q=${encodeURIComponent(q)}`, {
+    headers: { Authorization: `Bearer ${staffToken}` },
+  });
+}
+
 export type StuckProvisioningEntry = {
   id: string;
   e164: string;

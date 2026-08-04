@@ -33,6 +33,17 @@ def list_accounts(
     return service.list_accounts_overview(db)
 
 
+@router.get("/numbers/search")
+def search_numbers(
+    q: str,
+    db: Session = Depends(get_db),
+    _staff: PlatformStaff = Depends(get_current_staff),
+):
+    if not q.strip():
+        return []
+    return service.search_numbers(db, q.strip())
+
+
 @router.get("/numbers/stuck-provisioning")
 def list_stuck_provisioning(
     db: Session = Depends(get_db),
