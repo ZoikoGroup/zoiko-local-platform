@@ -1,3 +1,5 @@
+import pytest
+
 from app.media.models import CallDirection, CallRecord, VideoSession, VideoSessionStatus, Voicemail
 from app.numbering.numbers.models import PhoneNumber, PhoneNumberStatus
 
@@ -83,6 +85,7 @@ def test_summarize_call_rejects_without_consent(client, db_session):
     assert "consent" in response.json()["detail"].lower()
 
 
+@pytest.mark.live
 def test_summarize_call_success_path(client, db_session, monkeypatch):
     token, account_id = _signup_and_login(client, "intelcallsuccess@example.com", "Intel Call Success Co")
     call = _make_recorded_call(db_session, account_id)
@@ -140,6 +143,7 @@ def test_summarize_voicemail_rejects_without_consent(client, db_session):
     assert "consent" in response.json()["detail"].lower()
 
 
+@pytest.mark.live
 def test_summarize_voicemail_succeeds_with_a_country_specific_consent_grant(client, db_session, monkeypatch):
     """Consent scoped to the voicemail's own number's country (not GLOBAL)
     must be enough - jurisdiction is derived from the number, not just a
@@ -182,6 +186,7 @@ def test_summarize_voicemail_country_specific_consent_does_not_cover_a_different
     assert "consent" in response.json()["detail"].lower()
 
 
+@pytest.mark.live
 def test_summarize_voicemail_success_path(client, db_session, monkeypatch):
     token, account_id = _signup_and_login(client, "intelsuccess@example.com", "Intel Success Co")
     voicemail = _make_voicemail(db_session, account_id, "+15550005555")
@@ -303,6 +308,7 @@ def test_summarize_video_session_rejects_member_who_did_not_host(client, db_sess
     assert "not hosted by you" in response.json()["detail"].lower()
 
 
+@pytest.mark.live
 def test_summarize_video_session_success_path(client, db_session, monkeypatch):
     token, account_id = _signup_and_login(client, "intelvidsuccess@example.com", "Intel Video Success Co")
     me = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"}).json()

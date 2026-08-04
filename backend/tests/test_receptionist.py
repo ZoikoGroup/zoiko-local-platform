@@ -1,3 +1,4 @@
+import pytest
 from twilio.request_validator import RequestValidator
 
 from app.core.config import settings
@@ -77,6 +78,7 @@ def test_respond_without_consent_captures_raw_transcript_only(client, db_session
     assert calls[0]["guardrail_flags"] == []
 
 
+@pytest.mark.live
 def test_respond_with_consent_extracts_qualification_and_escalates_high_urgency(client, db_session):
     token, account_id = _signup_and_login(client, "receptionistconsent@example.com")
     me = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"})
@@ -211,6 +213,7 @@ def test_receptionist_call_has_no_guardrail_flags_when_summary_is_clean(client, 
     assert calls[0]["guardrail_flags"] == []
 
 
+@pytest.mark.live
 def test_high_urgency_does_not_escalate_without_a_nominated_team_member(client, db_session):
     """forwarding_number alone (used for plain business-hours forwarding)
     must not trigger receptionist escalation - only a nominated
