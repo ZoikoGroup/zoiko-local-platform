@@ -545,3 +545,93 @@ def test_usage_endpoint_sums_across_all_of_an_accounts_sessions(client, db_sessi
     response = client.get("/media/video/usage", headers=headers)
     assert response.status_code == 200
     assert response.json()["participant_minutes"] == 12.0
+
+
+@pytest.mark.live
+def test_group_video_call_issues_join_tokens_to_more_than_two_team_members(client):
+    """Roadmap §8 'Video Calling - Phase 1 Standard' targets up to
+    MAX_PARTICIPANTS=8 (app.integrations.video.livekit) - this only verified
+    1:1 rooms live before. Confirms a real LiveKit room actually accepts join
+    tokens for a 3rd and 4th distinct identity on the same room, not just a
+    host and one other."""
+    owner_token = _signup_and_login(client, "groupvideoowner@example.com")
+    owner_headers = {"Authorization": f"Bearer {owner_token}"}
+
+    for email in ("groupvideomember1@example.com", "groupvideomember2@example.com"):
+        add_response = client.post(
+            "/team/members",
+            json={"email": email, "password": "membersecret123", "role": "member"},
+            headers=owner_headers,
+        )
+        assert add_response.status_code == 201, add_response.text
+
+    member1_token = client.post(
+        "/auth/login", json={"email": "groupvideomember1@example.com", "password": "membersecret123"}
+    ).json()["access_token"]
+    member2_token = client.post(
+        "/auth/login", json={"email": "groupvideomember2@example.com", "password": "membersecret123"}
+    ).json()["access_token"]
+
+    room_name = client.post("/media/video/rooms", headers=owner_headers).json()["room_name"]
+
+    tokens = []
+    for headers, display_name in (
+        (owner_headers, "Owner"),
+        ({"Authorization": f"Bearer {member1_token}"}, "Member One"),
+        ({"Authorization": f"Bearer {member2_token}"}, "Member Two"),
+    ):
+        response = client.post(
+            f"/media/video/rooms/{room_name}/token", json={"display_name": display_name}, headers=headers
+        )
+        assert response.status_code == 200, response.text
+        tokens.append(response.json()["token"])
+
+    # Each participant gets their own distinct signed token (identity =
+    # their own user id) - not the same token reused across participants.
+    assert len(set(tokens)) == 3
+
+    client.post(f"/media/video/rooms/{room_name}/end", headers=owner_headers)
+
+
+@pytest.mark.live
+def test_group_video_call_tracks_three_concurrent_participants(client, db_session):
+    """Extends test_room_finished_closes_any_dangling_open_participant_sessions
+    (which only ever exercised a single dangling participant) to 3 - proves
+    usage tracking and the abrupt-disconnect cleanup both scale past a pair."""
+    from app.media.models import VideoParticipantSession
+
+    token = _signup_and_login(client, "groupvideotrack@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    room_name = client.post("/media/video/rooms", headers=headers).json()["room_name"]
+
+    identities = ["participant-a", "participant-b", "participant-c"]
+    for identity in identities:
+        body, auth_token = _participant_webhook_body_and_token("participant_joined", room_name, identity)
+        response = client.post("/media/video/webhook", content=body, headers={"Authorization": auth_token})
+        assert response.status_code == 204
+
+    open_rows = (
+        db_session.query(VideoParticipantSession)
+        .filter(
+            VideoParticipantSession.participant_identity.in_(identities),
+            VideoParticipantSession.left_at.is_(None),
+        )
+        .all()
+    )
+    assert len(open_rows) == 3
+
+    # One participant leaves normally; the other two are still mid-call when
+    # the room ends (e.g. both disconnected without a clean leave event).
+    left_body, left_token = _participant_webhook_body_and_token("participant_left", room_name, "participant-a")
+    client.post("/media/video/webhook", content=left_body, headers={"Authorization": left_token})
+
+    finished_body, finished_token = _livekit_webhook_body_and_token("room_finished", room_name)
+    client.post("/media/video/webhook", content=finished_body, headers={"Authorization": finished_token})
+
+    rows = (
+        db_session.query(VideoParticipantSession)
+        .filter(VideoParticipantSession.participant_identity.in_(identities))
+        .all()
+    )
+    assert len(rows) == 3
+    assert all(row.left_at is not None for row in rows)

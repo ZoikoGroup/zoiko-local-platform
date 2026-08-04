@@ -340,7 +340,13 @@ export default function VideoPage() {
             </div>
           )}
 
-          <div className="grid grid-cols-2 gap-3">
+          {/* auto-fit grid, not a fixed 2-column split - a fixed split works
+              for 1:1 but squeezes every remote tile into a single narrow
+              column once a 3rd+ participant joins (up to MAX_PARTICIPANTS=8
+              per app.integrations.video.livekit). `contents` on the remote
+              container lets each remote <video> land directly in this grid
+              as its own sibling cell, sized the same as the local tile. */}
+          <div className="grid gap-3 grid-cols-[repeat(auto-fit,minmax(160px,1fr))]">
             <div className="relative aspect-video bg-black rounded-lg overflow-hidden">
               <video ref={localVideoRef} autoPlay muted playsInline className="w-full h-full object-cover" />
               <span className="absolute bottom-2 left-2 text-xs text-white/80 bg-black/40 rounded px-2 py-0.5">
@@ -349,7 +355,7 @@ export default function VideoPage() {
             </div>
             <div
               ref={remoteContainerRef}
-              className="grid grid-cols-1 gap-2 [&>video]:w-full [&>video]:h-full [&>video]:object-cover [&>audio]:hidden"
+              className="contents [&>video]:aspect-video [&>video]:w-full [&>video]:rounded-lg [&>video]:bg-black [&>video]:object-cover [&>audio]:hidden"
             />
           </div>
 
