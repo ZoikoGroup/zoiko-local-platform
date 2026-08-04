@@ -33,9 +33,28 @@ needs to go back and add the Account/Number linkage, audit logging, and access c
 before this is production-ready. Don't treat its existence as "Stage 3 is done."
 
 ## What NOT to build yet
-No Kafka/event bus, no Kubernetes, no multi-country compliance, no ZoikoNex integration
-(billing/Stripe work is paused — connection model to the real ZoikoNex system needs
-clarifying before building a stand-in that might get thrown away).
+No Kubernetes, no multi-country compliance, no ZoikoNex integration (billing/Stripe work
+is paused — connection model to the real ZoikoNex system needs clarifying before building
+a stand-in that might get thrown away).
+
+**Exception (2026-08-04):** The "no Kafka/event bus" deferral above is lifted — founder
+directed building it. Single-node Apache Kafka (KRaft mode, no Zookeeper) runs via
+`docker-compose.yml` (host port 9095, not 9092 — an unrelated project's broker already
+uses 9092 on this dev machine). Producer/consumer wrapped in
+`backend/app/integrations/eventbus/kafka.py` (Provider Gateway); domain-facing publish
+functions in `backend/app/events/service.py`. Publishing is best-effort — a Kafka outage
+never fails the underlying business transaction, same rationale as the SMS/push
+notification fan-outs. Wired into representative real call sites, not every domain event
+in the system: `number.reserved`/`number.activated`/`number.suspended`
+(`numbering/numbers/service.py`), `call.started`/`call.ended` (`media/service.py`), and
+`notification.sent` (`notifications/service.py`). Extending the same pattern to other
+domains (video, receptionist, porting, compliance, etc.) is straightforward but not yet
+done — same scoping decision as the notification template registry (~9 core templates,
+not the full 195+39 estate). Single-broker dev gotcha worth remembering: the default
+`offsets.topic.replication.factor` is 3, which can never be satisfied with 1 broker and
+silently hangs every consumer group's partition assignment forever (producers still work
+fine, since they don't need the `__consumer_offsets` coordination topic) — the
+docker-compose service pins it to 1.
 
 **Exception (2026-07-31):** The video/AI Receptionist deferral below is lifted.
 Stage 2 (numbers: search/reserve/purchase), Stage 3 (voice: inbound/outbound calling,

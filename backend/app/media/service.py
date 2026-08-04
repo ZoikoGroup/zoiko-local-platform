@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 from app.audit.service import log_event
 from app.consent.models import ConsentType
 from app.consent.service import has_active_consent
+from app.events.service import publish_call_ended, publish_call_started
 from app.integrations.llm.groq import LLMError
 from app.integrations.storage.s3 import StorageError, generate_presigned_url
 from app.integrations.telecom import twilio as telecom
@@ -30,6 +31,9 @@ from app.numbering.numbers.service import NumberConflictError, assert_number_acc
 from app.retention.service import PURGED_MARKER
 from app.risk import service as risk_service
 from app.usage import service as usage_service
+
+
+TERMINAL_CALL_STATUSES = {"completed", "failed", "busy", "no-answer", "canceled"}
 
 
 class CallAuthorizationError(Exception):
@@ -122,6 +126,11 @@ def record_call(
         target_id=call.id,
         metadata={"from": from_number, "to": to_number, "status": status},
     )
+    if account_id and provider_call_sid:
+        publish_call_started(
+            account_id, call_sid=provider_call_sid, from_number=from_number, to_number=to_number,
+            direction=direction.value,
+        )
     return call
 
 
@@ -173,6 +182,8 @@ def update_call_status(db: Session, provider_call_sid: str, status: str, duratio
         db, actor_id=call.account_id, action="call.status_updated",
         target_type="call_record", target_id=call.id, metadata={"status": status, "duration": duration},
     )
+    if call.account_id and status in TERMINAL_CALL_STATUSES:
+        publish_call_ended(call.account_id, call_sid=provider_call_sid, status=status, duration_seconds=duration)
 
     # Usage Metering (Roadmap §2 Voice scope; Architecture §7 "Usage Event"
     # data model) - a completed call with a real duration and a known

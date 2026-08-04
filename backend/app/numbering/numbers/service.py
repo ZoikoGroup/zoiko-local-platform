@@ -9,6 +9,7 @@ from app.compliance.service import has_approved_case, is_requirement_active
 from app.consent.models import ConsentType
 from app.consent.service import has_active_consent
 from app.core.config import settings
+from app.events.service import publish_number_activated, publish_number_reserved, publish_number_suspended
 from app.integrations.telecom import twilio as telecom
 from app.notifications.service import notify_number_activated, notify_number_suspended
 from app.numbering.identity.models import Account, AccountType, User, UserRole
@@ -104,6 +105,7 @@ def reserve_number(db: Session, account_id: str, e164: str, country: str) -> Pho
         target_id=number.id,
         metadata={"e164": e164},
     )
+    publish_number_reserved(account_id, number_id=number.id, e164=e164, country=country)
     return number
 
 
@@ -187,6 +189,7 @@ def purchase_number(db: Session, account_id: str, e164: str) -> PhoneNumber:
         db, actor_id=account_id, action="number.activated",
         target_type="phone_number", target_id=number.id, metadata={"e164": e164, "provider_sid": bought["sid"]},
     )
+    publish_number_activated(account_id, number_id=number.id, e164=e164)
 
     owner = db.query(User).filter(User.account_id == account_id, User.role == UserRole.OWNER).first()
     if owner is not None:
@@ -208,6 +211,7 @@ def suspend_number(db: Session, user: User, e164: str, reason: str | None = None
         db, actor_id=user.id, action="number.suspended",
         target_type="phone_number", target_id=number.id, metadata={"e164": e164, "reason": reason},
     )
+    publish_number_suspended(user.account_id, number_id=number.id, e164=e164, reason=reason)
 
     owner = db.query(User).filter(User.account_id == user.account_id, User.role == UserRole.OWNER).first()
     if owner is not None:

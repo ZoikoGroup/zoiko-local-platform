@@ -25,7 +25,7 @@ def record_usage_event(
         account_id=account_id,
         event_type=event_type,
         quantity=quantity,
-        unit=unit,
+        unit=unit, 
         country_band=country_band,
         idempotency_key=idempotency_key,
     )

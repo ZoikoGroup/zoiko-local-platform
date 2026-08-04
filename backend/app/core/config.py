@@ -58,4 +58,19 @@ class Settings(BaseSettings):
     resend_api_key: str = ""
     email_from_address: str = "onboarding@resend.dev"
 
+    # Web Push (integrations/notifications/webpush.py) - browser push
+    # notifications, since no native iOS/Android app exists. Self-generated
+    # VAPID keypair (not a third-party vendor credential) identifying this
+    # server to browser push services; vapid_claim_email is the contact
+    # address push services may use to reach the sender if a key is abused.
+    vapid_public_key: str = ""
+    vapid_private_key: str = ""
+    vapid_claim_email: str = "admin@zoikogroup.com"
+
+    # Event bus (integrations/eventbus/kafka.py, app/events/) - single-node
+    # Kafka in KRaft mode via docker-compose.yml. Approved exception to the
+    # original "no Kafka" Phase 1 scope - see CLAUDE.md. Blank disables
+    # publishing (falls back to logging), same pattern as the other providers.
+    kafka_bootstrap_servers: str = ""
+
 settings = Settings()

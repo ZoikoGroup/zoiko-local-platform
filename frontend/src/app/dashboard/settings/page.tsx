@@ -22,6 +22,7 @@ import {
   type AuditEvent,
 } from "@/lib/api";
 import { getToken } from "@/lib/auth";
+import PushNotificationToggle from "@/components/PushNotificationToggle";
 
 type SetupState = { secret: string; otpauth_uri: string } | null;
 
@@ -494,17 +495,19 @@ export default function SettingsPage() {
         )}
       </div>
 
+      <PushNotificationToggle />
+
       <div className="bg-white rounded-xl border border-slate-200 p-6 space-y-4">
         <div>
           <h3 className="font-semibold text-slate-900">Communications History</h3>
-          <p className="text-xs text-slate-500 mt-0.5">Emails sent to your account.</p>
+          <p className="text-xs text-slate-500 mt-0.5">Emails, texts, and push notifications sent to your account.</p>
         </div>
 
         {notificationsLoading && <p className="text-sm text-slate-500">Loading...</p>}
         {notificationsError && <p className="text-sm text-red-600">{notificationsError}</p>}
 
         {!notificationsLoading && notifications.length === 0 && (
-          <p className="text-sm text-slate-500">No emails sent yet.</p>
+          <p className="text-sm text-slate-500">No notifications sent yet.</p>
         )}
 
         {!notificationsLoading && notifications.length > 0 && (
@@ -514,7 +517,7 @@ export default function SettingsPage() {
                 <div>
                   <div className="text-sm font-medium text-slate-800">{n.subject}</div>
                   <div className="text-xs text-slate-500 mt-0.5">
-                    {n.recipient_email} · {new Date(n.created_at).toLocaleString()}
+                    {n.recipient_email ?? n.recipient_phone ?? n.channel} · {new Date(n.created_at).toLocaleString()}
                   </div>
                 </div>
                 <span

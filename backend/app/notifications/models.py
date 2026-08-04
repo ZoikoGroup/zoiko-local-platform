@@ -22,6 +22,7 @@ class NotificationDeliveryStatus(str, enum.Enum):
 class NotificationChannel(str, enum.Enum):
     EMAIL = "email"
     SMS = "sms"
+    PUSH = "push"
 
 
 class NotificationTemplate(Base):
@@ -69,9 +70,38 @@ class NotificationDelivery(Base):
     # and vice versa.
     recipient_email: Mapped[str | None] = mapped_column(String(255), nullable=True)
     recipient_phone: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    push_subscription_id: Mapped[str | None] = mapped_column(
+        UUID(as_uuid=False), ForeignKey("push_subscriptions.id", ondelete="SET NULL"), nullable=True,
+    )
     subject: Mapped[str] = mapped_column(String(255), nullable=False)
     status: Mapped[NotificationDeliveryStatus] = mapped_column(
         Enum(NotificationDeliveryStatus, name="notification_delivery_status_enum"), nullable=False
     )
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    # Null until the recipient views it in the in-app notification bell -
+    # the same ledger row doubles as an in-app notification instead of a
+    # separate table, since every notification we send today already has
+    # an account_id and event_name to key off of.
+    read_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class PushSubscription(Base):
+    """One row per browser/device that has granted push permission - there's
+    no native app, so this is the Web Push subscription object the browser's
+    Push API returns (endpoint + the two keys needed to encrypt a payload to
+    it), tied to whichever user was logged in when they granted permission."""
+
+    __tablename__ = "push_subscriptions"
+
+    id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=new_uuid)
+    account_id: Mapped[str] = mapped_column(
+        UUID(as_uuid=False), ForeignKey("accounts.id", ondelete="CASCADE"), nullable=False, index=True,
+    )
+    user_id: Mapped[str] = mapped_column(
+        UUID(as_uuid=False), ForeignKey("users.id", ondelete="CASCADE"), nullable=False,
+    )
+    endpoint: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
+    p256dh: Mapped[str] = mapped_column(String(255), nullable=False)
+    auth: Mapped[str] = mapped_column(String(255), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

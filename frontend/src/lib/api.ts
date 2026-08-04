@@ -192,16 +192,64 @@ export function startKycVerification(
 export type NotificationDelivery = {
   id: string;
   event_name: string;
-  recipient_email: string;
+  channel: "email" | "sms" | "push";
+  recipient_email: string | null;
+  recipient_phone: string | null;
   subject: string;
   status: "sent" | "failed";
   error: string | null;
   created_at: string;
+  read_at: string | null;
 };
 
 export function listMyNotifications(token: string): Promise<NotificationDelivery[]> {
   return request<NotificationDelivery[]>("/notifications/me", {
     headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export function getUnreadNotificationCount(token: string): Promise<{ unread_count: number }> {
+  return request<{ unread_count: number }>("/notifications/me/unread-count", {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export function markNotificationRead(token: string, notificationId: string): Promise<NotificationDelivery> {
+  return request<NotificationDelivery>(`/notifications/me/${notificationId}/read`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export function markAllNotificationsRead(token: string): Promise<{ unread_count: number }> {
+  return request<{ unread_count: number }>("/notifications/me/read-all", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export type PushSubscriptionInfo = {
+  id: string;
+  endpoint: string;
+  created_at: string;
+};
+
+export function subscribeToPush(
+  token: string,
+  input: { endpoint: string; p256dh: string; auth: string }
+): Promise<PushSubscriptionInfo> {
+  return request<PushSubscriptionInfo>("/notifications/push/subscribe", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify(input),
+  });
+}
+
+export function unsubscribeFromPush(token: string, endpoint: string): Promise<void> {
+  return request<void>("/notifications/push/unsubscribe", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ endpoint }),
   });
 }
 
