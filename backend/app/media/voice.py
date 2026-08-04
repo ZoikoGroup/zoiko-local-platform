@@ -154,6 +154,7 @@ async def list_calls(
             "direction": c.direction.value,
             "duration": c.duration,
             "recording_url": c.recording_url,
+            "is_suspected_spam": c.is_suspected_spam,
             "created_at": c.created_at,
         }
         for c in calls

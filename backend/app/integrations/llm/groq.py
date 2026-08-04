@@ -50,9 +50,15 @@ _QUALIFICATION_SYSTEM_PROMPT = (
     "from Acme Corp called about a delayed shipment and asked for a callback today.\" "
     'Always a full sentence, never a fragment, or null if there is nothing to summarize), '
     '"urgency" (one of "low", "medium", "high"), "callback_preference" (string or '
-    "null, e.g. a phone number or \"email\" if mentioned). Never invent information "
-    "not present in the transcript. Never make commitments, quote prices, or give "
-    "legal/financial/medical advice — you are only extracting structured data."
+    "null, e.g. a phone number or \"email\" if mentioned), \"is_likely_spam\" (boolean - "
+    "true if the transcript matches a known spam/scam/robocall pattern: an unsolicited "
+    "sales pitch unrelated to this business, a fake prize/refund/warranty claim, an "
+    "impersonation of a government agency or bank asking for payment or personal "
+    "details, or a generic pre-recorded-sounding script with no specific reason for "
+    'calling THIS business), "spam_reason" (a short phrase naming which pattern matched, '
+    'or null if is_likely_spam is false). Never invent information not present in the '
+    "transcript. Never make commitments, quote prices, or give legal/financial/medical "
+    "advice — you are only extracting structured data."
 )
 
 

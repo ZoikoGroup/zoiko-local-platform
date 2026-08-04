@@ -193,6 +193,7 @@ export default function CallsPage() {
               duration={c.duration}
               createdAt={c.created_at}
               recordingUrl={c.recording_url}
+              suspectedSpam={c.is_suspected_spam}
               summaryState={summaries[`call:${c.id}`] ?? { status: "idle" }}
               onSummarize={() => handleSummarize("call", c.id)}
               onGrantConsent={() => handleGrantConsent("call", c.id)}
@@ -234,6 +235,7 @@ function CallRow({
   duration,
   createdAt,
   recordingUrl,
+  suspectedSpam,
   summaryState,
   onSummarize,
   onGrantConsent,
@@ -243,6 +245,7 @@ function CallRow({
   duration: number | null;
   createdAt: string;
   recordingUrl: string | null;
+  suspectedSpam?: boolean;
   summaryState: SummaryState;
   onSummarize: () => void;
   onGrantConsent: () => void;
@@ -251,7 +254,17 @@ function CallRow({
     <div className="rounded-lg border border-slate-200 px-4 py-3 space-y-2">
       <div className="flex items-center justify-between gap-4">
         <div>
-          <div className="text-sm font-medium text-slate-800">{label}</div>
+          <div className="text-sm font-medium text-slate-800 flex items-center gap-2">
+            {label}
+            {suspectedSpam && (
+              <span
+                title="This number called multiple other Zoiko Local accounts in a short window - a pattern typical of spam/robocall traffic, not a confirmed block."
+                className="text-[10px] font-semibold uppercase tracking-wide text-amber-700 bg-amber-100 rounded-full px-2 py-0.5"
+              >
+                Suspected spam
+              </span>
+            )}
+          </div>
           <div className="text-xs text-slate-500">
             {status} · {formatDuration(duration)} · {new Date(createdAt).toLocaleString()}
           </div>

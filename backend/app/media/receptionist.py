@@ -93,6 +93,8 @@ async def list_receptionist_calls(
             "urgency": c.urgency.value if c.urgency else None,
             "escalated": c.escalated,
             "guardrail_flags": c.guardrail_flags,
+            "is_likely_spam": c.is_likely_spam,
+            "spam_reason": c.spam_reason,
             "assigned_user_id": c.assigned_user_id,
             "assigned_user_email": user_emails.get(c.assigned_user_id) if c.assigned_user_id else None,
             "original_summary": c.original_summary,

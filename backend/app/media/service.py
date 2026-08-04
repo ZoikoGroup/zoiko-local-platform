@@ -101,6 +101,10 @@ def record_call(
     status: str,
     duration: int | None = None,
 ) -> CallRecord:
+    is_suspected_spam = (
+        direction == CallDirection.INBOUND
+        and risk_service.is_suspected_spam_caller(db, from_number, candidate_account_id=account_id)
+    )
     call = CallRecord(
         account_id=account_id,
         phone_number_id=phone_number_id,
@@ -110,6 +114,7 @@ def record_call(
         provider_call_sid=provider_call_sid,
         status=status,
         duration=duration,
+        is_suspected_spam=is_suspected_spam,
     )
     db.add(call)
     db.commit()
@@ -536,6 +541,8 @@ def capture_receptionist_call(
     # Guardrail check on the AI's OWN generated text, not the caller's raw
     # transcript - see app/intelligence/guardrails.py.
     guardrail_flags = check_for_disallowed_commitments(qualification.get("summary"), qualification.get("reason"))
+    is_likely_spam = bool(qualification.get("is_likely_spam"))
+    spam_reason = qualification.get("spam_reason") if is_likely_spam else None
 
     call = ReceptionistCall(
         account_id=owner.account_id,
@@ -549,6 +556,8 @@ def capture_receptionist_call(
         summary=qualification.get("summary"),
         urgency=urgency,
         guardrail_flags=guardrail_flags,
+        is_likely_spam=is_likely_spam,
+        spam_reason=spam_reason,
         model_version=model_version,
     )
     db.add(call)
@@ -557,7 +566,7 @@ def capture_receptionist_call(
     log_event(
         db, actor_id=owner.account_id, action="receptionist.call_captured",
         target_type="receptionist_call", target_id=call.id,
-        metadata={"urgency": urgency.value if urgency else None, "guardrail_flags": guardrail_flags},
+        metadata={"urgency": urgency.value if urgency else None, "guardrail_flags": guardrail_flags, "is_likely_spam": is_likely_spam},
     )
     return call
 

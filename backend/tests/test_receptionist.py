@@ -171,6 +171,99 @@ def test_receptionist_call_flags_a_pricing_commitment_in_the_generated_summary(c
     assert calls[0]["guardrail_flags"] == ["pricing_commitment"]
 
 
+def test_receptionist_call_flags_a_likely_spam_transcript(client, db_session, monkeypatch):
+    """AI content signal (Roadmap 'AI-driven fraud/spam signals') - distinct
+    from the platform-wide inbound-velocity signal on CallRecord, this comes
+    straight from qualify_caller()'s own extraction, same as name/urgency."""
+    token, account_id = _signup_and_login(client, "receptionistspam1@example.com")
+    number = PhoneNumber(
+        e164="+15550077777", country="US", status=PhoneNumberStatus.ACTIVE, account_id=account_id,
+        ai_receptionist_enabled=True,
+    )
+    db_session.add(number)
+    db_session.commit()
+
+    client.post(
+        "/compliance/consent", json={"consent_type": "ai_processing"}, headers={"Authorization": f"Bearer {token}"}
+    )
+    monkeypatch.setattr(
+        "app.media.service.qualify_caller",
+        lambda db, account_id, transcript, jurisdiction=None: (
+            {
+                "name": None,
+                "company": None,
+                "reason": "extended vehicle warranty offer",
+                "summary": "An automated pitch offering an extended vehicle warranty, unrelated to this business.",
+                "urgency": "low",
+                "callback_preference": None,
+                "is_likely_spam": True,
+                "spam_reason": "extended warranty scam pitch",
+            },
+            "groq/test",
+        ),
+    )
+
+    url = "http://testserver/media/receptionist/respond"
+    params = {
+        "CallSid": "CArecspam1", "To": "+15550077777", "From": "+15559997777",
+        "SpeechResult": "Your car's extended warranty is about to expire, press one to renew",
+    }
+    signature = _twilio_signature(url, params)
+    client.post("/media/receptionist/respond", data=params, headers={"X-Twilio-Signature": signature})
+
+    calls = client.get(
+        "/media/receptionist/calls", headers={"Authorization": f"Bearer {token}"}
+    ).json()
+    assert len(calls) == 1
+    assert calls[0]["is_likely_spam"] is True
+    assert calls[0]["spam_reason"] == "extended warranty scam pitch"
+
+
+def test_receptionist_call_is_not_flagged_spam_by_default(client, db_session, monkeypatch):
+    token, account_id = _signup_and_login(client, "receptionistspam2@example.com")
+    number = PhoneNumber(
+        e164="+15550088877", country="US", status=PhoneNumberStatus.ACTIVE, account_id=account_id,
+        ai_receptionist_enabled=True,
+    )
+    db_session.add(number)
+    db_session.commit()
+
+    client.post(
+        "/compliance/consent", json={"consent_type": "ai_processing"}, headers={"Authorization": f"Bearer {token}"}
+    )
+    monkeypatch.setattr(
+        "app.media.service.qualify_caller",
+        lambda db, account_id, transcript, jurisdiction=None: (
+            {
+                "name": "Sam",
+                "company": "Acme",
+                "reason": "asked about business hours",
+                "summary": "Sam from Acme asked when the shop opens tomorrow.",
+                "urgency": "low",
+                "callback_preference": None,
+                "is_likely_spam": False,
+                "spam_reason": None,
+            },
+            "groq/test",
+        ),
+    )
+
+    url = "http://testserver/media/receptionist/respond"
+    params = {
+        "CallSid": "CArecspam2", "To": "+15550088877", "From": "+15559998877",
+        "SpeechResult": "Hi, what time do you open tomorrow?",
+    }
+    signature = _twilio_signature(url, params)
+    client.post("/media/receptionist/respond", data=params, headers={"X-Twilio-Signature": signature})
+
+    calls = client.get(
+        "/media/receptionist/calls", headers={"Authorization": f"Bearer {token}"}
+    ).json()
+    assert len(calls) == 1
+    assert calls[0]["is_likely_spam"] is False
+    assert calls[0]["spam_reason"] is None
+
+
 def test_receptionist_call_has_no_guardrail_flags_when_summary_is_clean(client, db_session, monkeypatch):
     token, account_id = _signup_and_login(client, "receptionistguardrail2@example.com")
     number = PhoneNumber(

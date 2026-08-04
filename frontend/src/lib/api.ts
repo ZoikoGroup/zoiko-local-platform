@@ -492,6 +492,7 @@ export type CallLogEntry = {
   direction: "inbound" | "outbound";
   duration: number | null;
   recording_url: string | null;
+  is_suspected_spam: boolean;
   created_at: string;
 };
 
@@ -716,6 +717,8 @@ export type ReceptionistCallEntry = {
   urgency: "low" | "medium" | "high" | null;
   escalated: boolean;
   guardrail_flags: string[];
+  is_likely_spam: boolean;
+  spam_reason: string | null;
   assigned_user_id: string | null;
   assigned_user_email: string | null;
   original_summary: string | null;

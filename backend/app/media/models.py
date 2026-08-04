@@ -43,6 +43,12 @@ class CallRecord(Base):
     # separate recording rows already, so recording the whole outer call
     # there would just duplicate audio that's already captured.
     recording_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    # Roadmap "AI-driven fraud/spam signals" - platform-wide velocity signal,
+    # not AI: set at record_call() time for INBOUND calls when from_number
+    # has called several distinct accounts in a short window (see
+    # app.risk.service.is_suspected_spam_caller). A real customer calls one
+    # business; a robocall/spam campaign fans out across many.
+    is_suspected_spam: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -181,4 +187,13 @@ class ReceptionistCall(Base):
         UUID(as_uuid=False), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
     )
     model_version: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    # AI content signal, distinct from CallRecord.is_suspected_spam's
+    # velocity signal above - the LLM classifying the caller's OWN
+    # transcript for scam/spam pitch patterns (fake prize, warranty scam,
+    # generic sales pitch with no real reason for calling this business,
+    # etc.), same qualify_caller() extraction pass as name/company/urgency.
+    # Never set without AI-processing consent, same as every other field
+    # qualify_caller() produces.
+    is_likely_spam: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    spam_reason: Mapped[str | None] = mapped_column(String(255), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

@@ -467,6 +467,14 @@ export default function AIInsightsPage() {
                         )}
                       </div>
                       <div className="flex items-center gap-2 shrink-0">
+                        {c.is_likely_spam && (
+                          <span
+                            title={c.spam_reason ?? undefined}
+                            className="text-xs font-medium text-amber-700 bg-amber-100 rounded-full px-2.5 py-1"
+                          >
+                            Suspected spam
+                          </span>
+                        )}
                         {c.escalated && (
                           <span className="text-xs font-medium text-white bg-indigo-600 rounded-full px-2.5 py-1">
                             Escalated
