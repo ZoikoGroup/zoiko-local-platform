@@ -198,3 +198,84 @@ def test_notification_delivery_is_recorded_and_listable(client, db_session, monk
     body = response.json()
     assert len(body) == 1
     assert body[0]["subject"] == "+15550009999 is active on Zoiko Local"
+    assert body[0]["channel"] == "email"
+    assert body[0]["read_at"] is None
+
+
+def _signup_and_login(client, email: str) -> tuple[str, str]:
+    signup = client.post(
+        "/auth/signup",
+        json={
+            "account_name": "Notify Read Test Co",
+            "account_type": "business",
+            "email": email,
+            "password": "supersecret123",
+        },
+    )
+    account_id = signup.json()["account_id"]
+    login = client.post("/auth/login", json={"email": email, "password": "supersecret123"})
+    return login.json()["access_token"], account_id
+
+
+def test_mark_notification_read(client, db_session, monkeypatch):
+    from app.notifications.service import send_notification
+
+    monkeypatch.setattr("app.core.config.settings.resend_api_key", "")
+    token, account_id = _signup_and_login(client, "notifyread1@example.com")
+    delivery = send_notification(
+        db_session, event_name="number.activated", account_id=account_id,
+        recipient_email="notifyread1@example.com", context={"e164": "+15550001234"},
+    )
+
+    response = client.post(
+        f"/notifications/{delivery.id}/read", headers={"Authorization": f"Bearer {token}"}
+    )
+    assert response.status_code == 200
+    assert response.json()["read_at"] is not None
+
+    listed = client.get("/notifications/me", headers={"Authorization": f"Bearer {token}"}).json()
+    assert listed[0]["read_at"] is not None
+
+
+def test_mark_notification_read_rejects_other_account(client, db_session, monkeypatch):
+    from app.notifications.service import send_notification
+
+    monkeypatch.setattr("app.core.config.settings.resend_api_key", "")
+    _, owner_account_id = _signup_and_login(client, "notifyread2owner@example.com")
+    delivery = send_notification(
+        db_session, event_name="number.activated", account_id=owner_account_id,
+        recipient_email="notifyread2owner@example.com", context={"e164": "+15550005678"},
+    )
+
+    intruder_token, _ = _signup_and_login(client, "notifyread2intruder@example.com")
+    response = client.post(
+        f"/notifications/{delivery.id}/read", headers={"Authorization": f"Bearer {intruder_token}"}
+    )
+    assert response.status_code == 403
+
+
+def test_mark_all_notifications_read(client, db_session, monkeypatch):
+    from app.notifications.service import send_notification
+
+    monkeypatch.setattr("app.core.config.settings.resend_api_key", "")
+    token, account_id = _signup_and_login(client, "notifyreadall@example.com")
+    send_notification(
+        db_session, event_name="number.activated", account_id=account_id,
+        recipient_email="notifyreadall@example.com", context={"e164": "+15550001111"},
+    )
+    send_notification(
+        db_session, event_name="number.activated", account_id=account_id,
+        recipient_email="notifyreadall@example.com", context={"e164": "+15550002222"},
+    )
+
+    response = client.post("/notifications/read-all", headers={"Authorization": f"Bearer {token}"})
+    assert response.status_code == 200
+    assert response.json()["marked_read"] == 2
+
+    listed = client.get("/notifications/me", headers={"Authorization": f"Bearer {token}"}).json()
+    assert all(n["read_at"] is not None for n in listed)
+
+
+def test_mark_notification_read_requires_auth(client):
+    response = client.post("/notifications/some-id/read")
+    assert response.status_code == 401

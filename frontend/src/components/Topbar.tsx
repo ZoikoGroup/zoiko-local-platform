@@ -3,6 +3,7 @@
 import { useRouter, usePathname } from "next/navigation";
 import { clearToken } from "@/lib/auth";
 import { currentPageLabel } from "@/lib/nav";
+import NotificationBell from "@/components/NotificationBell";
 import type { User } from "@/lib/api";
 
 export default function Topbar({ user }: { user: User | null }) {
@@ -28,18 +29,7 @@ export default function Topbar({ user }: { user: User | null }) {
           Buy Number
         </button>
 
-        <button
-          className="w-9 h-9 rounded-lg flex items-center justify-center text-slate-500 hover:bg-slate-100 hover:text-slate-700 transition"
-          aria-label="Notifications"
-        >
-          <svg className="w-5 h-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
-            <path
-              strokeLinecap="round"
-              strokeLinejoin="round"
-              d="M15 17h5l-1.4-1.4A2 2 0 0 1 18 14.2V11a6 6 0 1 0-12 0v3.2a2 2 0 0 1-.6 1.4L4 17h5m6 0v1a3 3 0 1 1-6 0v-1m6 0H9"
-            />
-          </svg>
-        </button>
+        <NotificationBell />
 
         <div className="h-8 w-px bg-slate-200" />
 

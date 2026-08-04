@@ -192,15 +192,32 @@ export function startKycVerification(
 export type NotificationDelivery = {
   id: string;
   event_name: string;
-  recipient_email: string;
+  channel: "email" | "sms";
+  recipient_email: string | null;
+  recipient_phone: string | null;
   subject: string;
   status: "sent" | "failed";
   error: string | null;
   created_at: string;
+  read_at: string | null;
 };
 
 export function listMyNotifications(token: string): Promise<NotificationDelivery[]> {
   return request<NotificationDelivery[]>("/notifications/me", {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export function markNotificationRead(token: string, notificationId: string): Promise<NotificationDelivery> {
+  return request<NotificationDelivery>(`/notifications/${notificationId}/read`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export function markAllNotificationsRead(token: string): Promise<{ marked_read: number }> {
+  return request(`/notifications/read-all`, {
+    method: "POST",
     headers: { Authorization: `Bearer ${token}` },
   });
 }

@@ -1,3 +1,5 @@
+from datetime import datetime, timezone
+
 from sqlalchemy.orm import Session
 
 from app.audit.service import log_event
@@ -125,6 +127,31 @@ def list_account_notifications(db: Session, account_id: str) -> list[Notificatio
         .order_by(NotificationDelivery.created_at.desc())
         .all()
     )
+
+
+class NotificationAuthorizationError(Exception):
+    """Raised when the caller's account doesn't own the given notification."""
+
+
+def mark_notification_read(db: Session, account_id: str, notification_id: str) -> NotificationDelivery:
+    delivery = db.query(NotificationDelivery).filter(NotificationDelivery.id == notification_id).first()
+    if delivery is None or delivery.account_id != account_id:
+        raise NotificationAuthorizationError(f"{notification_id} is not a notification on your account")
+    if delivery.read_at is None:
+        delivery.read_at = datetime.now(timezone.utc)
+        db.commit()
+        db.refresh(delivery)
+    return delivery
+
+
+def mark_all_notifications_read(db: Session, account_id: str) -> int:
+    result = (
+        db.query(NotificationDelivery)
+        .filter(NotificationDelivery.account_id == account_id, NotificationDelivery.read_at.is_(None))
+        .update({NotificationDelivery.read_at: datetime.now(timezone.utc)}, synchronize_session=False)
+    )
+    db.commit()
+    return result
 
 
 def notify_number_activated(db: Session, *, account_id: str, account_email: str, e164: str) -> None:

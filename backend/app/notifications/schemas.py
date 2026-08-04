@@ -8,8 +8,11 @@ class NotificationDeliveryResponse(BaseModel):
 
     id: str
     event_name: str
-    recipient_email: str
+    channel: str
+    recipient_email: str | None
+    recipient_phone: str | None
     subject: str
     status: str
     error: str | None
     created_at: datetime
+    read_at: datetime | None
