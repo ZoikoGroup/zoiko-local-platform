@@ -81,6 +81,20 @@ export function login(input: { email: string; password: string }): Promise<Login
   });
 }
 
+export function forgotPassword(email: string): Promise<void> {
+  return request<void>("/auth/forgot-password", {
+    method: "POST",
+    body: JSON.stringify({ email }),
+  });
+}
+
+export function resetPassword(token: string, newPassword: string): Promise<LoginResult> {
+  return request<LoginResult>("/auth/reset-password", {
+    method: "POST",
+    body: JSON.stringify({ token, new_password: newPassword }),
+  });
+}
+
 export function getCurrentUser(token: string): Promise<User> {
   return request<User>("/auth/me", {
     headers: { Authorization: `Bearer ${token}` },

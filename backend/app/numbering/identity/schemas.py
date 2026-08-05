@@ -64,6 +64,15 @@ class UserResponse(BaseModel):
     phone_number: str | None
 
 
+class ForgotPasswordRequest(BaseModel):
+    email: EmailStr
+
+
+class ResetPasswordRequest(BaseModel):
+    token: str
+    new_password: str = _PasswordField
+
+
 class TeamMemberAdd(BaseModel):
     email: EmailStr
     password: str = _PasswordField

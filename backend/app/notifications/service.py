@@ -4,6 +4,7 @@ from zoneinfo import ZoneInfo
 from sqlalchemy.orm import Session
 
 from app.audit.service import log_event
+from app.core.config import settings
 from app.integrations.notifications.email import EmailError, send_email
 from app.integrations.telecom.twilio import TelecomError, send_sms
 from app.notifications.models import (
@@ -359,4 +360,15 @@ def notify_team_member_added(
         account_id=account_id,
         recipient_email=member_email,
         context={"account_name": account_name, "role": role},
+    )
+
+
+def notify_password_reset_requested(db: Session, *, account_id: str, user_email: str, token: str) -> None:
+    reset_url = f"{settings.frontend_base_url}/reset-password?token={token}"
+    send_notification(
+        db,
+        event_name="auth.password_reset",
+        account_id=account_id,
+        recipient_email=user_email,
+        context={"reset_url": reset_url},
     )

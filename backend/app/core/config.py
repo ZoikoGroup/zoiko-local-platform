@@ -41,6 +41,10 @@ class Settings(BaseSettings):
     # or the real deployed origin) — used to register Twilio webhook URLs
     # (call status callbacks) that can't be constructed from a request object
     public_base_url: str = ""
+    # The customer-facing web app's origin - used to build links inside
+    # emails (password reset, etc.) that must point at the frontend, not
+    # this API. Defaults to the local Next.js dev server.
+    frontend_base_url: str = "http://localhost:3000"
 
     livekit_url: str = ""
     livekit_api_key: str = ""

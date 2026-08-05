@@ -1,46 +1,64 @@
 "use client";
 
-import { useState } from "react";
-import { useRouter } from "next/navigation";
+import { useState, type FormEvent, Suspense } from "react";
+import { useRouter, useSearchParams } from "next/navigation";
 import Link from "next/link";
-import { login, googleAuth, completeMfaLogin, ApiError } from "@/lib/api";
+import { resetPassword, completeMfaLogin, ApiError } from "@/lib/api";
 import { saveToken } from "@/lib/auth";
 import AuthLayout from "@/components/AuthLayout";
-import GoogleSignInButton from "@/components/GoogleSignInButton";
 
-export default function LoginPage() {
+function ResetPasswordForm() {
   const router = useRouter();
-  const [email, setEmail] = useState("");
-  const [password, setPassword] = useState("");
+  const searchParams = useSearchParams();
+  const token = searchParams.get("token");
+
+  const [newPassword, setNewPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
   const [code, setCode] = useState("");
   const [mfaToken, setMfaToken] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
 
-  async function handleSubmit(e: React.FormEvent) {
+  if (!token) {
+    return (
+      <AuthLayout title="Invalid link" subtitle="This password reset link is missing its token.">
+        <p className="text-sm text-slate-500 text-center">
+          <Link href="/forgot-password" className="text-indigo-600 font-medium hover:text-indigo-700">
+            Request a new reset link
+          </Link>
+        </p>
+      </AuthLayout>
+    );
+  }
+
+  async function handleSubmit(e: FormEvent) {
     e.preventDefault();
     setError(null);
+    if (newPassword !== confirmPassword) {
+      setError("Passwords don't match.");
+      return;
+    }
     setLoading(true);
     try {
-      const result = await login({ email, password });
+      const result = await resetPassword(token as string, newPassword);
       if (result.mfa_required && result.mfa_token) {
         setMfaToken(result.mfa_token);
         return;
       }
       if (!result.access_token) {
-        setError("Something went wrong signing in.");
+        setError("Something went wrong resetting your password.");
         return;
       }
       saveToken(result.access_token);
       router.push("/dashboard");
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Something went wrong");
+      setError(err instanceof ApiError ? err.message : "This link is invalid or has expired.");
     } finally {
       setLoading(false);
     }
   }
 
-  async function handleMfaSubmit(e: React.FormEvent) {
+  async function handleMfaSubmit(e: FormEvent) {
     e.preventDefault();
     if (!mfaToken) return;
     setError(null);
@@ -53,17 +71,6 @@ export default function LoginPage() {
       setError(err instanceof ApiError ? err.message : "Invalid code");
     } finally {
       setLoading(false);
-    }
-  }
-
-  async function handleGoogleCredential(credential: string) {
-    setError(null);
-    try {
-      const { access_token } = await googleAuth(credential);
-      saveToken(access_token);
-      router.push("/dashboard");
-    } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Google sign-in failed");
     }
   }
 
@@ -92,84 +99,58 @@ export default function LoginPage() {
           >
             {loading ? "Verifying..." : "Verify"}
           </button>
-
-          <button
-            type="button"
-            onClick={() => {
-              setMfaToken(null);
-              setCode("");
-              setError(null);
-            }}
-            className="w-full text-xs text-slate-600 hover:text-slate-700"
-          >
-            Back to login
-          </button>
         </form>
       </AuthLayout>
     );
   }
 
   return (
-    <AuthLayout title="Welcome back" subtitle="Log in to continue to your account.">
-      <GoogleSignInButton onCredential={handleGoogleCredential} />
-
-      <div className="flex items-center gap-3 my-5">
-        <div className="h-px bg-slate-200 flex-1" />
-        <span className="text-xs text-slate-600">or continue with email</span>
-        <div className="h-px bg-slate-200 flex-1" />
-      </div>
-
+    <AuthLayout title="Choose a new password" subtitle="This link can only be used once and expires in 30 minutes.">
       <form onSubmit={handleSubmit} className="space-y-4">
         <div>
-          <label className="block text-sm font-medium text-slate-700 mb-1.5">Email</label>
-          <input
-            type="email"
-            required
-            value={email}
-            onChange={(e) => setEmail(e.target.value)}
-            className="w-full rounded-lg border border-slate-300 px-3.5 py-2.5 text-sm placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-indigo-500/40 focus:border-indigo-500 transition"
-            placeholder="you@example.com"
-          />
-        </div>
-        <div>
-          <div className="flex items-center justify-between mb-1.5">
-            <label className="block text-sm font-medium text-slate-700">Password</label>
-            <Link href="/forgot-password" className="text-xs text-indigo-600 hover:text-indigo-700">
-              Forgot password?
-            </Link>
-          </div>
+          <label className="block text-sm font-medium text-slate-700 mb-1.5">New password</label>
           <input
             type="password"
             required
-            value={password}
-            onChange={(e) => setPassword(e.target.value)}
+            autoFocus
+            minLength={8}
+            value={newPassword}
+            onChange={(e) => setNewPassword(e.target.value)}
+            className="w-full rounded-lg border border-slate-300 px-3.5 py-2.5 text-sm placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-indigo-500/40 focus:border-indigo-500 transition"
+            placeholder="••••••••"
+          />
+        </div>
+        <div>
+          <label className="block text-sm font-medium text-slate-700 mb-1.5">Confirm new password</label>
+          <input
+            type="password"
+            required
+            minLength={8}
+            value={confirmPassword}
+            onChange={(e) => setConfirmPassword(e.target.value)}
             className="w-full rounded-lg border border-slate-300 px-3.5 py-2.5 text-sm placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-indigo-500/40 focus:border-indigo-500 transition"
             placeholder="••••••••"
           />
         </div>
 
-        {error && (
-          <p className="text-sm text-red-600 bg-red-50 rounded-lg px-3 py-2">{error}</p>
-        )}
+        {error && <p className="text-sm text-red-600 bg-red-50 rounded-lg px-3 py-2">{error}</p>}
 
         <button
           type="submit"
           disabled={loading}
           className="w-full flex items-center justify-center gap-2 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-60 text-white rounded-lg py-2.5 text-sm font-medium transition shadow-sm shadow-indigo-600/20"
         >
-          {loading && (
-            <span className="w-4 h-4 border-2 border-white/40 border-t-white rounded-full animate-spin" />
-          )}
-          {loading ? "Logging in..." : "Log in"}
+          {loading ? "Saving..." : "Reset password"}
         </button>
       </form>
-
-      <p className="text-sm text-slate-500 mt-6 text-center">
-        Don&apos;t have an account?{" "}
-        <Link href="/signup" className="text-indigo-600 font-medium hover:text-indigo-700">
-          Sign up
-        </Link>
-      </p>
     </AuthLayout>
+  );
+}
+
+export default function ResetPasswordPage() {
+  return (
+    <Suspense fallback={null}>
+      <ResetPasswordForm />
+    </Suspense>
   );
 }
