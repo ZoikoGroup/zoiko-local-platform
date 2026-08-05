@@ -540,7 +540,7 @@ export default function AIInsightsPage() {
 
                     {c.guardrail_flags.length > 0 && (
                       <p className="text-xs font-medium text-red-700 bg-red-50 rounded-lg px-2.5 py-1.5">
-                        Review before acting — the AI's summary above may contain a{" "}
+                        Review before acting — the AI&apos;s summary above may contain a{" "}
                         {c.guardrail_flags.map((f) => f.replaceAll("_", " ")).join(" and ")} that was never
                         actually authorized.
                       </p>

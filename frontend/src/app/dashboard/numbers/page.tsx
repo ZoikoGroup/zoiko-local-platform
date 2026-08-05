@@ -755,8 +755,8 @@ export default function NumbersPage() {
 
       <div className="bg-white rounded-xl border border-slate-200 p-6 space-y-4">
         <p className="text-xs text-slate-500 bg-slate-50 rounded-lg px-3 py-2">
-          Porting moves a real number between carriers, so it's reviewed by our team and coordinated with
-          your current carrier by hand — it isn't instant like a new number purchase. We'll email you at
+          Porting moves a real number between carriers, so it&apos;s reviewed by our team and coordinated with
+          your current carrier by hand — it isn&apos;t instant like a new number purchase. We&apos;ll email you at
           each step.
         </p>
 
