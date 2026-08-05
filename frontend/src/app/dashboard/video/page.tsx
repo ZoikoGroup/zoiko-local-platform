@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState, useCallback } from "react";
+import { useEffect, useRef, useState, useCallback, type FormEvent } from "react";
 import { Room, RoomEvent, Track } from "livekit-client";
 import {
   getCurrentUser,
@@ -24,6 +24,17 @@ import { getToken } from "@/lib/auth";
 type CallState = "idle" | "lobby" | "connecting" | "in-call";
 type RecordingState = "idle" | "busy" | "consent_required" | "active";
 type DeviceStatus = "idle" | "requesting" | "ready" | "blocked";
+
+type ChatMessage = {
+  id: string;
+  senderName: string;
+  isLocal: boolean;
+  text: string;
+  ts: number;
+};
+
+const CHAT_ENCODER = new TextEncoder();
+const CHAT_DECODER = new TextDecoder();
 
 export default function VideoPage() {
   const [token] = useState<string | null>(() => getToken());
@@ -67,6 +78,10 @@ export default function VideoPage() {
   const [selectedAudioDeviceId, setSelectedAudioDeviceId] = useState("");
   const [lobbyConfidential, setLobbyConfidential] = useState(false);
   const [roomConfidential, setRoomConfidential] = useState(false);
+  const [chatOpen, setChatOpen] = useState(false);
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
+  const [chatInput, setChatInput] = useState("");
+  const [unreadChatCount, setUnreadChatCount] = useState(0);
 
   const roomRef = useRef<Room | null>(null);
   const localVideoRef = useRef<HTMLVideoElement>(null);
@@ -74,6 +89,8 @@ export default function VideoPage() {
   const lobbyVideoRef = useRef<HTMLVideoElement>(null);
   const remoteContainerRef = useRef<HTMLDivElement>(null);
   const attachedElements = useRef<Map<string, HTMLMediaElement>>(new Map());
+  const chatEndRef = useRef<HTMLDivElement>(null);
+  const chatOpenRef = useRef(false);
 
   const loadRooms = useCallback(() => {
     if (!token) return;
@@ -142,6 +159,15 @@ export default function VideoPage() {
       clearInterval(interval);
     };
   }, [callState, token, roomName]);
+
+  useEffect(() => {
+    chatOpenRef.current = chatOpen;
+  }, [chatOpen]);
+
+  useEffect(() => {
+    if (!chatOpen) return;
+    chatEndRef.current?.scrollIntoView({ block: "end" });
+  }, [chatMessages, chatOpen]);
 
   // Same timing issue as the camera effect above - the screen-share preview
   // element only renders once screenSharing is true, so attach after.
@@ -296,6 +322,21 @@ export default function VideoPage() {
       });
       room.on(RoomEvent.ParticipantConnected, () => setParticipantCount(room.remoteParticipants.size));
       room.on(RoomEvent.ParticipantDisconnected, () => setParticipantCount(room.remoteParticipants.size));
+      room.on(RoomEvent.DataReceived, (payload, participant) => {
+        let text: string;
+        try {
+          const parsed = JSON.parse(CHAT_DECODER.decode(payload));
+          if (parsed?.type !== "chat" || typeof parsed.text !== "string") return;
+          text = parsed.text;
+        } catch {
+          return;
+        }
+        setChatMessages((prev) => [
+          ...prev,
+          { id: `${Date.now()}-${Math.random()}`, senderName: participant?.name || "Guest", isLocal: false, text, ts: Date.now() },
+        ]);
+        if (!chatOpenRef.current) setUnreadChatCount((c) => c + 1);
+      });
       room.on(RoomEvent.Disconnected, () => {
         setCallState("idle");
         setRoomName(null);
@@ -326,6 +367,19 @@ export default function VideoPage() {
       const message = err instanceof ApiError || err instanceof Error ? err.message : "Unknown error.";
       setCallError(`Couldn't ${existingRoomName ? "join" : "start"} the call: ${message}`);
     }
+  }
+
+  function handleSendChatMessage(e: FormEvent) {
+    e.preventDefault();
+    const text = chatInput.trim();
+    const room = roomRef.current;
+    if (!text || !room) return;
+    room.localParticipant.publishData(CHAT_ENCODER.encode(JSON.stringify({ type: "chat", text })), { reliable: true });
+    setChatMessages((prev) => [
+      ...prev,
+      { id: `${Date.now()}-${Math.random()}`, senderName: "You", isLocal: true, text, ts: Date.now() },
+    ]);
+    setChatInput("");
   }
 
   async function handleCopyInviteLink() {
@@ -378,6 +432,9 @@ export default function VideoPage() {
     setRecordingState("idle");
     setWaitingGuests([]);
     setRoomConfidential(false);
+    setChatMessages([]);
+    setChatOpen(false);
+    setUnreadChatCount(0);
     try {
       await endVideoRoom(token, endingRoomName);
     } catch {
@@ -735,32 +792,72 @@ export default function VideoPage() {
             </div>
           )}
 
-          {screenSharing && (
-            <div className="relative aspect-video bg-black rounded-lg overflow-hidden">
-              <video ref={localScreenVideoRef} autoPlay muted playsInline className="w-full h-full object-contain" />
-              <span className="absolute bottom-2 left-2 text-xs text-white/80 bg-black/40 rounded px-2 py-0.5">
-                Your screen
-              </span>
-            </div>
-          )}
+          <div className="flex gap-3 items-stretch">
+            <div className="flex-1 min-w-0 space-y-3">
+              {screenSharing && (
+                <div className="relative aspect-video bg-black rounded-lg overflow-hidden">
+                  <video ref={localScreenVideoRef} autoPlay muted playsInline className="w-full h-full object-contain" />
+                  <span className="absolute bottom-2 left-2 text-xs text-white/80 bg-black/40 rounded px-2 py-0.5">
+                    Your screen
+                  </span>
+                </div>
+              )}
 
-          {/* auto-fit grid, not a fixed 2-column split - a fixed split works
-              for 1:1 but squeezes every remote tile into a single narrow
-              column once a 3rd+ participant joins (up to MAX_PARTICIPANTS=8
-              per app.integrations.video.livekit). `contents` on the remote
-              container lets each remote <video> land directly in this grid
-              as its own sibling cell, sized the same as the local tile. */}
-          <div className="grid gap-3 grid-cols-[repeat(auto-fit,minmax(160px,1fr))]">
-            <div className="relative aspect-video bg-black rounded-lg overflow-hidden">
-              <video ref={localVideoRef} autoPlay muted playsInline className="w-full h-full object-cover" />
-              <span className="absolute bottom-2 left-2 text-xs text-white/80 bg-black/40 rounded px-2 py-0.5">
-                You
-              </span>
+              {/* auto-fit grid, not a fixed 2-column split - a fixed split works
+                  for 1:1 but squeezes every remote tile into a single narrow
+                  column once a 3rd+ participant joins (up to MAX_PARTICIPANTS=8
+                  per app.integrations.video.livekit). `contents` on the remote
+                  container lets each remote <video> land directly in this grid
+                  as its own sibling cell, sized the same as the local tile. */}
+              <div className="grid gap-3 grid-cols-[repeat(auto-fit,minmax(160px,1fr))]">
+                <div className="relative aspect-video bg-black rounded-lg overflow-hidden">
+                  <video ref={localVideoRef} autoPlay muted playsInline className="w-full h-full object-cover" />
+                  <span className="absolute bottom-2 left-2 text-xs text-white/80 bg-black/40 rounded px-2 py-0.5">
+                    You
+                  </span>
+                </div>
+                <div
+                  ref={remoteContainerRef}
+                  className="contents [&>video]:aspect-video [&>video]:w-full [&>video]:rounded-lg [&>video]:bg-black [&>video]:object-cover [&>audio]:hidden"
+                />
+              </div>
             </div>
-            <div
-              ref={remoteContainerRef}
-              className="contents [&>video]:aspect-video [&>video]:w-full [&>video]:rounded-lg [&>video]:bg-black [&>video]:object-cover [&>audio]:hidden"
-            />
+
+            {chatOpen && (
+              <div className="w-64 shrink-0 flex flex-col bg-slate-950 border border-slate-800 rounded-lg">
+                <div className="px-3 py-2 border-b border-slate-800 text-xs font-medium text-slate-300">In-call chat</div>
+                <div className="flex-1 min-h-[200px] max-h-[320px] overflow-y-auto px-3 py-2 space-y-2">
+                  {chatMessages.length === 0 ? (
+                    <p className="text-xs text-slate-500">No messages yet.</p>
+                  ) : (
+                    chatMessages.map((m) => (
+                      <div key={m.id} className="text-sm">
+                        <span className={`text-xs font-medium ${m.isLocal ? "text-indigo-400" : "text-slate-400"}`}>
+                          {m.senderName}
+                        </span>
+                        <p className="text-slate-200 break-words">{m.text}</p>
+                      </div>
+                    ))
+                  )}
+                  <div ref={chatEndRef} />
+                </div>
+                <form onSubmit={handleSendChatMessage} className="flex items-center gap-1.5 p-2 border-t border-slate-800">
+                  <input
+                    value={chatInput}
+                    onChange={(e) => setChatInput(e.target.value)}
+                    placeholder="Message everyone"
+                    className="flex-1 min-w-0 text-sm rounded-lg bg-slate-800 border border-slate-700 text-white px-2.5 py-1.5 placeholder:text-slate-500 focus:outline-none focus:ring-2 focus:ring-indigo-500/40"
+                  />
+                  <button
+                    type="submit"
+                    disabled={!chatInput.trim()}
+                    className="text-xs font-medium rounded-lg px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-40 text-white"
+                  >
+                    Send
+                  </button>
+                </form>
+              </div>
+            )}
           </div>
 
           <div className="flex items-center justify-center gap-3 pt-2">
@@ -787,6 +884,22 @@ export default function VideoPage() {
               }`}
             >
               {screenSharing ? "Stop Sharing" : "Share Screen"}
+            </button>
+            <button
+              onClick={() => {
+                setChatOpen((v) => !v);
+                setUnreadChatCount(0);
+              }}
+              className={`relative text-xs font-medium rounded-lg px-3 py-2 ${
+                chatOpen ? "bg-emerald-700 text-white" : "bg-slate-800 text-white"
+              }`}
+            >
+              Chat
+              {unreadChatCount > 0 && (
+                <span className="absolute -top-1.5 -right-1.5 flex items-center justify-center w-4 h-4 rounded-full bg-red-500 text-white text-[10px] font-bold">
+                  {unreadChatCount > 9 ? "9+" : unreadChatCount}
+                </span>
+              )}
             </button>
             {recordingState !== "active" && !roomConfidential && (
               <button

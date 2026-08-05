@@ -1,12 +1,23 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type FormEvent } from "react";
 import { useParams } from "next/navigation";
 import { Room, RoomEvent, Track } from "livekit-client";
 import { guestJoinVideoRoom, checkGuestWaitingStatus, ApiError } from "@/lib/api";
 
 type CallState = "lobby" | "requesting" | "waiting" | "in-call" | "ended" | "denied" | "not-found";
 type DeviceStatus = "idle" | "requesting" | "ready" | "blocked";
+
+type ChatMessage = {
+  id: string;
+  senderName: string;
+  isLocal: boolean;
+  text: string;
+  ts: number;
+};
+
+const CHAT_ENCODER = new TextEncoder();
+const CHAT_DECODER = new TextDecoder();
 
 const POLL_INTERVAL_MS = 2000;
 
@@ -29,6 +40,10 @@ export default function GuestJoinPage() {
   const [lobbyVideoStream, setLobbyVideoStream] = useState<MediaStream | null>(null);
   const [participantCount, setParticipantCount] = useState(0);
   const [waitingId, setWaitingId] = useState<string | null>(null);
+  const [chatOpen, setChatOpen] = useState(false);
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
+  const [chatInput, setChatInput] = useState("");
+  const [unreadChatCount, setUnreadChatCount] = useState(0);
 
   const roomRef = useRef<Room | null>(null);
   const lobbyVideoRef = useRef<HTMLVideoElement>(null);
@@ -36,6 +51,8 @@ export default function GuestJoinPage() {
   const remoteContainerRef = useRef<HTMLDivElement>(null);
   const attachedElements = useRef<Map<string, HTMLMediaElement>>(new Map());
   const pendingJoinRef = useRef<{ camera: boolean; mic: boolean } | null>(null);
+  const chatEndRef = useRef<HTMLDivElement>(null);
+  const chatOpenRef = useRef(false);
 
   useEffect(() => {
     return () => {
@@ -59,6 +76,15 @@ export default function GuestJoinPage() {
     const cameraPublication = room.localParticipant.getTrackPublication(Track.Source.Camera);
     cameraPublication?.videoTrack?.attach(videoEl);
   }, [callState]);
+
+  useEffect(() => {
+    chatOpenRef.current = chatOpen;
+  }, [chatOpen]);
+
+  useEffect(() => {
+    if (!chatOpen) return;
+    chatEndRef.current?.scrollIntoView({ block: "end" });
+  }, [chatMessages, chatOpen]);
 
   function stopLobbyVideoPreview() {
     lobbyVideoStream?.getTracks().forEach((t) => t.stop());
@@ -118,6 +144,21 @@ export default function GuestJoinPage() {
     });
     room.on(RoomEvent.ParticipantConnected, () => setParticipantCount(room.remoteParticipants.size));
     room.on(RoomEvent.ParticipantDisconnected, () => setParticipantCount(room.remoteParticipants.size));
+    room.on(RoomEvent.DataReceived, (payload, participant) => {
+      let text: string;
+      try {
+        const parsed = JSON.parse(CHAT_DECODER.decode(payload));
+        if (parsed?.type !== "chat" || typeof parsed.text !== "string") return;
+        text = parsed.text;
+      } catch {
+        return;
+      }
+      setChatMessages((prev) => [
+        ...prev,
+        { id: `${Date.now()}-${Math.random()}`, senderName: participant?.name || "Guest", isLocal: false, text, ts: Date.now() },
+      ]);
+      if (!chatOpenRef.current) setUnreadChatCount((c) => c + 1);
+    });
     room.on(RoomEvent.Disconnected, () => {
       setCallState("ended");
       roomRef.current = null;
@@ -166,7 +207,6 @@ export default function GuestJoinPage() {
       cancelled = true;
       clearInterval(interval);
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [callState, roomName, waitingId]);
 
   async function handleJoin() {
@@ -195,6 +235,22 @@ export default function GuestJoinPage() {
     roomRef.current?.disconnect();
     roomRef.current = null;
     setCallState("ended");
+    setChatMessages([]);
+    setChatOpen(false);
+    setUnreadChatCount(0);
+  }
+
+  function handleSendChatMessage(e: FormEvent) {
+    e.preventDefault();
+    const text = chatInput.trim();
+    const room = roomRef.current;
+    if (!text || !room) return;
+    room.localParticipant.publishData(CHAT_ENCODER.encode(JSON.stringify({ type: "chat", text })), { reliable: true });
+    setChatMessages((prev) => [
+      ...prev,
+      { id: `${Date.now()}-${Math.random()}`, senderName: "You", isLocal: true, text, ts: Date.now() },
+    ]);
+    setChatInput("");
   }
 
   function handleToggleMicInCall() {
@@ -321,17 +377,55 @@ export default function GuestJoinPage() {
               <span>{participantCount} other participant{participantCount === 1 ? "" : "s"}</span>
             </div>
 
-            <div className="grid gap-3 grid-cols-[repeat(auto-fit,minmax(160px,1fr))]">
-              <div className="relative aspect-video bg-black rounded-lg overflow-hidden">
-                <video ref={localVideoRef} autoPlay muted playsInline className="w-full h-full object-cover" />
-                <span className="absolute bottom-2 left-2 text-xs text-white/80 bg-black/40 rounded px-2 py-0.5">
-                  You
-                </span>
+            <div className="flex gap-3 items-stretch">
+              <div className="flex-1 min-w-0 grid gap-3 grid-cols-[repeat(auto-fit,minmax(160px,1fr))]">
+                <div className="relative aspect-video bg-black rounded-lg overflow-hidden">
+                  <video ref={localVideoRef} autoPlay muted playsInline className="w-full h-full object-cover" />
+                  <span className="absolute bottom-2 left-2 text-xs text-white/80 bg-black/40 rounded px-2 py-0.5">
+                    You
+                  </span>
+                </div>
+                <div
+                  ref={remoteContainerRef}
+                  className="contents [&>video]:aspect-video [&>video]:w-full [&>video]:rounded-lg [&>video]:bg-black [&>video]:object-cover [&>audio]:hidden"
+                />
               </div>
-              <div
-                ref={remoteContainerRef}
-                className="contents [&>video]:aspect-video [&>video]:w-full [&>video]:rounded-lg [&>video]:bg-black [&>video]:object-cover [&>audio]:hidden"
-              />
+
+              {chatOpen && (
+                <div className="w-56 shrink-0 flex flex-col bg-slate-950 border border-slate-800 rounded-lg">
+                  <div className="px-3 py-2 border-b border-slate-800 text-xs font-medium text-slate-300">In-call chat</div>
+                  <div className="flex-1 min-h-[160px] max-h-[280px] overflow-y-auto px-3 py-2 space-y-2">
+                    {chatMessages.length === 0 ? (
+                      <p className="text-xs text-slate-500">No messages yet.</p>
+                    ) : (
+                      chatMessages.map((m) => (
+                        <div key={m.id} className="text-sm">
+                          <span className={`text-xs font-medium ${m.isLocal ? "text-indigo-400" : "text-slate-400"}`}>
+                            {m.senderName}
+                          </span>
+                          <p className="text-slate-200 break-words">{m.text}</p>
+                        </div>
+                      ))
+                    )}
+                    <div ref={chatEndRef} />
+                  </div>
+                  <form onSubmit={handleSendChatMessage} className="flex items-center gap-1.5 p-2 border-t border-slate-800">
+                    <input
+                      value={chatInput}
+                      onChange={(e) => setChatInput(e.target.value)}
+                      placeholder="Message everyone"
+                      className="flex-1 min-w-0 text-sm rounded-lg bg-slate-800 border border-slate-700 text-white px-2.5 py-1.5 placeholder:text-slate-500 focus:outline-none focus:ring-2 focus:ring-indigo-500/40"
+                    />
+                    <button
+                      type="submit"
+                      disabled={!chatInput.trim()}
+                      className="text-xs font-medium rounded-lg px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-40 text-white"
+                    >
+                      Send
+                    </button>
+                  </form>
+                </div>
+              )}
             </div>
 
             <div className="flex items-center justify-center gap-3 pt-2">
@@ -350,6 +444,22 @@ export default function GuestJoinPage() {
                 }`}
               >
                 {cameraOn ? "Stop Video" : "Start Video"}
+              </button>
+              <button
+                onClick={() => {
+                  setChatOpen((v) => !v);
+                  setUnreadChatCount(0);
+                }}
+                className={`relative text-xs font-medium rounded-lg px-3 py-2 ${
+                  chatOpen ? "bg-emerald-700 text-white" : "bg-slate-800 text-white"
+                }`}
+              >
+                Chat
+                {unreadChatCount > 0 && (
+                  <span className="absolute -top-1.5 -right-1.5 flex items-center justify-center w-4 h-4 rounded-full bg-red-500 text-white text-[10px] font-bold">
+                    {unreadChatCount > 9 ? "9+" : unreadChatCount}
+                  </span>
+                )}
               </button>
               <button
                 onClick={handleLeave}
