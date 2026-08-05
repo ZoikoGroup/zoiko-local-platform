@@ -109,6 +109,49 @@ class VideoParticipantSession(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
+class VideoWaitingGuestStatus(str, enum.Enum):
+    PENDING = "pending"
+    ADMITTED = "admitted"
+    DENIED = "denied"
+
+
+class VideoWaitingGuest(Base):
+    """Host waiting-room / admission for guest video join (Roadmap-adjacent
+    feature, built on top of the guest-join feature - see
+    app.media.service.request_guest_join / admit_waiting_guest). A guest's
+    join request lands here as PENDING instead of getting a LiveKit token
+    immediately; the host admits or denies it, and only then does the
+    guest's next poll receive a real token - never persisted here, since a
+    LiveKit access token is itself a bearer credential and there's no
+    reason to store one at rest when it's cheap to (re)generate on demand
+    from guest_identity/display_name once admitted.
+
+    No automatic expiry/cleanup of stale PENDING rows yet - a real product
+    would want one (this session's scope stopped at proving the admission
+    flow itself works), so this table will accumulate abandoned requests
+    over time. Worth a retention-style purge job later, same pattern as
+    app/retention/service.py, if this becomes a real problem.
+    """
+
+    __tablename__ = "video_waiting_guests"
+
+    id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=new_uuid)
+    video_session_id: Mapped[str] = mapped_column(
+        UUID(as_uuid=False), ForeignKey("video_sessions.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    display_name: Mapped[str] = mapped_column(String(100), nullable=False)
+    # Reserved at request time (not at admission) so the SAME identity is
+    # used throughout - the host is shown/approves this exact guest, not a
+    # freshly-minted one that could theoretically differ.
+    guest_identity: Mapped[str] = mapped_column(String(50), nullable=False, unique=True)
+    status: Mapped[VideoWaitingGuestStatus] = mapped_column(
+        Enum(VideoWaitingGuestStatus, name="video_waiting_guest_status_enum"),
+        nullable=False,
+        default=VideoWaitingGuestStatus.PENDING,
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
 class Voicemail(Base):
     __tablename__ = "voicemails"
 

@@ -615,16 +615,49 @@ export function joinVideoRoom(
   });
 }
 
-// Deliberately no token param - a guest joins via the shared link + their
-// name only, no Zoiko account (see backend's POST .../guest-token, which
-// has no auth dependency at all).
-export function guestJoinVideoRoom(
-  roomName: string,
-  displayName: string
-): Promise<{ token: string; url: string }> {
+// Deliberately no token param - a guest requests to join via the shared
+// link + their name only, no Zoiko account (see backend's POST
+// .../guest-token, which has no auth dependency at all). Doesn't return a
+// token directly - the guest lands in the waiting room until the host
+// admits them (see checkGuestWaitingStatus).
+export function guestJoinVideoRoom(roomName: string, displayName: string): Promise<{ waiting_id: string }> {
   return request(`/media/video/rooms/${encodeURIComponent(roomName)}/guest-token`, {
     method: "POST",
     body: JSON.stringify({ display_name: displayName }),
+  });
+}
+
+export type WaitingStatus = {
+  status: "pending" | "admitted" | "denied";
+  token: string | null;
+  url: string | null;
+};
+
+export function checkGuestWaitingStatus(roomName: string, waitingId: string): Promise<WaitingStatus> {
+  return request(
+    `/media/video/rooms/${encodeURIComponent(roomName)}/waiting/${encodeURIComponent(waitingId)}`
+  );
+}
+
+export type WaitingGuest = { id: string; display_name: string; created_at: string };
+
+export function listWaitingGuests(token: string, roomName: string): Promise<WaitingGuest[]> {
+  return request(`/media/video/rooms/${encodeURIComponent(roomName)}/waiting`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export function admitWaitingGuest(token: string, roomName: string, waitingId: string): Promise<{ admitted: boolean }> {
+  return request(`/media/video/rooms/${encodeURIComponent(roomName)}/waiting/${encodeURIComponent(waitingId)}/admit`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export function denyWaitingGuest(token: string, roomName: string, waitingId: string): Promise<{ denied: boolean }> {
+  return request(`/media/video/rooms/${encodeURIComponent(roomName)}/waiting/${encodeURIComponent(waitingId)}/deny`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
   });
 }
 

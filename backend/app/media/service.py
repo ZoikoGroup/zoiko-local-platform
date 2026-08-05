@@ -22,6 +22,8 @@ from app.media.models import (
     VideoParticipantSession,
     VideoSession,
     VideoSessionStatus,
+    VideoWaitingGuest,
+    VideoWaitingGuestStatus,
     Voicemail,
 )
 from app.numbering.identity.models import User, UserRole
@@ -48,6 +50,10 @@ class ReceptionistCallAuthorizationError(Exception):
 class RecordingConsentRequiredError(Exception):
     """Raised when starting a video recording without active AI-processing
     consent on file - recording is opt-in and consent-gated, never automatic."""
+
+
+class WaitingGuestNotFoundError(Exception):
+    """Raised when a waiting-room request id doesn't exist for the given room."""
 
 
 async def verify_twilio_webhook(request: Request) -> dict:
@@ -368,29 +374,118 @@ def generate_video_join_token(
     return video.build_participant_token(room_name, identity, display_name)
 
 
-def generate_guest_join_token(db: Session, room_name: str, display_name: str) -> str:
-    """Public, unauthenticated join - no Zoiko account involved at all. The
-    room_name itself (a random 64-bit-entropy `zl-<uuid hex>` string) is
-    what gates access, the same trust model as sharing a Zoom/Meet invite
-    link. Only an ACTIVE session can be joined, so an ended call's link
-    can't be replayed later and a fabricated room name is rejected the
-    same way a real-but-ended one is - this never reveals which case it
-    was. The guest's identity is server-generated (never client-supplied)
-    so it can't collide with or impersonate a real user's identity, and is
-    prefixed `guest-` so participant records/audit are distinguishable
-    from real account users at a glance.
-    """
+def _get_active_session_or_raise(db: Session, room_name: str) -> VideoSession:
     session = db.query(VideoSession).filter(VideoSession.room_name == room_name).first()
     if session is None or session.status != VideoSessionStatus.ACTIVE:
         raise VideoSessionAuthorizationError(f"{room_name} is not an active video session")
+    return session
+
+
+def request_guest_join(db: Session, room_name: str, display_name: str) -> VideoWaitingGuest:
+    """Public, unauthenticated request to join - no Zoiko account involved
+    at all. The room_name itself (a random 64-bit-entropy `zl-<uuid hex>`
+    string) is what gates access, the same trust model as sharing a Zoom/
+    Meet invite link. Only an ACTIVE session can be joined, so an ended
+    call's link can't be replayed later and a fabricated room name is
+    rejected the same way a real-but-ended one is - this never reveals
+    which case it was.
+
+    Doesn't return a token - lands the guest in the waiting room instead
+    (see check_waiting_status/admit_waiting_guest). The guest's identity is
+    reserved now, server-generated (never client-supplied) so it can't
+    collide with or impersonate a real user's identity, and prefixed
+    `guest-` so participant records/audit are distinguishable from real
+    account users at a glance.
+    """
+    session = _get_active_session_or_raise(db, room_name)
 
     guest_identity = f"guest-{uuid.uuid4().hex[:12]}"
-    log_event(
-        db, actor_id=session.account_id, action="video.guest_joined",
-        target_type="video_session", target_id=session.id,
-        metadata={"display_name": display_name, "guest_identity": guest_identity},
+    waiting_guest = VideoWaitingGuest(
+        video_session_id=session.id, display_name=display_name, guest_identity=guest_identity,
     )
-    return video.build_participant_token(room_name, guest_identity, display_name)
+    db.add(waiting_guest)
+    db.commit()
+    db.refresh(waiting_guest)
+    log_event(
+        db, actor_id=session.account_id, action="video.guest_join_requested",
+        target_type="video_session", target_id=session.id,
+        metadata={"display_name": display_name, "guest_identity": guest_identity, "waiting_id": waiting_guest.id},
+    )
+    return waiting_guest
+
+
+def check_waiting_status(db: Session, room_name: str, waiting_id: str) -> dict:
+    """Polled by the guest's browser while waiting for the host to respond.
+    A LiveKit token is only ever generated here, on demand, once admitted -
+    never persisted, since it's itself a bearer credential and there's no
+    reason to store one at rest when it's this cheap to regenerate."""
+    session = _get_active_session_or_raise(db, room_name)
+    waiting_guest = (
+        db.query(VideoWaitingGuest)
+        .filter(VideoWaitingGuest.id == waiting_id, VideoWaitingGuest.video_session_id == session.id)
+        .first()
+    )
+    if waiting_guest is None:
+        raise WaitingGuestNotFoundError(f"{waiting_id} is not a waiting-room request for {room_name}")
+
+    if waiting_guest.status == VideoWaitingGuestStatus.ADMITTED:
+        token = video.build_participant_token(room_name, waiting_guest.guest_identity, waiting_guest.display_name)
+        return {"status": "admitted", "token": token}
+    return {"status": waiting_guest.status.value, "token": None}
+
+
+def _assert_can_manage_video_session(db: Session, user: User, room_name: str) -> VideoSession:
+    session = _find_account_video_session(db, user.account_id, room_name)
+    if user.role == UserRole.MEMBER and session.host_user_id != user.id:
+        raise VideoSessionAuthorizationError(f"{room_name} was not started by you")
+    return session
+
+
+def list_waiting_guests(db: Session, user: User, room_name: str) -> list[VideoWaitingGuest]:
+    session = _assert_can_manage_video_session(db, user, room_name)
+    return (
+        db.query(VideoWaitingGuest)
+        .filter(
+            VideoWaitingGuest.video_session_id == session.id,
+            VideoWaitingGuest.status == VideoWaitingGuestStatus.PENDING,
+        )
+        .order_by(VideoWaitingGuest.created_at.asc())
+        .all()
+    )
+
+
+def _get_waiting_guest_for_host(db: Session, user: User, room_name: str, waiting_id: str) -> VideoWaitingGuest:
+    session = _assert_can_manage_video_session(db, user, room_name)
+    waiting_guest = (
+        db.query(VideoWaitingGuest)
+        .filter(VideoWaitingGuest.id == waiting_id, VideoWaitingGuest.video_session_id == session.id)
+        .first()
+    )
+    if waiting_guest is None:
+        raise WaitingGuestNotFoundError(f"{waiting_id} is not a waiting-room request for {room_name}")
+    return waiting_guest
+
+
+def admit_waiting_guest(db: Session, user: User, room_name: str, waiting_id: str) -> None:
+    waiting_guest = _get_waiting_guest_for_host(db, user, room_name, waiting_id)
+    waiting_guest.status = VideoWaitingGuestStatus.ADMITTED
+    db.commit()
+    log_event(
+        db, actor_id=user.id, action="video.guest_admitted",
+        target_type="video_session", target_id=waiting_guest.video_session_id,
+        metadata={"waiting_id": waiting_id, "display_name": waiting_guest.display_name},
+    )
+
+
+def deny_waiting_guest(db: Session, user: User, room_name: str, waiting_id: str) -> None:
+    waiting_guest = _get_waiting_guest_for_host(db, user, room_name, waiting_id)
+    waiting_guest.status = VideoWaitingGuestStatus.DENIED
+    db.commit()
+    log_event(
+        db, actor_id=user.id, action="video.guest_denied",
+        target_type="video_session", target_id=waiting_guest.video_session_id,
+        metadata={"waiting_id": waiting_id, "display_name": waiting_guest.display_name},
+    )
 
 
 def list_account_video_sessions(db: Session, account_id: str) -> list[VideoSession]:

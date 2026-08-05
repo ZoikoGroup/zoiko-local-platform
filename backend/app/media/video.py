@@ -66,15 +66,84 @@ async def guest_join_room(
     body: GuestJoinTokenRequest,
     db: Session = Depends(get_db),
 ):
-    """Deliberately no auth dependency - lets an external guest join via a
-    shared link + their name only, no Zoiko account. Rate-limited per IP
-    like the login endpoints, since this is the one video route anyone on
-    the internet can call without a token."""
+    """Deliberately no auth dependency - lets an external guest request to
+    join via a shared link + their name only, no Zoiko account. Doesn't
+    return a token directly - lands the guest in the waiting room (see
+    .../waiting/{waiting_id}) until the host admits them. Rate-limited per
+    IP like the login endpoints, since this is the one video route anyone
+    on the internet can call without a token."""
     try:
-        token = media_service.generate_guest_join_token(db, room_name, body.display_name)
+        waiting_guest = media_service.request_guest_join(db, room_name, body.display_name)
     except media_service.VideoSessionAuthorizationError as e:
         raise HTTPException(status_code=404, detail=str(e)) from e
-    return {"token": token, "url": settings.livekit_url}
+    return {"waiting_id": waiting_guest.id}
+
+
+@router.get("/rooms/{room_name}/waiting/{waiting_id}")
+@limiter.limit("60/minute")
+async def guest_waiting_status(
+    request: Request,
+    room_name: str,
+    waiting_id: str,
+    db: Session = Depends(get_db),
+):
+    """Polled by the guest's browser (no auth - the guest has no account)
+    every couple of seconds while waiting for the host to respond. A
+    looser rate limit than the join request itself, since normal waiting
+    behavior means several polls per minute, not an abuse pattern."""
+    try:
+        result = media_service.check_waiting_status(db, room_name, waiting_id)
+    except (media_service.VideoSessionAuthorizationError, media_service.WaitingGuestNotFoundError) as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    return {**result, "url": settings.livekit_url if result["token"] else None}
+
+
+@router.get("/rooms/{room_name}/waiting")
+async def list_waiting_guests(
+    room_name: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_writer),
+):
+    """Host-only - the waiting room list a host polls while in a call."""
+    try:
+        waiting_guests = media_service.list_waiting_guests(db, current_user, room_name)
+    except media_service.VideoSessionAuthorizationError as e:
+        raise HTTPException(status_code=403, detail=str(e)) from e
+    return [
+        {"id": g.id, "display_name": g.display_name, "created_at": g.created_at} for g in waiting_guests
+    ]
+
+
+@router.post("/rooms/{room_name}/waiting/{waiting_id}/admit")
+async def admit_waiting_guest(
+    room_name: str,
+    waiting_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_writer),
+):
+    try:
+        media_service.admit_waiting_guest(db, current_user, room_name, waiting_id)
+    except media_service.VideoSessionAuthorizationError as e:
+        raise HTTPException(status_code=403, detail=str(e)) from e
+    except media_service.WaitingGuestNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    return {"admitted": True}
+
+
+@router.post("/rooms/{room_name}/waiting/{waiting_id}/deny")
+async def deny_waiting_guest(
+    room_name: str,
+    waiting_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_writer),
+):
+    try:
+        media_service.deny_waiting_guest(db, current_user, room_name, waiting_id)
+    except media_service.VideoSessionAuthorizationError as e:
+        raise HTTPException(status_code=403, detail=str(e)) from e
+    except media_service.WaitingGuestNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    return {"denied": True}
 
 
 @router.post("/rooms/{room_name}/end")

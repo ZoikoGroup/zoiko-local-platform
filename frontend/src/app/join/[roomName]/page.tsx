@@ -3,15 +3,18 @@
 import { useEffect, useRef, useState } from "react";
 import { useParams } from "next/navigation";
 import { Room, RoomEvent, Track } from "livekit-client";
-import { guestJoinVideoRoom, ApiError } from "@/lib/api";
+import { guestJoinVideoRoom, checkGuestWaitingStatus, ApiError } from "@/lib/api";
 
-type CallState = "lobby" | "connecting" | "in-call" | "ended" | "not-found";
+type CallState = "lobby" | "requesting" | "waiting" | "in-call" | "ended" | "denied" | "not-found";
 type DeviceStatus = "idle" | "requesting" | "ready" | "blocked";
+
+const POLL_INTERVAL_MS = 2000;
 
 // Public, unauthenticated page - anyone with the link can land here, no
 // Zoiko account or login involved. Deliberately a much smaller feature set
 // than the dashboard's video page (no create/end room, no recording, no
-// screen share) - a guest can join, see/hear everyone, and leave.
+// screen share) - a guest can request to join, wait for the host to admit
+// them, then see/hear everyone and leave.
 export default function GuestJoinPage() {
   const params = useParams<{ roomName: string }>();
   const roomName = params.roomName;
@@ -25,12 +28,14 @@ export default function GuestJoinPage() {
   const [micStatus, setMicStatus] = useState<DeviceStatus>("idle");
   const [lobbyVideoStream, setLobbyVideoStream] = useState<MediaStream | null>(null);
   const [participantCount, setParticipantCount] = useState(0);
+  const [waitingId, setWaitingId] = useState<string | null>(null);
 
   const roomRef = useRef<Room | null>(null);
   const lobbyVideoRef = useRef<HTMLVideoElement>(null);
   const localVideoRef = useRef<HTMLVideoElement>(null);
   const remoteContainerRef = useRef<HTMLDivElement>(null);
   const attachedElements = useRef<Map<string, HTMLMediaElement>>(new Map());
+  const pendingJoinRef = useRef<{ camera: boolean; mic: boolean } | null>(null);
 
   useEffect(() => {
     return () => {
@@ -95,55 +100,94 @@ export default function GuestJoinPage() {
     }
   }
 
+  async function connectToRoom(liveKitToken: string, url: string) {
+    const { camera: useCamera, mic: useMic } = pendingJoinRef.current ?? { camera: false, mic: false };
+
+    const room = new Room();
+    roomRef.current = room;
+
+    room.on(RoomEvent.TrackSubscribed, (track) => {
+      if (track.kind === Track.Kind.Video || track.kind === Track.Kind.Audio) {
+        const el = track.attach();
+        attachedElements.current.set(track.sid ?? el.id, el);
+        remoteContainerRef.current?.appendChild(el);
+      }
+    });
+    room.on(RoomEvent.TrackUnsubscribed, (track) => {
+      track.detach().forEach((el) => el.remove());
+    });
+    room.on(RoomEvent.ParticipantConnected, () => setParticipantCount(room.remoteParticipants.size));
+    room.on(RoomEvent.ParticipantDisconnected, () => setParticipantCount(room.remoteParticipants.size));
+    room.on(RoomEvent.Disconnected, () => {
+      setCallState("ended");
+      roomRef.current = null;
+    });
+
+    await room.connect(url, liveKitToken);
+    if (useCamera) await room.localParticipant.setCameraEnabled(true);
+    if (useMic) await room.localParticipant.setMicrophoneEnabled(true);
+    setCameraOn(useCamera);
+    setMicOn(useMic);
+
+    setParticipantCount(room.remoteParticipants.size);
+    setCallState("in-call");
+  }
+
+  // Polls the waiting-room status while a request is pending - stops as
+  // soon as the host responds (or the guest navigates away, via cleanup).
+  useEffect(() => {
+    if (callState !== "waiting" || !roomName || !waitingId) return;
+
+    let cancelled = false;
+    const interval = setInterval(async () => {
+      try {
+        const result = await checkGuestWaitingStatus(roomName, waitingId);
+        if (cancelled) return;
+        if (result.status === "admitted" && result.token && result.url) {
+          clearInterval(interval);
+          await connectToRoom(result.token, result.url);
+        } else if (result.status === "denied") {
+          clearInterval(interval);
+          setCallState("denied");
+        }
+      } catch (err) {
+        if (cancelled) return;
+        clearInterval(interval);
+        if (err instanceof ApiError && err.status === 404) {
+          setCallState("not-found");
+          return;
+        }
+        setCallState("lobby");
+        setCallError("Lost connection while waiting - please try joining again.");
+      }
+    }, POLL_INTERVAL_MS);
+
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [callState, roomName, waitingId]);
+
   async function handleJoin() {
     if (!roomName || !displayName.trim()) return;
     setCallError(null);
-    setCallState("connecting");
-    const useCamera = cameraOn;
-    const useMic = micOn;
+    setCallState("requesting");
+    pendingJoinRef.current = { camera: cameraOn, mic: micOn };
     stopLobbyVideoPreview();
 
     try {
-      const { token, url } = await guestJoinVideoRoom(roomName, displayName.trim());
-
-      const room = new Room();
-      roomRef.current = room;
-
-      room.on(RoomEvent.TrackSubscribed, (track) => {
-        if (track.kind === Track.Kind.Video || track.kind === Track.Kind.Audio) {
-          const el = track.attach();
-          attachedElements.current.set(track.sid ?? el.id, el);
-          remoteContainerRef.current?.appendChild(el);
-        }
-      });
-      room.on(RoomEvent.TrackUnsubscribed, (track) => {
-        track.detach().forEach((el) => el.remove());
-      });
-      room.on(RoomEvent.ParticipantConnected, () => setParticipantCount(room.remoteParticipants.size));
-      room.on(RoomEvent.ParticipantDisconnected, () => setParticipantCount(room.remoteParticipants.size));
-      room.on(RoomEvent.Disconnected, () => {
-        setCallState("ended");
-        roomRef.current = null;
-      });
-
-      await room.connect(url, token);
-      if (useCamera) await room.localParticipant.setCameraEnabled(true);
-      if (useMic) await room.localParticipant.setMicrophoneEnabled(true);
-      setCameraOn(useCamera);
-      setMicOn(useMic);
-
-      setParticipantCount(room.remoteParticipants.size);
-      setCallState("in-call");
+      const { waiting_id } = await guestJoinVideoRoom(roomName, displayName.trim());
+      setWaitingId(waiting_id);
+      setCallState("waiting");
     } catch (err) {
-      roomRef.current?.disconnect();
-      roomRef.current = null;
       if (err instanceof ApiError && err.status === 404) {
         setCallState("not-found");
         return;
       }
       setCallState("lobby");
       const message = err instanceof ApiError || err instanceof Error ? err.message : "Unknown error.";
-      setCallError(`Couldn't join the call: ${message}`);
+      setCallError(`Couldn't request to join: ${message}`);
     }
   }
 
@@ -184,6 +228,21 @@ export default function GuestJoinPage() {
           </div>
         )}
 
+        {callState === "denied" && (
+          <div className="bg-slate-900 border border-slate-800 rounded-2xl p-8 text-center space-y-2">
+            <h1 className="text-lg font-semibold text-white">You weren&apos;t let in</h1>
+            <p className="text-sm text-slate-400">The host didn&apos;t admit you to this call.</p>
+          </div>
+        )}
+
+        {callState === "waiting" && (
+          <div className="bg-slate-900 border border-slate-800 rounded-2xl p-8 text-center space-y-3">
+            <div className="w-8 h-8 mx-auto rounded-full border-2 border-slate-700 border-t-indigo-500 animate-spin" />
+            <h1 className="text-lg font-semibold text-white">Waiting for the host to let you in…</h1>
+            <p className="text-sm text-slate-400">You&apos;ll join automatically once they admit you.</p>
+          </div>
+        )}
+
         {callState === "ended" && (
           <div className="bg-slate-900 border border-slate-800 rounded-2xl p-8 text-center space-y-2">
             <h1 className="text-lg font-semibold text-white">You&apos;ve left the call</h1>
@@ -191,7 +250,7 @@ export default function GuestJoinPage() {
           </div>
         )}
 
-        {(callState === "lobby" || callState === "connecting") && (
+        {(callState === "lobby" || callState === "requesting") && (
           <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 space-y-4">
             <div className="relative aspect-video bg-black rounded-lg overflow-hidden flex items-center justify-center">
               {cameraOn ? (
@@ -247,10 +306,10 @@ export default function GuestJoinPage() {
 
             <button
               onClick={handleJoin}
-              disabled={!displayName.trim() || callState === "connecting"}
+              disabled={!displayName.trim() || callState === "requesting"}
               className="w-full bg-indigo-600 hover:bg-indigo-700 disabled:opacity-60 text-white text-sm font-medium rounded-lg px-4 py-2.5"
             >
-              {callState === "connecting" ? "Joining…" : "Join meeting"}
+              {callState === "requesting" ? "Requesting…" : "Join meeting"}
             </button>
           </div>
         )}

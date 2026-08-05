@@ -777,16 +777,14 @@ def _seed_active_session(db_session, room_name: str, *, account_id: str | None =
     return session
 
 
-def test_guest_join_requires_no_auth_and_returns_a_real_token(client, db_session):
+def test_guest_join_requires_no_auth_and_lands_in_the_waiting_room(client, db_session):
     session = _seed_active_session(db_session, "zl-guest-test-1")
 
     response = client.post(
         f"/media/video/rooms/{session.room_name}/guest-token", json={"display_name": "Alex Guest"}
     )
     assert response.status_code == 200, response.text
-    body = response.json()
-    assert body["token"]
-    assert "url" in body
+    assert response.json()["waiting_id"]
 
 
 def test_guest_join_rejects_a_nonexistent_room(client):
@@ -816,36 +814,6 @@ def test_guest_join_rejects_a_blank_display_name(client, db_session):
     assert response.status_code == 422
 
 
-def test_guest_join_issues_a_distinct_identity_per_guest(client, db_session):
-    """Two guests joining the same room must not collide - each gets their
-    own server-generated guest-<uuid> identity, never client-supplied."""
-    from jose import jwt as jose_jwt
-
-    session = _seed_active_session(db_session, "zl-guest-test-distinct")
-
-    response1 = client.post(
-        f"/media/video/rooms/{session.room_name}/guest-token", json={"display_name": "Guest One"}
-    )
-    response2 = client.post(
-        f"/media/video/rooms/{session.room_name}/guest-token", json={"display_name": "Guest Two"}
-    )
-    assert response1.status_code == 200
-    assert response2.status_code == 200
-
-    token1 = response1.json()["token"]
-    token2 = response2.json()["token"]
-    assert token1 != token2
-
-    # LiveKit access tokens are JWTs - decode without verifying (this test
-    # doesn't have the LiveKit API secret's signing context) just to inspect
-    # the identity claim (`sub`) each token was actually issued for.
-    claims1 = jose_jwt.get_unverified_claims(token1)
-    claims2 = jose_jwt.get_unverified_claims(token2)
-    assert claims1["sub"].startswith("guest-")
-    assert claims2["sub"].startswith("guest-")
-    assert claims1["sub"] != claims2["sub"]
-
-
 def test_guest_join_creates_an_audit_event(client, db_session):
     from app.audit.models import AuditEvent
 
@@ -858,7 +826,7 @@ def test_guest_join_creates_an_audit_event(client, db_session):
 
     events = (
         db_session.query(AuditEvent)
-        .filter(AuditEvent.action == "video.guest_joined", AuditEvent.target == f"video_session:{session.id}")
+        .filter(AuditEvent.action == "video.guest_join_requested", AuditEvent.target == f"video_session:{session.id}")
         .all()
     )
     assert len(events) == 1
@@ -877,3 +845,112 @@ def test_guest_join_is_rate_limited_after_repeated_attempts(client, db_session):
         f"/media/video/rooms/{session.room_name}/guest-token", json={"display_name": "Repeat Guest"}
     )
     assert over_limit_response.status_code == 429
+
+
+def test_waiting_status_is_pending_before_the_host_responds(client, db_session):
+    session = _seed_active_session(db_session, "zl-waiting-test-pending")
+    waiting_id = client.post(
+        f"/media/video/rooms/{session.room_name}/guest-token", json={"display_name": "Waiting Guest"}
+    ).json()["waiting_id"]
+
+    response = client.get(f"/media/video/rooms/{session.room_name}/waiting/{waiting_id}")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "pending"
+    assert body["token"] is None
+
+
+def test_waiting_status_rejects_an_unknown_waiting_id(client, db_session):
+    session = _seed_active_session(db_session, "zl-waiting-test-unknown")
+
+    response = client.get(f"/media/video/rooms/{session.room_name}/waiting/00000000-0000-0000-0000-000000000000")
+    assert response.status_code == 404
+
+
+def _seed_active_session_with_real_owner(client, db_session, email: str, room_name: str):
+    """Like _seed_active_session, but the host is a real signed-up account
+    (with a real password) so tests can authenticate as them via the real
+    /auth/login endpoint - needed for the host-side waiting-room actions,
+    which require a genuine bearer token, not just a DB row."""
+    from app.media.models import VideoSession, VideoSessionStatus
+
+    token = _signup_and_login(client, email)
+    me = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"}).json()
+    session = VideoSession(
+        account_id=me["account_id"], host_user_id=me["id"], room_name=room_name,
+        status=VideoSessionStatus.ACTIVE,
+    )
+    db_session.add(session)
+    db_session.commit()
+    return session, {"Authorization": f"Bearer {token}"}
+
+
+def test_host_can_list_and_admit_a_waiting_guest(client, db_session):
+    from jose import jwt as jose_jwt
+
+    session, owner_headers = _seed_active_session_with_real_owner(
+        client, db_session, "waitingroomhost1@example.com", "zl-waiting-test-admit"
+    )
+
+    waiting_id = client.post(
+        f"/media/video/rooms/{session.room_name}/guest-token", json={"display_name": "Admit Me"}
+    ).json()["waiting_id"]
+
+    list_response = client.get(f"/media/video/rooms/{session.room_name}/waiting", headers=owner_headers)
+    assert list_response.status_code == 200
+    assert any(g["id"] == waiting_id and g["display_name"] == "Admit Me" for g in list_response.json())
+
+    admit_response = client.post(
+        f"/media/video/rooms/{session.room_name}/waiting/{waiting_id}/admit", headers=owner_headers
+    )
+    assert admit_response.status_code == 200
+
+    # The guest's own poll (no auth) must now see a real token.
+    status_response = client.get(f"/media/video/rooms/{session.room_name}/waiting/{waiting_id}")
+    body = status_response.json()
+    assert body["status"] == "admitted"
+    assert body["token"]
+    claims = jose_jwt.get_unverified_claims(body["token"])
+    assert claims["sub"].startswith("guest-")
+
+    # Admitted guests drop off the host's pending list.
+    list_after = client.get(f"/media/video/rooms/{session.room_name}/waiting", headers=owner_headers)
+    assert not any(g["id"] == waiting_id for g in list_after.json())
+
+
+def test_host_can_deny_a_waiting_guest(client, db_session):
+    session, owner_headers = _seed_active_session_with_real_owner(
+        client, db_session, "waitingroomhost2@example.com", "zl-waiting-test-deny"
+    )
+
+    waiting_id = client.post(
+        f"/media/video/rooms/{session.room_name}/guest-token", json={"display_name": "Deny Me"}
+    ).json()["waiting_id"]
+
+    deny_response = client.post(
+        f"/media/video/rooms/{session.room_name}/waiting/{waiting_id}/deny", headers=owner_headers
+    )
+    assert deny_response.status_code == 200
+
+    status_response = client.get(f"/media/video/rooms/{session.room_name}/waiting/{waiting_id}")
+    body = status_response.json()
+    assert body["status"] == "denied"
+    assert body["token"] is None
+
+
+def test_a_different_accounts_host_cannot_see_or_admit_a_waiting_guest(client, db_session):
+    session = _seed_active_session(db_session, "zl-waiting-test-other-account")
+    waiting_id = client.post(
+        f"/media/video/rooms/{session.room_name}/guest-token", json={"display_name": "Someone"}
+    ).json()["waiting_id"]
+
+    intruder_token = _signup_and_login(client, "waitingroomintruder@example.com")
+    intruder_headers = {"Authorization": f"Bearer {intruder_token}"}
+
+    list_response = client.get(f"/media/video/rooms/{session.room_name}/waiting", headers=intruder_headers)
+    assert list_response.status_code == 403
+
+    admit_response = client.post(
+        f"/media/video/rooms/{session.room_name}/waiting/{waiting_id}/admit", headers=intruder_headers
+    )
+    assert admit_response.status_code == 403

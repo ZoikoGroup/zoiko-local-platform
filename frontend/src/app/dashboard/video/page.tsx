@@ -11,9 +11,13 @@ import {
   startVideoRecording,
   summarizeVideoSession,
   grantAiProcessingConsent,
+  listWaitingGuests,
+  admitWaitingGuest,
+  denyWaitingGuest,
   ApiError,
   type VideoRoom,
   type ConversationSummary,
+  type WaitingGuest,
 } from "@/lib/api";
 import { getToken } from "@/lib/auth";
 
@@ -37,6 +41,8 @@ export default function VideoPage() {
   const [screenSharing, setScreenSharing] = useState(false);
   const [participantCount, setParticipantCount] = useState(0);
   const [inviteLinkCopied, setInviteLinkCopied] = useState(false);
+  const [waitingGuests, setWaitingGuests] = useState<WaitingGuest[]>([]);
+  const [admittingGuestId, setAdmittingGuestId] = useState<string | null>(null);
   const [recordingState, setRecordingState] = useState<RecordingState>("idle");
   const [recordingError, setRecordingError] = useState<string | null>(null);
 
@@ -111,6 +117,29 @@ export default function VideoPage() {
     const cameraPublication = room.localParticipant.getTrackPublication(Track.Source.Camera);
     cameraPublication?.videoTrack?.attach(videoEl);
   }, [callState]);
+
+  // Polls for guests waiting to be let in, while actually in a call - not
+  // before (no room exists yet to wait for) and not after (nothing to poll).
+  useEffect(() => {
+    if (callState !== "in-call" || !token || !roomName) return;
+    let cancelled = false;
+    const poll = () => {
+      listWaitingGuests(token, roomName)
+        .then((guests) => {
+          if (!cancelled) setWaitingGuests(guests);
+        })
+        .catch(() => {
+          // Transient failure - the next poll a few seconds later will just
+          // pick up where this one left off, not worth surfacing an error.
+        });
+    };
+    poll();
+    const interval = setInterval(poll, 3000);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, [callState, token, roomName]);
 
   // Same timing issue as the camera effect above - the screen-share preview
   // element only renders once screenSharing is true, so attach after.
@@ -300,6 +329,32 @@ export default function VideoPage() {
     }
   }
 
+  async function handleAdmitGuest(waitingId: string) {
+    if (!token || !roomName) return;
+    setAdmittingGuestId(waitingId);
+    try {
+      await admitWaitingGuest(token, roomName, waitingId);
+      setWaitingGuests((prev) => prev.filter((g) => g.id !== waitingId));
+    } catch {
+      // Next poll will re-sync the list either way - not worth a hard error banner.
+    } finally {
+      setAdmittingGuestId(null);
+    }
+  }
+
+  async function handleDenyGuest(waitingId: string) {
+    if (!token || !roomName) return;
+    setAdmittingGuestId(waitingId);
+    try {
+      await denyWaitingGuest(token, roomName, waitingId);
+      setWaitingGuests((prev) => prev.filter((g) => g.id !== waitingId));
+    } catch {
+      // Next poll will re-sync the list either way - not worth a hard error banner.
+    } finally {
+      setAdmittingGuestId(null);
+    }
+  }
+
   async function handleEndCall() {
     if (!token || !roomName) return;
     const endingRoomName = roomName;
@@ -309,6 +364,7 @@ export default function VideoPage() {
     setRoomName(null);
     setScreenSharing(false);
     setRecordingState("idle");
+    setWaitingGuests([]);
     try {
       await endVideoRoom(token, endingRoomName);
     } catch {
@@ -606,6 +662,37 @@ export default function VideoPage() {
           )}
           {recordingError && (
             <p className="text-xs text-red-400 bg-red-950/50 rounded-lg px-3 py-2">{recordingError}</p>
+          )}
+
+          {waitingGuests.length > 0 && (
+            <div className="bg-indigo-950/50 border border-indigo-900 rounded-lg px-3 py-2 space-y-2">
+              <p className="text-xs font-medium text-indigo-300">
+                {waitingGuests.length} {waitingGuests.length === 1 ? "person" : "people"} waiting to join
+              </p>
+              <ul className="space-y-1.5">
+                {waitingGuests.map((guest) => (
+                  <li key={guest.id} className="flex items-center justify-between gap-3 text-sm">
+                    <span className="text-slate-200 truncate">{guest.display_name}</span>
+                    <div className="flex items-center gap-2 shrink-0">
+                      <button
+                        onClick={() => handleAdmitGuest(guest.id)}
+                        disabled={admittingGuestId === guest.id}
+                        className="text-xs font-medium rounded-lg px-2.5 py-1 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-60 text-white"
+                      >
+                        Admit
+                      </button>
+                      <button
+                        onClick={() => handleDenyGuest(guest.id)}
+                        disabled={admittingGuestId === guest.id}
+                        className="text-xs font-medium rounded-lg px-2.5 py-1 bg-slate-800 hover:bg-slate-700 disabled:opacity-60 text-slate-300"
+                      >
+                        Deny
+                      </button>
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            </div>
           )}
 
           {screenSharing && (
