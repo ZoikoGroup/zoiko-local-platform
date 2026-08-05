@@ -956,6 +956,73 @@ export function listUsage(token: string): Promise<UsageEvent[]> {
   });
 }
 
+// --- Billing / Plans / Entitlements ---
+// No payment processing - this only gates feature/resource limits locally,
+// pending a real ZoikoNex connection (see backend app/billing/models.py).
+
+export type Plan = {
+  plan_code: string;
+  name: string;
+  max_numbers: number;
+  max_team_seats: number;
+  monthly_voice_minutes: number;
+  monthly_video_minutes: number;
+  monthly_ai_summaries: number;
+  trial_days: number;
+};
+
+export type Subscription = {
+  id: string;
+  plan_code: string;
+  status: "trialing" | "active" | "past_due" | "canceled";
+  trial_ends_at: string | null;
+  current_period_start: string;
+  current_period_end: string;
+  zoikonex_ref: string | null;
+};
+
+export type UsageResourceSummary = {
+  resource: string;
+  used: number;
+  limit: number;
+};
+
+export type UsageSummary = {
+  plan_code: string;
+  plan_name: string;
+  status: string;
+  trial_ends_at: string | null;
+  current_period_start: string;
+  current_period_end: string;
+  resources: UsageResourceSummary[];
+};
+
+export function listPlans(token: string): Promise<Plan[]> {
+  return request<Plan[]>("/billing/plans", {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export function getSubscription(token: string): Promise<Subscription> {
+  return request<Subscription>("/billing/subscription", {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export function changeSubscriptionPlan(token: string, planCode: string): Promise<Subscription> {
+  return request<Subscription>("/billing/subscription/plan", {
+    method: "PUT",
+    headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ plan_code: planCode }),
+  });
+}
+
+export function getUsageSummary(token: string): Promise<UsageSummary> {
+  return request<UsageSummary>("/billing/usage-summary", {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
 // --- Number Porting ---
 
 export type PortingRequest = {

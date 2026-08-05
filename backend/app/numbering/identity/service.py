@@ -1,6 +1,7 @@
 from sqlalchemy.orm import Session
 
 from app.audit.service import log_event
+from app.billing.service import assert_seat_quota_available
 from app.core.security import (
     generate_mfa_secret,
     hash_password,
@@ -102,6 +103,8 @@ def add_team_member(
     existing = db.query(User).filter(User.email == email).first()
     if existing:
         raise ValueError("A user with this email already exists")
+
+    assert_seat_quota_available(db, account_id)
 
     member = User(
         account_id=account_id,

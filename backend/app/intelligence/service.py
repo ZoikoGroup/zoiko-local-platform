@@ -19,6 +19,7 @@ from app.numbering.identity.models import User, UserRole
 from app.numbering.numbers.service import NumberConflictError, assert_number_access, assigned_number_ids
 from app.numbering.numbers.models import PhoneNumber
 from app.retention.service import PURGED_MARKER
+from app.usage import service as usage_service
 
 AI_DISCLAIMER = "AI-generated summary — may be inaccurate; not an authoritative record."
 
@@ -118,6 +119,15 @@ def _analyze_and_store(
             "source_id": source_id,
             "urgency": urgency.value if urgency else None,
         },
+    )
+
+    # Usage Metering (Architecture doc §7/§5 "AI processing units") - one
+    # unit per generated summary, keyed by the summary's own id so a retry
+    # of the same summarize call (which always creates a new record, never
+    # updates one in place) is correctly counted as new usage, not a duplicate.
+    usage_service.record_usage_event(
+        db, account_id=account_id, event_type="ai_summary", quantity=1, unit="summaries",
+        country_band=None, idempotency_key=f"ai_summary:{record.id}",
     )
     return record
 

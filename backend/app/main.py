@@ -7,6 +7,7 @@ from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 
 from app.audit.routes import router as audit_router
+from app.billing.routes import router as billing_router
 from app.compliance.routes import router as compliance_router
 from app.consent.routes import router as consent_router
 from app.contacts.routes import router as contacts_router
@@ -68,6 +69,7 @@ app.add_middleware(
 app.include_router(identity_router)
 app.include_router(team_router)
 app.include_router(audit_router)
+app.include_router(billing_router)
 app.include_router(compliance_router)
 app.include_router(consent_router)
 app.include_router(contacts_router)

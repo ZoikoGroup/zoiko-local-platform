@@ -557,6 +557,20 @@ def handle_video_webhook_event(db: Session, event) -> None:
             row.left_at = session.ended_at or now
         if dangling:
             db.commit()
+
+        # Usage Metering (Architecture doc §7/§5) - room_finished is the one
+        # point where every participant's time is finalized (dangling rows
+        # just closed above), so it's the right moment to rate the whole
+        # call's participant-minutes, not per-participant on each leave.
+        usage_service.record_usage_event(
+            db,
+            account_id=session.account_id,
+            event_type="video_participant_minutes",
+            quantity=get_participant_minutes(db, session.id),
+            unit="minutes",
+            country_band=None,
+            idempotency_key=f"video_participant_minutes:{session.id}",
+        )
     elif event.event == "participant_joined":
         db.add(
             VideoParticipantSession(

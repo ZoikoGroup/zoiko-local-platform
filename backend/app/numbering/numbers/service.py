@@ -5,6 +5,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.audit.service import log_event
+from app.billing import service as billing_service
 from app.compliance.service import has_approved_case, is_requirement_active
 from app.consent.models import ConsentType
 from app.consent.service import has_active_consent
@@ -119,6 +120,12 @@ def purchase_number(db: Session, account_id: str, e164: str) -> PhoneNumber:
         number.reserved_until is not None and number.reserved_until < now
     ):
         raise NumberConflictError(f"Reservation for {e164} expired — reserve it again before purchasing")
+
+    # Architecture doc §5 "Subscription and Entitlement" - number allowance
+    # gate. Checked before the (unwindable) emergency-disclosure/KYC checks
+    # below since it's the cheapest possible reason to reject, and unlike
+    # those, has nothing to persist on rejection.
+    billing_service.assert_number_quota_available(db, account_id, exclude_number_id=number.id)
 
     if not has_active_consent(db, account_id, ConsentType.EMERGENCY_CALLING_ACKNOWLEDGED):
         raise EmergencyDisclosureRequiredError(
