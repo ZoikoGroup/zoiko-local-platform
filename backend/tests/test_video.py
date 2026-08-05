@@ -1011,3 +1011,137 @@ def test_a_different_accounts_host_cannot_see_or_admit_a_waiting_guest(client, d
         f"/media/video/rooms/{session.room_name}/waiting/{waiting_id}/admit", headers=intruder_headers
     )
     assert admit_response.status_code == 403
+
+
+# --- Call-quality telemetry ---
+
+
+def test_report_call_quality_requires_auth(client):
+    response = client.post("/media/video/rooms/some-room/quality", json={"quality": "good"})
+    assert response.status_code == 401
+
+
+def test_report_call_quality_404s_with_no_open_participant_session(client):
+    token = _signup_and_login(client, "qualitynosession@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    room_name = client.post("/media/video/rooms", headers=headers).json()["room_name"]
+
+    response = client.post(
+        f"/media/video/rooms/{room_name}/quality", json={"quality": "poor"}, headers=headers
+    )
+    assert response.status_code == 404
+
+    client.post(f"/media/video/rooms/{room_name}/end", headers=headers)
+
+
+def _open_participant_session(db_session, video_session_id: str, participant_identity: str):
+    from datetime import datetime, timezone
+
+    from app.media.models import VideoParticipantSession
+
+    row = VideoParticipantSession(
+        video_session_id=video_session_id, participant_identity=participant_identity,
+        joined_at=datetime.now(timezone.utc),
+    )
+    db_session.add(row)
+    db_session.commit()
+    return row
+
+
+def test_report_call_quality_records_the_sample(client, db_session):
+    token = _signup_and_login(client, "qualitysample1@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    me = client.get("/auth/me", headers=headers).json()
+    room_name = client.post("/media/video/rooms", headers=headers).json()["room_name"]
+    _open_participant_session(db_session, _room_session_id(db_session, room_name), me["id"])
+
+    response = client.post(
+        f"/media/video/rooms/{room_name}/quality", json={"quality": "good"}, headers=headers
+    )
+    assert response.status_code == 200, response.text
+
+    list_response = client.get("/media/video/rooms", headers=headers)
+    matching = next(r for r in list_response.json() if r["room_name"] == room_name)
+    assert matching["worst_connection_quality"] == "good"
+    assert matching["reconnect_count"] == 0
+
+    client.post(f"/media/video/rooms/{room_name}/end", headers=headers)
+
+
+def test_report_call_quality_keeps_the_worst_value_seen(client, db_session):
+    token = _signup_and_login(client, "qualitysample2@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    me = client.get("/auth/me", headers=headers).json()
+    room_name = client.post("/media/video/rooms", headers=headers).json()["room_name"]
+    _open_participant_session(db_session, _room_session_id(db_session, room_name), me["id"])
+
+    client.post(f"/media/video/rooms/{room_name}/quality", json={"quality": "excellent"}, headers=headers)
+    client.post(f"/media/video/rooms/{room_name}/quality", json={"quality": "poor"}, headers=headers)
+    # A later "excellent" sample must NOT erase the "poor" dip already seen.
+    client.post(f"/media/video/rooms/{room_name}/quality", json={"quality": "excellent"}, headers=headers)
+
+    list_response = client.get("/media/video/rooms", headers=headers)
+    matching = next(r for r in list_response.json() if r["room_name"] == room_name)
+    assert matching["worst_connection_quality"] == "poor"
+
+    client.post(f"/media/video/rooms/{room_name}/end", headers=headers)
+
+
+def test_report_call_quality_counts_reconnects(client, db_session):
+    token = _signup_and_login(client, "qualityreconnect@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    me = client.get("/auth/me", headers=headers).json()
+    room_name = client.post("/media/video/rooms", headers=headers).json()["room_name"]
+    _open_participant_session(db_session, _room_session_id(db_session, room_name), me["id"])
+
+    client.post(
+        f"/media/video/rooms/{room_name}/quality",
+        json={"quality": "good", "reconnected": True}, headers=headers,
+    )
+    client.post(
+        f"/media/video/rooms/{room_name}/quality",
+        json={"quality": "good", "reconnected": True}, headers=headers,
+    )
+
+    list_response = client.get("/media/video/rooms", headers=headers)
+    matching = next(r for r in list_response.json() if r["room_name"] == room_name)
+    assert matching["reconnect_count"] == 2
+
+    client.post(f"/media/video/rooms/{room_name}/end", headers=headers)
+
+
+def _room_session_id(db_session, room_name: str) -> str:
+    from app.media.models import VideoSession
+
+    return db_session.query(VideoSession).filter(VideoSession.room_name == room_name).first().id
+
+
+def test_get_call_quality_summary_aggregates_across_participants(db_session):
+    from app.media.models import ConnectionQuality, VideoSession, VideoSessionStatus
+    from app.media.service import get_call_quality_summary
+    from app.numbering.identity.models import Account, AccountType, User, UserRole
+
+    account = Account(name="Quality Summary Co", account_type=AccountType.INDIVIDUAL)
+    db_session.add(account)
+    db_session.flush()
+    user = User(account_id=account.id, email="qualitysummary@example.com", role=UserRole.OWNER)
+    db_session.add(user)
+    db_session.flush()
+
+    session = VideoSession(
+        account_id=account.id, host_user_id=user.id, room_name="zl-quality-summary-test",
+        status=VideoSessionStatus.ENDED,
+    )
+    db_session.add(session)
+    db_session.flush()
+
+    row_a = _open_participant_session(db_session, session.id, "user-a")
+    row_a.worst_connection_quality = ConnectionQuality.GOOD
+    row_a.reconnect_count = 1
+    row_b = _open_participant_session(db_session, session.id, "user-b")
+    row_b.worst_connection_quality = ConnectionQuality.POOR
+    row_b.reconnect_count = 2
+    db_session.commit()
+
+    summary = get_call_quality_summary(db_session, session.id)
+    assert summary == {"worst_connection_quality": "poor", "reconnect_count": 3}

@@ -17,6 +17,7 @@ from app.intelligence.service import qualify_caller
 from app.media.models import (
     CallDirection,
     CallRecord,
+    ConnectionQuality,
     ReceptionistCall,
     ReceptionistUrgency,
     VideoParticipantSession,
@@ -616,6 +617,67 @@ def get_participant_minutes(db: Session, video_session_id: str) -> float:
     now = datetime.now(timezone.utc)
     total_duration = sum(((row.left_at or now) - row.joined_at for row in rows), timedelta())
     return round(total_duration.total_seconds() / 60, 2)
+
+
+# Worse-than ranking, not alphabetical - used to decide whether a new sample
+# should replace the stored "worst quality seen" for a participant.
+_QUALITY_RANK = {ConnectionQuality.EXCELLENT: 0, ConnectionQuality.GOOD: 1, ConnectionQuality.POOR: 2}
+
+
+class ParticipantSessionNotFoundError(Exception):
+    """Raised when a quality sample arrives for a room/identity with no
+    currently-open participant session - most likely a race between the
+    client's first sample and LiveKit's participant_joined webhook, or a
+    stale POST after the participant already left."""
+
+
+def record_call_quality_sample(
+    db: Session, room_name: str, participant_identity: str, *, quality: ConnectionQuality, reconnected: bool
+) -> VideoParticipantSession:
+    row = (
+        db.query(VideoParticipantSession)
+        .join(VideoSession, VideoSession.id == VideoParticipantSession.video_session_id)
+        .filter(
+            VideoSession.room_name == room_name,
+            VideoParticipantSession.participant_identity == participant_identity,
+            VideoParticipantSession.left_at.is_(None),
+        )
+        .order_by(VideoParticipantSession.joined_at.desc())
+        .first()
+    )
+    if row is None:
+        raise ParticipantSessionNotFoundError(
+            f"No open participant session for {participant_identity!r} in {room_name!r}"
+        )
+
+    if row.worst_connection_quality is None or _QUALITY_RANK[quality] > _QUALITY_RANK[row.worst_connection_quality]:
+        row.worst_connection_quality = quality
+    if reconnected:
+        row.reconnect_count += 1
+    db.commit()
+    db.refresh(row)
+    return row
+
+
+def get_call_quality_summary(db: Session, video_session_id: str) -> dict:
+    """Aggregates every participant's telemetry for one call into a single
+    room-level summary for the call-history list - the worst quality any
+    participant experienced, and the total reconnects across all of them."""
+    rows = (
+        db.query(VideoParticipantSession)
+        .filter(VideoParticipantSession.video_session_id == video_session_id)
+        .all()
+    )
+    worst = None
+    for row in rows:
+        if row.worst_connection_quality is None:
+            continue
+        if worst is None or _QUALITY_RANK[row.worst_connection_quality] > _QUALITY_RANK[worst]:
+            worst = row.worst_connection_quality
+    return {
+        "worst_connection_quality": worst.value if worst else None,
+        "reconnect_count": sum(row.reconnect_count for row in rows),
+    }
 
 
 def _handle_egress_ended(db: Session, event) -> None:

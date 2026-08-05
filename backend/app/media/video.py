@@ -4,6 +4,8 @@ Gateway: app.integrations.video.livekit). Every route requires auth and is
 scoped to the caller's account_id; every state change is audited.
 """
 
+from typing import Literal
+
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
@@ -14,6 +16,7 @@ from app.core.deps import get_current_user, require_writer
 from app.core.rate_limit import limiter
 from app.integrations.video.livekit import VideoError, verify_webhook_event
 from app.media import service as media_service
+from app.media.models import ConnectionQuality
 from app.numbering.identity.models import User
 
 router = APIRouter(prefix="/media/video", tags=["video"])
@@ -29,6 +32,11 @@ class GuestJoinTokenRequest(BaseModel):
 
 class CreateRoomRequest(BaseModel):
     confidential: bool = False
+
+
+class QualitySampleRequest(BaseModel):
+    quality: Literal["excellent", "good", "poor"]
+    reconnected: bool = False
 
 
 @router.post("/rooms", status_code=status.HTTP_201_CREATED)
@@ -67,6 +75,28 @@ async def join_room(
     # token above - returned here so the frontend doesn't need its own
     # separate copy of the same LiveKit project URL configured.
     return {"token": token, "url": settings.livekit_url}
+
+
+@router.post("/rooms/{room_name}/quality")
+async def report_call_quality(
+    room_name: str,
+    body: QualitySampleRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """The client only calls this when its own LiveKit ConnectionQuality
+    actually changes (or on a reconnect), not on a fixed interval - see
+    the video page's RoomEvent.ConnectionQualityChanged handler. Best-effort:
+    a missing/already-ended participant session is a soft 404, not worth
+    surfacing to the user mid-call."""
+    try:
+        media_service.record_call_quality_sample(
+            db, room_name, current_user.id,
+            quality=ConnectionQuality(body.quality), reconnected=body.reconnected,
+        )
+    except media_service.ParticipantSessionNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    return {"recorded": True}
 
 
 @router.post("/rooms/{room_name}/guest-token")
@@ -222,6 +252,7 @@ async def list_rooms(
             "recording_url": media_service.get_recording_download_url(s),
             "participant_minutes": media_service.get_participant_minutes(db, s.id),
             "confidential": s.confidential,
+            **media_service.get_call_quality_summary(db, s.id),
         }
         for s in sessions
     ]

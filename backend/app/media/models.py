@@ -18,6 +18,17 @@ class CallDirection(str, enum.Enum):
     OUTBOUND = "outbound"
 
 
+class ConnectionQuality(str, enum.Enum):
+    """Mirrors the LiveKit client SDK's own ConnectionQuality enum
+    (livekit-client's ConnectionQuality.Excellent/Good/Poor) - the client
+    is what actually observes this (packet loss, RTT), so these values are
+    reported in, not independently measured server-side."""
+
+    EXCELLENT = "excellent"
+    GOOD = "good"
+    POOR = "poor"
+
+
 class CallRecord(Base):
     __tablename__ = "call_records"
 
@@ -119,6 +130,15 @@ class VideoParticipantSession(Base):
     joined_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     left_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    # Call-quality telemetry (architecture doc §11) - client-reported, not a
+    # continuous stream: the client only POSTs when its own ConnectionQuality
+    # actually changes, and this column keeps the WORST value seen rather
+    # than the latest, so a call that dips briefly still shows the dip.
+    worst_connection_quality: Mapped[ConnectionQuality | None] = mapped_column(
+        Enum(ConnectionQuality, name="connection_quality_enum"), nullable=True
+    )
+    reconnect_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
 
 class VideoWaitingGuestStatus(str, enum.Enum):

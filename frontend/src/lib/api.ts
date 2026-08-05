@@ -662,6 +662,8 @@ export type VideoRoom = {
   recording_url: string | null;
   participant_minutes: number;
   confidential: boolean;
+  worst_connection_quality: "excellent" | "good" | "poor" | null;
+  reconnect_count: number;
 };
 
 export function listVideoRooms(token: string): Promise<VideoRoom[]> {
@@ -753,6 +755,19 @@ export function startVideoRecording(
   return request(`/media/video/rooms/${encodeURIComponent(roomName)}/recording/start`, {
     method: "POST",
     headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export function reportCallQuality(
+  token: string,
+  roomName: string,
+  quality: "excellent" | "good" | "poor",
+  reconnected: boolean = false
+): Promise<{ recorded: boolean }> {
+  return request(`/media/video/rooms/${encodeURIComponent(roomName)}/quality`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ quality, reconnected }),
   });
 }
 

@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState, useCallback, type FormEvent } from "react";
-import { Room, RoomEvent, Track } from "livekit-client";
+import { Room, RoomEvent, Track, ConnectionQuality } from "livekit-client";
 import {
   getCurrentUser,
   listVideoRooms,
@@ -9,6 +9,7 @@ import {
   joinVideoRoom,
   endVideoRoom,
   startVideoRecording,
+  reportCallQuality,
   summarizeVideoSession,
   grantAiProcessingConsent,
   listWaitingGuests,
@@ -82,6 +83,7 @@ export default function VideoPage() {
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
   const [chatInput, setChatInput] = useState("");
   const [unreadChatCount, setUnreadChatCount] = useState(0);
+  const [connectionQuality, setConnectionQuality] = useState<"excellent" | "good" | "poor" | null>(null);
 
   const roomRef = useRef<Room | null>(null);
   const localVideoRef = useRef<HTMLVideoElement>(null);
@@ -337,6 +339,20 @@ export default function VideoPage() {
         ]);
         if (!chatOpenRef.current) setUnreadChatCount((c) => c + 1);
       });
+      room.on(RoomEvent.ConnectionQualityChanged, (quality, participant) => {
+        if (!participant.isLocal) return;
+        if (quality !== ConnectionQuality.Excellent && quality !== ConnectionQuality.Good && quality !== ConnectionQuality.Poor) {
+          return; // "lost"/"unknown" aren't a quality tier worth persisting - a real disconnect is covered separately
+        }
+        setConnectionQuality(quality);
+        reportCallQuality(token, targetRoomName as string, quality).catch(() => {
+          // Best-effort telemetry - a failed sample just means one gap in
+          // the call's quality history, not worth interrupting the call.
+        });
+      });
+      room.on(RoomEvent.Reconnected, () => {
+        reportCallQuality(token, targetRoomName as string, connectionQuality ?? "good", true).catch(() => {});
+      });
       room.on(RoomEvent.Disconnected, () => {
         setCallState("idle");
         setRoomName(null);
@@ -435,6 +451,7 @@ export default function VideoPage() {
     setChatMessages([]);
     setChatOpen(false);
     setUnreadChatCount(0);
+    setConnectionQuality(null);
     try {
       await endVideoRoom(token, endingRoomName);
     } catch {
@@ -812,7 +829,19 @@ export default function VideoPage() {
               <div className="grid gap-3 grid-cols-[repeat(auto-fit,minmax(160px,1fr))]">
                 <div className="relative aspect-video bg-black rounded-lg overflow-hidden">
                   <video ref={localVideoRef} autoPlay muted playsInline className="w-full h-full object-cover" />
-                  <span className="absolute bottom-2 left-2 text-xs text-white/80 bg-black/40 rounded px-2 py-0.5">
+                  <span className="absolute bottom-2 left-2 flex items-center gap-1.5 text-xs text-white/80 bg-black/40 rounded px-2 py-0.5">
+                    <span
+                      title={connectionQuality ? `Connection: ${connectionQuality}` : undefined}
+                      className={`w-1.5 h-1.5 rounded-full ${
+                        connectionQuality === "excellent"
+                          ? "bg-emerald-400"
+                          : connectionQuality === "good"
+                            ? "bg-amber-400"
+                            : connectionQuality === "poor"
+                              ? "bg-red-500"
+                              : "bg-slate-500"
+                      }`}
+                    />
                     You
                   </span>
                 </div>
@@ -941,6 +970,14 @@ export default function VideoPage() {
                     {r.confidential && (
                       <span className="text-[11px] font-medium text-indigo-700 bg-indigo-50 border border-indigo-200 rounded-full px-2 py-0.5">
                         Confidential
+                      </span>
+                    )}
+                    {r.worst_connection_quality === "poor" && (
+                      <span
+                        className="text-[11px] font-medium text-red-700 bg-red-50 border border-red-200 rounded-full px-2 py-0.5"
+                        title={r.reconnect_count > 0 ? `${r.reconnect_count} reconnect(s) during this call` : undefined}
+                      >
+                        Poor connection
                       </span>
                     )}
                   </span>
