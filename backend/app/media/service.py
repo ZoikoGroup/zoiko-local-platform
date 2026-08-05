@@ -52,6 +52,13 @@ class RecordingConsentRequiredError(Exception):
     consent on file - recording is opt-in and consent-gated, never automatic."""
 
 
+class ConfidentialModeRecordingBlockedError(Exception):
+    """Raised when trying to record a session created with confidential=True.
+    Blocked unconditionally, regardless of consent status - confidential mode
+    is a stronger guarantee than "consent not yet granted", so it's checked
+    first and consent is never even considered."""
+
+
 class WaitingGuestNotFoundError(Exception):
     """Raised when a waiting-room request id doesn't exist for the given room."""
 
@@ -295,7 +302,9 @@ def _find_account_video_session(db: Session, account_id: str, room_name: str) ->
     return session
 
 
-async def create_video_session(db: Session, account_id: str, host_user_id: str) -> VideoSession:
+async def create_video_session(
+    db: Session, account_id: str, host_user_id: str, confidential: bool = False
+) -> VideoSession:
     room_name = f"zl-{uuid.uuid4().hex[:16]}"
     await video.create_room(room_name)
 
@@ -305,13 +314,15 @@ async def create_video_session(db: Session, account_id: str, host_user_id: str) 
         room_name=room_name,
         status=VideoSessionStatus.ACTIVE,
         started_at=datetime.now(timezone.utc),
+        confidential=confidential,
     )
     db.add(session)
     db.commit()
     db.refresh(session)
     log_event(
         db, actor_id=account_id, action="video.session.started",
-        target_type="video_session", target_id=session.id, metadata={"room_name": room_name},
+        target_type="video_session", target_id=session.id,
+        metadata={"room_name": room_name, "confidential": confidential},
     )
     return session
 
@@ -348,6 +359,10 @@ async def start_video_recording(db: Session, user: User, room_name: str) -> Vide
         raise VideoSessionAuthorizationError(f"{room_name} is not an active session")
     if session.recording_egress_id:
         raise VideoSessionAuthorizationError(f"{room_name} is already being recorded")
+    if session.confidential:
+        raise ConfidentialModeRecordingBlockedError(
+            f"{room_name} is a confidential session — recording is disabled and cannot be enabled"
+        )
     if not has_active_consent(db, user.account_id, ConsentType.AI_PROCESSING):
         raise RecordingConsentRequiredError(
             "AI processing consent is required before recording video calls — "

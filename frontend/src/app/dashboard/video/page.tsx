@@ -65,6 +65,8 @@ export default function VideoPage() {
   const [audioDevices, setAudioDevices] = useState<MediaDeviceInfo[]>([]);
   const [selectedVideoDeviceId, setSelectedVideoDeviceId] = useState("");
   const [selectedAudioDeviceId, setSelectedAudioDeviceId] = useState("");
+  const [lobbyConfidential, setLobbyConfidential] = useState(false);
+  const [roomConfidential, setRoomConfidential] = useState(false);
 
   const roomRef = useRef<Room | null>(null);
   const localVideoRef = useRef<HTMLVideoElement>(null);
@@ -175,6 +177,7 @@ export default function VideoPage() {
     setLobbyMicOn(false);
     setLobbyCameraStatus("idle");
     setLobbyMicStatus("idle");
+    setLobbyConfidential(existingRoomName ? rooms.find((r) => r.room_name === existingRoomName)?.confidential ?? false : false);
     setCallState("lobby");
 
     if (token) {
@@ -267,7 +270,15 @@ export default function VideoPage() {
 
     try {
       const me = await getCurrentUser(token);
-      const targetRoomName = existingRoomName ?? (await createVideoRoom(token)).room_name;
+      let targetRoomName = existingRoomName;
+      let isConfidential = lobbyConfidential;
+      if (!targetRoomName) {
+        const created = await createVideoRoom(token, lobbyConfidential);
+        targetRoomName = created.room_name;
+        isConfidential = created.confidential;
+      } else {
+        isConfidential = rooms.find((r) => r.room_name === targetRoomName)?.confidential ?? false;
+      }
       const { token: liveKitToken, url } = await joinVideoRoom(token, targetRoomName, displayName || me.email);
 
       const room = new Room();
@@ -305,6 +316,7 @@ export default function VideoPage() {
       setMicOn(useMic);
 
       setRoomName(targetRoomName);
+      setRoomConfidential(isConfidential);
       setParticipantCount(room.remoteParticipants.size);
       setCallState("in-call");
     } catch (err) {
@@ -365,6 +377,7 @@ export default function VideoPage() {
     setScreenSharing(false);
     setRecordingState("idle");
     setWaitingGuests([]);
+    setRoomConfidential(false);
     try {
       await endVideoRoom(token, endingRoomName);
     } catch {
@@ -602,6 +615,28 @@ export default function VideoPage() {
               />
             </div>
 
+            {lobbyRoomName ? (
+              lobbyConfidential && (
+                <p className="text-xs text-indigo-300 bg-indigo-950/40 border border-indigo-900 rounded-lg px-3 py-2">
+                  Confidential Mode is active for this call. Recording and AI notes are off.
+                </p>
+              )
+            ) : (
+              <label className="flex items-start gap-2 text-xs text-slate-300 bg-slate-800/60 rounded-lg px-3 py-2 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={lobbyConfidential}
+                  onChange={(e) => setLobbyConfidential(e.target.checked)}
+                  className="mt-0.5"
+                />
+                <span>
+                  <span className="font-medium text-slate-200">Confidential Mode</span>
+                  <br />
+                  Disables recording and AI notes for this call. Can&apos;t be changed once the call starts.
+                </span>
+              </label>
+            )}
+
             {callError && <p className="text-xs text-red-400 bg-red-950/50 rounded-lg px-3 py-2">{callError}</p>}
 
             <div className="flex gap-2 pt-1">
@@ -640,6 +675,11 @@ export default function VideoPage() {
               >
                 {inviteLinkCopied ? "Link copied!" : "Copy invite link"}
               </button>
+              {roomConfidential && (
+                <span className="flex items-center gap-1 text-indigo-300 bg-indigo-950/60 border border-indigo-900 rounded-full px-2 py-0.5 text-[11px] font-medium">
+                  Confidential Mode: Active
+                </span>
+              )}
             </div>
             <div className="flex items-center gap-3">
               {recordingState === "active" && (
@@ -748,7 +788,7 @@ export default function VideoPage() {
             >
               {screenSharing ? "Stop Sharing" : "Share Screen"}
             </button>
-            {recordingState !== "active" && (
+            {recordingState !== "active" && !roomConfidential && (
               <button
                 onClick={handleStartRecording}
                 disabled={recordingState === "busy"}
@@ -783,7 +823,14 @@ export default function VideoPage() {
             return (
               <div key={r.room_name} className="rounded-lg border border-slate-200 px-4 py-3 space-y-2">
                 <div className="flex items-center justify-between">
-                  <span className="font-mono text-sm text-slate-800">{r.room_name}</span>
+                  <span className="flex items-center gap-2">
+                    <span className="font-mono text-sm text-slate-800">{r.room_name}</span>
+                    {r.confidential && (
+                      <span className="text-[11px] font-medium text-indigo-700 bg-indigo-50 border border-indigo-200 rounded-full px-2 py-0.5">
+                        Confidential
+                      </span>
+                    )}
+                  </span>
                   <div className="flex items-center gap-3">
                     {r.participant_minutes > 0 && (
                       <span className="text-xs text-slate-400">{r.participant_minutes} participant-min</span>

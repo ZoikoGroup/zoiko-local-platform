@@ -77,6 +77,18 @@ class VideoSession(Base):
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
+    # Set once at creation (from the video-conferencing reference screenshot's
+    # "Confidential Mode" toggle) - not changeable mid-call, since flipping it
+    # on partway through would falsely imply everything said before the
+    # switch was also protected. When true, recording is blocked outright
+    # (see start_video_recording's ConfidentialModeRecordingBlockedError),
+    # which transitively blocks AI summaries too - summarize_video_session
+    # already requires a finished recording_url to exist, so a confidential
+    # session that never has one can never be summarized either. No new
+    # storage/consent bypass needed - just refusing to create the artifact
+    # in the first place.
+    confidential: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
     # Roadmap "Recording: off by default... must be consented" - recording is
     # opt-in per session (never automatic like the voice-forwarding path),
     # gated on the same AI-processing consent record used for call/voicemail

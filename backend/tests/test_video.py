@@ -938,6 +938,63 @@ def test_host_can_deny_a_waiting_guest(client, db_session):
     assert body["token"] is None
 
 
+def test_create_room_defaults_to_not_confidential(client, monkeypatch):
+    monkeypatch.setattr("app.media.service.video.create_room", _fake_create_room)
+    token = _signup_and_login(client, "videoconfidentialdefault@example.com")
+
+    response = client.post("/media/video/rooms", headers={"Authorization": f"Bearer {token}"})
+    assert response.status_code == 201
+    assert response.json()["confidential"] is False
+
+
+def test_create_room_persists_confidential_flag(client, db_session, monkeypatch):
+    from app.media.models import VideoSession
+
+    monkeypatch.setattr("app.media.service.video.create_room", _fake_create_room)
+    token = _signup_and_login(client, "videoconfidentialcreate@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    response = client.post("/media/video/rooms", json={"confidential": True}, headers=headers)
+    assert response.status_code == 201
+    assert response.json()["confidential"] is True
+
+    session = db_session.query(VideoSession).filter(VideoSession.room_name == response.json()["room_name"]).first()
+    assert session.confidential is True
+
+    list_response = client.get("/media/video/rooms", headers=headers)
+    matching = next(r for r in list_response.json() if r["room_name"] == response.json()["room_name"])
+    assert matching["confidential"] is True
+
+
+def test_start_recording_is_blocked_unconditionally_for_a_confidential_session(client, db_session):
+    from app.media.models import VideoSession, VideoSessionStatus
+
+    token = _signup_and_login(client, "videoconfidentialrecord@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    client.post("/compliance/consent", json={"consent_type": "ai_processing"}, headers=headers)
+    me = client.get("/auth/me", headers=headers).json()
+
+    session = VideoSession(
+        account_id=me["account_id"], host_user_id=me["id"], room_name="zl-test-confidential-record",
+        status=VideoSessionStatus.ACTIVE, confidential=True,
+    )
+    db_session.add(session)
+    db_session.commit()
+
+    # Consent is granted, so this proves confidential mode blocks recording
+    # on its own - not merely as a side effect of missing consent.
+    response = client.post(f"/media/video/rooms/{session.room_name}/recording/start", headers=headers)
+    assert response.status_code == 403
+    assert "confidential" in response.json()["detail"].lower()
+
+    db_session.refresh(session)
+    assert session.recording_egress_id is None
+
+
+async def _fake_create_room(room_name):
+    return None
+
+
 def test_a_different_accounts_host_cannot_see_or_admit_a_waiting_guest(client, db_session):
     session = _seed_active_session(db_session, "zl-waiting-test-other-account")
     waiting_id = client.post(

@@ -588,6 +588,7 @@ export type VideoRoom = {
   recording_in_progress: boolean;
   recording_url: string | null;
   participant_minutes: number;
+  confidential: boolean;
 };
 
 export function listVideoRooms(token: string): Promise<VideoRoom[]> {
@@ -596,10 +597,14 @@ export function listVideoRooms(token: string): Promise<VideoRoom[]> {
   });
 }
 
-export function createVideoRoom(token: string): Promise<{ room_name: string; status: string }> {
+export function createVideoRoom(
+  token: string,
+  confidential: boolean = false
+): Promise<{ room_name: string; status: string; confidential: boolean }> {
   return request("/media/video/rooms", {
     method: "POST",
     headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ confidential }),
   });
 }
 

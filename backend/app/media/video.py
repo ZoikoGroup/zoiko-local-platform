@@ -27,16 +27,27 @@ class GuestJoinTokenRequest(BaseModel):
     display_name: str = Field(min_length=1, max_length=100)
 
 
+class CreateRoomRequest(BaseModel):
+    confidential: bool = False
+
+
 @router.post("/rooms", status_code=status.HTTP_201_CREATED)
 async def create_room(
+    body: CreateRoomRequest = CreateRoomRequest(),
     db: Session = Depends(get_db),
     current_user: User = Depends(require_writer),
 ):
     try:
-        session = await media_service.create_video_session(db, current_user.account_id, current_user.id)
+        session = await media_service.create_video_session(
+            db, current_user.account_id, current_user.id, confidential=body.confidential
+        )
     except VideoError as e:
         raise HTTPException(status_code=502, detail=str(e)) from e
-    return {"room_name": session.room_name, "status": session.status.value}
+    return {
+        "room_name": session.room_name,
+        "status": session.status.value,
+        "confidential": session.confidential,
+    }
 
 
 @router.post("/rooms/{room_name}/token")
@@ -173,6 +184,8 @@ async def start_recording(
         raise HTTPException(status_code=403, detail=str(e)) from e
     except media_service.RecordingConsentRequiredError as e:
         raise HTTPException(status_code=403, detail=str(e)) from e
+    except media_service.ConfidentialModeRecordingBlockedError as e:
+        raise HTTPException(status_code=403, detail=str(e)) from e
     except VideoError as e:
         raise HTTPException(status_code=502, detail=str(e)) from e
     return {"room_name": session.room_name, "recording": True}
@@ -208,6 +221,7 @@ async def list_rooms(
             "recording_in_progress": s.recording_egress_id is not None and s.recording_url is None,
             "recording_url": media_service.get_recording_download_url(s),
             "participant_minutes": media_service.get_participant_minutes(db, s.id),
+            "confidential": s.confidential,
         }
         for s in sessions
     ]
