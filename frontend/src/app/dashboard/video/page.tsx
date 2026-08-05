@@ -412,7 +412,7 @@ export default function VideoPage() {
 
           <div className="flex items-center gap-3 pt-1">
             <div className="h-px bg-slate-200 flex-1" />
-            <span className="text-xs text-slate-400">or join a teammate&apos;s call</span>
+            <span className="text-xs text-slate-600">or join a teammate&apos;s call</span>
             <div className="h-px bg-slate-200 flex-1" />
           </div>
 
@@ -452,7 +452,7 @@ export default function VideoPage() {
               {lobbyCameraOn ? (
                 <video ref={lobbyVideoRef} autoPlay muted playsInline className="w-full h-full object-cover" />
               ) : (
-                <div className="flex flex-col items-center gap-2 text-slate-500">
+                <div className="flex flex-col items-center gap-2 text-slate-400">
                   <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" className="w-10 h-10">
                     <path d="M3 3l18 18M15 10l4.55-2.9A1 1 0 0121 8v8a1 1 0 01-1.45.9L15 14M5 6h7a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2V8a2 2 0 012-2z" />
                   </svg>

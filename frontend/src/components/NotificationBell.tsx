@@ -108,16 +108,24 @@ export default function NotificationBell() {
           {error && <p className="text-xs text-red-600 px-4 py-3">{error}</p>}
 
           {notifications.length === 0 && !error && (
-            <p className="text-sm text-slate-400 px-4 py-6 text-center">No notifications yet.</p>
+            <p className="text-sm text-slate-600 px-4 py-6 text-center">No notifications yet.</p>
           )}
 
           <ul className="max-h-96 overflow-y-auto divide-y divide-slate-100">
             {notifications.slice(0, 20).map((n) => (
               <li
                 key={n.id}
+                role={!n.read_at ? "button" : undefined}
+                tabIndex={!n.read_at ? 0 : undefined}
                 onClick={() => !n.read_at && handleMarkRead(n.id)}
-                className={`px-4 py-3 text-sm cursor-pointer transition ${
-                  n.read_at ? "bg-white" : "bg-indigo-50/60 hover:bg-indigo-50"
+                onKeyDown={(e) => {
+                  if (!n.read_at && (e.key === "Enter" || e.key === " ")) {
+                    e.preventDefault();
+                    handleMarkRead(n.id);
+                  }
+                }}
+                className={`px-4 py-3 text-sm transition ${
+                  n.read_at ? "bg-white" : "bg-indigo-50/60 hover:bg-indigo-50 cursor-pointer"
                 }`}
               >
                 <div className="flex items-start gap-2">
@@ -128,7 +136,7 @@ export default function NotificationBell() {
                       {n.status === "failed" && (
                         <span className="text-[10px] font-medium text-red-600 uppercase">Delivery failed</span>
                       )}
-                      <span className="text-[10px] text-slate-400">
+                      <span className="text-[10px] text-slate-600">
                         {new Date(n.created_at).toLocaleString()}
                       </span>
                     </div>

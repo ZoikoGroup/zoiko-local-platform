@@ -531,7 +531,7 @@ export default function NumbersPage() {
         <p className="text-sm text-slate-500">Search, reserve, and verify a number for your account.</p>
       </div>
 
-      <div className="flex items-center gap-2 text-xs font-medium text-slate-400">
+      <div className="flex items-center gap-2 text-xs font-medium text-slate-600">
         {["Search", "Reserve", "Verify", "Checkout"].map((label, i) => {
           const stepIndex = ["search", "reserved", "compliance", "checkout"].indexOf(step);
           const active = i <= stepIndex || step === "purchased";
@@ -548,7 +548,11 @@ export default function NumbersPage() {
       {step === "search" && (
         <div className="bg-white rounded-xl border border-slate-200 p-6 space-y-4">
           <div className="flex flex-wrap gap-3">
+            <label htmlFor="search-country" className="sr-only">
+              Country to search
+            </label>
             <select
+              id="search-country"
               value={countryCode}
               onChange={(e) => setCountryCode(e.target.value)}
               className="rounded-lg border border-slate-300 px-3 py-2 text-sm"

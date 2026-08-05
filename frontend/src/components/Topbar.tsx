@@ -45,7 +45,7 @@ export default function Topbar({ user }: { user: User | null }) {
           </div>
           <button
             onClick={handleLogout}
-            className="text-xs text-slate-400 hover:text-slate-700 font-medium ml-1 transition"
+            className="text-xs text-slate-600 hover:text-slate-700 font-medium ml-1 transition"
           >
             Log out
           </button>

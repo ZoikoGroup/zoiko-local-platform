@@ -84,7 +84,7 @@ function EmptyState({ label }: { label: string }) {
       <div className="w-10 h-10 rounded-full bg-slate-50 flex items-center justify-center text-slate-300">
         <SparkleIcon className="w-5 h-5" />
       </div>
-      <p className="text-sm text-slate-400">{label}</p>
+      <p className="text-sm text-slate-600">{label}</p>
     </div>
   );
 }
@@ -280,7 +280,7 @@ export default function AIInsightsPage() {
         <div className="px-6 py-5 border-b border-slate-100 space-y-3">
           <div>
             <h3 className="font-semibold text-slate-900">Call &amp; Voicemail Summaries</h3>
-            <p className="text-xs text-slate-400 mt-0.5">
+            <p className="text-xs text-slate-600 mt-0.5">
               AI-generated — may be inaccurate, not an authoritative record.
             </p>
           </div>
@@ -430,7 +430,7 @@ export default function AIInsightsPage() {
       <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
         <div className="px-6 py-5 border-b border-slate-100">
           <h3 className="font-semibold text-slate-900">AI Receptionist</h3>
-          <p className="text-xs text-slate-400 mt-0.5">
+          <p className="text-xs text-slate-600 mt-0.5">
             Caller qualification captured when a number has the AI Receptionist enabled.
           </p>
           {routedNotice && (

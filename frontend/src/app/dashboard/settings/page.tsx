@@ -250,7 +250,7 @@ export default function SettingsPage() {
               ON
             </span>
           ) : (
-            <span className="text-xs font-medium text-slate-500 bg-slate-100 rounded-full px-3 py-1">
+            <span className="text-xs font-medium text-slate-700 bg-slate-100 rounded-full px-3 py-1">
               OFF
             </span>
           )}
@@ -275,7 +275,7 @@ export default function SettingsPage() {
             <div className="flex justify-center bg-white p-3 border border-slate-200 rounded-lg w-fit mx-auto">
               <QRCodeSVG value={setupState.otpauth_uri} size={160} />
             </div>
-            <p className="text-xs text-slate-400 text-center break-all">
+            <p className="text-xs text-slate-600 text-center break-all">
               Can&apos;t scan? Enter manually: <span className="font-mono">{setupState.secret}</span>
             </p>
             <input
@@ -468,6 +468,7 @@ export default function SettingsPage() {
                     <input
                       type="number"
                       min={1}
+                      aria-label={`${RETENTION_LABELS[key]} retention in days`}
                       value={retentionDrafts[key] ?? retention[key]}
                       onChange={(e) =>
                         setRetentionDrafts((prev) => ({ ...prev, [key]: e.target.value }))
@@ -555,7 +556,7 @@ export default function SettingsPage() {
                     <div className="text-xs text-slate-500 mt-0.5 font-mono">{event.target}</div>
                     {event.reason && <div className="text-xs text-slate-500 mt-0.5">{event.reason}</div>}
                   </div>
-                  <div className="text-xs text-slate-400 text-right shrink-0">
+                  <div className="text-xs text-slate-600 text-right shrink-0">
                     <div>{event.actor}</div>
                     <div>{new Date(event.created_at).toLocaleString()}</div>
                   </div>

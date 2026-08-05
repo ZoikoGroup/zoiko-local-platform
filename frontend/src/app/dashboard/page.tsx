@@ -207,7 +207,7 @@ export default function DashboardPage() {
                   {Math.round(videoMinutesThisWeek)}
                 </div>
                 <div className="text-sm">video minutes in the last 7 days</div>
-                <p className="text-xs text-slate-400 mt-2">Trend charts are coming in a later stage.</p>
+                <p className="text-xs text-slate-600 mt-2">Trend charts are coming in a later stage.</p>
               </>
             )}
           </div>
@@ -230,7 +230,7 @@ export default function DashboardPage() {
                     <div className="text-slate-500 text-xs truncate">{item.detail}</div>
                   </div>
                   <div className="text-right shrink-0 pl-3">
-                    <div className="text-xs text-slate-400">{timeAgo(new Date(item.ts).toISOString())}</div>
+                    <div className="text-xs text-slate-600">{timeAgo(new Date(item.ts).toISOString())}</div>
                     <div className="text-xs text-emerald-600">{item.status}</div>
                   </div>
                 </li>
