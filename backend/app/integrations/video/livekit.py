@@ -7,11 +7,22 @@ directly — everything else calls the functions below instead.
 from livekit import api as livekit_api
 
 from app.core.config import settings
+from app.integrations._shared.circuit_breaker import CircuitBreaker, with_failover_async
+
+_breaker = CircuitBreaker("video")
+
+
+def circuit_state() -> str:
+    return _breaker.state.value
 
 
 class VideoError(Exception):
     """Raised instead of letting a livekit-specific exception escape this module."""
 
+
+# Imported after VideoError is defined - _secondary_stub imports it back
+# from this module, which would otherwise be a circular import.
+from app.integrations.video import _secondary_stub as secondary  # noqa: E402
 
 # Roadmap doc §8 "Video Calling - Phase 1 Standard": target up to 8 participants.
 MAX_PARTICIPANTS = 8
@@ -40,38 +51,46 @@ async def health_check() -> dict:
 
 
 async def create_room(room_name: str) -> dict:
-    # _client() itself raises (a plain ValueError, not TwirpError) when
-    # LIVEKIT_URL/KEY/SECRET aren't configured - guarded separately so that
-    # case gets the same clean VideoError as a real API failure, instead of
-    # an unhandled 500.
-    try:
-        client = _client()
-    except ValueError as e:
-        raise VideoError(str(e)) from e
+    async def _primary() -> dict:
+        # _client() itself raises (a plain ValueError, not TwirpError) when
+        # LIVEKIT_URL/KEY/SECRET aren't configured - guarded separately so
+        # that case gets the same clean VideoError as a real API failure,
+        # instead of an unhandled 500.
+        try:
+            client = _client()
+        except ValueError as e:
+            raise VideoError(str(e)) from e
 
-    try:
-        room = await client.room.create_room(
-            livekit_api.CreateRoomRequest(name=room_name, max_participants=MAX_PARTICIPANTS)
-        )
-    except livekit_api.TwirpError as e:
-        raise VideoError(str(e)) from e
-    finally:
-        await client.aclose()
-    return {"name": room.name, "sid": room.sid}
+        try:
+            room = await client.room.create_room(
+                livekit_api.CreateRoomRequest(name=room_name, max_participants=MAX_PARTICIPANTS)
+            )
+        except livekit_api.TwirpError as e:
+            raise VideoError(str(e)) from e
+        finally:
+            await client.aclose()
+        return {"name": room.name, "sid": room.sid}
+
+    secondary_fn = (lambda: secondary.create_room(room_name)) if settings.video_failover_enabled else None
+    return await with_failover_async(_breaker, _primary, secondary_fn, VideoError)
 
 
 async def end_room(room_name: str) -> None:
-    try:
-        client = _client()
-    except ValueError as e:
-        raise VideoError(str(e)) from e
+    async def _primary() -> None:
+        try:
+            client = _client()
+        except ValueError as e:
+            raise VideoError(str(e)) from e
 
-    try:
-        await client.room.delete_room(livekit_api.DeleteRoomRequest(room=room_name))
-    except livekit_api.TwirpError as e:
-        raise VideoError(str(e)) from e
-    finally:
-        await client.aclose()
+        try:
+            await client.room.delete_room(livekit_api.DeleteRoomRequest(room=room_name))
+        except livekit_api.TwirpError as e:
+            raise VideoError(str(e)) from e
+        finally:
+            await client.aclose()
+
+    secondary_fn = (lambda: secondary.end_room(room_name)) if settings.video_failover_enabled else None
+    await with_failover_async(_breaker, _primary, secondary_fn, VideoError)
 
 
 async def start_room_recording(room_name: str) -> str:

@@ -8,6 +8,13 @@ import json
 import httpx
 
 from app.core.config import settings
+from app.integrations._shared.circuit_breaker import CircuitBreaker, with_failover
+
+_breaker = CircuitBreaker("llm")
+
+
+def circuit_state() -> str:
+    return _breaker.state.value
 
 _CHAT_COMPLETIONS_URL = "https://api.groq.com/openai/v1/chat/completions"
 _MODELS_URL = "https://api.groq.com/openai/v1/models"
@@ -60,6 +67,11 @@ class LLMError(Exception):
     """Raised instead of letting an httpx/vendor-specific exception escape this module."""
 
 
+# Imported after LLMError is defined - _secondary_stub imports it back from
+# this module, which would otherwise be a circular import.
+from app.integrations.llm import _secondary_stub as secondary  # noqa: E402
+
+
 def extract_conversation_summary(transcript: str) -> dict:
     """Structured call/voicemail intelligence (Architecture doc §2.3 Phase 1
     AI: "language detection... AI-generated action extraction"; Roadmap §2:
@@ -70,57 +82,69 @@ def extract_conversation_summary(transcript: str) -> dict:
     if not settings.groq_api_key:
         raise LLMError("Groq API key is not configured")
 
-    try:
-        response = httpx.post(
-            _CHAT_COMPLETIONS_URL,
-            headers={"Authorization": f"Bearer {settings.groq_api_key}"},
-            json={
-                "model": _MODEL,
-                "messages": [
-                    {"role": "system", "content": _SUMMARY_SYSTEM_PROMPT},
-                    {"role": "user", "content": transcript},
-                ],
-                "temperature": 0.2,
-                "response_format": {"type": "json_object"},
-            },
-            timeout=30.0,
-        )
-        response.raise_for_status()
-    except httpx.HTTPError as e:
-        raise LLMError(f"Groq summarization request failed: {e}") from e
+    def _primary() -> dict:
+        try:
+            response = httpx.post(
+                _CHAT_COMPLETIONS_URL,
+                headers={"Authorization": f"Bearer {settings.groq_api_key}"},
+                json={
+                    "model": _MODEL,
+                    "messages": [
+                        {"role": "system", "content": _SUMMARY_SYSTEM_PROMPT},
+                        {"role": "user", "content": transcript},
+                    ],
+                    "temperature": 0.2,
+                    "response_format": {"type": "json_object"},
+                },
+                timeout=30.0,
+            )
+            response.raise_for_status()
+        except httpx.HTTPError as e:
+            raise LLMError(f"Groq summarization request failed: {e}") from e
 
-    content = response.json()["choices"][0]["message"]["content"]
-    try:
-        return json.loads(content)
-    except json.JSONDecodeError as e:
-        raise LLMError(f"Groq returned non-JSON summary output: {content!r}") from e
+        content = response.json()["choices"][0]["message"]["content"]
+        try:
+            return json.loads(content)
+        except json.JSONDecodeError as e:
+            raise LLMError(f"Groq returned non-JSON summary output: {content!r}") from e
+
+    secondary_fn = (
+        (lambda: secondary.extract_conversation_summary(transcript)) if settings.llm_failover_enabled else None
+    )
+    return with_failover(_breaker, _primary, secondary_fn, LLMError)
 
 
 def extract_receptionist_qualification(transcript: str) -> dict:
     if not settings.groq_api_key:
         raise LLMError("Groq API key is not configured")
 
-    try:
-        response = httpx.post(
-            _CHAT_COMPLETIONS_URL,
-            headers={"Authorization": f"Bearer {settings.groq_api_key}"},
-            json={
-                "model": _MODEL,
-                "messages": [
-                    {"role": "system", "content": _QUALIFICATION_SYSTEM_PROMPT},
-                    {"role": "user", "content": transcript},
-                ],
-                "temperature": 0.1,
-                "response_format": {"type": "json_object"},
-            },
-            timeout=30.0,
-        )
-        response.raise_for_status()
-    except httpx.HTTPError as e:
-        raise LLMError(f"Groq qualification extraction failed: {e}") from e
+    def _primary() -> dict:
+        try:
+            response = httpx.post(
+                _CHAT_COMPLETIONS_URL,
+                headers={"Authorization": f"Bearer {settings.groq_api_key}"},
+                json={
+                    "model": _MODEL,
+                    "messages": [
+                        {"role": "system", "content": _QUALIFICATION_SYSTEM_PROMPT},
+                        {"role": "user", "content": transcript},
+                    ],
+                    "temperature": 0.1,
+                    "response_format": {"type": "json_object"},
+                },
+                timeout=30.0,
+            )
+            response.raise_for_status()
+        except httpx.HTTPError as e:
+            raise LLMError(f"Groq qualification extraction failed: {e}") from e
 
-    content = response.json()["choices"][0]["message"]["content"]
-    try:
-        return json.loads(content)
-    except json.JSONDecodeError as e:
-        raise LLMError(f"Groq returned non-JSON qualification output: {content!r}") from e
+        content = response.json()["choices"][0]["message"]["content"]
+        try:
+            return json.loads(content)
+        except json.JSONDecodeError as e:
+            raise LLMError(f"Groq returned non-JSON qualification output: {content!r}") from e
+
+    secondary_fn = (
+        (lambda: secondary.extract_receptionist_qualification(transcript)) if settings.llm_failover_enabled else None
+    )
+    return with_failover(_breaker, _primary, secondary_fn, LLMError)

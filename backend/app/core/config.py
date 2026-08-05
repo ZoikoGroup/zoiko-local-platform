@@ -79,4 +79,33 @@ class Settings(BaseSettings):
     # publishing (falls back to logging), same pattern as the other providers.
     kafka_bootstrap_servers: str = ""
 
+    # Multi-provider failover (integrations/_shared/circuit_breaker.py) - per
+    # category, a circuit breaker wraps the primary vendor call and falls
+    # back to a secondary provider if one is enabled. No real second-vendor
+    # credentials exist yet for any category, so every secondary is an
+    # honestly-labeled stub that raises a clear "not configured" error until
+    # real credentials are supplied - these flags all default off.
+    telecom_failover_enabled: bool = False
+    video_failover_enabled: bool = False
+    llm_failover_enabled: bool = False
+    transcription_failover_enabled: bool = False
+    kyc_failover_enabled: bool = False
+    storage_failover_enabled: bool = False
+    email_failover_enabled: bool = False
+    webpush_failover_enabled: bool = False
+
+    # Observability (core/telemetry.py, core/logging.py) - OpenTelemetry
+    # tracing/metrics + structured JSON logging. Off by default so pytest and
+    # local dev are unaffected unless explicitly opted in, same "blank/false
+    # disables" pattern as Kafka above. A blank otel_exporter_otlp_endpoint
+    # with otel_enabled=true prints spans/metrics to the console instead of
+    # requiring a real OTel collector to exist.
+    otel_enabled: bool = False
+    otel_service_name: str = "zoiko-backend"
+    otel_exporter_otlp_endpoint: str = ""
+    log_level: str = "INFO"
+    # Periodic health_check() sweep across every integration
+    # (ops/synthetic.py), logged + emitted as an OTel gauge. 0 disables it.
+    synthetic_check_interval_seconds: int = 0
+
 settings = Settings()

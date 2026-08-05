@@ -8,7 +8,12 @@ from sqlalchemy.orm import Session
 from app.audit.service import log_event
 from app.consent.models import ConsentType
 from app.consent.service import has_active_consent
-from app.events.service import publish_call_ended, publish_call_started
+from app.events.service import (
+    publish_call_ended,
+    publish_call_started,
+    publish_video_room_created,
+    publish_video_room_ended,
+)
 from app.integrations.llm.groq import LLMError
 from app.integrations.storage.s3 import StorageError, generate_presigned_url
 from app.integrations.telecom import twilio as telecom
@@ -313,6 +318,7 @@ async def create_video_session(db: Session, account_id: str, host_user_id: str) 
         db, actor_id=account_id, action="video.session.started",
         target_type="video_session", target_id=session.id, metadata={"room_name": room_name},
     )
+    publish_video_room_created(account_id, room_name=room_name)
     return session
 
 
@@ -337,6 +343,7 @@ async def end_video_session(db: Session, user: User, room_name: str) -> VideoSes
         db, actor_id=user.account_id, action="video.session.ended",
         target_type="video_session", target_id=session.id, metadata={"room_name": room_name},
     )
+    publish_video_room_ended(user.account_id, room_name=room_name)
     return session
 
 

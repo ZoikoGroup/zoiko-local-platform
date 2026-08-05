@@ -1,10 +1,18 @@
 import logging
+import uuid
 from datetime import datetime, timezone
+
+from opentelemetry import metrics
 
 from app.integrations.eventbus import kafka as eventbus
 from app.integrations.eventbus.kafka import EventBusError
 
 logger = logging.getLogger("zoiko.events")
+
+_meter = metrics.get_meter("zoiko.events")
+_publish_failures = _meter.create_counter(
+    "zoiko.events.publish_failures", description="Kafka publish failures - best-effort, never fails the caller"
+)
 
 
 def publish_event(topic: str, event_type: str, account_id: str | None, data: dict) -> None:
@@ -12,9 +20,10 @@ def publish_event(topic: str, event_type: str, account_id: str | None, data: dic
     notifications.service.send_notification's role for the email/SMS/push
     pipeline. Best-effort: a Kafka outage must never fail the business
     transaction that's already committed to Postgres: the event bus is a
-    durable/replayable *record* of what happened, not the system of record
+    durable/replaayable *record* of what happened, not the system of record
     for whether it happened."""
     envelope = {
+        "event_id": str(uuid.uuid4()),
         "event_type": event_type,
         "occurred_at": datetime.now(timezone.utc).isoformat(),
         "account_id": account_id,
@@ -23,6 +32,7 @@ def publish_event(topic: str, event_type: str, account_id: str | None, data: dic
     try:
         eventbus.publish(topic=topic, key=account_id, payload=envelope)
     except EventBusError:
+        _publish_failures.add(1, attributes={"topic": topic, "event_type": event_type})
         logger.warning("Failed to publish event %s to topic %s", event_type, topic, exc_info=True)
 
 
@@ -64,3 +74,11 @@ def publish_notification_sent(account_id: str | None, *, event_name: str, channe
         "zoiko.notifications", "notification.sent", account_id,
         {"event_name": event_name, "channel": channel, "status": status},
     )
+
+
+def publish_video_room_created(account_id: str, *, room_name: str) -> None:
+    publish_event("zoiko.video", "video.room.created", account_id, {"room_name": room_name})
+
+
+def publish_video_room_ended(account_id: str, *, room_name: str) -> None:
+    publish_event("zoiko.video", "video.room.ended", account_id, {"room_name": room_name})

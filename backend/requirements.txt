@@ -23,6 +23,17 @@ kafka-python==3.0.9  # Event bus - see app/integrations/eventbus/kafka.py
 pgvector==0.5.0  # SQLAlchemy Vector column type - semantic search over AI summaries
 slowapi==0.1.10  # rate limiting on login endpoints - see app/core/rate_limit.py
 
+# Observability (core/telemetry.py, core/logging.py) - OpenTelemetry tracing
+# + metrics, OTLP-over-HTTP exporter. Off by default (OTEL_ENABLED=false);
+# no new paid backend required - a blank OTEL_EXPORTER_OTLP_ENDPOINT prints
+# to the console instead.
+opentelemetry-api==1.44.0
+opentelemetry-sdk==1.44.0
+opentelemetry-instrumentation-fastapi==0.65b0
+opentelemetry-instrumentation-sqlalchemy==0.65b0
+opentelemetry-instrumentation-httpx==0.65b0
+opentelemetry-exporter-otlp-proto-http==1.44.0
+
 # dev/test
 pytest==8.3.3
 httpx==0.27.2

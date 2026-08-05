@@ -42,6 +42,13 @@ services:
     volumes:
       - zoiko_kafka_data:/var/lib/kafka/data
 
+  # No consumer service defined here - the backend isn't containerized yet.
+  # Run the event-log consumer (backend/app/events/consumer.py) locally
+  # alongside this broker with:
+  #   cd backend && python -m app.events.consumer
+  # It writes every zoiko.numbers/zoiko.calls/zoiko.notifications/zoiko.video
+  # message into the event_log table, deduped on the envelope's event_id.
+
 volumes:
   zoiko_pgdata:
   zoiko_kafka_data:

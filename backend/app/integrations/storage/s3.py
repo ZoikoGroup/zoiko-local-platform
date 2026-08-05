@@ -11,10 +11,22 @@ import boto3
 from botocore.exceptions import BotoCoreError, ClientError
 
 from app.core.config import settings
+from app.integrations._shared.circuit_breaker import CircuitBreaker, with_failover
+
+_breaker = CircuitBreaker("storage")
+
+
+def circuit_state() -> str:
+    return _breaker.state.value
 
 
 class StorageError(Exception):
     """Raised instead of letting a boto3/botocore exception escape this module."""
+
+
+# Imported after StorageError is defined - _secondary_stub imports it back
+# from this module, which would otherwise be a circular import.
+from app.integrations.storage import _secondary_stub as secondary  # noqa: E402
 
 
 def _client():
@@ -47,10 +59,14 @@ def delete_object(key: str) -> None:
     """Deletes one object from the configured bucket — used to actually
     remove a recording's file once it's past its retention window, not just
     unlink it in our own database."""
-    try:
-        _client().delete_object(Bucket=settings.s3_bucket, Key=key)
-    except (BotoCoreError, ClientError) as e:
-        raise StorageError(str(e)) from e
+    def _primary() -> None:
+        try:
+            _client().delete_object(Bucket=settings.s3_bucket, Key=key)
+        except (BotoCoreError, ClientError) as e:
+            raise StorageError(str(e)) from e
+
+    secondary_fn = (lambda: secondary.delete_object(key)) if settings.storage_failover_enabled else None
+    with_failover(_breaker, _primary, secondary_fn, StorageError)
 
 
 def download_object(key: str) -> bytes:
@@ -58,11 +74,15 @@ def download_object(key: str) -> bytes:
     a stored recording (e.g. a video call's egress output) to another
     provider (Groq transcription) rather than serving it to a browser, so a
     presigned URL isn't the right shape here."""
-    try:
-        response = _client().get_object(Bucket=settings.s3_bucket, Key=key)
-        return response["Body"].read()
-    except (BotoCoreError, ClientError) as e:
-        raise StorageError(str(e)) from e
+    def _primary() -> bytes:
+        try:
+            response = _client().get_object(Bucket=settings.s3_bucket, Key=key)
+            return response["Body"].read()
+        except (BotoCoreError, ClientError) as e:
+            raise StorageError(str(e)) from e
+
+    secondary_fn = (lambda: secondary.download_object(key)) if settings.storage_failover_enabled else None
+    return with_failover(_breaker, _primary, secondary_fn, StorageError)
 
 
 def generate_presigned_url(key: str, expires_in: int = 3600) -> str:
@@ -70,9 +90,15 @@ def generate_presigned_url(key: str, expires_in: int = 3600) -> str:
     permanent bucket URL 404s/403s in a browser. Callers must generate a
     fresh signed URL each time a recording is served rather than storing
     one, since it expires."""
-    try:
-        return _client().generate_presigned_url(
-            "get_object", Params={"Bucket": settings.s3_bucket, "Key": key}, ExpiresIn=expires_in
-        )
-    except (BotoCoreError, ClientError) as e:
-        raise StorageError(str(e)) from e
+    def _primary() -> str:
+        try:
+            return _client().generate_presigned_url(
+                "get_object", Params={"Bucket": settings.s3_bucket, "Key": key}, ExpiresIn=expires_in
+            )
+        except (BotoCoreError, ClientError) as e:
+            raise StorageError(str(e)) from e
+
+    secondary_fn = (
+        (lambda: secondary.generate_presigned_url(key, expires_in)) if settings.storage_failover_enabled else None
+    )
+    return with_failover(_breaker, _primary, secondary_fn, StorageError)

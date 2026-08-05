@@ -12,8 +12,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from app.audit import models as audit_models  # noqa: F401
 from app.compliance import models as compliance_models  # noqa: F401
 from app.consent import models as consent_models  # noqa: F401
+from app.contacts import models as contacts_models  # noqa: F401
 from app.core.config import settings
 from app.core.database import Base
+from app.events import models as events_models  # noqa: F401
 from app.intelligence import models as intelligence_models  # noqa: F401
 from app.media import models as media_models  # noqa: F401
 from app.numbering.identity import models as identity_models  # noqa: F401
