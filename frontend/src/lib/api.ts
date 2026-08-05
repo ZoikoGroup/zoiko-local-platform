@@ -496,8 +496,9 @@ export type CallLogEntry = {
   created_at: string;
 };
 
-export function listCalls(token: string): Promise<CallLogEntry[]> {
-  return request<CallLogEntry[]>("/media/voice/calls", {
+export function listCalls(token: string, limit?: number): Promise<CallLogEntry[]> {
+  const query = limit ? `?limit=${limit}` : "";
+  return request<CallLogEntry[]>(`/media/voice/calls${query}`, {
     headers: { Authorization: `Bearer ${token}` },
   });
 }
