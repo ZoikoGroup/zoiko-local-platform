@@ -210,18 +210,18 @@ export default function GuestJoinPage() {
   }
 
   return (
-    <div className="min-h-screen bg-slate-950 flex items-center justify-center p-6">
+    <main className="min-h-screen bg-slate-950 flex items-center justify-center p-6">
       <div className="w-full max-w-2xl">
         <div className="flex items-center gap-2 justify-center mb-6">
           <div className="w-8 h-8 rounded-lg bg-indigo-600 text-white flex items-center justify-center font-bold text-sm">
             Z
           </div>
-          <span className="font-semibold text-white">Zoiko Local</span>
+          <h1 className="font-semibold text-white">Zoiko Local</h1>
         </div>
 
         {callState === "not-found" && (
           <div className="bg-slate-900 border border-slate-800 rounded-2xl p-8 text-center space-y-2">
-            <h1 className="text-lg font-semibold text-white">This call isn&apos;t available</h1>
+            <h2 className="text-lg font-semibold text-white">This call isn&apos;t available</h2>
             <p className="text-sm text-slate-400">
               The link may have expired, or the call has already ended.
             </p>
@@ -230,7 +230,7 @@ export default function GuestJoinPage() {
 
         {callState === "denied" && (
           <div className="bg-slate-900 border border-slate-800 rounded-2xl p-8 text-center space-y-2">
-            <h1 className="text-lg font-semibold text-white">You weren&apos;t let in</h1>
+            <h2 className="text-lg font-semibold text-white">You weren&apos;t let in</h2>
             <p className="text-sm text-slate-400">The host didn&apos;t admit you to this call.</p>
           </div>
         )}
@@ -238,14 +238,14 @@ export default function GuestJoinPage() {
         {callState === "waiting" && (
           <div className="bg-slate-900 border border-slate-800 rounded-2xl p-8 text-center space-y-3">
             <div className="w-8 h-8 mx-auto rounded-full border-2 border-slate-700 border-t-indigo-500 animate-spin" />
-            <h1 className="text-lg font-semibold text-white">Waiting for the host to let you in…</h1>
+            <h2 className="text-lg font-semibold text-white">Waiting for the host to let you in…</h2>
             <p className="text-sm text-slate-400">You&apos;ll join automatically once they admit you.</p>
           </div>
         )}
 
         {callState === "ended" && (
           <div className="bg-slate-900 border border-slate-800 rounded-2xl p-8 text-center space-y-2">
-            <h1 className="text-lg font-semibold text-white">You&apos;ve left the call</h1>
+            <h2 className="text-lg font-semibold text-white">You&apos;ve left the call</h2>
             <p className="text-sm text-slate-400">You can close this tab now.</p>
           </div>
         )}
@@ -361,6 +361,6 @@ export default function GuestJoinPage() {
           </div>
         )}
       </div>
-    </div>
+    </main>
   );
 }
