@@ -279,3 +279,321 @@ def test_mark_all_notifications_read(client, db_session, monkeypatch):
 def test_mark_notification_read_requires_auth(client):
     response = client.post("/notifications/some-id/read")
     assert response.status_code == 401
+
+
+# --- Priority tiers, quiet hours, and the preference/suppression center ---
+
+
+def test_get_or_create_preference_returns_sane_defaults(db_session):
+    from app.notifications.service import get_or_create_preference
+
+    from app.numbering.identity.models import Account, AccountType
+
+    account = Account(name="Prefs Default Co", account_type=AccountType.INDIVIDUAL)
+    db_session.add(account)
+    db_session.flush()
+
+    pref = get_or_create_preference(db_session, account.id)
+    assert pref.transactional_enabled is True
+    assert pref.sms_enabled is True
+    assert pref.quiet_hours_start is None
+    assert pref.quiet_hours_timezone == "UTC"
+
+    # Idempotent - a second call returns the same row, not a duplicate.
+    again = get_or_create_preference(db_session, account.id)
+    assert again.account_id == pref.account_id
+
+
+def test_update_preference_sets_and_clears_quiet_hours(db_session):
+    from datetime import time as dtime
+
+    from app.notifications.service import update_preference
+
+    from app.numbering.identity.models import Account, AccountType
+
+    account = Account(name="Prefs Update Co", account_type=AccountType.INDIVIDUAL)
+    db_session.add(account)
+    db_session.flush()
+
+    pref = update_preference(
+        db_session, account.id,
+        quiet_hours_start=dtime(22, 0), quiet_hours_end=dtime(7, 0), quiet_hours_timezone="America/New_York",
+    )
+    assert pref.quiet_hours_start == dtime(22, 0)
+    assert pref.quiet_hours_timezone == "America/New_York"
+
+    cleared = update_preference(db_session, account.id, quiet_hours_start=None, quiet_hours_end=None)
+    assert cleared.quiet_hours_start is None
+    assert cleared.quiet_hours_end is None
+    # Not passed this time - must stay unchanged (the `...` sentinel), not reset to UTC.
+    assert cleared.quiet_hours_timezone == "America/New_York"
+
+
+def test_update_preference_rejects_an_invalid_timezone(db_session):
+    from app.notifications.service import InvalidTimezoneError, update_preference
+
+    from app.numbering.identity.models import Account, AccountType
+
+    account = Account(name="Prefs Badtz Co", account_type=AccountType.INDIVIDUAL)
+    db_session.add(account)
+    db_session.flush()
+
+    try:
+        update_preference(db_session, account.id, quiet_hours_timezone="Not/A_Zone")
+        assert False, "expected InvalidTimezoneError"
+    except InvalidTimezoneError:
+        pass
+
+
+def test_is_within_quiet_hours_normal_and_overnight_ranges():
+    from datetime import datetime, time as dtime, timezone as dtimezone
+
+    from app.notifications.service import is_within_quiet_hours
+    from app.notifications.models import NotificationPreference
+
+    normal = NotificationPreference(
+        account_id="x", quiet_hours_start=dtime(9, 0), quiet_hours_end=dtime(17, 0), quiet_hours_timezone="UTC"
+    )
+    assert is_within_quiet_hours(normal, now=datetime(2026, 1, 1, 12, 0, tzinfo=dtimezone.utc)) is True
+    assert is_within_quiet_hours(normal, now=datetime(2026, 1, 1, 20, 0, tzinfo=dtimezone.utc)) is False
+
+    overnight = NotificationPreference(
+        account_id="x", quiet_hours_start=dtime(22, 0), quiet_hours_end=dtime(7, 0), quiet_hours_timezone="UTC"
+    )
+    assert is_within_quiet_hours(overnight, now=datetime(2026, 1, 1, 23, 0, tzinfo=dtimezone.utc)) is True
+    assert is_within_quiet_hours(overnight, now=datetime(2026, 1, 1, 3, 0, tzinfo=dtimezone.utc)) is True
+    assert is_within_quiet_hours(overnight, now=datetime(2026, 1, 1, 12, 0, tzinfo=dtimezone.utc)) is False
+
+    disabled = NotificationPreference(account_id="x", quiet_hours_timezone="UTC")
+    assert is_within_quiet_hours(disabled, now=datetime(2026, 1, 1, 23, 0, tzinfo=dtimezone.utc)) is False
+
+
+def test_transactional_email_is_suppressed_when_opted_out(db_session, monkeypatch):
+    from app.notifications.service import send_notification, update_preference
+
+    from app.numbering.identity.models import Account, AccountType
+
+    monkeypatch.setattr("app.core.config.settings.resend_api_key", "")
+    sent = []
+    monkeypatch.setattr("app.notifications.service.send_email", lambda **kw: sent.append(kw))
+
+    account = Account(name="Suppress Email Co", account_type=AccountType.INDIVIDUAL)
+    db_session.add(account)
+    db_session.flush()
+    update_preference(db_session, account.id, transactional_enabled=False)
+
+    delivery = send_notification(
+        db_session, event_name="number.activated", account_id=account.id,
+        recipient_email="x@example.com", context={"e164": "+15550001111"},
+    )
+    assert delivery.status == "suppressed"
+    assert sent == []
+
+
+def test_critical_priority_email_bypasses_transactional_suppression(db_session, monkeypatch):
+    from app.notifications.service import send_notification, update_preference
+
+    from app.numbering.identity.models import Account, AccountType
+
+    monkeypatch.setattr("app.core.config.settings.resend_api_key", "")
+    sent = []
+    monkeypatch.setattr("app.notifications.service.send_email", lambda **kw: sent.append(kw))
+
+    account = Account(name="Critical Bypass Co", account_type=AccountType.INDIVIDUAL)
+    db_session.add(account)
+    db_session.flush()
+    update_preference(db_session, account.id, transactional_enabled=False)
+
+    # number.suspended is CRITICAL priority despite being TRANSACTIONAL category.
+    delivery = send_notification(
+        db_session, event_name="number.suspended", account_id=account.id,
+        recipient_email="x@example.com", context={"e164": "+15550001111", "reason_line": ""},
+    )
+    assert delivery.status == "sent"
+    assert len(sent) == 1
+
+
+def test_security_category_email_bypasses_transactional_suppression(db_session, monkeypatch):
+    from app.notifications.service import send_notification, update_preference
+
+    from app.numbering.identity.models import Account, AccountType
+
+    monkeypatch.setattr("app.core.config.settings.resend_api_key", "")
+    sent = []
+    monkeypatch.setattr("app.notifications.service.send_email", lambda **kw: sent.append(kw))
+
+    account = Account(name="Security Bypass Co", account_type=AccountType.INDIVIDUAL)
+    db_session.add(account)
+    db_session.flush()
+    update_preference(db_session, account.id, transactional_enabled=False)
+
+    delivery = send_notification(
+        db_session, event_name="team_member.added", account_id=account.id,
+        recipient_email="x@example.com", context={"account_name": "Acme", "role": "admin"},
+    )
+    assert delivery.status == "sent"
+    assert len(sent) == 1
+
+
+def test_sms_is_suppressed_when_sms_disabled(db_session, monkeypatch):
+    from app.notifications.service import send_sms_notification, update_preference
+
+    from app.numbering.identity.models import Account, AccountType
+
+    sent = []
+    monkeypatch.setattr("app.notifications.service.send_sms", lambda to, body: sent.append((to, body)))
+
+    account = Account(name="Suppress SMS Co", account_type=AccountType.INDIVIDUAL)
+    db_session.add(account)
+    db_session.flush()
+    update_preference(db_session, account.id, sms_enabled=False)
+
+    delivery = send_sms_notification(
+        db_session, event_name="number.suspended", account_id=account.id,
+        recipient_phone="+15551234567", context={"e164": "+15550001111", "reason_line": ""},
+    )
+    # number.suspended is CRITICAL, so the opt-out is bypassed here too -
+    # confirms SMS suppression and CRITICAL-exemption compose correctly.
+    assert delivery.status == "sent"
+    assert len(sent) == 1
+
+
+def test_sms_is_suppressed_for_a_standard_priority_template_when_disabled(db_session, monkeypatch):
+    from app.notifications.service import send_sms_notification, update_preference
+    from app.notifications.models import NotificationTemplate, NotificationCategory
+
+    from app.numbering.identity.models import Account, AccountType
+
+    sent = []
+    monkeypatch.setattr("app.notifications.service.send_sms", lambda to, body: sent.append((to, body)))
+
+    # number.suspended is the only seeded template with an sms_body_template -
+    # temporarily drop it to STANDARD to exercise the non-exempt SMS path.
+    template = db_session.query(NotificationTemplate).filter(NotificationTemplate.key == "number.suspended").first()
+    from app.notifications.models import NotificationPriority
+    template.priority = NotificationPriority.STANDARD
+    db_session.commit()
+
+    account = Account(name="Suppress SMS Standard Co", account_type=AccountType.INDIVIDUAL)
+    db_session.add(account)
+    db_session.flush()
+    update_preference(db_session, account.id, sms_enabled=False)
+
+    delivery = send_sms_notification(
+        db_session, event_name="number.suspended", account_id=account.id,
+        recipient_phone="+15551234567", context={"e164": "+15550001111", "reason_line": ""},
+    )
+    assert delivery.status == "suppressed"
+    assert "disabled" in delivery.error
+    assert sent == []
+
+
+def test_sms_is_held_during_quiet_hours(db_session, monkeypatch):
+    from datetime import time as dtime
+
+    from app.notifications.service import send_sms_notification, update_preference
+    from app.notifications.models import NotificationTemplate, NotificationPriority
+
+    from app.numbering.identity.models import Account, AccountType
+
+    sent = []
+    monkeypatch.setattr("app.notifications.service.send_sms", lambda to, body: sent.append((to, body)))
+
+    template = db_session.query(NotificationTemplate).filter(NotificationTemplate.key == "number.suspended").first()
+    template.priority = NotificationPriority.STANDARD
+    db_session.commit()
+
+    account = Account(name="Quiet Hours Co", account_type=AccountType.INDIVIDUAL)
+    db_session.add(account)
+    db_session.flush()
+    # Covers virtually the entire day so this is deterministic regardless of
+    # wall-clock time when the test runs.
+    update_preference(
+        db_session, account.id,
+        quiet_hours_start=dtime(0, 0, 0), quiet_hours_end=dtime(23, 59, 59), quiet_hours_timezone="UTC",
+    )
+
+    delivery = send_sms_notification(
+        db_session, event_name="number.suspended", account_id=account.id,
+        recipient_phone="+15551234567", context={"e164": "+15550001111", "reason_line": ""},
+    )
+    assert delivery.status == "suppressed"
+    assert "quiet hours" in delivery.error
+    assert sent == []
+
+
+def _signup_and_login_owner(client, email: str) -> str:
+    client.post(
+        "/auth/signup",
+        json={"account_name": "Prefs Route Co", "account_type": "business", "email": email, "password": "supersecret123"},
+    )
+    return client.post("/auth/login", json={"email": email, "password": "supersecret123"}).json()["access_token"]
+
+
+def test_get_preferences_requires_auth(client):
+    response = client.get("/notifications/preferences")
+    assert response.status_code == 401
+
+
+def test_get_preferences_returns_defaults(client):
+    token = _signup_and_login_owner(client, "prefsroute1@example.com")
+    response = client.get("/notifications/preferences", headers={"Authorization": f"Bearer {token}"})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["transactional_enabled"] is True
+    assert body["sms_enabled"] is True
+    assert body["quiet_hours_start"] is None
+
+
+def test_put_preferences_updates_fields(client):
+    token = _signup_and_login_owner(client, "prefsroute2@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    response = client.put(
+        "/notifications/preferences",
+        json={"transactional_enabled": False, "quiet_hours_start": "22:00:00", "quiet_hours_end": "07:00:00"},
+        headers=headers,
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["transactional_enabled"] is False
+    assert body["quiet_hours_start"] == "22:00:00"
+
+    refetched = client.get("/notifications/preferences", headers=headers).json()
+    assert refetched["transactional_enabled"] is False
+
+
+def test_put_preferences_rejects_invalid_timezone(client):
+    token = _signup_and_login_owner(client, "prefsroute3@example.com")
+    response = client.put(
+        "/notifications/preferences",
+        json={"quiet_hours_timezone": "Not/A_Real_Zone"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert response.status_code == 422
+
+
+def test_put_preferences_forbidden_for_viewer(client):
+    owner_token = _signup_and_login_owner(client, "prefsrouteviewer@example.com")
+    owner_headers = {"Authorization": f"Bearer {owner_token}"}
+    client.post(
+        "/team/members",
+        json={"email": "prefsrouteviewermember@example.com", "password": "supersecret123", "role": "viewer"},
+        headers=owner_headers,
+    )
+    viewer_token = client.post(
+        "/auth/login", json={"email": "prefsrouteviewermember@example.com", "password": "supersecret123"}
+    ).json()["access_token"]
+
+    response = client.put(
+        "/notifications/preferences",
+        json={"transactional_enabled": False},
+        headers={"Authorization": f"Bearer {viewer_token}"},
+    )
+    assert response.status_code == 403
+
+    # But read access is unrestricted, same as everything else Viewer can see.
+    get_response = client.get(
+        "/notifications/preferences", headers={"Authorization": f"Bearer {viewer_token}"}
+    )
+    assert get_response.status_code == 200

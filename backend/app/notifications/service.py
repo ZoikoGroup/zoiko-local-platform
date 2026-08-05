@@ -1,4 +1,5 @@
-from datetime import datetime, timezone
+from datetime import datetime, time, timezone
+from zoneinfo import ZoneInfo
 
 from sqlalchemy.orm import Session
 
@@ -6,9 +7,12 @@ from app.audit.service import log_event
 from app.integrations.notifications.email import EmailError, send_email
 from app.integrations.telecom.twilio import TelecomError, send_sms
 from app.notifications.models import (
+    NotificationCategory,
     NotificationChannel,
     NotificationDelivery,
     NotificationDeliveryStatus,
+    NotificationPreference,
+    NotificationPriority,
     NotificationTemplate,
 )
 
@@ -23,6 +27,73 @@ class SmsTemplateMissingError(Exception):
     """Raised when SMS is requested for an event whose template has no
     sms_body_template - most templates are email-only on purpose (see
     NotificationTemplate.sms_body_template's docstring)."""
+
+
+class InvalidTimezoneError(Exception):
+    """Raised when a preference update's quiet_hours_timezone isn't a real
+    IANA zone name - caught at save time rather than the next time a
+    notification tries to use it and crashes instead."""
+
+
+def get_or_create_preference(db: Session, account_id: str) -> NotificationPreference:
+    pref = db.query(NotificationPreference).filter(NotificationPreference.account_id == account_id).first()
+    if pref is None:
+        pref = NotificationPreference(account_id=account_id)
+        db.add(pref)
+        db.commit()
+        db.refresh(pref)
+    return pref
+
+
+def update_preference(
+    db: Session,
+    account_id: str,
+    *,
+    transactional_enabled: bool | None = None,
+    sms_enabled: bool | None = None,
+    quiet_hours_start: time | None = ...,
+    quiet_hours_end: time | None = ...,
+    quiet_hours_timezone: str | None = None,
+) -> NotificationPreference:
+    """Uses `...` (not None) as the "leave unchanged" sentinel for the two
+    quiet-hours time fields specifically, since None is itself a meaningful
+    value for them (clears quiet hours entirely) - unlike the booleans and
+    timezone, which always have a real value worth setting."""
+    pref = get_or_create_preference(db, account_id)
+    if transactional_enabled is not None:
+        pref.transactional_enabled = transactional_enabled
+    if sms_enabled is not None:
+        pref.sms_enabled = sms_enabled
+    if quiet_hours_start is not ...:
+        pref.quiet_hours_start = quiet_hours_start
+    if quiet_hours_end is not ...:
+        pref.quiet_hours_end = quiet_hours_end
+    if quiet_hours_timezone is not None:
+        try:
+            ZoneInfo(quiet_hours_timezone)
+        except Exception as e:
+            raise InvalidTimezoneError(f"{quiet_hours_timezone!r} is not a valid timezone") from e
+        pref.quiet_hours_timezone = quiet_hours_timezone
+    db.commit()
+    db.refresh(pref)
+    return pref
+
+
+def _is_exempt_from_suppression(template: NotificationTemplate) -> bool:
+    """SECURITY-category or CRITICAL-priority templates always send,
+    regardless of preference or quiet hours - see NotificationPreference's
+    docstring for why."""
+    return template.category == NotificationCategory.SECURITY or template.priority == NotificationPriority.CRITICAL
+
+
+def is_within_quiet_hours(pref: NotificationPreference, *, now: datetime | None = None) -> bool:
+    if pref.quiet_hours_start is None or pref.quiet_hours_end is None:
+        return False
+    now_local = (now or datetime.now(timezone.utc)).astimezone(ZoneInfo(pref.quiet_hours_timezone)).time()
+    start, end = pref.quiet_hours_start, pref.quiet_hours_end
+    if start <= end:
+        return start <= now_local <= end
+    return now_local >= start or now_local <= end  # overnight range, e.g. 22:00-06:00
 
 
 def send_notification(
@@ -53,11 +124,22 @@ def send_notification(
         subject=subject,
         status=NotificationDeliveryStatus.SENT,
     )
-    try:
-        send_email(to=recipient_email, subject=subject, body=body)
-    except EmailError as e:
-        delivery.status = NotificationDeliveryStatus.FAILED
-        delivery.error = str(e)
+
+    # A bare account_id=None call (no account context yet, e.g. pre-signup
+    # flows) has no preference to check, so it always sends.
+    is_opted_out = (
+        account_id is not None
+        and not _is_exempt_from_suppression(template)
+        and not get_or_create_preference(db, account_id).transactional_enabled
+    )
+    if is_opted_out:
+        delivery.status = NotificationDeliveryStatus.SUPPRESSED
+    else:
+        try:
+            send_email(to=recipient_email, subject=subject, body=body)
+        except EmailError as e:
+            delivery.status = NotificationDeliveryStatus.FAILED
+            delivery.error = str(e)
 
     db.add(delivery)
     db.commit()
@@ -66,7 +148,7 @@ def send_notification(
     log_event(
         db,
         actor="system",
-        action="notification.sent" if delivery.status == NotificationDeliveryStatus.SENT else "notification.failed",
+        action=f"notification.{delivery.status.value}",
         target=f"notification_delivery:{delivery.id}",
         after={"event_name": event_name, "recipient_email": recipient_email, "status": delivery.status},
     )
@@ -100,11 +182,24 @@ def send_sms_notification(
         subject=body[:255],  # SMS has no separate subject line - reuse the body for the ledger's display column
         status=NotificationDeliveryStatus.SENT,
     )
-    try:
-        send_sms(to=recipient_phone, body=body)
-    except TelecomError as e:
-        delivery.status = NotificationDeliveryStatus.FAILED
-        delivery.error = str(e)
+
+    # SMS is the interruptive channel (buzzes a phone), so unlike email it's
+    # also gated on quiet hours, not just the opt-out toggle - both checks
+    # skipped for CRITICAL-priority templates.
+    pref = get_or_create_preference(db, account_id) if account_id else None
+    is_exempt = _is_exempt_from_suppression(template)
+    if pref and not is_exempt and not pref.sms_enabled:
+        delivery.status = NotificationDeliveryStatus.SUPPRESSED
+        delivery.error = "Suppressed: SMS notifications are disabled for this account"
+    elif pref and not is_exempt and is_within_quiet_hours(pref):
+        delivery.status = NotificationDeliveryStatus.SUPPRESSED
+        delivery.error = "Suppressed: sent during the account's configured quiet hours"
+    else:
+        try:
+            send_sms(to=recipient_phone, body=body)
+        except TelecomError as e:
+            delivery.status = NotificationDeliveryStatus.FAILED
+            delivery.error = str(e)
 
     db.add(delivery)
     db.commit()
@@ -113,7 +208,7 @@ def send_sms_notification(
     log_event(
         db,
         actor="system",
-        action="notification.sent" if delivery.status == NotificationDeliveryStatus.SENT else "notification.failed",
+        action=f"notification.{delivery.status.value}",
         target=f"notification_delivery:{delivery.id}",
         after={"event_name": event_name, "recipient_phone": recipient_phone, "status": delivery.status},
     )

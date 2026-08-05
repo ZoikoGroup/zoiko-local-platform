@@ -136,6 +136,9 @@ export default function NotificationBell() {
                       {n.status === "failed" && (
                         <span className="text-[10px] font-medium text-red-600 uppercase">Delivery failed</span>
                       )}
+                      {n.status === "suppressed" && (
+                        <span className="text-[10px] font-medium text-slate-500 uppercase">Not sent (your preferences)</span>
+                      )}
                       <span className="text-[10px] text-slate-600">
                         {new Date(n.created_at).toLocaleString()}
                       </span>

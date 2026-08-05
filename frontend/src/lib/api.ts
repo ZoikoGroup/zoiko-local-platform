@@ -244,7 +244,7 @@ export type NotificationDelivery = {
   recipient_email: string | null;
   recipient_phone: string | null;
   subject: string;
-  status: "sent" | "failed";
+  status: "sent" | "failed" | "suppressed";
   error: string | null;
   created_at: string;
   read_at: string | null;
@@ -267,6 +267,31 @@ export function markAllNotificationsRead(token: string): Promise<{ marked_read: 
   return request(`/notifications/read-all`, {
     method: "POST",
     headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export type NotificationPreferences = {
+  transactional_enabled: boolean;
+  sms_enabled: boolean;
+  quiet_hours_start: string | null; // "HH:MM:SS"
+  quiet_hours_end: string | null;
+  quiet_hours_timezone: string;
+};
+
+export function getNotificationPreferences(token: string): Promise<NotificationPreferences> {
+  return request<NotificationPreferences>("/notifications/preferences", {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export function updateNotificationPreferences(
+  token: string,
+  updates: Partial<NotificationPreferences>
+): Promise<NotificationPreferences> {
+  return request<NotificationPreferences>("/notifications/preferences", {
+    method: "PUT",
+    headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify(updates),
   });
 }
 
