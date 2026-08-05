@@ -948,3 +948,77 @@ export function removeBlockedDestination(staffToken: string, ruleId: string): Pr
     headers: { Authorization: `Bearer ${staffToken}` },
   });
 }
+
+// --- Contacts ---
+
+export type Contact = {
+  id: string;
+  account_id: string;
+  name: string;
+  phone_number: string;
+  email: string | null;
+  notes: string | null;
+  created_by_user_id: string | null;
+  created_at: string;
+};
+
+export type ContactInput = {
+  name: string;
+  phone_number: string;
+  email?: string | null;
+  notes?: string | null;
+};
+
+export type ContactHistory = {
+  calls: {
+    id: string;
+    direction: "inbound" | "outbound";
+    from: string;
+    to: string;
+    status: string;
+    duration: number | null;
+    created_at: string;
+  }[];
+  voicemails: {
+    id: string;
+    from: string;
+    duration: number | null;
+    recording_url: string;
+    created_at: string;
+  }[];
+};
+
+export function listContacts(token: string): Promise<Contact[]> {
+  return request<Contact[]>("/contacts", {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export function createContact(token: string, input: ContactInput): Promise<Contact> {
+  return request<Contact>("/contacts", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify(input),
+  });
+}
+
+export function updateContact(token: string, contactId: string, input: ContactInput): Promise<Contact> {
+  return request<Contact>(`/contacts/${encodeURIComponent(contactId)}`, {
+    method: "PUT",
+    headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify(input),
+  });
+}
+
+export function deleteContact(token: string, contactId: string): Promise<void> {
+  return request<void>(`/contacts/${encodeURIComponent(contactId)}`, {
+    method: "DELETE",
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export function getContactHistory(token: string, contactId: string): Promise<ContactHistory> {
+  return request<ContactHistory>(`/contacts/${encodeURIComponent(contactId)}/history`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
