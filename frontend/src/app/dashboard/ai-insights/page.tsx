@@ -9,10 +9,12 @@ import {
   assignReceptionistCall,
   editReceptionistCallSummary,
   listTeamMembers,
+  listContacts,
   ApiError,
   type SummaryListEntry,
   type ReceptionistCallEntry,
   type TeamMember,
+  type Contact,
 } from "@/lib/api";
 import { getToken } from "@/lib/auth";
 
@@ -114,6 +116,7 @@ export default function AIInsightsPage() {
   const [receptionistError, setReceptionistError] = useState<string | null>(null);
 
   const [teamMembers, setTeamMembers] = useState<TeamMember[]>([]);
+  const [contacts, setContacts] = useState<Contact[]>([]);
   const [routingCallId, setRoutingCallId] = useState<string | null>(null);
   const [routingSelection, setRoutingSelection] = useState<Record<string, string>>({});
   const [routingError, setRoutingError] = useState<Record<string, string>>({});
@@ -152,7 +155,20 @@ export default function AIInsightsPage() {
         // calls, just without the ability to route them - not worth
         // surfacing as an error.
       });
+    listContacts(token)
+      .then(setContacts)
+      .catch(() => {
+        // Non-essential - callers just show the AI's extracted name (or
+        // the bare number) instead of a saved contact name.
+      });
   }, [token]);
+
+  // A saved contact's name is more authoritative than the AI's
+  // transcript-extracted caller_name guess, so it takes priority when both exist.
+  const contactNameByPhone = contacts.reduce<Record<string, string>>((acc, c) => {
+    acc[c.phone_number] = c.name;
+    return acc;
+  }, {});
 
   async function handleRouteCall(callId: string) {
     if (!token) return;
@@ -449,6 +465,7 @@ export default function AIInsightsPage() {
         <ul className="divide-y divide-slate-100">
           {receptionistCalls.map((c) => {
             const urgencyStyle = c.urgency ? URGENCY_STYLES[c.urgency] : null;
+            const displayName = contactNameByPhone[c.caller_number] ?? c.caller_name;
             return (
               <li
                 key={c.id}
@@ -456,12 +473,12 @@ export default function AIInsightsPage() {
               >
                 <div className="flex gap-3.5">
                   <div className="w-9 h-9 rounded-full bg-indigo-100 text-indigo-700 text-xs font-semibold flex items-center justify-center shrink-0">
-                    {initials(c.caller_name)}
+                    {initials(displayName)}
                   </div>
                   <div className="flex-1 min-w-0 space-y-1.5">
                     <div className="flex items-center justify-between gap-4 flex-wrap">
                       <div className="text-sm font-semibold text-slate-800">
-                        {c.caller_name ?? "Unknown caller"}
+                        {displayName ?? "Unknown caller"}
                         {c.caller_company && (
                           <span className="text-slate-400 font-normal"> · {c.caller_company}</span>
                         )}

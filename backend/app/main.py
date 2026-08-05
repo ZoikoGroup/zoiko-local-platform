@@ -1,3 +1,5 @@
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from slowapi import _rate_limit_exceeded_handler
@@ -7,10 +9,13 @@ from sqlalchemy import text
 from app.audit.routes import router as audit_router
 from app.compliance.routes import router as compliance_router
 from app.consent.routes import router as consent_router
+from app.contacts.routes import router as contacts_router
 from app.core.config import settings
 from app.core.database import engine
+from app.core.logging import configure_logging
 from app.core.rate_limit import limiter
 from app.core.startup_checks import assert_jwt_secret_is_configured, parse_allowed_origins
+from app.core.telemetry import setup_telemetry, shutdown_telemetry
 from app.intelligence.routes import router as intelligence_router
 from app.media.receptionist import router as receptionist_router
 from app.media.video import router as video_router
@@ -27,7 +32,18 @@ from app.risk.routes import router as risk_router
 from app.staff.routes import router as staff_router
 from app.usage.routes import router as usage_router
 
-app = FastAPI(title="Zoiko Local API")
+# Runs once at import time (not per app-instance), before any FastAPI app
+# exists - configure_logging() itself has nothing to do with app.state.
+configure_logging()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    yield
+    shutdown_telemetry()
+
+
+app = FastAPI(title="Zoiko Local API", lifespan=lifespan)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
@@ -42,11 +58,19 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Must run before the app ever serves a request (including the lifespan
+# protocol itself) - Starlette caches its middleware stack on first ASGI
+# call, so instrumenting from inside the lifespan handler above would be
+# one request too late for FastAPIInstrumentor's ASGI-level wrapping to
+# actually take effect.
+setup_telemetry(app, engine)
+
 app.include_router(identity_router)
 app.include_router(team_router)
 app.include_router(audit_router)
 app.include_router(compliance_router)
 app.include_router(consent_router)
+app.include_router(contacts_router)
 app.include_router(staff_router)
 app.include_router(voice_router)
 app.include_router(voicemail_router)

@@ -923,3 +923,67 @@ export function removeBlockedDestination(staffToken: string, ruleId: string): Pr
     headers: { Authorization: `Bearer ${staffToken}` },
   });
 }
+
+// --- Contacts ---
+
+export type Contact = {
+  id: string;
+  name: string;
+  phone_number: string;
+  email: string | null;
+  notes: string | null;
+  created_at: string;
+};
+
+export type ContactHistoryEntry = {
+  type: "call" | "voicemail" | "receptionist_call";
+  id: string;
+  direction: string | null;
+  status: string | null;
+  duration: number | null;
+  summary: string | null;
+  recording_url: string | null;
+  created_at: string;
+};
+
+export function listContacts(token: string): Promise<Contact[]> {
+  return request<Contact[]>("/contacts", {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export function createContact(
+  token: string,
+  input: { name: string; phone_number: string; email?: string; notes?: string }
+): Promise<Contact> {
+  return request<Contact>("/contacts", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify(input),
+  });
+}
+
+export function updateContact(
+  token: string,
+  contactId: string,
+  input: { name: string; phone_number: string; email?: string; notes?: string }
+): Promise<Contact> {
+  return request<Contact>(`/contacts/${encodeURIComponent(contactId)}`, {
+    method: "PUT",
+    headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify(input),
+  });
+}
+
+export function deleteContact(token: string, contactId: string): Promise<void> {
+  return request<void>(`/contacts/${encodeURIComponent(contactId)}`, {
+    method: "DELETE",
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export function getContactHistory(token: string, contactId: string): Promise<ContactHistoryEntry[]> {
+  return request<ContactHistoryEntry[]>(`/contacts/${encodeURIComponent(contactId)}/history`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}

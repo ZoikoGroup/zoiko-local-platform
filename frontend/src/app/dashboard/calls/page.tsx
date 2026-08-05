@@ -9,11 +9,13 @@ import {
   summarizeCall,
   summarizeVoicemail,
   grantAiProcessingConsent,
+  listContacts,
   ApiError,
   type MyPhoneNumber,
   type CallLogEntry,
   type VoicemailEntry,
   type ConversationSummary,
+  type Contact,
 } from "@/lib/api";
 import { getToken } from "@/lib/auth";
 
@@ -38,6 +40,7 @@ export default function CallsPage() {
   const [numbers, setNumbers] = useState<MyPhoneNumber[]>([]);
   const [calls, setCalls] = useState<CallLogEntry[]>([]);
   const [voicemails, setVoicemails] = useState<VoicemailEntry[]>([]);
+  const [contacts, setContacts] = useState<Contact[]>([]);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
 
@@ -51,17 +54,29 @@ export default function CallsPage() {
 
   const loadAll = useCallback(() => {
     if (!token) return;
-    return Promise.all([listMyNumbers(token), listCalls(token), listVoicemails(token)])
-      .then(([numbersData, callsData, voicemailsData]) => {
+    return Promise.all([listMyNumbers(token), listCalls(token), listVoicemails(token), listContacts(token)])
+      .then(([numbersData, callsData, voicemailsData, contactsData]) => {
         setNumbers(numbersData);
         setCalls(callsData);
         setVoicemails(voicemailsData);
+        setContacts(contactsData);
         setLoadError(null);
         setFromNumber((current) => current || numbersData.find((n) => n.status === "active")?.e164 || "");
       })
       .catch(() => setLoadError("Couldn't load calls and voicemail."))
       .finally(() => setLoading(false));
   }, [token]);
+
+  // Resolves a raw phone number to a saved contact's name, falling back to
+  // the bare number - built once per contacts load rather than searching
+  // the array on every row render.
+  const contactNameByPhone = contacts.reduce<Record<string, string>>((acc, c) => {
+    acc[c.phone_number] = c.name;
+    return acc;
+  }, {});
+  function displayNumber(phone: string): string {
+    return contactNameByPhone[phone] ?? phone;
+  }
 
   useEffect(() => {
     loadAll();
@@ -188,7 +203,7 @@ export default function CallsPage() {
           {calls.map((c) => (
             <CallRow
               key={c.id}
-              label={`${c.direction === "inbound" ? c.from : c.to} · ${c.direction}`}
+              label={`${displayNumber(c.direction === "inbound" ? c.from : c.to)} · ${c.direction}`}
               status={c.status}
               duration={c.duration}
               createdAt={c.created_at}
@@ -212,7 +227,7 @@ export default function CallsPage() {
           {voicemails.map((v) => (
             <CallRow
               key={v.id}
-              label={`From ${v.from}`}
+              label={`From ${displayNumber(v.from)}`}
               status="left a message"
               duration={v.duration}
               createdAt={v.created_at}
