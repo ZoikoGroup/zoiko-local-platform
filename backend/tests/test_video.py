@@ -97,6 +97,118 @@ def test_create_room_requires_auth(client):
     assert response.status_code == 401
 
 
+def test_create_room_returns_a_clean_502_on_a_genuine_livekit_failure(client, db_session, monkeypatch):
+    """Chaos test: LiveKit configured correctly but the API call itself
+    fails (real outage/timeout - a VideoError from a genuine TwirpError,
+    not a missing-config ValueError). No VideoSession row should be left
+    behind half-created."""
+    from app.integrations.video.livekit import VideoError
+    from app.media.models import VideoSession
+
+    async def _raise(*args, **kwargs):
+        raise VideoError("livekit request failed: 503 Service Unavailable")
+
+    monkeypatch.setattr("app.media.service.video.create_room", _raise)
+    token = _signup_and_login(client, "videocreatelivekitdown@example.com")
+    account_id = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"}).json()["account_id"]
+
+    response = client.post("/media/video/rooms", headers={"Authorization": f"Bearer {token}"})
+    assert response.status_code == 502
+
+    assert db_session.query(VideoSession).filter(VideoSession.account_id == account_id).count() == 0
+
+
+def test_end_room_returns_a_clean_502_on_a_genuine_livekit_failure(client, db_session, monkeypatch):
+    """Same chaos scenario for ending a room - the session must stay ACTIVE
+    (not silently marked ENDED) if the provider call actually failed, since
+    that would desync our record from the still-live LiveKit room."""
+    from app.integrations.video.livekit import VideoError
+    from app.media.models import VideoSession, VideoSessionStatus
+
+    token = _signup_and_login(client, "videoendlivekitdown@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    me = client.get("/auth/me", headers=headers).json()
+
+    session = VideoSession(
+        account_id=me["account_id"], host_user_id=me["id"], room_name="zl-test-end-livekit-down",
+        status=VideoSessionStatus.ACTIVE,
+    )
+    db_session.add(session)
+    db_session.commit()
+
+    async def _raise(*args, **kwargs):
+        raise VideoError("livekit request failed: 503 Service Unavailable")
+
+    monkeypatch.setattr("app.media.service.video.end_room", _raise)
+
+    response = client.post(f"/media/video/rooms/{session.room_name}/end", headers=headers)
+    assert response.status_code == 502
+
+    db_session.refresh(session)
+    assert session.status == VideoSessionStatus.ACTIVE
+    assert session.ended_at is None
+
+
+def test_start_recording_returns_a_clean_502_on_a_genuine_livekit_failure(client, db_session, monkeypatch):
+    """Chaos test for the Egress API call itself failing - the session must
+    not be left thinking a recording is in progress (recording_egress_id
+    must stay unset) if LiveKit never actually started one."""
+    from app.integrations.video.livekit import VideoError
+    from app.media.models import VideoSession, VideoSessionStatus
+
+    token = _signup_and_login(client, "videorecordlivekitdown@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    client.post("/compliance/consent", json={"consent_type": "ai_processing"}, headers=headers)
+    me = client.get("/auth/me", headers=headers).json()
+
+    session = VideoSession(
+        account_id=me["account_id"], host_user_id=me["id"], room_name="zl-test-record-livekit-down",
+        status=VideoSessionStatus.ACTIVE,
+    )
+    db_session.add(session)
+    db_session.commit()
+
+    async def _raise(*args, **kwargs):
+        raise VideoError("livekit egress request failed: 503 Service Unavailable")
+
+    monkeypatch.setattr("app.media.service.video.start_room_recording", _raise)
+
+    response = client.post(f"/media/video/rooms/{session.room_name}/recording/start", headers=headers)
+    assert response.status_code == 502
+
+    db_session.refresh(session)
+    assert session.recording_egress_id is None
+
+
+def test_list_rooms_degrades_recording_url_to_none_on_a_genuine_s3_failure(client, db_session, monkeypatch):
+    """Chaos test for the S3/boto3 call site in get_recording_download_url -
+    a genuine presigned-URL generation failure (bucket unreachable) must not
+    break the whole call-history list, just that one row's download link."""
+    from app.integrations.storage.s3 import StorageError
+    from app.media.models import VideoSession, VideoSessionStatus
+
+    token = _signup_and_login(client, "videolists3down@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    me = client.get("/auth/me", headers=headers).json()
+
+    session = VideoSession(
+        account_id=me["account_id"], host_user_id=me["id"], room_name="zl-test-list-s3-down",
+        status=VideoSessionStatus.ENDED, recording_url="https://s3.example.com/recordings/zl-test-list-s3-down.mp4",
+    )
+    db_session.add(session)
+    db_session.commit()
+
+    def _raise(*args, **kwargs):
+        raise StorageError("Unable to generate presigned URL: connection reset")
+
+    monkeypatch.setattr("app.media.service.generate_presigned_url", _raise)
+
+    response = client.get("/media/video/rooms", headers=headers)
+    assert response.status_code == 200
+    matching = next(r for r in response.json() if r["room_name"] == "zl-test-list-s3-down")
+    assert matching["recording_url"] is None
+
+
 def test_create_room_fails_cleanly_when_livekit_url_is_not_configured(client, monkeypatch):
     """A missing LIVEKIT_URL makes the SDK's own client constructor raise a
     plain ValueError (not a TwirpError) - must still surface as a clean 502,

@@ -413,6 +413,27 @@ def test_start_kyc_fails_cleanly_when_stripe_is_not_configured(client, monkeypat
     assert response.status_code == 502
 
 
+def test_start_kyc_returns_a_clean_502_on_a_genuine_stripe_failure(client, monkeypatch):
+    """Chaos test: Stripe IS configured, but the API call itself fails (a
+    real outage/timeout), not a missing secret key - the "not configured"
+    test above only covers the latter."""
+    from app.integrations.kyc.stripe_identity import KYCError
+
+    monkeypatch.setattr("app.core.config.settings.stripe_secret_key", "sk_test_fake")
+
+    def _raise(reference_id):
+        raise KYCError("Stripe Identity request failed: connection timed out")
+
+    monkeypatch.setattr("app.compliance.service.stripe_identity.create_verification_session", _raise)
+
+    token = _signup_and_login(client, "kycstripedown@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    case_id = _open_case(client, headers)
+
+    response = client.post(f"/compliance/cases/{case_id}/kyc/start", headers=headers)
+    assert response.status_code == 502
+
+
 def test_start_kyc_success_stores_inquiry_id_and_returns_verification_url(client, db_session, monkeypatch):
     monkeypatch.setattr("app.core.config.settings.stripe_secret_key", "sk_test_fake")
     monkeypatch.setattr(

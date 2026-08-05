@@ -296,3 +296,47 @@ def test_purge_removes_a_video_recording_past_retention(client, db_session, monk
     response = client.post("/retention/purge", headers={"Authorization": f"Bearer {staff_token}"})
     assert response.json()["video_recording"] == {"purged": 1, "failed": 0}
     assert deleted_keys == ["recordings/zl-purgetest1.mp4"]
+
+
+def test_purge_leaves_video_recording_url_untouched_when_storage_deletion_fails(client, db_session, monkeypatch):
+    """Video-recording analog of test_purge_leaves_recording_url_untouched_
+    when_provider_deletion_fails above - the S3/boto3 call site had zero
+    genuine-failure coverage before this."""
+    from app.integrations.storage.s3 import StorageError
+
+    def _fail(key):
+        raise StorageError("boom")
+
+    monkeypatch.setattr("app.retention.service.delete_object", _fail)
+
+    signup = client.post(
+        "/auth/signup",
+        json={
+            "account_name": "Purge Video Fail Co",
+            "account_type": "individual",
+            "email": "purgevideofail@example.com",
+            "password": "supersecret123",
+        },
+    )
+    account_id = signup.json()["account_id"]
+    me = client.post(
+        "/auth/login", json={"email": "purgevideofail@example.com", "password": "supersecret123"}
+    ).json()["access_token"]
+    user_id = client.get("/auth/me", headers={"Authorization": f"Bearer {me}"}).json()["id"]
+
+    old = datetime.now(timezone.utc) - timedelta(days=200)
+    original_url = "https://s3.example.com/zoiko-local-video-recordings/recordings/zl-purgefailtest.mp4"
+    session = VideoSession(
+        account_id=account_id, host_user_id=user_id, room_name="zl-purgefailtest",
+        status=VideoSessionStatus.ENDED, started_at=old, ended_at=old,
+        recording_url=original_url,
+    )
+    db_session.add(session)
+    db_session.commit()
+
+    staff_token = _create_and_login_staff(db_session, client, "purgestaff7@zoikolocal.com")
+    response = client.post("/retention/purge", headers={"Authorization": f"Bearer {staff_token}"})
+    assert response.json()["video_recording"] == {"purged": 0, "failed": 1}
+
+    db_session.refresh(session)
+    assert session.recording_url == original_url  # untouched - safe to retry next run

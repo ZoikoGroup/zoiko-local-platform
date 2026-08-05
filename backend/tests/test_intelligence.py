@@ -118,6 +118,121 @@ def test_summarize_call_success_path(client, db_session, monkeypatch):
     assert body["language"] is None or isinstance(body["language"], str)
 
 
+def test_summarize_call_returns_a_clean_502_when_groq_summarization_fails(client, db_session, monkeypatch):
+    """Chaos test: extract_conversation_summary raising LLMError (a real
+    Groq outage/timeout, not a missing API key) must not become an
+    unhandled 500 - and no ConversationSummary row should be left behind
+    half-written."""
+    from app.integrations.llm.groq import LLMError
+    from app.intelligence.models import ConversationSummary
+
+    token, account_id = _signup_and_login(client, "intelcallgroqdown@example.com", "Intel Call Groq Down Co")
+    call = _make_recorded_call(db_session, account_id)
+    client.post(
+        "/compliance/consent", json={"consent_type": "ai_processing"}, headers={"Authorization": f"Bearer {token}"}
+    )
+
+    monkeypatch.setattr("app.intelligence.service.download_recording", lambda url: b"fake-audio-bytes")
+    monkeypatch.setattr("app.intelligence.service.transcribe_audio", lambda audio_bytes: "test transcript")
+
+    def _raise(*args, **kwargs):
+        raise LLMError("Groq summarization request failed: connection timed out")
+
+    monkeypatch.setattr("app.intelligence.service.extract_conversation_summary", _raise)
+
+    response = client.post(
+        f"/intelligence/calls/{call.id}/summarize", headers={"Authorization": f"Bearer {token}"}
+    )
+    assert response.status_code == 502
+
+    assert db_session.query(ConversationSummary).filter(ConversationSummary.source_id == call.id).count() == 0
+
+
+def test_summarize_call_degrades_gracefully_when_embedding_generation_fails(client, db_session, monkeypatch):
+    """A Cohere outage must not block the summary itself - the documented
+    degrade-gracefully behavior in _analyze_and_store's try/except, proven
+    here rather than just asserted in a comment."""
+    from app.integrations.embeddings.cohere import EmbeddingError
+
+    token, account_id = _signup_and_login(client, "intelcallcoheredown@example.com", "Intel Call Cohere Down Co")
+    call = _make_recorded_call(db_session, account_id)
+    client.post(
+        "/compliance/consent", json={"consent_type": "ai_processing"}, headers={"Authorization": f"Bearer {token}"}
+    )
+
+    monkeypatch.setattr("app.intelligence.service.download_recording", lambda url: b"fake-audio-bytes")
+    monkeypatch.setattr("app.intelligence.service.transcribe_audio", lambda audio_bytes: "test transcript")
+    monkeypatch.setattr(
+        "app.intelligence.service.extract_conversation_summary",
+        lambda transcript: {
+            "summary": "Test summary.", "language": "en", "urgency": "low",
+            "action_items": [], "suggested_follow_up": None,
+        },
+    )
+
+    def _raise(*args, **kwargs):
+        raise EmbeddingError("Cohere embedding request failed: connection refused")
+
+    monkeypatch.setattr("app.intelligence.service.generate_embedding", _raise)
+
+    response = client.post(
+        f"/intelligence/calls/{call.id}/summarize", headers={"Authorization": f"Bearer {token}"}
+    )
+    assert response.status_code == 201, response.text
+    assert response.json()["summary"] == "Test summary."
+
+
+def test_search_summaries_returns_empty_when_cohere_is_unreachable(client, db_session, monkeypatch):
+    """Same degrade-to-empty-results contract as an unrelated search query -
+    a Cohere outage during search must read as "no matches," not an error."""
+    from app.integrations.embeddings.cohere import EmbeddingError
+
+    token, account_id = _signup_and_login(client, "searchcoheredown@example.com", "Search Cohere Down Co")
+    _seed_summary(
+        db_session, account_id,
+        summary="Caller reported a billing dispute over their last invoice.",
+        transcript="Hi, I think I was overcharged on my last invoice.",
+        with_embedding=False,
+    )
+
+    def _raise(*args, **kwargs):
+        raise EmbeddingError("Cohere embedding request failed: connection refused")
+
+    monkeypatch.setattr("app.intelligence.service.generate_embedding", _raise)
+
+    response = client.get(
+        "/intelligence/summaries/search", params={"q": "billing invoice"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert response.status_code == 200
+    assert response.json() == []
+
+
+def test_summarize_video_session_returns_a_clean_502_when_storage_download_fails(client, db_session, monkeypatch):
+    """Chaos test for the S3/boto3 call site in _download_and_transcribe_video
+    - a genuine mid-call StorageError (bucket unreachable, object missing),
+    not a "not configured" scenario."""
+    from app.integrations.storage.s3 import StorageError
+
+    token, account_id = _signup_and_login(client, "intelvidstoragedown@example.com", "Intel Video Storage Down Co")
+    me = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"}).json()
+    session = _make_video_session(db_session, account_id, me["id"], room_name="zl-test-storage-down")
+    client.post(
+        "/compliance/consent", json={"consent_type": "ai_processing"}, headers={"Authorization": f"Bearer {token}"}
+    )
+
+    def _raise(*args, **kwargs):
+        raise StorageError("Unable to download s3://recordings/zl-test-storage-down.mp4: connection reset")
+
+    monkeypatch.setattr("app.intelligence.service.download_object", _raise)
+
+    response = client.post(
+        f"/intelligence/video-sessions/{session.room_name}/summarize",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert response.status_code == 502
+
+
 def test_summarize_voicemail_rejects_other_account(client, db_session):
     _, owner_account_id = _signup_and_login(client, "intelowner@example.com", "Intel Owner Co")
     voicemail = _make_voicemail(db_session, owner_account_id, "+15550004444")

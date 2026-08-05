@@ -126,6 +126,52 @@ def test_respond_with_consent_extracts_qualification_and_escalates_high_urgency(
     assert calls[0]["guardrail_flags"] == []
 
 
+def test_receptionist_call_degrades_to_raw_transcript_when_groq_is_down(client, db_session, monkeypatch):
+    """Chaos test proving the documented degrade behavior in
+    media.service.capture_receptionist_call actually works: a genuine Groq
+    outage mid-call (LLMError, not a missing API key) must still capture
+    the raw transcript and return a normal TwiML response - never break the
+    live call."""
+    from app.integrations.llm.groq import LLMError
+
+    token, account_id = _signup_and_login(client, "receptionistgroqdown@example.com")
+    number = PhoneNumber(
+        e164="+15550099999", country="US", status=PhoneNumberStatus.ACTIVE, account_id=account_id,
+        ai_receptionist_enabled=True,
+    )
+    db_session.add(number)
+    db_session.commit()
+
+    client.post(
+        "/compliance/consent", json={"consent_type": "ai_processing"}, headers={"Authorization": f"Bearer {token}"}
+    )
+
+    def _raise(*args, **kwargs):
+        raise LLMError("Groq qualification extraction failed: connection timed out")
+
+    monkeypatch.setattr("app.media.service.qualify_caller", _raise)
+
+    url = "http://testserver/media/receptionist/respond"
+    params = {
+        "CallSid": "CArecgroqdown1", "To": "+15550099999", "From": "+15559999999",
+        "SpeechResult": "Hi this is Sam calling about a delayed order, please call back.",
+    }
+    signature = _twilio_signature(url, params)
+    response = client.post("/media/receptionist/respond", data=params, headers={"X-Twilio-Signature": signature})
+    assert response.status_code == 200
+    assert "<Hangup" in response.text or "<Dial" not in response.text
+
+    calls = client.get(
+        "/media/receptionist/calls", headers={"Authorization": f"Bearer {token}"}
+    ).json()
+    assert len(calls) == 1
+    assert calls[0]["raw_transcript"].startswith("Hi this is Sam")
+    assert calls[0]["caller_name"] is None
+    assert calls[0]["urgency"] is None
+    assert calls[0]["model_version"] is None
+    assert calls[0]["is_likely_spam"] is False
+
+
 def test_receptionist_call_flags_a_pricing_commitment_in_the_generated_summary(client, db_session, monkeypatch):
     """The system prompt already tells the model never to quote prices -
     this proves the guardrail catches it anyway if the model does it,

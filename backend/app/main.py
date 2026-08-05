@@ -1,8 +1,10 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError
 
 from app.audit.routes import router as audit_router
 from app.compliance.routes import router as compliance_router
@@ -30,6 +32,21 @@ from app.usage.routes import router as usage_router
 app = FastAPI(title="Zoiko Local API")
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+
+@app.exception_handler(DBAPIError)
+async def database_unavailable_handler(request: Request, exc: DBAPIError) -> JSONResponse:
+    """Chaos-testing finding: a plain route with no DB-specific try/except
+    (most list/read endpoints) let a real Postgres outage bubble up as a
+    generic, unhandled 500 - technically not a crash (FastAPI's default
+    debug=False already keeps the traceback out of the response), but a
+    503 correctly tells the caller this is transient and retry-able, which
+    a bare 500 does not. Registered on DBAPIError (not the narrower
+    OperationalError) since a pool-exhaustion or driver-level failure can
+    surface as either, and both mean the same thing to a client: try again
+    shortly, not "your request was invalid."
+    """
+    return JSONResponse(status_code=503, content={"detail": "Service temporarily unavailable - please try again shortly."})
 
 # Fail fast rather than boot insecurely - see app/core/startup_checks.py.
 assert_jwt_secret_is_configured(settings.environment, settings.jwt_secret_key)
