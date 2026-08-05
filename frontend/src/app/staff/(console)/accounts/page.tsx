@@ -69,8 +69,8 @@ export default function StaffAccountsPage() {
     <>
       <div className="bg-slate-900 border border-slate-800 rounded-xl p-5 space-y-3">
         <div>
-          <h3 className="font-medium text-white">Find a Number</h3>
-          <p className="text-xs text-slate-500">
+          <h2 className="font-medium text-white">Find a Number</h2>
+          <p className="text-xs text-slate-400">
             Search by phone number or provider SID, across every account.
           </p>
         </div>
@@ -95,7 +95,7 @@ export default function StaffAccountsPage() {
         {numberResults !== null && (
           <>
             {numberResults.length === 0 ? (
-              <p className="text-sm text-slate-500">No matching numbers.</p>
+              <p className="text-sm text-slate-400">No matching numbers.</p>
             ) : (
               <div className="space-y-2">
                 {numberResults.map((r) => (
@@ -105,7 +105,7 @@ export default function StaffAccountsPage() {
                   >
                     <div>
                       <span className="font-mono text-white">{r.e164}</span>
-                      <span className="ml-3 text-xs text-slate-500">
+                      <span className="ml-3 text-xs text-slate-400">
                         {r.account_name ?? "Unknown account"} &middot; {r.account_owner_email ?? "—"}
                       </span>
                     </div>
@@ -126,16 +126,16 @@ export default function StaffAccountsPage() {
         </p>
       )}
 
-      {loading && <p className="text-sm text-slate-500">Loading...</p>}
+      {loading && <p className="text-sm text-slate-400">Loading...</p>}
 
       {!loading && accounts.length === 0 && (
-        <p className="text-sm text-slate-500">No accounts yet.</p>
+        <p className="text-sm text-slate-400">No accounts yet.</p>
       )}
 
       <div className="bg-slate-900 border border-slate-800 rounded-xl overflow-hidden">
         <table className="w-full text-sm">
           <thead>
-            <tr className="border-b border-slate-800 text-left text-xs text-slate-500">
+            <tr className="border-b border-slate-800 text-left text-xs text-slate-400">
               <th className="px-4 py-2.5 font-medium">Account</th>
               <th className="px-4 py-2.5 font-medium">Owner</th>
               <th className="px-4 py-2.5 font-medium">Type</th>
@@ -152,7 +152,7 @@ export default function StaffAccountsPage() {
                 <td className="px-4 py-2.5 text-slate-400 capitalize">{a.account_type}</td>
                 <td className="px-4 py-2.5 text-slate-200">{a.member_count}</td>
                 <td className="px-4 py-2.5 text-slate-200">{a.number_count}</td>
-                <td className="px-4 py-2.5 text-slate-500">
+                <td className="px-4 py-2.5 text-slate-400">
                   {new Date(a.created_at).toLocaleDateString()}
                 </td>
               </tr>

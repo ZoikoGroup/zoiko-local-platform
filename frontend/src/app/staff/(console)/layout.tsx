@@ -26,8 +26,8 @@ export default function StaffConsoleLayout({ children }: { children: React.React
     <div className="min-h-screen bg-slate-950 text-slate-200">
       <header className="border-b border-slate-800 px-6 py-4 flex items-center justify-between">
         <div>
-          <div className="font-semibold text-white">Zoiko Local — Ops Console</div>
-          <div className="text-xs text-slate-500">Internal staff only</div>
+          <h1 className="font-semibold text-white">Zoiko Local — Ops Console</h1>
+          <div className="text-xs text-slate-400">Internal staff only</div>
         </div>
         <button onClick={handleLogout} className="text-xs text-slate-400 hover:text-white transition">
           Log out
@@ -43,7 +43,7 @@ export default function StaffConsoleLayout({ children }: { children: React.React
               className={`px-3 py-3 text-sm border-b-2 transition ${
                 pathname === item.href
                   ? "border-slate-200 text-white"
-                  : "border-transparent text-slate-500 hover:text-slate-300"
+                  : "border-transparent text-slate-400 hover:text-slate-300"
               }`}
             >
               {item.label}

@@ -62,7 +62,7 @@ export default function StaffProvidersPage() {
   return (
     <>
       <div className="flex items-center justify-between">
-        <p className="text-xs text-slate-500">
+        <p className="text-xs text-slate-400">
           Live reachability checks against each real provider — not just &ldquo;is a key configured.&rdquo;
         </p>
         <button onClick={load} className="text-xs text-slate-400 hover:text-white transition">
@@ -74,7 +74,7 @@ export default function StaffProvidersPage() {
         <p className="text-sm text-red-400 bg-red-950/50 border border-red-900 rounded-lg px-3 py-2">{error}</p>
       )}
 
-      {loading && <p className="text-sm text-slate-500">Loading...</p>}
+      {loading && <p className="text-sm text-slate-400">Loading...</p>}
 
       <div className="space-y-2">
         {providers.map((p) => (
@@ -84,7 +84,7 @@ export default function StaffProvidersPage() {
           >
             <div>
               <div className="text-sm text-white font-medium">{PROVIDER_LABELS[p.name] ?? p.name}</div>
-              {p.detail && <div className="text-xs text-slate-500 mt-0.5">{p.detail}</div>}
+              {p.detail && <div className="text-xs text-slate-400 mt-0.5">{p.detail}</div>}
             </div>
             <span className={`text-xs font-medium rounded-full px-2.5 py-1 shrink-0 ${statusStyle(p.configured, p.ok)}`}>
               {statusLabel(p.configured, p.ok)}

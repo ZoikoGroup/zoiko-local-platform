@@ -104,10 +104,10 @@ export default function StaffCasesPage() {
         </p>
       )}
 
-      {loading && <p className="text-sm text-slate-500">Loading...</p>}
+      {loading && <p className="text-sm text-slate-400">Loading...</p>}
 
       {!loading && cases.length === 0 && (
-        <p className="text-sm text-slate-500">No {tab === "all" ? "" : tab} cases.</p>
+        <p className="text-sm text-slate-400">No {tab === "all" ? "" : tab} cases.</p>
       )}
 
       <div className="space-y-3">
@@ -116,7 +116,7 @@ export default function StaffCasesPage() {
             <div className="flex items-start justify-between">
               <div>
                 <div className="font-medium text-white">{c.account_name}</div>
-                <div className="text-xs text-slate-500">{c.account_owner_email}</div>
+                <div className="text-xs text-slate-400">{c.account_owner_email}</div>
               </div>
               <span
                 className={`text-xs font-medium rounded-full px-2.5 py-1 capitalize ${
@@ -133,25 +133,25 @@ export default function StaffCasesPage() {
 
             <div className="mt-3 grid grid-cols-2 gap-3 text-sm">
               <div>
-                <div className="text-xs text-slate-500">Jurisdiction</div>
+                <div className="text-xs text-slate-400">Jurisdiction</div>
                 <div className="text-slate-200">{c.jurisdiction}</div>
               </div>
               <div>
-                <div className="text-xs text-slate-500">Requirement</div>
+                <div className="text-xs text-slate-400">Requirement</div>
                 <div className="text-slate-200">{c.requirement_type.replaceAll("_", " ")}</div>
               </div>
             </div>
 
             <div className="mt-3">
-              <div className="text-xs text-slate-500 mb-1">Documents submitted</div>
+              <div className="text-xs text-slate-400 mb-1">Documents submitted</div>
               {c.documents.length === 0 ? (
-                <div className="text-sm text-slate-500 italic">None yet</div>
+                <div className="text-sm text-slate-400 italic">None yet</div>
               ) : (
                 <ul className="text-sm text-slate-200 space-y-0.5">
                   {c.documents.map((d, i) => (
                     <li key={i}>
                       {d.document_type.replaceAll("_", " ")} —{" "}
-                      <span className="text-slate-500 font-mono text-xs">{d.reference}</span>
+                      <span className="text-slate-400 font-mono text-xs">{d.reference}</span>
                     </li>
                   ))}
                 </ul>
