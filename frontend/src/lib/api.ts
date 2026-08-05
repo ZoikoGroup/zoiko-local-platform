@@ -31,10 +31,14 @@ async function request<T>(
   path: string,
   options: RequestInit = {}
 ): Promise<T> {
+  // FormData bodies (file uploads) must NOT get a Content-Type set here -
+  // the browser generates its own multipart boundary, and overriding it
+  // with application/json breaks the upload silently server-side.
+  const isFormData = options.body instanceof FormData;
   const response = await fetch(`${API_BASE_URL}${path}`, {
     ...options,
     headers: {
-      "Content-Type": "application/json",
+      ...(isFormData ? {} : { "Content-Type": "application/json" }),
       ...options.headers,
     },
   });
@@ -168,14 +172,58 @@ export function openComplianceCase(
   });
 }
 
+export type ComplianceDocument = {
+  document_type: string;
+  storage_key: string;
+  filename: string;
+  content_type: string;
+  uploaded_at: string;
+};
+
 export type MyComplianceCase = ComplianceCase & {
-  documents: { document_type: string; reference: string }[];
+  documents: ComplianceDocument[];
   created_at: string;
 };
 
 export function listMyComplianceCases(token: string): Promise<MyComplianceCase[]> {
   return request<MyComplianceCase[]>("/compliance/cases/me", {
     headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export function submitComplianceDocument(
+  token: string,
+  caseId: string,
+  documentType: string,
+  file: File
+): Promise<MyComplianceCase> {
+  const formData = new FormData();
+  formData.append("document_type", documentType);
+  formData.append("file", file);
+  return request<MyComplianceCase>(`/compliance/cases/${caseId}/documents`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+    body: formData,
+  });
+}
+
+export function getComplianceDocumentDownloadUrl(
+  token: string,
+  caseId: string,
+  documentIndex: number
+): Promise<{ url: string }> {
+  return request(`/compliance/cases/${caseId}/documents/${documentIndex}/download-url`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export function getStaffComplianceDocumentDownloadUrl(
+  staffToken: string,
+  caseId: string,
+  documentIndex: number
+): Promise<{ url: string }> {
+  return request(`/compliance/staff/cases/${caseId}/documents/${documentIndex}/download-url`, {
+    headers: { Authorization: `Bearer ${staffToken}` },
   });
 }
 
@@ -239,7 +287,7 @@ export type StaffComplianceCase = ComplianceCase & {
   account_name: string;
   account_owner_email: string;
   number_id: string | null;
-  documents: { document_type: string; reference: string }[];
+  documents: ComplianceDocument[];
   expires_at: string | null;
   created_at: string;
 };

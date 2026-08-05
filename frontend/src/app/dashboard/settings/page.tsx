@@ -10,6 +10,8 @@ import {
   mfaDisable,
   listMyComplianceCases,
   startKycVerification,
+  submitComplianceDocument,
+  getComplianceDocumentDownloadUrl,
   listRetentionPolicies,
   setRetentionPolicy,
   listMyNotifications,
@@ -45,6 +47,11 @@ export default function SettingsPage() {
   const [casesLoading, setCasesLoading] = useState(true);
   const [verifyingCaseId, setVerifyingCaseId] = useState<string | null>(null);
   const [verifyError, setVerifyError] = useState<string | null>(null);
+  const [uploadOpenCaseId, setUploadOpenCaseId] = useState<string | null>(null);
+  const [uploadDocumentType, setUploadDocumentType] = useState("government_id");
+  const [uploadingCaseId, setUploadingCaseId] = useState<string | null>(null);
+  const [uploadError, setUploadError] = useState<string | null>(null);
+  const [downloadingDoc, setDownloadingDoc] = useState<string | null>(null);
 
   const [auditEvents, setAuditEvents] = useState<AuditEvent[]>([]);
   const [auditLoading, setAuditLoading] = useState(true);
@@ -116,6 +123,38 @@ export default function SettingsPage() {
       setVerifyError(err instanceof ApiError ? err.message : "Couldn't start identity verification.");
     } finally {
       setVerifyingCaseId(null);
+    }
+  }
+
+  async function handleUploadDocument(caseId: string, file: File) {
+    const token = getToken();
+    if (!token) return;
+    setUploadingCaseId(caseId);
+    setUploadError(null);
+    try {
+      const updated = await submitComplianceDocument(token, caseId, uploadDocumentType, file);
+      setCases((prev) => prev.map((c) => (c.id === caseId ? updated : c)));
+      setUploadOpenCaseId(null);
+    } catch (err) {
+      setUploadError(err instanceof ApiError ? err.message : "Couldn't upload document.");
+    } finally {
+      setUploadingCaseId(null);
+    }
+  }
+
+  async function handleViewDocument(caseId: string, documentIndex: number) {
+    const token = getToken();
+    if (!token) return;
+    const key = `${caseId}:${documentIndex}`;
+    setDownloadingDoc(key);
+    setUploadError(null);
+    try {
+      const { url } = await getComplianceDocumentDownloadUrl(token, caseId, documentIndex);
+      window.open(url, "_blank", "noopener,noreferrer");
+    } catch (err) {
+      setUploadError(err instanceof ApiError ? err.message : "Couldn't open document.");
+    } finally {
+      setDownloadingDoc(null);
     }
   }
 
@@ -388,8 +427,8 @@ export default function SettingsPage() {
 
         {casesLoading && <p className="text-sm text-slate-500">Loading...</p>}
 
-        {verifyError && (
-          <p className="text-sm text-red-600 bg-red-50 rounded-lg px-3 py-2">{verifyError}</p>
+        {(verifyError || uploadError) && (
+          <p className="text-sm text-red-600 bg-red-50 rounded-lg px-3 py-2">{verifyError || uploadError}</p>
         )}
 
         {!casesLoading && cases.length === 0 && (
@@ -402,40 +441,108 @@ export default function SettingsPage() {
         {!casesLoading && cases.length > 0 && (
           <ul className="divide-y divide-slate-100">
             {cases.map((c) => (
-              <li key={c.id} className="py-3 flex items-center justify-between gap-4">
-                <div>
-                  <div className="text-sm font-medium text-slate-800">
-                    {c.jurisdiction} — {c.requirement_type.replaceAll("_", " ")}
+              <li key={c.id} className="py-3 space-y-2">
+                <div className="flex items-center justify-between gap-4">
+                  <div>
+                    <div className="text-sm font-medium text-slate-800">
+                      {c.jurisdiction} — {c.requirement_type.replaceAll("_", " ")}
+                    </div>
+                    <div className="text-xs text-slate-500 mt-0.5">
+                      {c.documents.length} document{c.documents.length === 1 ? "" : "s"} submitted ·{" "}
+                      {new Date(c.created_at).toLocaleDateString()}
+                    </div>
                   </div>
-                  <div className="text-xs text-slate-500 mt-0.5">
-                    {c.documents.length} document{c.documents.length === 1 ? "" : "s"} submitted ·{" "}
-                    {new Date(c.created_at).toLocaleDateString()}
-                  </div>
-                </div>
-                <div className="flex items-center gap-3 shrink-0">
-                  {(c.status === "pending" || c.status === "rejected") && (
-                    <button
-                      onClick={() => handleStartVerification(c.id)}
-                      disabled={verifyingCaseId === c.id}
-                      className="text-xs font-medium text-indigo-600 hover:text-indigo-800 disabled:opacity-50"
+                  <div className="flex items-center gap-3 shrink-0">
+                    {(c.status === "pending" || c.status === "rejected") && (
+                      <button
+                        onClick={() => handleStartVerification(c.id)}
+                        disabled={verifyingCaseId === c.id}
+                        className="text-xs font-medium text-indigo-600 hover:text-indigo-800 disabled:opacity-50"
+                      >
+                        {verifyingCaseId === c.id
+                          ? "Starting…"
+                          : c.status === "rejected"
+                            ? "Try again"
+                            : c.kyc_inquiry_id
+                              ? "Continue verification"
+                              : "Verify identity"}
+                      </button>
+                    )}
+                    <span
+                      className={`text-xs font-medium rounded-full px-2.5 py-1 capitalize ${
+                        STATUS_STYLES[c.status] ?? "bg-slate-100 text-slate-600"
+                      }`}
                     >
-                      {verifyingCaseId === c.id
-                        ? "Starting…"
-                        : c.status === "rejected"
-                          ? "Try again"
-                          : c.kyc_inquiry_id
-                            ? "Continue verification"
-                            : "Verify identity"}
-                    </button>
-                  )}
-                  <span
-                    className={`text-xs font-medium rounded-full px-2.5 py-1 capitalize ${
-                      STATUS_STYLES[c.status] ?? "bg-slate-100 text-slate-600"
-                    }`}
-                  >
-                    {c.status}
-                  </span>
+                      {c.status}
+                    </span>
+                  </div>
                 </div>
+
+                {c.documents.length > 0 && (
+                  <ul className="space-y-1 pl-0.5">
+                    {c.documents.map((d, i) => {
+                      const docKey = `${c.id}:${i}`;
+                      return (
+                        <li key={docKey} className="flex items-center gap-2 text-xs text-slate-600">
+                          <span>{d.document_type.replaceAll("_", " ")} — {d.filename}</span>
+                          <button
+                            onClick={() => handleViewDocument(c.id, i)}
+                            disabled={downloadingDoc === docKey}
+                            className="text-indigo-600 hover:text-indigo-800 disabled:opacity-50 font-medium"
+                          >
+                            {downloadingDoc === docKey ? "Opening…" : "View"}
+                          </button>
+                        </li>
+                      );
+                    })}
+                  </ul>
+                )}
+
+                {c.status !== "approved" && (
+                  <div>
+                    {uploadOpenCaseId === c.id ? (
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <select
+                          value={uploadDocumentType}
+                          onChange={(e) => setUploadDocumentType(e.target.value)}
+                          className="text-xs rounded-lg border border-slate-200 px-2 py-1.5"
+                        >
+                          <option value="government_id">Government ID</option>
+                          <option value="business_registration">Business registration</option>
+                          <option value="proof_of_address">Proof of address</option>
+                          <option value="other">Other</option>
+                        </select>
+                        <input
+                          type="file"
+                          accept="application/pdf,image/jpeg,image/png"
+                          disabled={uploadingCaseId === c.id}
+                          onChange={(e) => {
+                            const file = e.target.files?.[0];
+                            if (file) handleUploadDocument(c.id, file);
+                          }}
+                          className="text-xs"
+                        />
+                        {uploadingCaseId === c.id && <span className="text-xs text-slate-500">Uploading…</span>}
+                        <button
+                          onClick={() => setUploadOpenCaseId(null)}
+                          className="text-xs text-slate-500 hover:text-slate-700"
+                        >
+                          Cancel
+                        </button>
+                      </div>
+                    ) : (
+                      <button
+                        onClick={() => {
+                          setUploadOpenCaseId(c.id);
+                          setUploadError(null);
+                        }}
+                        className="text-xs font-medium text-indigo-600 hover:text-indigo-800"
+                      >
+                        Upload document
+                      </button>
+                    )}
+                  </div>
+                )}
               </li>
             ))}
           </ul>

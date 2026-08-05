@@ -43,6 +43,17 @@ def health_check() -> dict:
         return {"configured": True, "ok": False, "detail": str(e)}
 
 
+def upload_object(key: str, data: bytes, content_type: str) -> None:
+    """Uploads raw bytes to the configured (private) bucket — used for
+    documents a customer submits directly (e.g. compliance verification
+    docs), as opposed to recordings, which providers write via their own
+    egress/callback flow rather than us pushing bytes ourselves."""
+    try:
+        _client().put_object(Bucket=settings.s3_bucket, Key=key, Body=data, ContentType=content_type)
+    except (BotoCoreError, ClientError) as e:
+        raise StorageError(str(e)) from e
+
+
 def delete_object(key: str) -> None:
     """Deletes one object from the configured bucket — used to actually
     remove a recording's file once it's past its retention window, not just

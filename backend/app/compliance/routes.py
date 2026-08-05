@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile, status
 from sqlalchemy.orm import Session
 
 from app.compliance import service
@@ -8,12 +8,13 @@ from app.compliance.schemas import (
     ComplianceCaseResponse,
     ComplianceCaseStaffResponse,
     ComplianceRuleResponse,
-    DocumentSubmit,
+    DocumentDownloadUrl,
     KYCVerificationStart,
 )
 from app.core.database import get_db
 from app.core.deps import get_current_staff, get_current_user, require_admin, require_staff_role, require_writer
 from app.integrations.kyc.stripe_identity import KYCError, construct_webhook_event
+from app.integrations.storage.s3 import StorageError
 from app.numbering.identity.models import User
 from app.staff.models import PlatformStaff, PlatformStaffRole
 
@@ -66,9 +67,10 @@ def list_all_cases(
 
 
 @router.post("/cases/{case_id}/documents", response_model=ComplianceCaseResponse)
-def submit_document(
+async def submit_document(
     case_id: str,
-    payload: DocumentSubmit,
+    document_type: str = Form(...),
+    file: UploadFile = File(...),
     db: Session = Depends(get_db),
     current_user: User = Depends(require_admin),
 ):
@@ -76,9 +78,58 @@ def submit_document(
     if case.account_id != current_user.account_id:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not your case")
 
-    return service.submit_document(
-        db, case, document_type=payload.document_type, reference=payload.reference, actor=current_user.id
-    )
+    data = await file.read()
+    try:
+        return service.submit_document(
+            db,
+            case,
+            document_type=document_type,
+            filename=file.filename or "document",
+            content_type=file.content_type or "application/octet-stream",
+            data=data,
+            actor=current_user.id,
+        )
+    except (service.UnsupportedDocumentTypeError, service.DocumentTooLargeError) as e:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e)) from e
+    except StorageError as e:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(e)) from e
+
+
+@router.get("/cases/{case_id}/documents/{document_index}/download-url", response_model=DocumentDownloadUrl)
+def get_document_download_url(
+    case_id: str,
+    document_index: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    case = _get_case_or_404(db, case_id)
+    if case.account_id != current_user.account_id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not your case")
+
+    try:
+        url = service.get_document_download_url(case, document_index)
+    except service.DocumentNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
+    except StorageError as e:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(e)) from e
+    return {"url": url}
+
+
+@router.get("/staff/cases/{case_id}/documents/{document_index}/download-url", response_model=DocumentDownloadUrl)
+def staff_get_document_download_url(
+    case_id: str,
+    document_index: int,
+    db: Session = Depends(get_db),
+    _staff: PlatformStaff = Depends(get_current_staff),
+):
+    case = _get_case_or_404(db, case_id)
+    try:
+        url = service.get_document_download_url(case, document_index)
+    except service.DocumentNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
+    except StorageError as e:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(e)) from e
+    return {"url": url}
 
 
 @router.post("/cases/{case_id}/kyc/start", response_model=KYCVerificationStart)
