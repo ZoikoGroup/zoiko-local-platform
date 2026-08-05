@@ -615,6 +615,19 @@ export function joinVideoRoom(
   });
 }
 
+// Deliberately no token param - a guest joins via the shared link + their
+// name only, no Zoiko account (see backend's POST .../guest-token, which
+// has no auth dependency at all).
+export function guestJoinVideoRoom(
+  roomName: string,
+  displayName: string
+): Promise<{ token: string; url: string }> {
+  return request(`/media/video/rooms/${encodeURIComponent(roomName)}/guest-token`, {
+    method: "POST",
+    body: JSON.stringify({ display_name: displayName }),
+  });
+}
+
 export function endVideoRoom(token: string, roomName: string): Promise<{ room_name: string; status: string }> {
   return request(`/media/video/rooms/${encodeURIComponent(roomName)}/end`, {
     method: "POST",

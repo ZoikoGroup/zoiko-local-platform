@@ -5,12 +5,13 @@ scoped to the caller's account_id; every state change is audited.
 """
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.core.database import get_db
 from app.core.deps import get_current_user, require_writer
+from app.core.rate_limit import limiter
 from app.integrations.video.livekit import VideoError, verify_webhook_event
 from app.media import service as media_service
 from app.numbering.identity.models import User
@@ -20,6 +21,10 @@ router = APIRouter(prefix="/media/video", tags=["video"])
 
 class JoinTokenRequest(BaseModel):
     display_name: str
+
+
+class GuestJoinTokenRequest(BaseModel):
+    display_name: str = Field(min_length=1, max_length=100)
 
 
 @router.post("/rooms", status_code=status.HTTP_201_CREATED)
@@ -50,6 +55,25 @@ async def join_room(
     # The LiveKit client SDK (browser) connects directly to this URL with the
     # token above - returned here so the frontend doesn't need its own
     # separate copy of the same LiveKit project URL configured.
+    return {"token": token, "url": settings.livekit_url}
+
+
+@router.post("/rooms/{room_name}/guest-token")
+@limiter.limit("10/minute")
+async def guest_join_room(
+    request: Request,
+    room_name: str,
+    body: GuestJoinTokenRequest,
+    db: Session = Depends(get_db),
+):
+    """Deliberately no auth dependency - lets an external guest join via a
+    shared link + their name only, no Zoiko account. Rate-limited per IP
+    like the login endpoints, since this is the one video route anyone on
+    the internet can call without a token."""
+    try:
+        token = media_service.generate_guest_join_token(db, room_name, body.display_name)
+    except media_service.VideoSessionAuthorizationError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
     return {"token": token, "url": settings.livekit_url}
 
 

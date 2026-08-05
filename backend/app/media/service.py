@@ -368,6 +368,31 @@ def generate_video_join_token(
     return video.build_participant_token(room_name, identity, display_name)
 
 
+def generate_guest_join_token(db: Session, room_name: str, display_name: str) -> str:
+    """Public, unauthenticated join - no Zoiko account involved at all. The
+    room_name itself (a random 64-bit-entropy `zl-<uuid hex>` string) is
+    what gates access, the same trust model as sharing a Zoom/Meet invite
+    link. Only an ACTIVE session can be joined, so an ended call's link
+    can't be replayed later and a fabricated room name is rejected the
+    same way a real-but-ended one is - this never reveals which case it
+    was. The guest's identity is server-generated (never client-supplied)
+    so it can't collide with or impersonate a real user's identity, and is
+    prefixed `guest-` so participant records/audit are distinguishable
+    from real account users at a glance.
+    """
+    session = db.query(VideoSession).filter(VideoSession.room_name == room_name).first()
+    if session is None or session.status != VideoSessionStatus.ACTIVE:
+        raise VideoSessionAuthorizationError(f"{room_name} is not an active video session")
+
+    guest_identity = f"guest-{uuid.uuid4().hex[:12]}"
+    log_event(
+        db, actor_id=session.account_id, action="video.guest_joined",
+        target_type="video_session", target_id=session.id,
+        metadata={"display_name": display_name, "guest_identity": guest_identity},
+    )
+    return video.build_participant_token(room_name, guest_identity, display_name)
+
+
 def list_account_video_sessions(db: Session, account_id: str) -> list[VideoSession]:
     return (
         db.query(VideoSession)

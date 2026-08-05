@@ -747,3 +747,133 @@ def test_group_video_call_tracks_three_concurrent_participants(client, db_sessio
     )
     assert len(rows) == 3
     assert all(row.left_at is not None for row in rows)
+
+
+def _seed_active_session(db_session, room_name: str, *, account_id: str | None = None, host_user_id: str | None = None):
+    """Seeds a VideoSession row directly, bypassing the real LiveKit room-
+    creation call - build_participant_token (what guest-token issuance
+    actually calls) is pure JWT signing with no network call, so guest-join
+    tests don't need @pytest.mark.live at all."""
+    from app.media.models import VideoSession, VideoSessionStatus
+    from app.numbering.identity.models import Account, AccountType, User, UserRole
+
+    if account_id is None:
+        account = Account(name="Guest Join Test Co", account_type=AccountType.BUSINESS)
+        db_session.add(account)
+        db_session.flush()
+        account_id = account.id
+    if host_user_id is None:
+        user = User(account_id=account_id, email=f"guesthost-{room_name}@example.com", role=UserRole.OWNER)
+        db_session.add(user)
+        db_session.flush()
+        host_user_id = user.id
+
+    session = VideoSession(
+        account_id=account_id, host_user_id=host_user_id, room_name=room_name,
+        status=VideoSessionStatus.ACTIVE,
+    )
+    db_session.add(session)
+    db_session.commit()
+    return session
+
+
+def test_guest_join_requires_no_auth_and_returns_a_real_token(client, db_session):
+    session = _seed_active_session(db_session, "zl-guest-test-1")
+
+    response = client.post(
+        f"/media/video/rooms/{session.room_name}/guest-token", json={"display_name": "Alex Guest"}
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["token"]
+    assert "url" in body
+
+
+def test_guest_join_rejects_a_nonexistent_room(client):
+    response = client.post(
+        "/media/video/rooms/zl-does-not-exist/guest-token", json={"display_name": "Alex Guest"}
+    )
+    assert response.status_code == 404
+
+
+def test_guest_join_rejects_an_ended_room(client, db_session):
+    from app.media.models import VideoSessionStatus
+
+    session = _seed_active_session(db_session, "zl-guest-test-ended")
+    session.status = VideoSessionStatus.ENDED
+    db_session.commit()
+
+    response = client.post(
+        f"/media/video/rooms/{session.room_name}/guest-token", json={"display_name": "Alex Guest"}
+    )
+    assert response.status_code == 404
+
+
+def test_guest_join_rejects_a_blank_display_name(client, db_session):
+    session = _seed_active_session(db_session, "zl-guest-test-blank-name")
+
+    response = client.post(f"/media/video/rooms/{session.room_name}/guest-token", json={"display_name": ""})
+    assert response.status_code == 422
+
+
+def test_guest_join_issues_a_distinct_identity_per_guest(client, db_session):
+    """Two guests joining the same room must not collide - each gets their
+    own server-generated guest-<uuid> identity, never client-supplied."""
+    from jose import jwt as jose_jwt
+
+    session = _seed_active_session(db_session, "zl-guest-test-distinct")
+
+    response1 = client.post(
+        f"/media/video/rooms/{session.room_name}/guest-token", json={"display_name": "Guest One"}
+    )
+    response2 = client.post(
+        f"/media/video/rooms/{session.room_name}/guest-token", json={"display_name": "Guest Two"}
+    )
+    assert response1.status_code == 200
+    assert response2.status_code == 200
+
+    token1 = response1.json()["token"]
+    token2 = response2.json()["token"]
+    assert token1 != token2
+
+    # LiveKit access tokens are JWTs - decode without verifying (this test
+    # doesn't have the LiveKit API secret's signing context) just to inspect
+    # the identity claim (`sub`) each token was actually issued for.
+    claims1 = jose_jwt.get_unverified_claims(token1)
+    claims2 = jose_jwt.get_unverified_claims(token2)
+    assert claims1["sub"].startswith("guest-")
+    assert claims2["sub"].startswith("guest-")
+    assert claims1["sub"] != claims2["sub"]
+
+
+def test_guest_join_creates_an_audit_event(client, db_session):
+    from app.audit.models import AuditEvent
+
+    session = _seed_active_session(db_session, "zl-guest-test-audit")
+
+    response = client.post(
+        f"/media/video/rooms/{session.room_name}/guest-token", json={"display_name": "Audited Guest"}
+    )
+    assert response.status_code == 200
+
+    events = (
+        db_session.query(AuditEvent)
+        .filter(AuditEvent.action == "video.guest_joined", AuditEvent.target == f"video_session:{session.id}")
+        .all()
+    )
+    assert len(events) == 1
+
+
+def test_guest_join_is_rate_limited_after_repeated_attempts(client, db_session):
+    session = _seed_active_session(db_session, "zl-guest-test-ratelimit")
+
+    for _ in range(10):
+        response = client.post(
+            f"/media/video/rooms/{session.room_name}/guest-token", json={"display_name": "Repeat Guest"}
+        )
+        assert response.status_code == 200
+
+    over_limit_response = client.post(
+        f"/media/video/rooms/{session.room_name}/guest-token", json={"display_name": "Repeat Guest"}
+    )
+    assert over_limit_response.status_code == 429

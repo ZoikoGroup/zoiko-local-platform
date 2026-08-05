@@ -36,6 +36,7 @@ export default function VideoPage() {
   const [micOn, setMicOn] = useState(true);
   const [screenSharing, setScreenSharing] = useState(false);
   const [participantCount, setParticipantCount] = useState(0);
+  const [inviteLinkCopied, setInviteLinkCopied] = useState(false);
   const [recordingState, setRecordingState] = useState<RecordingState>("idle");
   const [recordingError, setRecordingError] = useState<string | null>(null);
 
@@ -283,6 +284,19 @@ export default function VideoPage() {
       setCallState("idle");
       const message = err instanceof ApiError || err instanceof Error ? err.message : "Unknown error.";
       setCallError(`Couldn't ${existingRoomName ? "join" : "start"} the call: ${message}`);
+    }
+  }
+
+  async function handleCopyInviteLink() {
+    if (!roomName) return;
+    const inviteUrl = `${window.location.origin}/join/${roomName}`;
+    try {
+      await navigator.clipboard.writeText(inviteUrl);
+      setInviteLinkCopied(true);
+      setTimeout(() => setInviteLinkCopied(false), 2000);
+    } catch {
+      // Clipboard access can be denied by the browser - not worth a hard error,
+      // the room name/link is already visible on screen to copy by hand.
     }
   }
 
@@ -561,7 +575,16 @@ export default function VideoPage() {
       {callState === "in-call" && (
         <div className="bg-slate-900 rounded-xl border border-slate-800 p-4 space-y-3">
           <div className="flex items-center justify-between text-xs text-slate-400 px-1">
-            <span className="font-mono">{roomName}</span>
+            <div className="flex items-center gap-2">
+              <span className="font-mono">{roomName}</span>
+              <button
+                onClick={handleCopyInviteLink}
+                className="text-indigo-400 hover:text-indigo-300 font-medium"
+                title="Copy a link anyone can use to join this call without a Zoiko account"
+              >
+                {inviteLinkCopied ? "Link copied!" : "Copy invite link"}
+              </button>
+            </div>
             <div className="flex items-center gap-3">
               {recordingState === "active" && (
                 <span className="flex items-center gap-1.5 text-red-400">
