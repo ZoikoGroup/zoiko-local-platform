@@ -1,4 +1,4 @@
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.orm import Session
 
@@ -11,7 +11,7 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
 
 
 def get_current_user(
-    token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)
+    request: Request, token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)
 ) -> User:
     """A logged-in customer account user (signup/login). Rejects staff
     tokens - a staff login can never be used as if it were a customer."""
@@ -28,6 +28,12 @@ def get_current_user(
     user = db.query(User).filter(User.id == payload.get("sub")).first()
     if user is None:
         raise credentials_error
+
+    # For app.core.error_logging.ErrorLoggingMiddleware - lets a 5xx logged
+    # to error_events be traced back to the account/user that hit it,
+    # without every route needing to know about error logging itself.
+    request.state.account_id = user.account_id
+    request.state.user_id = user.id
 
     return user
 
@@ -57,7 +63,7 @@ def require_writer(current_user: User = Depends(get_current_user)) -> User:
     return current_user
 
 
-def get_current_staff(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
+def get_current_staff(request: Request, token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
     """A logged-in Zoiko platform staff member. Rejects customer tokens -
     no customer, including an account Owner, can act as staff."""
     credentials_error = HTTPException(
@@ -73,6 +79,9 @@ def get_current_staff(token: str = Depends(oauth2_scheme), db: Session = Depends
     staff = db.query(PlatformStaff).filter(PlatformStaff.id == payload.get("sub")).first()
     if staff is None or not staff.is_active:
         raise credentials_error
+
+    # See get_current_user's identical note - staff has no account_id.
+    request.state.user_id = staff.id
 
     return staff
 

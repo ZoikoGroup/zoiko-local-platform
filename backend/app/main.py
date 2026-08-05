@@ -11,6 +11,7 @@ from app.compliance.routes import router as compliance_router
 from app.consent.routes import router as consent_router
 from app.core.config import settings
 from app.core.database import engine
+from app.core.error_logging import ErrorLoggingMiddleware
 from app.core.rate_limit import limiter
 from app.core.startup_checks import assert_jwt_secret_is_configured, parse_allowed_origins
 from app.intelligence.routes import router as intelligence_router
@@ -51,6 +52,10 @@ async def database_unavailable_handler(request: Request, exc: DBAPIError) -> JSO
 # Fail fast rather than boot insecurely - see app/core/startup_checks.py.
 assert_jwt_secret_is_configured(settings.environment, settings.jwt_secret_key)
 
+# Added before CORSMiddleware so CORS ends up outermost (last added wraps
+# first) - even an error response this middleware logs still needs its CORS
+# headers added by the layer above it.
+app.add_middleware(ErrorLoggingMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=parse_allowed_origins(settings.allowed_origins),
