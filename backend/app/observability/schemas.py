@@ -27,3 +27,25 @@ class ErrorCountSummary(BaseModel):
     path: str
     status_code: int
     count: int
+
+
+class ProviderCallTraceResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    request_id: str | None
+    provider: str
+    operation: str
+    duration_ms: float
+    success: bool
+    error_detail: str | None
+    created_at: datetime
+
+
+class ProviderLatencySummary(BaseModel):
+    provider: str
+    operation: str
+    count: int
+    avg_duration_ms: float
+    max_duration_ms: float
+    failure_count: int

@@ -11,6 +11,7 @@ import boto3
 from botocore.exceptions import BotoCoreError, ClientError
 
 from app.core.config import settings
+from app.observability.service import trace_provider_call
 
 
 class StorageError(Exception):
@@ -49,7 +50,8 @@ def upload_object(key: str, data: bytes, content_type: str) -> None:
     docs), as opposed to recordings, which providers write via their own
     egress/callback flow rather than us pushing bytes ourselves."""
     try:
-        _client().put_object(Bucket=settings.s3_bucket, Key=key, Body=data, ContentType=content_type)
+        with trace_provider_call("s3", "upload_object"):
+            _client().put_object(Bucket=settings.s3_bucket, Key=key, Body=data, ContentType=content_type)
     except (BotoCoreError, ClientError) as e:
         raise StorageError(str(e)) from e
 
@@ -59,7 +61,8 @@ def delete_object(key: str) -> None:
     remove a recording's file once it's past its retention window, not just
     unlink it in our own database."""
     try:
-        _client().delete_object(Bucket=settings.s3_bucket, Key=key)
+        with trace_provider_call("s3", "delete_object"):
+            _client().delete_object(Bucket=settings.s3_bucket, Key=key)
     except (BotoCoreError, ClientError) as e:
         raise StorageError(str(e)) from e
 
@@ -70,8 +73,9 @@ def download_object(key: str) -> bytes:
     provider (Groq transcription) rather than serving it to a browser, so a
     presigned URL isn't the right shape here."""
     try:
-        response = _client().get_object(Bucket=settings.s3_bucket, Key=key)
-        return response["Body"].read()
+        with trace_provider_call("s3", "download_object"):
+            response = _client().get_object(Bucket=settings.s3_bucket, Key=key)
+            return response["Body"].read()
     except (BotoCoreError, ClientError) as e:
         raise StorageError(str(e)) from e
 

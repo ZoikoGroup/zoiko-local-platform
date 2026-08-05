@@ -8,6 +8,7 @@ import json
 import httpx
 
 from app.core.config import settings
+from app.observability.service import trace_provider_call
 
 _CHAT_COMPLETIONS_URL = "https://api.groq.com/openai/v1/chat/completions"
 _MODELS_URL = "https://api.groq.com/openai/v1/models"
@@ -77,21 +78,22 @@ def extract_conversation_summary(transcript: str) -> dict:
         raise LLMError("Groq API key is not configured")
 
     try:
-        response = httpx.post(
-            _CHAT_COMPLETIONS_URL,
-            headers={"Authorization": f"Bearer {settings.groq_api_key}"},
-            json={
-                "model": _MODEL,
-                "messages": [
-                    {"role": "system", "content": _SUMMARY_SYSTEM_PROMPT},
-                    {"role": "user", "content": transcript},
-                ],
-                "temperature": 0.2,
-                "response_format": {"type": "json_object"},
-            },
-            timeout=30.0,
-        )
-        response.raise_for_status()
+        with trace_provider_call("groq_llm", "extract_conversation_summary"):
+            response = httpx.post(
+                _CHAT_COMPLETIONS_URL,
+                headers={"Authorization": f"Bearer {settings.groq_api_key}"},
+                json={
+                    "model": _MODEL,
+                    "messages": [
+                        {"role": "system", "content": _SUMMARY_SYSTEM_PROMPT},
+                        {"role": "user", "content": transcript},
+                    ],
+                    "temperature": 0.2,
+                    "response_format": {"type": "json_object"},
+                },
+                timeout=30.0,
+            )
+            response.raise_for_status()
     except httpx.HTTPError as e:
         raise LLMError(f"Groq summarization request failed: {e}") from e
 
@@ -107,21 +109,22 @@ def extract_receptionist_qualification(transcript: str) -> dict:
         raise LLMError("Groq API key is not configured")
 
     try:
-        response = httpx.post(
-            _CHAT_COMPLETIONS_URL,
-            headers={"Authorization": f"Bearer {settings.groq_api_key}"},
-            json={
-                "model": _MODEL,
-                "messages": [
-                    {"role": "system", "content": _QUALIFICATION_SYSTEM_PROMPT},
-                    {"role": "user", "content": transcript},
-                ],
-                "temperature": 0.1,
-                "response_format": {"type": "json_object"},
-            },
-            timeout=30.0,
-        )
-        response.raise_for_status()
+        with trace_provider_call("groq_llm", "extract_receptionist_qualification"):
+            response = httpx.post(
+                _CHAT_COMPLETIONS_URL,
+                headers={"Authorization": f"Bearer {settings.groq_api_key}"},
+                json={
+                    "model": _MODEL,
+                    "messages": [
+                        {"role": "system", "content": _QUALIFICATION_SYSTEM_PROMPT},
+                        {"role": "user", "content": transcript},
+                    ],
+                    "temperature": 0.1,
+                    "response_format": {"type": "json_object"},
+                },
+                timeout=30.0,
+            )
+            response.raise_for_status()
     except httpx.HTTPError as e:
         raise LLMError(f"Groq qualification extraction failed: {e}") from e
 

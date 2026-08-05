@@ -56,6 +56,24 @@ def cleanup_error_events():
         db.close()
 
 
+@pytest.fixture(autouse=True)
+def cleanup_provider_call_traces():
+    """Same rationale as cleanup_error_events - record_provider_call_trace
+    also uses an independent SessionLocal (see its docstring), so rows
+    written by any test that exercises a traced Provider Gateway call
+    escape the normal per-test transaction rollback."""
+    yield
+    from app.core.database import SessionLocal
+    from app.observability.models import ProviderCallTrace
+
+    db = SessionLocal()
+    try:
+        db.query(ProviderCallTrace).delete()
+        db.commit()
+    finally:
+        db.close()
+
+
 @pytest.fixture()
 def db_session():
     """Each test runs inside its own transaction, rolled back at the end —

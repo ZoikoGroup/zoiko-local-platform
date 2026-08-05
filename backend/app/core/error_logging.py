@@ -8,7 +8,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.types import ASGIApp
 
-from app.observability.service import record_error_event
+from app.observability.service import current_request_id, record_error_event
 
 # Deliberately plain stdout JSON (one line per request/error), not a
 # third-party logging library - Fly.io (and any container platform) already
@@ -56,38 +56,48 @@ class ErrorLoggingMiddleware(BaseHTTPMiddleware):
         request.state.account_id = None
         request.state.user_id = None
 
-        start = time.perf_counter()
+        # Lets Provider Gateway calls made anywhere downstream in this
+        # request tag their traces with this request_id - see
+        # app.observability.service.current_request_id. Reset in `finally`
+        # so a value never leaks into whatever request reuses this task
+        # next (ContextVar tokens are the sanctioned way to do this, not a
+        # bare `.set(None)` afterward).
+        request_id_token = current_request_id.set(request_id)
         try:
-            response = await call_next(request)
-        except Exception as exc:
+            start = time.perf_counter()
+            try:
+                response = await call_next(request)
+            except Exception as exc:
+                duration_ms = round((time.perf_counter() - start) * 1000, 1)
+                record_error_event(
+                    request_id=request_id,
+                    method=request.method,
+                    path=request.url.path,
+                    status_code=500,
+                    exception=exc,
+                    account_id=request.state.account_id,
+                    user_id=request.state.user_id,
+                )
+                self._log(request, request_id, 500, duration_ms, error=str(exc))
+                raise
+
             duration_ms = round((time.perf_counter() - start) * 1000, 1)
-            record_error_event(
-                request_id=request_id,
-                method=request.method,
-                path=request.url.path,
-                status_code=500,
-                exception=exc,
-                account_id=request.state.account_id,
-                user_id=request.state.user_id,
-            )
-            self._log(request, request_id, 500, duration_ms, error=str(exc))
-            raise
+            response.headers["X-Request-ID"] = request_id
 
-        duration_ms = round((time.perf_counter() - start) * 1000, 1)
-        response.headers["X-Request-ID"] = request_id
+            if response.status_code >= 500:
+                record_error_event(
+                    request_id=request_id,
+                    method=request.method,
+                    path=request.url.path,
+                    status_code=response.status_code,
+                    account_id=request.state.account_id,
+                    user_id=request.state.user_id,
+                )
 
-        if response.status_code >= 500:
-            record_error_event(
-                request_id=request_id,
-                method=request.method,
-                path=request.url.path,
-                status_code=response.status_code,
-                account_id=request.state.account_id,
-                user_id=request.state.user_id,
-            )
-
-        self._log(request, request_id, response.status_code, duration_ms)
-        return response
+            self._log(request, request_id, response.status_code, duration_ms)
+            return response
+        finally:
+            current_request_id.reset(request_id_token)
 
     def _log(self, request: Request, request_id: str, status_code: int, duration_ms: float, error: str | None = None) -> None:
         entry = {

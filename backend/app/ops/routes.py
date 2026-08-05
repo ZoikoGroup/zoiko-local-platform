@@ -4,7 +4,13 @@ from sqlalchemy.orm import Session
 from app.core.database import get_db
 from app.core.deps import get_current_staff
 from app.observability import service as observability_service
-from app.observability.schemas import ErrorCountSummary, ErrorEventDetailResponse, ErrorEventResponse
+from app.observability.schemas import (
+    ErrorCountSummary,
+    ErrorEventDetailResponse,
+    ErrorEventResponse,
+    ProviderCallTraceResponse,
+    ProviderLatencySummary,
+)
 from app.ops import service
 from app.staff.models import PlatformStaff
 
@@ -54,6 +60,35 @@ def error_detail(
     if event is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Error event not found")
     return event
+
+
+@router.get("/traces", response_model=list[ProviderCallTraceResponse])
+def list_traces(
+    provider: str | None = None,
+    request_id: str | None = None,
+    limit: int = 200,
+    db: Session = Depends(get_db),
+    _staff: PlatformStaff = Depends(get_current_staff),
+):
+    """Self-hosted distributed tracing (Roadmap Month 5 launch-readiness
+    gate) - every outbound Provider Gateway call, most recent first.
+    Filter by request_id to see every external call one specific inbound
+    request made (correlates with the X-Request-ID header and, for 5xx
+    requests, the matching /ops/errors row)."""
+    return observability_service.list_recent_provider_traces(
+        db, provider=provider, request_id=request_id, limit=limit
+    )
+
+
+@router.get("/traces/summary", response_model=list[ProviderLatencySummary])
+def trace_summary(
+    hours: int = 24,
+    db: Session = Depends(get_db),
+    _staff: PlatformStaff = Depends(get_current_staff),
+):
+    """Grouped by provider+operation - avg/max latency and failure count
+    over the window, the "what's slow or flaky right now" view."""
+    return observability_service.provider_call_latency_summary(db, hours=hours)
 
 
 @router.get("/status")

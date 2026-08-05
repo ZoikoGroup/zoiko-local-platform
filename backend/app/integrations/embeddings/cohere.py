@@ -7,6 +7,7 @@ search over AI summaries - see app/intelligence/service.py.
 import httpx
 
 from app.core.config import settings
+from app.observability.service import trace_provider_call
 
 _EMBED_URL = "https://api.cohere.com/v2/embed"
 _MODEL = "embed-v4.0"
@@ -39,18 +40,19 @@ def generate_embedding(text: str, *, input_type: str) -> list[float]:
         raise EmbeddingError("Cohere API key is not configured")
 
     try:
-        response = httpx.post(
-            _EMBED_URL,
-            headers={"Authorization": f"Bearer {settings.cohere_api_key}"},
-            json={
-                "model": _MODEL,
-                "texts": [text],
-                "input_type": input_type,
-                "embedding_types": ["float"],
-            },
-            timeout=30.0,
-        )
-        response.raise_for_status()
+        with trace_provider_call("cohere", "generate_embedding"):
+            response = httpx.post(
+                _EMBED_URL,
+                headers={"Authorization": f"Bearer {settings.cohere_api_key}"},
+                json={
+                    "model": _MODEL,
+                    "texts": [text],
+                    "input_type": input_type,
+                    "embedding_types": ["float"],
+                },
+                timeout=30.0,
+            )
+            response.raise_for_status()
     except httpx.HTTPError as e:
         raise EmbeddingError(f"Cohere embedding request failed: {e}") from e
 

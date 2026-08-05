@@ -15,6 +15,7 @@ from twilio.rest import Client
 from twilio.twiml.voice_response import VoiceResponse
 
 from app.core.config import settings
+from app.observability.service import trace_provider_call
 
 _NUMBER_TYPE_PATH = {"local": "Local", "mobile": "Mobile", "tollfree": "TollFree"}
 
@@ -48,7 +49,8 @@ def send_sms(to: str, body: str) -> dict:
     if not settings.twilio_trial_number:
         raise TelecomError("No Twilio notification number configured (TWILIO_TRIAL_NUMBER)")
     try:
-        message = _client().messages.create(to=to, from_=settings.twilio_trial_number, body=body)
+        with trace_provider_call("twilio", "send_sms"):
+            message = _client().messages.create(to=to, from_=settings.twilio_trial_number, body=body)
     except TwilioException as e:
         raise TelecomError(str(e)) from e
     return {"sid": message.sid, "status": message.status}
@@ -68,8 +70,9 @@ def search_available_numbers(country: str, number_type: str = "local", area_code
         kwargs["contains"] = contains
 
     try:
-        resource = getattr(_client().available_phone_numbers(country), _NUMBER_TYPE_PATH[number_type].lower())
-        numbers = resource.list(**kwargs)
+        with trace_provider_call("twilio", "search_available_numbers"):
+            resource = getattr(_client().available_phone_numbers(country), _NUMBER_TYPE_PATH[number_type].lower())
+            numbers = resource.list(**kwargs)
     except TwilioException as e:
         # Twilio's SDK raises the bare base class (no .status) for some
         # lower-level failures (e.g. missing/invalid credentials) rather
@@ -92,7 +95,8 @@ def search_available_numbers(country: str, number_type: str = "local", area_code
 
 def list_owned_numbers() -> list[dict]:
     try:
-        numbers = _client().incoming_phone_numbers.list()
+        with trace_provider_call("twilio", "list_owned_numbers"):
+            numbers = _client().incoming_phone_numbers.list()
     except TwilioException as e:
         raise TelecomError(str(e)) from e
     return [{"sid": n.sid, "phone_number": n.phone_number, "capabilities": n.capabilities} for n in numbers]
@@ -105,12 +109,13 @@ def set_voice_webhook(phone_number_sid: str, public_base_url: str) -> None:
     purchase time.
     """
     try:
-        _client().incoming_phone_numbers(phone_number_sid).update(
-            voice_url=f"{public_base_url}/media/voice/incoming",
-            voice_method="POST",
-            status_callback=f"{public_base_url}/media/voice/status-callback",
-            status_callback_method="POST",
-        )
+        with trace_provider_call("twilio", "set_voice_webhook"):
+            _client().incoming_phone_numbers(phone_number_sid).update(
+                voice_url=f"{public_base_url}/media/voice/incoming",
+                voice_method="POST",
+                status_callback=f"{public_base_url}/media/voice/status-callback",
+                status_callback_method="POST",
+            )
     except TwilioException as e:
         raise TelecomError(str(e)) from e
 
@@ -120,7 +125,8 @@ def release_number(phone_number_sid: str) -> None:
     cancelling a number in our own DB leaves it sitting active (and billing)
     on the real Twilio account forever."""
     try:
-        _client().incoming_phone_numbers(phone_number_sid).delete()
+        with trace_provider_call("twilio", "release_number"):
+            _client().incoming_phone_numbers(phone_number_sid).delete()
     except TwilioException as e:
         raise TelecomError(str(e)) from e
 
@@ -143,7 +149,8 @@ def buy_number(phone_number: str) -> dict:
         kwargs["status_callback_method"] = "POST"
 
     try:
-        number = _client().incoming_phone_numbers.create(**kwargs)
+        with trace_provider_call("twilio", "buy_number"):
+            number = _client().incoming_phone_numbers.create(**kwargs)
     except TwilioException as e:
         raise TelecomError(str(e)) from e
     return {"sid": number.sid, "phone_number": number.phone_number, "capabilities": number.capabilities}
@@ -171,7 +178,8 @@ def place_call(
         kwargs["status_callback_method"] = "POST"
 
     try:
-        call = _client().calls.create(**kwargs)
+        with trace_provider_call("twilio", "place_call"):
+            call = _client().calls.create(**kwargs)
     except TwilioException as e:
         raise TelecomError(str(e)) from e
     return {"sid": call.sid, "status": call.status, "to": call.to, "from": call.from_}
@@ -179,7 +187,8 @@ def place_call(
 
 def get_call(call_sid: str) -> dict:
     try:
-        call = _client().calls(call_sid).fetch()
+        with trace_provider_call("twilio", "get_call"):
+            call = _client().calls(call_sid).fetch()
     except TwilioException as e:
         raise TelecomError(str(e)) from e
     return {"sid": call.sid, "status": call.status, "to": call.to, "from": call.from_, "duration": call.duration}
@@ -190,7 +199,8 @@ def list_calls(limit: int = 20) -> list[dict]:
     calls made (returns an empty list, not an error).
     """
     try:
-        calls = _client().calls.list(limit=limit)
+        with trace_provider_call("twilio", "list_calls"):
+            calls = _client().calls.list(limit=limit)
     except TwilioException as e:
         raise TelecomError(str(e)) from e
     return [{"sid": c.sid, "status": c.status, "to": c.to, "from": c.from_} for c in calls]
@@ -275,10 +285,11 @@ def download_recording(recording_url: str) -> bytes:
     """Recording media URLs require the same Basic Auth as the REST API —
     unauthenticated fetches get a 401, so this can't just be a plain GET."""
     try:
-        response = httpx.get(
-            recording_url, auth=(settings.twilio_account_sid, settings.twilio_auth_token), timeout=30.0
-        )
-        response.raise_for_status()
+        with trace_provider_call("twilio", "download_recording"):
+            response = httpx.get(
+                recording_url, auth=(settings.twilio_account_sid, settings.twilio_auth_token), timeout=30.0
+            )
+            response.raise_for_status()
     except httpx.HTTPError as e:
         raise TelecomError(f"Could not download recording: {e}") from e
     return response.content
@@ -289,7 +300,8 @@ def delete_recording(recording_sid: str) -> None:
     voicemail/call recording is past its retention window, so the audio
     doesn't just sit there forever after we stop linking to it."""
     try:
-        _client().recordings(recording_sid).delete()
+        with trace_provider_call("twilio", "delete_recording"):
+            _client().recordings(recording_sid).delete()
     except TwilioException as e:
         raise TelecomError(str(e)) from e
 

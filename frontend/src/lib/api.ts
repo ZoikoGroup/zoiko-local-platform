@@ -450,6 +450,48 @@ export function listProviderStatuses(staffToken: string): Promise<{ providers: P
   });
 }
 
+// --- Distributed tracing (self-hosted, staff-only) ---
+
+export type ProviderCallTrace = {
+  id: string;
+  request_id: string | null;
+  provider: string;
+  operation: string;
+  duration_ms: number;
+  success: boolean;
+  error_detail: string | null;
+  created_at: string;
+};
+
+export type ProviderLatencySummary = {
+  provider: string;
+  operation: string;
+  count: number;
+  avg_duration_ms: number;
+  max_duration_ms: number;
+  failure_count: number;
+};
+
+export function listProviderTraces(
+  staffToken: string,
+  filters: { provider?: string; requestId?: string; limit?: number } = {}
+): Promise<ProviderCallTrace[]> {
+  const params = new URLSearchParams();
+  if (filters.provider) params.set("provider", filters.provider);
+  if (filters.requestId) params.set("request_id", filters.requestId);
+  if (filters.limit) params.set("limit", String(filters.limit));
+  const query = params.toString() ? `?${params.toString()}` : "";
+  return request<ProviderCallTrace[]>(`/ops/traces${query}`, {
+    headers: { Authorization: `Bearer ${staffToken}` },
+  });
+}
+
+export function getProviderTraceSummary(staffToken: string, hours: number = 24): Promise<ProviderLatencySummary[]> {
+  return request<ProviderLatencySummary[]>(`/ops/traces/summary?hours=${hours}`, {
+    headers: { Authorization: `Bearer ${staffToken}` },
+  });
+}
+
 // --- Public status page (no auth) ---
 
 export type PublicStatus = {
