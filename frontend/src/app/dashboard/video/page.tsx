@@ -17,8 +17,9 @@ import {
 } from "@/lib/api";
 import { getToken } from "@/lib/auth";
 
-type CallState = "idle" | "connecting" | "in-call";
+type CallState = "idle" | "lobby" | "connecting" | "in-call";
 type RecordingState = "idle" | "busy" | "consent_required" | "active";
+type DeviceStatus = "idle" | "requesting" | "ready" | "blocked";
 
 export default function VideoPage() {
   const [token] = useState<string | null>(() => getToken());
@@ -42,9 +43,26 @@ export default function VideoPage() {
   const [summarizingRoom, setSummarizingRoom] = useState<string | null>(null);
   const [summaryErrors, setSummaryErrors] = useState<Record<string, string>>({});
 
+  // Pre-join lobby - a device/camera check before actually connecting to the
+  // LiveKit room, not just an instant auto-join. lobbyRoomName is null when
+  // starting a brand new call (a room is created only once "Join meeting"
+  // is clicked) vs joining an existing active one.
+  const [lobbyRoomName, setLobbyRoomName] = useState<string | null>(null);
+  const [lobbyDisplayName, setLobbyDisplayName] = useState("");
+  const [lobbyCameraOn, setLobbyCameraOn] = useState(false);
+  const [lobbyMicOn, setLobbyMicOn] = useState(false);
+  const [lobbyCameraStatus, setLobbyCameraStatus] = useState<DeviceStatus>("idle");
+  const [lobbyMicStatus, setLobbyMicStatus] = useState<DeviceStatus>("idle");
+  const [lobbyVideoStream, setLobbyVideoStream] = useState<MediaStream | null>(null);
+  const [videoDevices, setVideoDevices] = useState<MediaDeviceInfo[]>([]);
+  const [audioDevices, setAudioDevices] = useState<MediaDeviceInfo[]>([]);
+  const [selectedVideoDeviceId, setSelectedVideoDeviceId] = useState("");
+  const [selectedAudioDeviceId, setSelectedAudioDeviceId] = useState("");
+
   const roomRef = useRef<Room | null>(null);
   const localVideoRef = useRef<HTMLVideoElement>(null);
   const localScreenVideoRef = useRef<HTMLVideoElement>(null);
+  const lobbyVideoRef = useRef<HTMLVideoElement>(null);
   const remoteContainerRef = useRef<HTMLDivElement>(null);
   const attachedElements = useRef<Map<string, HTMLMediaElement>>(new Map());
 
@@ -66,8 +84,19 @@ export default function VideoPage() {
   useEffect(() => {
     return () => {
       roomRef.current?.disconnect();
+      lobbyVideoStream?.getTracks().forEach((t) => t.stop());
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // Attaches the lobby's own getUserMedia preview stream (separate from any
+  // LiveKit room - we haven't connected to one yet at this point) to its
+  // <video> element whenever the stream changes.
+  useEffect(() => {
+    const videoEl = lobbyVideoRef.current;
+    if (!videoEl) return;
+    videoEl.srcObject = lobbyVideoStream;
+  }, [lobbyVideoStream, callState]);
 
   // Runs once callState flips to "in-call", which is when the <video> element
   // below actually mounts - attaching earlier (e.g. right after
@@ -93,16 +122,123 @@ export default function VideoPage() {
     screenPublication?.videoTrack?.attach(videoEl);
   }, [screenSharing]);
 
+  async function refreshDeviceList() {
+    try {
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      setVideoDevices(devices.filter((d) => d.kind === "videoinput"));
+      setAudioDevices(devices.filter((d) => d.kind === "audioinput"));
+    } catch {
+      // Device labels are blank until permission has been granted at least
+      // once - the dropdowns just show generically-named options until then.
+    }
+  }
+
+  function stopLobbyVideoPreview() {
+    lobbyVideoStream?.getTracks().forEach((t) => t.stop());
+    setLobbyVideoStream(null);
+  }
+
+  async function openLobby(existingRoomName: string | null) {
+    setCallError(null);
+    setLobbyRoomName(existingRoomName);
+    setLobbyCameraOn(false);
+    setLobbyMicOn(false);
+    setLobbyCameraStatus("idle");
+    setLobbyMicStatus("idle");
+    setCallState("lobby");
+
+    if (token) {
+      try {
+        const me = await getCurrentUser(token);
+        setLobbyDisplayName((prev) => prev || me.email);
+      } catch {
+        // Name field just stays editable/blank - not fatal to opening the lobby.
+      }
+    }
+    await refreshDeviceList();
+  }
+
+  function handleCancelLobby() {
+    stopLobbyVideoPreview();
+    setCallState("idle");
+    setLobbyRoomName(null);
+  }
+
+  async function handleLobbyToggleCamera() {
+    if (lobbyCameraOn) {
+      stopLobbyVideoPreview();
+      setLobbyCameraOn(false);
+      return;
+    }
+    setLobbyCameraStatus("requesting");
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: selectedVideoDeviceId ? { deviceId: { exact: selectedVideoDeviceId } } : true,
+      });
+      setLobbyVideoStream(stream);
+      setLobbyCameraOn(true);
+      setLobbyCameraStatus("ready");
+      await refreshDeviceList(); // device labels become available once permission is granted
+    } catch {
+      setLobbyCameraStatus("blocked");
+      setLobbyCameraOn(false);
+    }
+  }
+
+  async function handleLobbyToggleMic() {
+    if (lobbyMicOn) {
+      setLobbyMicOn(false);
+      return;
+    }
+    setLobbyMicStatus("requesting");
+    try {
+      // Just a permission/availability check - the mic isn't actually kept
+      // open in the lobby (nothing here needs a live audio level meter), so
+      // the stream is released immediately. LiveKit acquires its own fresh
+      // mic stream once the call actually connects.
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: selectedAudioDeviceId ? { deviceId: { exact: selectedAudioDeviceId } } : true,
+      });
+      stream.getTracks().forEach((t) => t.stop());
+      setLobbyMicOn(true);
+      setLobbyMicStatus("ready");
+      await refreshDeviceList();
+    } catch {
+      setLobbyMicStatus("blocked");
+      setLobbyMicOn(false);
+    }
+  }
+
+  async function handleLobbyVideoDeviceChange(deviceId: string) {
+    setSelectedVideoDeviceId(deviceId);
+    if (!lobbyCameraOn) return;
+    stopLobbyVideoPreview();
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ video: { deviceId: { exact: deviceId } } });
+      setLobbyVideoStream(stream);
+    } catch {
+      setLobbyCameraStatus("blocked");
+      setLobbyCameraOn(false);
+    }
+  }
+
   async function connectToRoom(existingRoomName: string | null) {
     if (!token) return;
     setCallError(null);
     setCallState("connecting");
     setRecordingState("idle");
     setRecordingError(null);
+    const useCamera = lobbyCameraOn;
+    const useMic = lobbyMicOn;
+    const displayName = lobbyDisplayName.trim();
+    const videoDeviceId = selectedVideoDeviceId;
+    const audioDeviceId = selectedAudioDeviceId;
+    stopLobbyVideoPreview();
+
     try {
       const me = await getCurrentUser(token);
       const targetRoomName = existingRoomName ?? (await createVideoRoom(token)).room_name;
-      const { token: liveKitToken, url } = await joinVideoRoom(token, targetRoomName, me.email);
+      const { token: liveKitToken, url } = await joinVideoRoom(token, targetRoomName, displayName || me.email);
 
       const room = new Room();
       roomRef.current = room;
@@ -126,7 +262,17 @@ export default function VideoPage() {
       });
 
       await room.connect(url, liveKitToken);
-      await room.localParticipant.enableCameraAndMicrophone();
+      // Respects the lobby's camera/mic toggles and chosen devices, rather
+      // than always turning both on - a caller who left the camera off in
+      // the lobby expects it to still be off once they're actually in the call.
+      if (useCamera) {
+        await room.localParticipant.setCameraEnabled(true, videoDeviceId ? { deviceId: videoDeviceId } : undefined);
+      }
+      if (useMic) {
+        await room.localParticipant.setMicrophoneEnabled(true, audioDeviceId ? { deviceId: audioDeviceId } : undefined);
+      }
+      setCameraOn(useCamera);
+      setMicOn(useMic);
 
       setRoomName(targetRoomName);
       setParticipantCount(room.remoteParticipants.size);
@@ -258,7 +404,7 @@ export default function VideoPage() {
       {callState === "idle" && (
         <div className="bg-white rounded-xl border border-slate-200 p-6 space-y-4">
           <button
-            onClick={() => connectToRoom(null)}
+            onClick={() => openLobby(null)}
             className="bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-medium rounded-lg px-4 py-2"
           >
             Start a Video Call
@@ -273,7 +419,7 @@ export default function VideoPage() {
           <form
             onSubmit={(e) => {
               e.preventDefault();
-              if (joinRoomInput.trim()) connectToRoom(joinRoomInput.trim());
+              if (joinRoomInput.trim()) openLobby(joinRoomInput.trim());
             }}
             className="flex gap-2"
           >
@@ -295,6 +441,114 @@ export default function VideoPage() {
           {callError && (
             <p className="text-sm text-red-600 bg-red-50 rounded-lg px-3 py-2">{callError}</p>
           )}
+        </div>
+      )}
+
+      {callState === "lobby" && (
+        <div className="bg-slate-900 rounded-xl border border-slate-800 p-4 grid gap-4 sm:grid-cols-[1.3fr_1fr]">
+          {/* Camera preview */}
+          <div className="space-y-3">
+            <div className="relative aspect-video bg-black rounded-lg overflow-hidden flex items-center justify-center">
+              {lobbyCameraOn ? (
+                <video ref={lobbyVideoRef} autoPlay muted playsInline className="w-full h-full object-cover" />
+              ) : (
+                <div className="flex flex-col items-center gap-2 text-slate-500">
+                  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" className="w-10 h-10">
+                    <path d="M3 3l18 18M15 10l4.55-2.9A1 1 0 0121 8v8a1 1 0 01-1.45.9L15 14M5 6h7a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2V8a2 2 0 012-2z" />
+                  </svg>
+                  <span className="text-sm">Camera off</span>
+                  {lobbyCameraStatus === "blocked" && (
+                    <span className="text-xs text-red-400">Camera access was blocked by the browser.</span>
+                  )}
+                </div>
+              )}
+            </div>
+
+            <div className="flex items-center justify-center gap-3">
+              <button
+                onClick={handleLobbyToggleMic}
+                disabled={lobbyMicStatus === "requesting"}
+                className={`text-xs font-medium rounded-lg px-3 py-2 disabled:opacity-60 ${
+                  lobbyMicOn ? "bg-slate-800 text-white" : "bg-red-700 text-white"
+                }`}
+              >
+                Mic {lobbyMicOn ? "On" : "Off"}
+              </button>
+              <button
+                onClick={handleLobbyToggleCamera}
+                disabled={lobbyCameraStatus === "requesting"}
+                className={`text-xs font-medium rounded-lg px-3 py-2 disabled:opacity-60 ${
+                  lobbyCameraOn ? "bg-slate-800 text-white" : "bg-red-700 text-white"
+                }`}
+              >
+                {lobbyCameraStatus === "requesting" ? "Turning on…" : `Camera ${lobbyCameraOn ? "On" : "Off"}`}
+              </button>
+            </div>
+
+            {(videoDevices.length > 0 || audioDevices.length > 0) && (
+              <div className="grid grid-cols-2 gap-2">
+                <select
+                  value={selectedVideoDeviceId}
+                  onChange={(e) => handleLobbyVideoDeviceChange(e.target.value)}
+                  className="w-full text-xs rounded-lg bg-slate-800 text-slate-200 border border-slate-700 px-2 py-1.5"
+                >
+                  <option value="">Default camera</option>
+                  {videoDevices.map((d) => (
+                    <option key={d.deviceId} value={d.deviceId}>
+                      {d.label || "Camera"}
+                    </option>
+                  ))}
+                </select>
+                <select
+                  value={selectedAudioDeviceId}
+                  onChange={(e) => setSelectedAudioDeviceId(e.target.value)}
+                  className="w-full text-xs rounded-lg bg-slate-800 text-slate-200 border border-slate-700 px-2 py-1.5"
+                >
+                  <option value="">Default microphone</option>
+                  {audioDevices.map((d) => (
+                    <option key={d.deviceId} value={d.deviceId}>
+                      {d.label || "Microphone"}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            )}
+          </div>
+
+          {/* Meeting details + join */}
+          <div className="space-y-4">
+            <div>
+              <h3 className="text-white font-semibold">{lobbyRoomName ? "Join call" : "Start a call"}</h3>
+              <p className="text-xs text-slate-400 font-mono mt-0.5">{lobbyRoomName ?? "A new room will be created"}</p>
+            </div>
+
+            <div>
+              <label className="block text-xs font-medium text-slate-400 mb-1 tracking-wide uppercase">Your name</label>
+              <input
+                value={lobbyDisplayName}
+                onChange={(e) => setLobbyDisplayName(e.target.value)}
+                placeholder="Enter your name"
+                className="w-full rounded-lg bg-slate-800 border border-slate-700 text-white text-sm px-3 py-2 placeholder:text-slate-500 focus:outline-none focus:ring-2 focus:ring-indigo-500/40"
+              />
+            </div>
+
+            {callError && <p className="text-xs text-red-400 bg-red-950/50 rounded-lg px-3 py-2">{callError}</p>}
+
+            <div className="flex gap-2 pt-1">
+              <button
+                onClick={() => connectToRoom(lobbyRoomName)}
+                className="flex-1 bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-medium rounded-lg px-4 py-2"
+              >
+                Join meeting
+              </button>
+              <button
+                onClick={handleCancelLobby}
+                className="text-sm font-medium rounded-lg px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-200"
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
         </div>
       )}
 
@@ -459,7 +713,7 @@ export default function VideoPage() {
                     </span>
                     {r.status === "active" && callState === "idle" && (
                       <button
-                        onClick={() => connectToRoom(r.room_name)}
+                        onClick={() => openLobby(r.room_name)}
                         className="text-xs font-medium text-indigo-600 hover:text-indigo-800"
                       >
                         Join
