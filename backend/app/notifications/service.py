@@ -169,12 +169,6 @@ def send_sms_notification(
     return delivery
 
 
-class NotificationNotFoundError(Exception):
-    """Raised when a notification is looked up by id but doesn't belong to
-    the requesting account - kept distinct from a generic 404 so callers
-    can't accidentally leak another account's notification ids."""
-
-
 def list_account_notifications(db: Session, account_id: str) -> list[NotificationDelivery]:
     return (
         db.query(NotificationDelivery)
@@ -184,23 +178,14 @@ def list_account_notifications(db: Session, account_id: str) -> list[Notificatio
     )
 
 
-def count_unread_notifications(db: Session, account_id: str) -> int:
-    return (
-        db.query(NotificationDelivery)
-        .filter(NotificationDelivery.account_id == account_id, NotificationDelivery.read_at.is_(None))
-        .count()
-    )
+class NotificationAuthorizationError(Exception):
+    """Raised when the caller's account doesn't own the given notification."""
 
 
 def mark_notification_read(db: Session, account_id: str, notification_id: str) -> NotificationDelivery:
-    delivery = (
-        db.query(NotificationDelivery)
-        .filter(NotificationDelivery.id == notification_id, NotificationDelivery.account_id == account_id)
-        .first()
-    )
-    if delivery is None:
-        raise NotificationNotFoundError(f"No notification {notification_id!r} for this account")
-
+    delivery = db.query(NotificationDelivery).filter(NotificationDelivery.id == notification_id).first()
+    if delivery is None or delivery.account_id != account_id:
+        raise NotificationAuthorizationError(f"{notification_id} is not a notification on your account")
     if delivery.read_at is None:
         delivery.read_at = datetime.now(timezone.utc)
         db.commit()
@@ -213,22 +198,19 @@ def mark_notification_read(db: Session, account_id: str, notification_id: str) -
 
 
 def mark_all_notifications_read(db: Session, account_id: str) -> int:
-    unread = (
+    result = (
         db.query(NotificationDelivery)
         .filter(NotificationDelivery.account_id == account_id, NotificationDelivery.read_at.is_(None))
-        .all()
+        .update({NotificationDelivery.read_at: datetime.now(timezone.utc)}, synchronize_session=False)
     )
-    now = datetime.now(timezone.utc)
-    for delivery in unread:
-        delivery.read_at = now
     db.commit()
 
-    if unread:
+    if result:
         log_event(
             db, actor_id=account_id, action="notification.read_all",
-            target_type="account", target_id=account_id, metadata={"count": len(unread)},
+            target_type="account", target_id=account_id, metadata={"count": result},
         )
-    return len(unread)
+    return result
 
 
 def subscribe_to_push(

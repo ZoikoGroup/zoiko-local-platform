@@ -1,11 +1,17 @@
-from pydantic import BaseModel, EmailStr, ConfigDict
+from pydantic import BaseModel, EmailStr, ConfigDict, Field
+
+# Security-review fix: signup previously accepted any string, including a
+# 1-character password. min_length=8 matches current NIST 800-63B guidance
+# (length over composition rules); max_length=128 caps request size and
+# avoids bcrypt's well-known 72-byte truncation footgun on very long input.
+_PasswordField = Field(min_length=8, max_length=128)
 
 
 class SignupRequest(BaseModel):
     account_name: str
     account_type: str  # "individual" or "business"
     email: EmailStr
-    password: str
+    password: str = _PasswordField
 
 
 class LoginRequest(BaseModel):
@@ -60,5 +66,5 @@ class UserResponse(BaseModel):
 
 class TeamMemberAdd(BaseModel):
     email: EmailStr
-    password: str
+    password: str = _PasswordField
     role: str  # "admin" or "member" - never "owner", there is exactly one per account

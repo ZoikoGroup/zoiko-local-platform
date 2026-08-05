@@ -2,10 +2,9 @@
 
 import { useEffect, useRef, useState } from "react";
 import {
-  getUnreadNotificationCount,
   listMyNotifications,
-  markAllNotificationsRead,
   markNotificationRead,
+  markAllNotificationsRead,
   type NotificationDelivery,
 } from "@/lib/api";
 import { getToken } from "@/lib/auth";
@@ -13,30 +12,32 @@ import { getToken } from "@/lib/auth";
 const POLL_INTERVAL_MS = 30_000;
 
 export default function NotificationBell() {
-  const [open, setOpen] = useState(false);
-  const [unreadCount, setUnreadCount] = useState(0);
+  const [token] = useState<string | null>(() => getToken());
   const [notifications, setNotifications] = useState<NotificationDelivery[]>([]);
-  const [loading, setLoading] = useState(false);
+  const [open, setOpen] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
 
+  const unreadCount = notifications.filter((n) => !n.read_at).length;
+
   useEffect(() => {
-    const token = getToken();
     if (!token) return;
-
-    function refreshUnreadCount() {
-      getUnreadNotificationCount(token!)
-        .then((res) => setUnreadCount(res.unread_count))
-        .catch(() => {});
+    function load() {
+      listMyNotifications(token as string)
+        .then((data) => {
+          setNotifications(data);
+          setError(null);
+        })
+        .catch(() => setError("Couldn't load notifications."));
     }
-
-    refreshUnreadCount();
-    const interval = setInterval(refreshUnreadCount, POLL_INTERVAL_MS);
+    load();
+    const interval = setInterval(load, POLL_INTERVAL_MS);
     return () => clearInterval(interval);
-  }, []);
+  }, [token]);
 
   useEffect(() => {
-    function handleClickOutside(event: MouseEvent) {
-      if (containerRef.current && !containerRef.current.contains(event.target as Node)) {
+    function handleClickOutside(e: MouseEvent) {
+      if (containerRef.current && !containerRef.current.contains(e.target as Node)) {
         setOpen(false);
       }
     }
@@ -44,40 +45,35 @@ export default function NotificationBell() {
     return () => document.removeEventListener("mousedown", handleClickOutside);
   }, []);
 
-  function toggleOpen() {
-    const next = !open;
-    setOpen(next);
-    if (next) {
-      const token = getToken();
-      if (!token) return;
-      setLoading(true);
-      listMyNotifications(token)
-        .then((all) => setNotifications(all.slice(0, 10)))
-        .catch(() => {})
-        .finally(() => setLoading(false));
+  async function handleOpen() {
+    setOpen((prev) => !prev);
+  }
+
+  async function handleMarkRead(id: string) {
+    if (!token) return;
+    setNotifications((prev) => prev.map((n) => (n.id === id ? { ...n, read_at: new Date().toISOString() } : n)));
+    try {
+      await markNotificationRead(token, id);
+    } catch {
+      // best-effort - a poll refresh within 30s will correct any drift
     }
   }
 
-  function handleMarkRead(id: string) {
-    const token = getToken();
+  async function handleMarkAllRead() {
     if (!token) return;
-    setNotifications((prev) => prev.map((n) => (n.id === id ? { ...n, read_at: new Date().toISOString() } : n)));
-    setUnreadCount((prev) => Math.max(0, prev - 1));
-    markNotificationRead(token, id).catch(() => {});
-  }
-
-  function handleMarkAllRead() {
-    const token = getToken();
-    if (!token) return;
-    setNotifications((prev) => prev.map((n) => ({ ...n, read_at: n.read_at ?? new Date().toISOString() })));
-    setUnreadCount(0);
-    markAllNotificationsRead(token).catch(() => {});
+    const now = new Date().toISOString();
+    setNotifications((prev) => prev.map((n) => ({ ...n, read_at: n.read_at ?? now })));
+    try {
+      await markAllNotificationsRead(token);
+    } catch {
+      // best-effort - a poll refresh within 30s will correct any drift
+    }
   }
 
   return (
     <div className="relative" ref={containerRef}>
       <button
-        onClick={toggleOpen}
+        onClick={handleOpen}
         className="relative w-9 h-9 rounded-lg flex items-center justify-center text-slate-500 hover:bg-slate-100 hover:text-slate-700 transition"
         aria-label="Notifications"
       >
@@ -89,55 +85,58 @@ export default function NotificationBell() {
           />
         </svg>
         {unreadCount > 0 && (
-          <span className="absolute top-1 right-1 min-w-[16px] h-4 px-1 rounded-full bg-red-500 text-white text-[10px] font-semibold leading-4 text-center">
+          <span className="absolute top-1 right-1 min-w-[16px] h-4 px-1 rounded-full bg-red-500 text-white text-[10px] font-semibold flex items-center justify-center">
             {unreadCount > 9 ? "9+" : unreadCount}
           </span>
         )}
       </button>
 
       {open && (
-        <div className="absolute right-0 mt-2 w-80 max-h-96 overflow-y-auto bg-white rounded-xl border border-slate-200 shadow-lg z-20">
+        <div className="absolute right-0 mt-2 w-80 bg-white rounded-xl border border-slate-200 shadow-lg z-20 overflow-hidden">
           <div className="flex items-center justify-between px-4 py-3 border-b border-slate-100">
-            <h3 className="text-sm font-semibold text-slate-900">Notifications</h3>
+            <span className="text-sm font-semibold text-slate-900">Notifications</span>
             {unreadCount > 0 && (
               <button
                 onClick={handleMarkAllRead}
-                className="text-xs text-indigo-600 hover:text-indigo-800 font-medium"
+                className="text-xs font-medium text-indigo-600 hover:text-indigo-800"
               >
-                Mark all as read
+                Mark all read
               </button>
             )}
           </div>
 
-          {loading && <p className="px-4 py-6 text-sm text-slate-500 text-center">Loading...</p>}
+          {error && <p className="text-xs text-red-600 px-4 py-3">{error}</p>}
 
-          {!loading && notifications.length === 0 && (
-            <p className="px-4 py-6 text-sm text-slate-500 text-center">No notifications yet.</p>
+          {notifications.length === 0 && !error && (
+            <p className="text-sm text-slate-400 px-4 py-6 text-center">No notifications yet.</p>
           )}
 
-          {!loading && notifications.length > 0 && (
-            <ul className="divide-y divide-slate-100">
-              {notifications.map((n) => (
-                <li
-                  key={n.id}
-                  onClick={() => !n.read_at && handleMarkRead(n.id)}
-                  className={`px-4 py-3 cursor-pointer transition ${
-                    n.read_at ? "bg-white" : "bg-indigo-50/60 hover:bg-indigo-50"
-                  }`}
-                >
-                  <div className="flex items-start gap-2">
-                    {!n.read_at && <span className="mt-1.5 w-1.5 h-1.5 rounded-full bg-indigo-600 shrink-0" />}
-                    <div className={n.read_at ? "pl-3.5" : ""}>
-                      <div className="text-sm font-medium text-slate-800">{n.subject}</div>
-                      <div className="text-xs text-slate-500 mt-0.5">
+          <ul className="max-h-96 overflow-y-auto divide-y divide-slate-100">
+            {notifications.slice(0, 20).map((n) => (
+              <li
+                key={n.id}
+                onClick={() => !n.read_at && handleMarkRead(n.id)}
+                className={`px-4 py-3 text-sm cursor-pointer transition ${
+                  n.read_at ? "bg-white" : "bg-indigo-50/60 hover:bg-indigo-50"
+                }`}
+              >
+                <div className="flex items-start gap-2">
+                  {!n.read_at && <span className="mt-1.5 w-1.5 h-1.5 rounded-full bg-indigo-600 shrink-0" />}
+                  <div className={n.read_at ? "pl-3.5" : ""}>
+                    <p className="text-slate-800 leading-snug">{n.subject}</p>
+                    <div className="flex items-center gap-2 mt-1">
+                      {n.status === "failed" && (
+                        <span className="text-[10px] font-medium text-red-600 uppercase">Delivery failed</span>
+                      )}
+                      <span className="text-[10px] text-slate-400">
                         {new Date(n.created_at).toLocaleString()}
-                      </div>
+                      </span>
                     </div>
                   </div>
-                </li>
-              ))}
-            </ul>
-          )}
+                </div>
+              </li>
+            ))}
+          </ul>
         </div>
       )}
     </div>

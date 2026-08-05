@@ -3,6 +3,7 @@
 import { useRouter, usePathname } from "next/navigation";
 import { clearToken } from "@/lib/auth";
 import { currentPageLabel } from "@/lib/nav";
+import NotificationBell from "@/components/NotificationBell";
 import type { User } from "@/lib/api";
 import NotificationBell from "@/components/NotificationBell";
 

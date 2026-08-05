@@ -18,10 +18,6 @@ class NotificationDeliveryResponse(BaseModel):
     read_at: datetime | None
 
 
-class UnreadCountResponse(BaseModel):
-    unread_count: int
-
-
 class PushSubscribeRequest(BaseModel):
     endpoint: str
     p256dh: str

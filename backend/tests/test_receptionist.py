@@ -1,3 +1,4 @@
+import pytest
 from twilio.request_validator import RequestValidator
 
 from app.core.config import settings
@@ -77,6 +78,7 @@ def test_respond_without_consent_captures_raw_transcript_only(client, db_session
     assert calls[0]["guardrail_flags"] == []
 
 
+@pytest.mark.live
 def test_respond_with_consent_extracts_qualification_and_escalates_high_urgency(client, db_session):
     token, account_id = _signup_and_login(client, "receptionistconsent@example.com")
     me = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"})
@@ -211,6 +213,7 @@ def test_receptionist_call_has_no_guardrail_flags_when_summary_is_clean(client, 
     assert calls[0]["guardrail_flags"] == []
 
 
+@pytest.mark.live
 def test_high_urgency_does_not_escalate_without_a_nominated_team_member(client, db_session):
     """forwarding_number alone (used for plain business-hours forwarding)
     must not trigger receptionist escalation - only a nominated
@@ -361,3 +364,67 @@ def test_assign_receptionist_call_can_unassign(client, db_session):
     )
     assert response.status_code == 200
     assert response.json()["assigned_user_id"] is None
+
+
+def _seed_receptionist_call_with_summary(db_session, account_id: str, *, e164: str, summary: str):
+    from app.media.models import ReceptionistCall
+
+    number = PhoneNumber(
+        e164=e164, country="US", status=PhoneNumberStatus.ACTIVE, account_id=account_id,
+        ai_receptionist_enabled=True,
+    )
+    db_session.add(number)
+    db_session.commit()
+
+    call = ReceptionistCall(
+        account_id=account_id, phone_number_id=number.id, call_sid=f"CAseed{e164}",
+        caller_number="+15559990000", raw_transcript="Hi, calling about a quote.",
+        summary=summary, model_version="groq/test",
+    )
+    db_session.add(call)
+    db_session.commit()
+    return call
+
+
+def test_edit_receptionist_call_summary_preserves_original(client, db_session):
+    owner_token, account_id = _signup_and_login(client, "receptionistedit1@example.com")
+    owner_headers = {"Authorization": f"Bearer {owner_token}"}
+    call = _seed_receptionist_call_with_summary(
+        db_session, account_id, e164="+15550099999", summary="Original AI summary."
+    )
+    call_id = call.id
+
+    response = client.patch(
+        f"/media/receptionist/calls/{call_id}",
+        json={"summary": "Corrected: caller wants a refund, not a quote."},
+        headers=owner_headers,
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["summary"] == "Corrected: caller wants a refund, not a quote."
+    assert response.json()["original_summary"] is not None
+
+    calls = client.get("/media/receptionist/calls", headers=owner_headers).json()
+    assert calls[0]["edited_at"] is not None
+
+
+def test_edit_receptionist_call_summary_rejects_other_account(client, db_session):
+    owner_token, account_id = _signup_and_login(client, "receptionistedit2owner@example.com")
+    owner_headers = {"Authorization": f"Bearer {owner_token}"}
+    _capture_a_call(client, db_session, account_id, e164="+15550011122", call_sid="CArecedit2")
+    call_id = client.get("/media/receptionist/calls", headers=owner_headers).json()[0]["id"]
+
+    intruder_token, _ = _signup_and_login(client, "receptionistedit2intruder@example.com")
+    response = client.patch(
+        f"/media/receptionist/calls/{call_id}",
+        json={"summary": "Hijacked."},
+        headers={"Authorization": f"Bearer {intruder_token}"},
+    )
+    assert response.status_code == 403
+
+
+def test_edit_receptionist_call_summary_requires_auth(client, db_session):
+    _, account_id = _signup_and_login(client, "receptionistedit3@example.com")
+    _capture_a_call(client, db_session, account_id, e164="+15550033344", call_sid="CArecedit3")
+
+    response = client.patch("/media/receptionist/calls/does-not-matter", json={"summary": "x"})
+    assert response.status_code == 401

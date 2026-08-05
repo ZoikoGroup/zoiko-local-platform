@@ -20,6 +20,8 @@ boto3==1.35.36  # S3-compatible object storage (recordings) - see app/integratio
 stripe==15.4.0  # Identity verification (KYC/KYB) - see app/integrations/kyc/stripe_identity.py
 pywebpush==2.3.0  # Web Push (VAPID) - see app/integrations/notifications/webpush.py
 kafka-python==3.0.9  # Event bus - see app/integrations/eventbus/kafka.py
+pgvector==0.5.0  # SQLAlchemy Vector column type - semantic search over AI summaries
+slowapi==0.1.10  # rate limiting on login endpoints - see app/core/rate_limit.py
 
 # dev/test
 pytest==8.3.3

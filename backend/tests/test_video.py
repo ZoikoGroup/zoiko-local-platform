@@ -1,6 +1,7 @@
 import base64
 import hashlib
 
+import pytest
 from google.protobuf.json_format import MessageToJson
 from livekit import api as livekit_api
 from livekit.protocol import egress as egress_pb
@@ -108,6 +109,7 @@ def test_create_room_fails_cleanly_when_livekit_url_is_not_configured(client, mo
     assert "url must be set" in response.json()["detail"]
 
 
+@pytest.mark.live
 def test_video_room_lifecycle(client):
     token = _signup_and_login(client, "videouser@example.com")
     headers = {"Authorization": f"Bearer {token}"}
@@ -133,6 +135,7 @@ def test_video_room_lifecycle(client):
     assert end_response.json()["status"] == "ended"
 
 
+@pytest.mark.live
 def test_end_room_rejects_other_account(client):
     token1 = _signup_and_login(client, "videohost@example.com")
     token2 = _signup_and_login(client, "videointruder@example.com")
@@ -154,6 +157,7 @@ def test_start_recording_requires_auth(client):
     assert response.status_code == 401
 
 
+@pytest.mark.live
 def test_start_recording_requires_consent(client):
     token = _signup_and_login(client, "videorecordnoconsent@example.com")
     headers = {"Authorization": f"Bearer {token}"}
@@ -166,6 +170,7 @@ def test_start_recording_requires_consent(client):
     client.post(f"/media/video/rooms/{room_name}/end", headers=headers)
 
 
+@pytest.mark.live
 def test_start_recording_fails_cleanly_when_storage_is_not_configured(client, monkeypatch):
     """Consent granted, but no S3-compatible bucket configured - LiveKit's
     Egress API has no free built-in storage, so this must fail cleanly (502)
@@ -195,6 +200,7 @@ def _fake_stop_recording(sink: list | None = None):
     return _stop
 
 
+@pytest.mark.live
 def test_member_cannot_start_recording_on_a_room_they_did_not_host(client, monkeypatch):
     """Same host-only restriction as ending a room (Member scoping) -
     recording is the more sensitive of the two actions, so it must not be
@@ -226,6 +232,7 @@ def test_member_cannot_start_recording_on_a_room_they_did_not_host(client, monke
     client.post(f"/media/video/rooms/{room_name}/end", headers=owner_headers)
 
 
+@pytest.mark.live
 def test_start_recording_succeeds_with_consent(client, monkeypatch):
     monkeypatch.setattr("app.media.service.video.start_room_recording", _fake_start_recording)
     monkeypatch.setattr("app.media.service.video.stop_room_recording", _fake_stop_recording())
@@ -245,6 +252,7 @@ def test_start_recording_succeeds_with_consent(client, monkeypatch):
     client.post(f"/media/video/rooms/{room_name}/end", headers=headers)
 
 
+@pytest.mark.live
 def test_start_recording_rejects_when_already_recording(client, monkeypatch):
     monkeypatch.setattr("app.media.service.video.start_room_recording", _fake_start_recording)
     monkeypatch.setattr("app.media.service.video.stop_room_recording", _fake_stop_recording())
@@ -262,6 +270,7 @@ def test_start_recording_rejects_when_already_recording(client, monkeypatch):
     client.post(f"/media/video/rooms/{room_name}/end", headers=headers)
 
 
+@pytest.mark.live
 def test_end_session_stops_an_in_progress_recording(client, monkeypatch):
     monkeypatch.setattr("app.media.service.video.start_room_recording", _fake_start_recording)
     stopped = []
@@ -277,6 +286,7 @@ def test_end_session_stops_an_in_progress_recording(client, monkeypatch):
     assert stopped == ["EG_fake_egress_id"]
 
 
+@pytest.mark.live
 def test_webhook_egress_ended_attaches_recording_url(client, db_session):
     token = _signup_and_login(client, "videorecordwebhook@example.com")
     headers = {"Authorization": f"Bearer {token}"}
@@ -313,6 +323,7 @@ def test_webhook_egress_ended_attaches_recording_url(client, db_session):
     client.post(f"/media/video/rooms/{room_name}/end", headers=headers)
 
 
+@pytest.mark.live
 def test_webhook_egress_ended_attaches_recording_url_from_legacy_file_field(client, db_session):
     token = _signup_and_login(client, "videorecordwebhooklegacy@example.com")
     headers = {"Authorization": f"Bearer {token}"}
@@ -346,6 +357,7 @@ def test_webhook_egress_ended_attaches_recording_url_from_legacy_file_field(clie
     client.post(f"/media/video/rooms/{room_name}/end", headers=headers)
 
 
+@pytest.mark.live
 def test_webhook_rejects_invalid_signature(client):
     body, _ = _livekit_webhook_body_and_token("room_finished", "some-room")
     response = client.post(
@@ -354,6 +366,7 @@ def test_webhook_rejects_invalid_signature(client):
     assert response.status_code == 403
 
 
+@pytest.mark.live
 def test_webhook_room_finished_marks_session_ended(client):
     token = _signup_and_login(client, "videowebhookuser@example.com")
     headers = {"Authorization": f"Bearer {token}"}
@@ -377,6 +390,7 @@ def test_webhook_room_finished_marks_session_ended(client):
     client.post(f"/media/video/rooms/{room_name}/end", headers=headers)
 
 
+@pytest.mark.live
 def test_participant_joined_creates_an_open_participant_session(client, db_session):
     from app.media.models import VideoParticipantSession
 
@@ -400,6 +414,7 @@ def test_participant_joined_creates_an_open_participant_session(client, db_sessi
     client.post(f"/media/video/rooms/{room_name}/end", headers=headers)
 
 
+@pytest.mark.live
 def test_participant_left_closes_the_matching_open_session(client, db_session):
     from app.media.models import VideoParticipantSession
 
@@ -428,6 +443,7 @@ def test_participant_left_closes_the_matching_open_session(client, db_session):
     client.post(f"/media/video/rooms/{room_name}/end", headers=headers)
 
 
+@pytest.mark.live
 def test_room_finished_closes_any_dangling_open_participant_sessions(client, db_session):
     from app.media.models import VideoParticipantSession
 

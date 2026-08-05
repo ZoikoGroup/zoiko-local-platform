@@ -171,5 +171,14 @@ class ReceptionistCall(Base):
     # app/intelligence/guardrails.py), empty when clean. Never derived from
     # raw_transcript - a caller mentioning a price or a lawsuit is normal.
     guardrail_flags: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    # AI governance: "human-editable outputs" - same pattern as
+    # ConversationSummary.original_summary. Editing never re-runs the
+    # guardrail check above: a human correcting/authorizing wording is a
+    # deliberate decision, not unvetted model output.
+    original_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    edited_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    edited_by_user_id: Mapped[str | None] = mapped_column(
+        UUID(as_uuid=False), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
     model_version: Mapped[str | None] = mapped_column(String(100), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

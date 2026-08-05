@@ -79,10 +79,10 @@ class NotificationDelivery(Base):
     )
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-    # Null until the recipient views it in the in-app notification bell -
-    # the same ledger row doubles as an in-app notification instead of a
-    # separate table, since every notification we send today already has
-    # an account_id and event_name to key off of.
+
+    # In-app notification center - the dashboard bell icon reads this ledger
+    # directly rather than a separate table, since it's already the record
+    # of every notification-worthy event. NULL means unread.
     read_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 

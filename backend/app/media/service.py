@@ -237,6 +237,21 @@ def list_account_calls(db: Session, user: User, limit: int = 20) -> list[CallRec
     return query.order_by(CallRecord.created_at.desc()).limit(limit).all()
 
 
+def assert_can_access_call(db: Session, user: User, call_sid: str) -> None:
+    """Security-review fix: GET /media/voice/calls/{call_sid} used to proxy
+    straight to Twilio with no ownership check at all - any authenticated
+    user on the platform could look up any other account's call metadata
+    (phone numbers, duration, status) by SID. This enforces the same
+    account/assignment boundary list_account_calls already uses, before the
+    route is allowed to query the provider."""
+    call = db.query(CallRecord).filter(CallRecord.provider_call_sid == call_sid).first()
+    if call is None or call.account_id != user.account_id:
+        raise CallAuthorizationError(f"{call_sid} is not a call owned by your account")
+    ids = assigned_number_ids(db, user)
+    if ids is not None and call.phone_number_id not in ids:
+        raise CallAuthorizationError(f"{call_sid} is not a call owned by your account")
+
+
 def record_voicemail(
     db: Session,
     *,
@@ -605,6 +620,41 @@ def route_receptionist_call(
         db, actor_id=user.id, action="receptionist.call_routed",
         target_type="receptionist_call", target_id=call.id,
         metadata={"assigned_user_id": assigned_user_id},
+    )
+    return call
+
+
+def edit_receptionist_call_summary(
+    db: Session, user: User, receptionist_call_id: str, new_summary: str
+) -> ReceptionistCall:
+    """AI governance's "human-editable outputs" requirement, applied to the
+    receptionist's narrated summary - same access boundary as routing it
+    (assert_number_access), and never re-runs the guardrail check: a human
+    correcting the wording is a deliberate decision, not unvetted model
+    output."""
+    call = db.query(ReceptionistCall).filter(ReceptionistCall.id == receptionist_call_id).first()
+    if call is None or call.account_id != user.account_id:
+        raise ReceptionistCallAuthorizationError(
+            f"{receptionist_call_id} is not a receptionist call owned by your account"
+        )
+    if call.phone_number_id is not None:
+        number = db.query(PhoneNumber).filter(PhoneNumber.id == call.phone_number_id).first()
+        if number is not None:
+            try:
+                assert_number_access(number, user)
+            except NumberConflictError as e:
+                raise ReceptionistCallAuthorizationError(str(e)) from e
+
+    if call.original_summary is None:
+        call.original_summary = call.summary
+    call.summary = new_summary
+    call.edited_at = datetime.now(timezone.utc)
+    call.edited_by_user_id = user.id
+    db.commit()
+    db.refresh(call)
+    log_event(
+        db, actor_id=user.id, action="receptionist.call_summary_edited",
+        target_type="receptionist_call", target_id=call.id, metadata={"edited": True},
     )
     return call
 

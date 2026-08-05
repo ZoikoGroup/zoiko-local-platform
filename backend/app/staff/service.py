@@ -1,9 +1,10 @@
-from sqlalchemy import func
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 from app.core.security import hash_password, verify_password
 from app.numbering.identity.models import Account, User, UserRole
 from app.numbering.numbers.models import PhoneNumber
+from app.numbering.numbers.service import list_stuck_provisioning as _list_stuck_provisioning
 from app.staff.models import PlatformStaff, PlatformStaffRole
 
 
@@ -59,4 +60,67 @@ def list_accounts_overview(db: Session) -> list[dict]:
             "created_at": account.created_at,
         }
         for account in accounts
+    ]
+
+
+def list_stuck_provisioning(db: Session) -> list[dict]:
+    """Staff recovery queue - numbers stranded mid-purchase by a process
+    crash, joined with enough account context to act without a second
+    lookup (same pattern as list_accounts_overview / compliance's
+    list_all_cases / porting's list_all_porting_requests)."""
+    numbers = _list_stuck_provisioning(db)
+    account_ids = {n.account_id for n in numbers}
+    accounts = {a.id: a for a in db.query(Account).filter(Account.id.in_(account_ids)).all()}
+    owners = {
+        u.account_id: u.email
+        for u in db.query(User).filter(User.account_id.in_(account_ids), User.role == UserRole.OWNER).all()
+    }
+    return [
+        {
+            "id": n.id,
+            "e164": n.e164,
+            "country": n.country,
+            "status": n.status,
+            "account_id": n.account_id,
+            "account_name": accounts[n.account_id].name if n.account_id in accounts else None,
+            "account_owner_email": owners.get(n.account_id),
+            "provisioning_started_at": n.provisioning_started_at,
+        }
+        for n in numbers
+    ]
+
+
+def search_numbers(db: Session, query: str) -> list[dict]:
+    """Cross-account number lookup for ops - a support agent has a number or
+    a Twilio SID a customer gave them and needs to find which account owns
+    it, without a database console. Same join-in-context shape as the other
+    staff list views. Capped at 50 - this is a lookup tool for a specific
+    number, not a bulk export."""
+    pattern = f"%{query}%"
+    numbers = (
+        db.query(PhoneNumber)
+        .filter(or_(PhoneNumber.e164.ilike(pattern), PhoneNumber.provider_sid.ilike(pattern)))
+        .order_by(PhoneNumber.created_at.desc())
+        .limit(50)
+        .all()
+    )
+    account_ids = {n.account_id for n in numbers}
+    accounts = {a.id: a for a in db.query(Account).filter(Account.id.in_(account_ids)).all()}
+    owners = {
+        u.account_id: u.email
+        for u in db.query(User).filter(User.account_id.in_(account_ids), User.role == UserRole.OWNER).all()
+    }
+    return [
+        {
+            "id": n.id,
+            "e164": n.e164,
+            "country": n.country,
+            "status": n.status,
+            "provider_sid": n.provider_sid,
+            "account_id": n.account_id,
+            "account_name": accounts[n.account_id].name if n.account_id in accounts else None,
+            "account_owner_email": owners.get(n.account_id),
+            "created_at": n.created_at,
+        }
+        for n in numbers
     ]

@@ -45,6 +45,15 @@ class PhoneNumber(Base):
     # grab it again.
     cancelled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
+    # Architecture doc's "Provisioning Job" object, in miniature - set when
+    # status enters PURCHASE_PENDING, cleared the moment it resolves to
+    # ACTIVE or back to RESERVED. The normal purchase_number() flow never
+    # returns to the caller with this still set - a non-null value on a row
+    # still sitting in PURCHASE_PENDING/PROVISIONING means the process died
+    # mid-purchase, which is exactly what the staff recovery queue
+    # (app/staff/service.py's list_stuck_provisioning) surfaces.
+    provisioning_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
     # Roadmap "Team and RBAC ... number assignment" — which team member this
     # number is handed to (e.g. a sales line given to one agent). NULL means
     # unassigned: any Owner/Admin on the account can still manage it, but no

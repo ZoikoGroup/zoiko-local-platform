@@ -1,6 +1,7 @@
 from twilio.request_validator import RequestValidator
 
 from app.core.config import settings
+from app.media.models import CallDirection, CallRecord
 from app.numbering.numbers.models import PhoneNumber, PhoneNumberStatus
 
 
@@ -269,3 +270,75 @@ def test_incoming_call_goes_to_voicemail_outside_business_hours(client, db_sessi
     assert response.status_code == 200
     assert "<Record" in response.text
     assert "<Dial" not in response.text
+
+
+def _signup_and_login_with_account(client, email: str) -> tuple[str, str]:
+    signup = client.post(
+        "/auth/signup",
+        json={
+            "account_name": "Get Call Test Co",
+            "account_type": "business",
+            "email": email,
+            "password": "supersecret123",
+        },
+    )
+    account_id = signup.json()["account_id"]
+    login = client.post("/auth/login", json={"email": email, "password": "supersecret123"})
+    return login.json()["access_token"], account_id
+
+
+def _seed_call_record(db_session, account_id: str, *, call_sid: str) -> CallRecord:
+    call = CallRecord(
+        account_id=account_id, phone_number_id=None, direction=CallDirection.INBOUND,
+        from_number="+15559990000", to_number="+15550001111", provider_call_sid=call_sid,
+        status="completed", duration=42,
+    )
+    db_session.add(call)
+    db_session.commit()
+    return call
+
+
+def test_get_call_requires_auth(client):
+    response = client.get("/media/voice/calls/CAsomecallsid00000000000000000")
+    assert response.status_code == 401
+
+
+def test_get_call_rejects_other_account(client, db_session):
+    """Security-review fix: this endpoint used to proxy straight to Twilio
+    with no ownership check - any authenticated user could look up any
+    other account's call metadata by SID."""
+    _, owner_account_id = _signup_and_login_with_account(client, "getcallowner@example.com")
+    call = _seed_call_record(db_session, owner_account_id, call_sid="CAidortest0000000000000000000001")
+
+    intruder_token, _ = _signup_and_login_with_account(client, "getcallintruder@example.com")
+    response = client.get(
+        f"/media/voice/calls/{call.provider_call_sid}",
+        headers={"Authorization": f"Bearer {intruder_token}"},
+    )
+    assert response.status_code == 403
+
+
+def test_get_call_rejects_a_call_sid_that_does_not_exist(client, db_session):
+    token, _ = _signup_and_login_with_account(client, "getcallnoexist@example.com")
+    response = client.get(
+        "/media/voice/calls/CAdoesnotexist00000000000000000",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert response.status_code == 403
+
+
+def test_get_call_succeeds_for_the_owning_account(client, db_session, monkeypatch):
+    token, account_id = _signup_and_login_with_account(client, "getcallowner2@example.com")
+    call = _seed_call_record(db_session, account_id, call_sid="CAidortest0000000000000000000002")
+
+    monkeypatch.setattr(
+        "app.media.voice.telecom.get_call",
+        lambda call_sid: {"sid": call_sid, "status": "completed", "to": "+15550001111", "from": "+15559990000", "duration": 42},
+    )
+
+    response = client.get(
+        f"/media/voice/calls/{call.provider_call_sid}",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert response.status_code == 200
+    assert response.json()["sid"] == call.provider_call_sid

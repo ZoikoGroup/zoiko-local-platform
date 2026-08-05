@@ -161,7 +161,15 @@ async def list_calls(
 
 
 @router.get("/calls/{call_sid}")
-async def get_call(call_sid: str, current_user: User = Depends(get_current_user)):
+async def get_call(
+    call_sid: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    try:
+        media_service.assert_can_access_call(db, current_user, call_sid)
+    except media_service.CallAuthorizationError as e:
+        raise HTTPException(status_code=403, detail=str(e)) from e
     try:
         return telecom.get_call(call_sid)
     except TelecomError as e:

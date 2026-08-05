@@ -208,21 +208,15 @@ export function listMyNotifications(token: string): Promise<NotificationDelivery
   });
 }
 
-export function getUnreadNotificationCount(token: string): Promise<{ unread_count: number }> {
-  return request<{ unread_count: number }>("/notifications/me/unread-count", {
-    headers: { Authorization: `Bearer ${token}` },
-  });
-}
-
 export function markNotificationRead(token: string, notificationId: string): Promise<NotificationDelivery> {
-  return request<NotificationDelivery>(`/notifications/me/${notificationId}/read`, {
+  return request<NotificationDelivery>(`/notifications/${notificationId}/read`, {
     method: "POST",
     headers: { Authorization: `Bearer ${token}` },
   });
 }
 
-export function markAllNotificationsRead(token: string): Promise<{ unread_count: number }> {
-  return request<{ unread_count: number }>("/notifications/me/read-all", {
+export function markAllNotificationsRead(token: string): Promise<{ marked_read: number }> {
+  return request(`/notifications/read-all`, {
     method: "POST",
     headers: { Authorization: `Bearer ${token}` },
   });
@@ -317,6 +311,61 @@ export type AccountOverview = {
 export function listStaffAccounts(token: string): Promise<AccountOverview[]> {
   return request<AccountOverview[]>("/staff/accounts", {
     headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export type StaffNumberSearchResult = {
+  id: string;
+  e164: string;
+  country: string;
+  status: string;
+  provider_sid: string | null;
+  account_id: string;
+  account_name: string | null;
+  account_owner_email: string | null;
+  created_at: string;
+};
+
+export function searchStaffNumbers(staffToken: string, q: string): Promise<StaffNumberSearchResult[]> {
+  return request<StaffNumberSearchResult[]>(`/staff/numbers/search?q=${encodeURIComponent(q)}`, {
+    headers: { Authorization: `Bearer ${staffToken}` },
+  });
+}
+
+export type StuckProvisioningEntry = {
+  id: string;
+  e164: string;
+  country: string;
+  status: string;
+  account_id: string;
+  account_name: string | null;
+  account_owner_email: string | null;
+  provisioning_started_at: string | null;
+};
+
+export function listStuckProvisioning(staffToken: string): Promise<StuckProvisioningEntry[]> {
+  return request<StuckProvisioningEntry[]>("/staff/numbers/stuck-provisioning", {
+    headers: { Authorization: `Bearer ${staffToken}` },
+  });
+}
+
+export function retryProvisioning(
+  staffToken: string,
+  numberId: string
+): Promise<{ id: string; e164: string; status: string }> {
+  return request(`/staff/numbers/${numberId}/retry-provisioning`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${staffToken}` },
+  });
+}
+
+export function releaseProvisioning(
+  staffToken: string,
+  numberId: string
+): Promise<{ id: string; e164: string; status: string }> {
+  return request(`/staff/numbers/${numberId}/release-provisioning`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${staffToken}` },
   });
 }
 
@@ -655,6 +704,9 @@ export type SummaryListEntry = {
   model_version: string;
   created_at: string;
   disclaimer: string;
+  original_summary: string | null;
+  edited_at: string | null;
+  edited_by_user_id: string | null;
 };
 
 export function listSummaries(token: string): Promise<SummaryListEntry[]> {
@@ -666,6 +718,14 @@ export function listSummaries(token: string): Promise<SummaryListEntry[]> {
 export function searchSummaries(token: string, q: string): Promise<SummaryListEntry[]> {
   return request<SummaryListEntry[]>(`/intelligence/summaries/search?q=${encodeURIComponent(q)}`, {
     headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export function editSummary(token: string, summaryId: string, summary: string): Promise<SummaryListEntry> {
+  return request<SummaryListEntry>(`/intelligence/summaries/${summaryId}`, {
+    method: "PATCH",
+    headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ summary }),
   });
 }
 
@@ -683,6 +743,8 @@ export type ReceptionistCallEntry = {
   guardrail_flags: string[];
   assigned_user_id: string | null;
   assigned_user_email: string | null;
+  original_summary: string | null;
+  edited_at: string | null;
   model_version: string | null;
   created_at: string;
 };
@@ -702,6 +764,18 @@ export function assignReceptionistCall(
     method: "POST",
     headers: { Authorization: `Bearer ${token}` },
     body: JSON.stringify({ assigned_user_id: assignedUserId }),
+  });
+}
+
+export function editReceptionistCallSummary(
+  token: string,
+  callId: string,
+  summary: string
+): Promise<{ id: string; summary: string; original_summary: string | null; edited_at: string | null }> {
+  return request(`/media/receptionist/calls/${callId}`, {
+    method: "PATCH",
+    headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ summary }),
   });
 }
 

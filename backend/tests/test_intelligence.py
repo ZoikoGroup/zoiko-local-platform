@@ -1,3 +1,5 @@
+import pytest
+
 from app.media.models import CallDirection, CallRecord, VideoSession, VideoSessionStatus, Voicemail
 from app.numbering.numbers.models import PhoneNumber, PhoneNumberStatus
 
@@ -83,6 +85,7 @@ def test_summarize_call_rejects_without_consent(client, db_session):
     assert "consent" in response.json()["detail"].lower()
 
 
+@pytest.mark.live
 def test_summarize_call_success_path(client, db_session, monkeypatch):
     token, account_id = _signup_and_login(client, "intelcallsuccess@example.com", "Intel Call Success Co")
     call = _make_recorded_call(db_session, account_id)
@@ -140,6 +143,7 @@ def test_summarize_voicemail_rejects_without_consent(client, db_session):
     assert "consent" in response.json()["detail"].lower()
 
 
+@pytest.mark.live
 def test_summarize_voicemail_succeeds_with_a_country_specific_consent_grant(client, db_session, monkeypatch):
     """Consent scoped to the voicemail's own number's country (not GLOBAL)
     must be enough - jurisdiction is derived from the number, not just a
@@ -182,6 +186,7 @@ def test_summarize_voicemail_country_specific_consent_does_not_cover_a_different
     assert "consent" in response.json()["detail"].lower()
 
 
+@pytest.mark.live
 def test_summarize_voicemail_success_path(client, db_session, monkeypatch):
     token, account_id = _signup_and_login(client, "intelsuccess@example.com", "Intel Success Co")
     voicemail = _make_voicemail(db_session, account_id, "+15550005555")
@@ -303,6 +308,7 @@ def test_summarize_video_session_rejects_member_who_did_not_host(client, db_sess
     assert "not hosted by you" in response.json()["detail"].lower()
 
 
+@pytest.mark.live
 def test_summarize_video_session_success_path(client, db_session, monkeypatch):
     token, account_id = _signup_and_login(client, "intelvidsuccess@example.com", "Intel Video Success Co")
     me = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"}).json()
@@ -333,18 +339,23 @@ def test_summarize_video_session_success_path(client, db_session, monkeypatch):
     assert isinstance(body["action_items"], list)
 
 
-def _seed_summary(db_session, account_id: str, *, summary: str, transcript: str) -> None:
+def _seed_summary(
+    db_session, account_id: str, *, summary: str, transcript: str, with_embedding: bool = True
+) -> None:
+    from app.integrations.embeddings.cohere import generate_embedding
     from app.intelligence.models import ConversationSummary, SummarySourceType
 
-    db_session.add(
-        ConversationSummary(
-            account_id=account_id, source_type=SummarySourceType.VOICEMAIL, source_id=account_id,
-            transcript=transcript, summary=summary, model_version="groq/test",
-        )
+    record = ConversationSummary(
+        account_id=account_id, source_type=SummarySourceType.VOICEMAIL, source_id=account_id,
+        transcript=transcript, summary=summary, model_version="groq/test",
     )
+    if with_embedding:
+        record.embedding = generate_embedding(f"{summary} {transcript}", input_type="search_document")
+    db_session.add(record)
     db_session.commit()
 
 
+@pytest.mark.live
 def test_search_summaries_finds_a_matching_record_by_content(client, db_session):
     token, account_id = _signup_and_login(client, "search1@example.com", "Search Test Co")
     _seed_summary(
@@ -368,6 +379,31 @@ def test_search_summaries_finds_a_matching_record_by_content(client, db_session)
     assert "billing" in results[0]["summary"].lower()
 
 
+@pytest.mark.live
+def test_search_summaries_finds_a_match_by_meaning_not_exact_words(client, db_session):
+    """The actual point of upgrading from keyword to semantic search - the
+    seeded summary never uses the words "connectivity" or "issue", but real
+    Cohere embeddings still recognize they mean the same thing. Calibrated
+    live against real cosine-distance measurements (see
+    _SEMANTIC_DISTANCE_THRESHOLD's docstring in intelligence/service.py)."""
+    token, account_id = _signup_and_login(client, "search5@example.com", "Search Test Co 5")
+    _seed_summary(
+        db_session, account_id,
+        summary="The internet is down and customer cannot get online.",
+        transcript="My wifi isn't working and I can't connect to anything.",
+    )
+
+    response = client.get(
+        "/intelligence/summaries/search", params={"q": "connectivity issue"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert response.status_code == 200
+    results = response.json()
+    assert len(results) == 1
+    assert "internet" in results[0]["summary"].lower()
+
+
+@pytest.mark.live
 def test_search_summaries_returns_empty_for_no_match(client, db_session):
     token, account_id = _signup_and_login(client, "search2@example.com", "Search Test Co 2")
     _seed_summary(
@@ -384,6 +420,7 @@ def test_search_summaries_returns_empty_for_no_match(client, db_session):
     assert response.json() == []
 
 
+@pytest.mark.live
 def test_search_summaries_is_scoped_to_the_callers_own_account(client, db_session):
     token_a, account_a = _signup_and_login(client, "search3a@example.com", "Search Test Co 3A")
     _, account_b = _signup_and_login(client, "search3b@example.com", "Search Test Co 3B")
@@ -408,10 +445,85 @@ def test_search_summaries_requires_auth(client):
 
 def test_search_summaries_with_blank_query_returns_empty(client, db_session):
     token, account_id = _signup_and_login(client, "search4@example.com", "Search Test Co 4")
-    _seed_summary(db_session, account_id, summary="Anything", transcript="Anything at all")
+    _seed_summary(db_session, account_id, summary="Anything", transcript="Anything at all", with_embedding=False)
 
     response = client.get(
         "/intelligence/summaries/search", params={"q": "   "}, headers={"Authorization": f"Bearer {token}"}
     )
     assert response.status_code == 200
     assert response.json() == []
+
+
+def _seed_call_summary(db_session, account_id: str, *, summary: str = "Original AI summary."):
+    from app.intelligence.models import ConversationSummary, SummarySourceType
+
+    call = CallRecord(
+        account_id=account_id, phone_number_id=None, direction=CallDirection.INBOUND,
+        from_number="+15559990000", to_number="+15550001111", provider_call_sid="CAeditsum1",
+        status="completed", duration=60, recording_url="https://example.com/call.wav",
+    )
+    db_session.add(call)
+    db_session.commit()
+
+    record = ConversationSummary(
+        account_id=account_id, source_type=SummarySourceType.CALL, source_id=call.id,
+        transcript="Hi, calling about my order.", summary=summary, model_version="groq/test",
+    )
+    db_session.add(record)
+    db_session.commit()
+    return record
+
+
+def test_edit_summary_updates_text_and_preserves_the_original(client, db_session):
+    token, account_id = _signup_and_login(client, "editsum1@example.com", "Edit Summary Co 1")
+    record = _seed_call_summary(db_session, account_id, summary="Original AI summary.")
+
+    response = client.patch(
+        f"/intelligence/summaries/{record.id}", json={"summary": "Corrected: caller wants a refund, not a repair."},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["summary"] == "Corrected: caller wants a refund, not a repair."
+    assert body["original_summary"] == "Original AI summary."
+    assert body["edited_at"] is not None
+
+
+def test_edit_summary_twice_keeps_the_first_original(client, db_session):
+    token, account_id = _signup_and_login(client, "editsum2@example.com", "Edit Summary Co 2")
+    record = _seed_call_summary(db_session, account_id, summary="First AI summary.")
+
+    client.patch(
+        f"/intelligence/summaries/{record.id}", json={"summary": "First correction."},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    response = client.patch(
+        f"/intelligence/summaries/{record.id}", json={"summary": "Second correction."},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["summary"] == "Second correction."
+    # original_summary must still be the very first AI output, not the
+    # first edit - it's only ever set once.
+    assert body["original_summary"] == "First AI summary."
+
+
+def test_edit_summary_rejects_other_account(client, db_session):
+    _, owner_account_id = _signup_and_login(client, "editsum3owner@example.com", "Edit Summary Co 3")
+    record = _seed_call_summary(db_session, owner_account_id)
+
+    intruder_token, _ = _signup_and_login(client, "editsum3intruder@example.com", "Edit Summary Co 3 Intruder")
+    response = client.patch(
+        f"/intelligence/summaries/{record.id}", json={"summary": "Hijacked."},
+        headers={"Authorization": f"Bearer {intruder_token}"},
+    )
+    assert response.status_code == 403
+
+
+def test_edit_summary_requires_auth(client, db_session):
+    _, account_id = _signup_and_login(client, "editsum4@example.com", "Edit Summary Co 4")
+    record = _seed_call_summary(db_session, account_id)
+
+    response = client.patch(f"/intelligence/summaries/{record.id}", json={"summary": "x"})
+    assert response.status_code == 401

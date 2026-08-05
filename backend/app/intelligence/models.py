@@ -2,11 +2,13 @@ import enum
 import uuid
 from datetime import datetime
 
-from sqlalchemy import JSON, DateTime, Enum, ForeignKey, String, Text, func
+from pgvector.sqlalchemy import Vector
+from sqlalchemy import JSON, DateTime, Enum, ForeignKey, Index, String, Text, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import Base
+from app.integrations.embeddings.cohere import EMBEDDING_DIMENSIONS
 from app.media.models import ReceptionistUrgency
 
 
@@ -22,6 +24,12 @@ class SummarySourceType(str, enum.Enum):
 
 class ConversationSummary(Base):
     __tablename__ = "conversation_summaries"
+    __table_args__ = (
+        Index(
+            "conversation_summaries_embedding_hnsw_idx", "embedding",
+            postgresql_using="hnsw", postgresql_ops={"embedding": "vector_cosine_ops"},
+        ),
+    )
 
     id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=new_uuid)
     account_id: Mapped[str] = mapped_column(
@@ -50,3 +58,21 @@ class ConversationSummary(Base):
     # must be explainable/traceable to the exact model version that produced them
     model_version: Mapped[str] = mapped_column(String(100), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    # AI governance: outputs must be "human-editable" (Architecture doc
+    # §2.3), not just labelled non-authoritative. original_summary is only
+    # ever populated on the FIRST edit (preserves what the model actually
+    # said, for evidence/traceability), never touched again on subsequent
+    # edits - `summary` above always holds the current, possibly
+    # human-corrected text that's actually shown.
+    original_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    edited_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    edited_by_user_id: Mapped[str | None] = mapped_column(
+        UUID(as_uuid=False), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+
+    # Real semantic search (Architecture doc: "pgvector acceptable for MVP
+    # semantic search"). Nullable - populated at creation time going
+    # forward; a Cohere failure degrades to no embedding (search just won't
+    # surface that record) rather than failing the whole summarize call.
+    embedding: Mapped[list[float] | None] = mapped_column(Vector(EMBEDDING_DIMENSIONS), nullable=True)

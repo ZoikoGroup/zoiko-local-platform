@@ -198,10 +198,11 @@ def test_notification_delivery_is_recorded_and_listable(client, db_session, monk
     body = response.json()
     assert len(body) == 1
     assert body[0]["subject"] == "+15550009999 is active on Zoiko Local"
+    assert body[0]["channel"] == "email"
     assert body[0]["read_at"] is None
 
 
-def _signup_and_login(client, email):
+def _signup_and_login(client, email: str) -> tuple[str, str]:
     signup = client.post(
         "/auth/signup",
         json={
@@ -213,85 +214,76 @@ def _signup_and_login(client, email):
     )
     account_id = signup.json()["account_id"]
     login = client.post("/auth/login", json={"email": email, "password": "supersecret123"})
-    token = login.json()["access_token"]
-    return account_id, token
+    return login.json()["access_token"], account_id
 
 
-def test_unread_count_and_mark_read_flow(client, db_session, monkeypatch):
+def test_mark_notification_read(client, db_session, monkeypatch):
     from app.notifications.service import send_notification
 
     monkeypatch.setattr("app.core.config.settings.resend_api_key", "")
-
-    account_id, token = _signup_and_login(client, "unreadflow@example.com")
-    headers = {"Authorization": f"Bearer {token}"}
-
-    send_notification(
+    token, account_id = _signup_and_login(client, "notifyread1@example.com")
+    delivery = send_notification(
         db_session, event_name="number.activated", account_id=account_id,
-        recipient_email="unreadflow@example.com", context={"e164": "+15550001234"},
+        recipient_email="notifyread1@example.com", context={"e164": "+15550001234"},
     )
 
-    count_response = client.get("/notifications/me/unread-count", headers=headers)
-    assert count_response.json() == {"unread_count": 1}
+    response = client.post(
+        f"/notifications/{delivery.id}/read", headers={"Authorization": f"Bearer {token}"}
+    )
+    assert response.status_code == 200
+    assert response.json()["read_at"] is not None
 
-    notification_id = client.get("/notifications/me", headers=headers).json()[0]["id"]
-    read_response = client.post(f"/notifications/me/{notification_id}/read", headers=headers)
-    assert read_response.status_code == 200
-    assert read_response.json()["read_at"] is not None
-
-    assert client.get("/notifications/me/unread-count", headers=headers).json() == {"unread_count": 0}
+    listed = client.get("/notifications/me", headers={"Authorization": f"Bearer {token}"}).json()
+    assert listed[0]["read_at"] is not None
 
 
-def test_mark_notification_read_404_for_another_accounts_notification(client, db_session, monkeypatch):
+def test_mark_notification_read_rejects_other_account(client, db_session, monkeypatch):
     from app.notifications.service import send_notification
 
     monkeypatch.setattr("app.core.config.settings.resend_api_key", "")
-
-    owner_account_id, _ = _signup_and_login(client, "notifowner@example.com")
-    _, other_token = _signup_and_login(client, "notifintruder@example.com")
-
-    send_notification(
+    _, owner_account_id = _signup_and_login(client, "notifyread2owner@example.com")
+    delivery = send_notification(
         db_session, event_name="number.activated", account_id=owner_account_id,
-        recipient_email="notifowner@example.com", context={"e164": "+15550005678"},
+        recipient_email="notifyread2owner@example.com", context={"e164": "+15550005678"},
     )
 
-    owner_headers = {"Authorization": f"Bearer {_login_token(client, 'notifowner@example.com')}"}
-    owner_notification_id = client.get("/notifications/me", headers=owner_headers).json()[0]["id"]
-
-    other_headers = {"Authorization": f"Bearer {other_token}"}
-    response = client.post(f"/notifications/me/{owner_notification_id}/read", headers=other_headers)
-    assert response.status_code == 404
-
-
-def _login_token(client, email):
-    login = client.post("/auth/login", json={"email": email, "password": "supersecret123"})
-    return login.json()["access_token"]
+    intruder_token, _ = _signup_and_login(client, "notifyread2intruder@example.com")
+    response = client.post(
+        f"/notifications/{delivery.id}/read", headers={"Authorization": f"Bearer {intruder_token}"}
+    )
+    assert response.status_code == 403
 
 
 def test_mark_all_notifications_read(client, db_session, monkeypatch):
     from app.notifications.service import send_notification
 
     monkeypatch.setattr("app.core.config.settings.resend_api_key", "")
+    token, account_id = _signup_and_login(client, "notifyreadall@example.com")
+    send_notification(
+        db_session, event_name="number.activated", account_id=account_id,
+        recipient_email="notifyreadall@example.com", context={"e164": "+15550001111"},
+    )
+    send_notification(
+        db_session, event_name="number.activated", account_id=account_id,
+        recipient_email="notifyreadall@example.com", context={"e164": "+15550002222"},
+    )
 
-    account_id, token = _signup_and_login(client, "markallread@example.com")
-    headers = {"Authorization": f"Bearer {token}"}
-
-    for e164 in ("+15551110000", "+15552220000"):
-        send_notification(
-            db_session, event_name="number.activated", account_id=account_id,
-            recipient_email="markallread@example.com", context={"e164": e164},
-        )
-
-    assert client.get("/notifications/me/unread-count", headers=headers).json() == {"unread_count": 2}
-
-    response = client.post("/notifications/me/read-all", headers=headers)
+    response = client.post("/notifications/read-all", headers={"Authorization": f"Bearer {token}"})
     assert response.status_code == 200
-    assert response.json() == {"unread_count": 0}
-    assert client.get("/notifications/me/unread-count", headers=headers).json() == {"unread_count": 0}
+    assert response.json()["marked_read"] == 2
+
+    listed = client.get("/notifications/me", headers={"Authorization": f"Bearer {token}"}).json()
+    assert all(n["read_at"] is not None for n in listed)
+
+
+def test_mark_notification_read_requires_auth(client):
+    response = client.post("/notifications/some-id/read")
+    assert response.status_code == 401
 
 
 def test_push_subscribe_then_unsubscribe(client, monkeypatch):
     monkeypatch.setattr("app.core.config.settings.resend_api_key", "")
-    account_id, token = _signup_and_login(client, "pushsubscribe@example.com")
+    token, _ = _signup_and_login(client, "pushsubscribe@example.com")
     headers = {"Authorization": f"Bearer {token}"}
 
     response = client.post(
@@ -310,7 +302,7 @@ def test_push_subscribe_then_unsubscribe(client, monkeypatch):
 def test_push_subscribe_upserts_on_same_endpoint(db_session, client, monkeypatch):
     from app.notifications.models import PushSubscription
     monkeypatch.setattr("app.core.config.settings.resend_api_key", "")
-    _, token = _signup_and_login(client, "pushupsert@example.com")
+    token, _ = _signup_and_login(client, "pushupsert@example.com")
     headers = {"Authorization": f"Bearer {token}"}
 
     for _ in range(2):
@@ -424,7 +416,7 @@ def test_notifications_list_endpoint_serializes_push_deliveries_with_no_email(cl
     monkeypatch.setattr("app.core.config.settings.resend_api_key", "")
     monkeypatch.setattr("app.notifications.service.send_push", lambda **kwargs: None)
 
-    account_id, token = _signup_and_login(client, "pushlistregression@example.com")
+    token, account_id = _signup_and_login(client, "pushlistregression@example.com")
     headers = {"Authorization": f"Bearer {token}"}
 
     subscribe_response = client.post(
