@@ -11,6 +11,16 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file="../.env")
 
     database_url: str = "postgresql+psycopg2://zoiko:zoiko@localhost:5433/zoiko_local"
+    # loadtest.py's actual finding: Postgres itself was NOT the bottleneck
+    # under 50 concurrent users (pg_stat_activity showed 1-2 active queries,
+    # <2% container CPU, mostly idle connections) - so this is deliberately
+    # a modest bump over SQLAlchemy's bare default (pool_size=5,
+    # max_overflow=10), not an aggressive one. The real ceiling found was
+    # request concurrency in a single uvicorn process (see Dockerfile's
+    # WEB_CONCURRENCY). Multiplied by however many worker processes run per
+    # machine, so keep this conservative - it's per-process, not per-machine.
+    db_pool_size: int = 10
+    db_max_overflow: int = 10
     jwt_secret_key: str = PLACEHOLDER_JWT_SECRET_KEY
     environment: str = "development"
     # Comma-separated allowed CORS origins - the deployed frontend's real
