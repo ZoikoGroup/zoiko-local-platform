@@ -21,7 +21,7 @@ from app.notifications.service import (
     notify_number_verification_required,
 )
 from app.numbering.identity.models import Account, AccountType, User, UserRole
-from app.numbering.numbers.models import PhoneNumber, PhoneNumberStatus, RingGroupDestination
+from app.numbering.numbers.models import IVROption, PhoneNumber, PhoneNumberStatus, RingGroupDestination
 
 RESERVATION_TTL_MINUTES = 12
 QUARANTINE_DAYS = 90
@@ -485,6 +485,80 @@ def list_ring_group(db: Session, e164: str) -> list[RingGroupDestination]:
         .filter(PhoneNumber.e164 == e164)
         .order_by(RingGroupDestination.ring_order.asc())
         .all()
+    )
+
+
+MAX_IVR_OPTIONS = 10
+_VALID_IVR_DIGITS = set("0123456789")
+
+
+class InvalidIVROptionError(Exception):
+    """Raised for a digit outside 0-9, a duplicate digit, or too many options."""
+
+
+def set_ivr_menu(
+    db: Session, user: User, e164: str, greeting: str, options: dict[str, str]
+) -> tuple[PhoneNumber, list[IVROption]]:
+    """Replaces the number's entire IVR menu in one call, same pattern as
+    set_ring_group - simpler for a customer-facing "here's my whole menu"
+    form than incremental per-digit endpoints. An empty greeting clears the
+    menu entirely (see clear_ivr_menu), reverting to the number's existing
+    ring-group/receptionist/voicemail behavior."""
+    number = db.query(PhoneNumber).filter(PhoneNumber.e164 == e164).first()
+    if number is None or number.account_id != user.account_id:
+        raise NumberConflictError(f"{e164} is not a number owned by your account")
+    assert_number_access(number, user)
+
+    if not greeting.strip():
+        raise InvalidIVROptionError("A greeting message is required")
+    if len(options) > MAX_IVR_OPTIONS:
+        raise InvalidIVROptionError(f"An IVR menu may have up to {MAX_IVR_OPTIONS} options")
+    for digit in options:
+        if digit not in _VALID_IVR_DIGITS:
+            raise InvalidIVROptionError(f"{digit!r} is not a valid digit - use 0-9")
+
+    number.ivr_greeting = greeting
+    db.query(IVROption).filter(IVROption.phone_number_id == number.id).delete()
+    rows = [
+        IVROption(phone_number_id=number.id, digit=digit, destination_number=destination)
+        for digit, destination in options.items()
+    ]
+    db.add_all(rows)
+    db.commit()
+
+    log_event(
+        db, actor_id=user.account_id, action="number.ivr_menu_updated",
+        target_type="phone_number", target_id=number.id, metadata={"e164": e164, "options": options},
+    )
+    return get_ivr_menu(db, e164)
+
+
+def get_ivr_menu(db: Session, e164: str) -> tuple[PhoneNumber | None, list[IVROption]]:
+    number = db.query(PhoneNumber).filter(PhoneNumber.e164 == e164).first()
+    if number is None:
+        return None, []
+    options = (
+        db.query(IVROption)
+        .filter(IVROption.phone_number_id == number.id)
+        .order_by(IVROption.digit.asc())
+        .all()
+    )
+    return number, options
+
+
+def clear_ivr_menu(db: Session, user: User, e164: str) -> None:
+    number = db.query(PhoneNumber).filter(PhoneNumber.e164 == e164).first()
+    if number is None or number.account_id != user.account_id:
+        raise NumberConflictError(f"{e164} is not a number owned by your account")
+    assert_number_access(number, user)
+
+    number.ivr_greeting = None
+    db.query(IVROption).filter(IVROption.phone_number_id == number.id).delete()
+    db.commit()
+
+    log_event(
+        db, actor_id=user.account_id, action="number.ivr_menu_cleared",
+        target_type="phone_number", target_id=number.id, metadata={"e164": e164},
     )
 
 

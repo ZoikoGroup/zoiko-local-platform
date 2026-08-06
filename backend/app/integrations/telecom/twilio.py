@@ -277,6 +277,22 @@ def build_ring_group_response(
     return str(response)
 
 
+def build_ivr_menu_response(greeting: str, action_url: str, no_input_redirect_url: str) -> str:
+    """Enhanced business routing (Architecture doc Phase 2) - "press 1 for
+    sales, 2 for support." Gathers a single DTMF digit; Twilio requests
+    action_url once any digit is pressed (even if the caller hangs up
+    mid-menu, an empty Digits value is posted there - see voice.py's
+    /ivr-select). If nothing is pressed before the gather times out,
+    Twilio does NOT call action_url at all - it falls through to the
+    <Redirect> below instead, which returns the number to its normal
+    (non-IVR) call-handling behavior."""
+    response = VoiceResponse()
+    gather = response.gather(input="dtmf", num_digits=1, action=action_url, method="POST", timeout=6)
+    gather.say(greeting)
+    response.redirect(no_input_redirect_url, method="POST")
+    return str(response)
+
+
 def build_gather_response(prompt: str, action_url: str) -> str:
     """Builds TwiML for the AI Receptionist's single free-form capture: Twilio
     transcribes the caller's speech itself (no vendor call needed for this

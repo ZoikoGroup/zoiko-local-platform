@@ -86,6 +86,33 @@ class PhoneNumber(Base):
         UUID(as_uuid=False), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
     )
 
+    # Architecture doc Phase 2 "enhanced business routing" - IVR-style menu
+    # ("press 1 for sales, 2 for support"). Non-null/non-empty means the
+    # number has an IVR menu configured (see IVROption below) and inbound
+    # calls play this greeting and gather a digit before falling into the
+    # existing ring-group/receptionist/voicemail flow. A number with no
+    # greeting set behaves exactly as before this feature existed.
+    ivr_greeting: Mapped[str | None] = mapped_column(String(500), nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class IVROption(Base):
+    """One keypad choice on a number's IVR menu (see PhoneNumber.ivr_greeting).
+    Pressing `digit` rings `destination_number` (single dial, same overflow-
+    to-voicemail fallback as the ring group / plain forwarding paths - see
+    voice.py's /ivr-select route). A digit with no matching option, or no
+    input before the gather times out, falls through to the number's
+    existing ring-group/receptionist/voicemail behavior."""
+
+    __tablename__ = "ivr_options"
+
+    id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=new_uuid)
+    phone_number_id: Mapped[str] = mapped_column(
+        UUID(as_uuid=False), ForeignKey("phone_numbers.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    digit: Mapped[str] = mapped_column(String(1), nullable=False)
+    destination_number: Mapped[str] = mapped_column(String(20), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 

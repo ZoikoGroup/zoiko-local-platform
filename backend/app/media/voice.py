@@ -34,13 +34,57 @@ class OutboundCallRequest(BaseModel):
     message: str = "This is a call from Zoiko Local."
 
 
+def _default_call_twiml(request: Request, db: Session, owner, to_number: str) -> str:
+    """The number's normal (non-IVR) call handling: ring group/forwarding,
+    then AI receptionist, then voicemail, then "unrecognized number." Used
+    both when no IVR menu is configured at all, and as the fallback for an
+    IVR menu that got no input or an unrecognized digit (see /ivr-select
+    and /ivr-no-input below) - a number with an IVR menu that isn't
+    answered still ends up exactly where it would have without one.
+    """
+    if owner is not None and media_service.should_forward_call(owner):
+        status_callback_url = str(request.base_url) + "media/voice/status-callback"
+        fallback_action_url = str(request.base_url) + "media/voice/forward-fallback"
+        recording_callback_url = (
+            str(request.base_url) + "media/voice/recording-callback"
+            if media_service.should_record_forwarded_call(db, owner.account_id)
+            else None
+        )
+        # Enhanced business routing: ring every configured destination
+        # simultaneously if a ring group is set, otherwise fall back to
+        # the plain single forwarding_number - identical behavior to
+        # before this feature existed for any number that never sets one.
+        ring_group = numbers_service.list_ring_group(db, to_number)
+        destinations = [d.destination_number for d in ring_group] or [owner.forwarding_number]
+        return telecom.build_ring_group_response(
+            destinations, fallback_action_url, status_callback_url, recording_callback_url
+        )
+    elif owner is not None and owner.ai_receptionist_enabled:
+        action_url = str(request.base_url) + "media/receptionist/respond"
+        return telecom.build_gather_response(
+            "Thanks for calling. You're speaking with an automated assistant, not a person. "
+            "Please tell us your name, company, the reason for your call, and whether "
+            "it's urgent, after the tone.",
+            action_url,
+        )
+    elif owner is not None:
+        callback_url = str(request.base_url) + "media/voicemail/recording-complete"
+        return telecom.build_record_response(callback_url)
+    else:
+        return telecom.build_say_response(
+            "Thanks for calling Zoiko Local. This number isn't recognized."
+        )
+
+
 @router.post("/incoming")
 async def incoming_call(request: Request, db: Session = Depends(get_db)):
-    """Twilio hits this as a webhook when someone calls a number we own. If a
-    forwarding_number is configured (and current time is within any configured
-    business hours), the call is forwarded live; otherwise it goes to
-    voicemail. The call is attributed to the owning account (or logged as
-    unrecognized) via the persisted CallRecord regardless of which branch runs.
+    """Twilio hits this as a webhook when someone calls a number we own. If
+    an IVR menu is configured, it's offered first (see _default_call_twiml
+    for what happens after: on a matched digit, no input, or an
+    unrecognized digit). Otherwise: forwarding/ring group, then AI
+    receptionist, then voicemail. The call is attributed to the owning
+    account (or logged as unrecognized) via the persisted CallRecord
+    regardless of which branch runs.
     """
     params = await media_service.verify_twilio_webhook(request)
 
@@ -59,38 +103,57 @@ async def incoming_call(request: Request, db: Session = Depends(get_db)):
         status=params.get("CallStatus", "unknown"),
     )
 
-    if owner is not None and media_service.should_forward_call(owner):
+    if owner is not None and owner.ivr_greeting:
+        action_url = str(request.base_url) + "media/voice/ivr-select"
+        no_input_url = str(request.base_url) + "media/voice/ivr-no-input"
+        twiml = telecom.build_ivr_menu_response(owner.ivr_greeting, action_url, no_input_url)
+    else:
+        twiml = _default_call_twiml(request, db, owner, to_number)
+    return Response(content=twiml, media_type="application/xml")
+
+
+@router.post("/ivr-select")
+async def ivr_select(request: Request, db: Session = Depends(get_db)):
+    """Twilio requests this as the IVR <Gather>'s `action` URL once a digit
+    is pressed (see telecom.build_ivr_menu_response). An unrecognized digit
+    (or an empty Digits value from an interrupted call) falls through to
+    the number's normal call handling, same as no IVR menu at all."""
+    params = await media_service.verify_twilio_webhook(request)
+    to_number = params.get("To", "")
+    digit = params.get("Digits", "")
+    owner = media_service.find_number_owner(db, to_number)
+
+    option = None
+    if owner is not None and digit:
+        _, options = numbers_service.get_ivr_menu(db, to_number)
+        option = next((o for o in options if o.digit == digit), None)
+
+    if option is None:
+        twiml = _default_call_twiml(request, db, owner, to_number)
+    else:
         status_callback_url = str(request.base_url) + "media/voice/status-callback"
         fallback_action_url = str(request.base_url) + "media/voice/forward-fallback"
         recording_callback_url = (
             str(request.base_url) + "media/voice/recording-callback"
-            if media_service.should_record_forwarded_call(db, owner.account_id)
+            if owner is not None and media_service.should_record_forwarded_call(db, owner.account_id)
             else None
         )
-        # Enhanced business routing: ring every configured destination
-        # simultaneously if a ring group is set, otherwise fall back to
-        # the plain single forwarding_number - identical behavior to
-        # before this feature existed for any number that never sets one.
-        ring_group = numbers_service.list_ring_group(db, to_number)
-        destinations = [d.destination_number for d in ring_group] or [owner.forwarding_number]
         twiml = telecom.build_ring_group_response(
-            destinations, fallback_action_url, status_callback_url, recording_callback_url
+            [option.destination_number], fallback_action_url, status_callback_url, recording_callback_url
         )
-    elif owner is not None and owner.ai_receptionist_enabled:
-        action_url = str(request.base_url) + "media/receptionist/respond"
-        twiml = telecom.build_gather_response(
-            "Thanks for calling. You're speaking with an automated assistant, not a person. "
-            "Please tell us your name, company, the reason for your call, and whether "
-            "it's urgent, after the tone.",
-            action_url,
-        )
-    elif owner is not None:
-        callback_url = str(request.base_url) + "media/voicemail/recording-complete"
-        twiml = telecom.build_record_response(callback_url)
-    else:
-        twiml = telecom.build_say_response(
-            "Thanks for calling Zoiko Local. This number isn't recognized."
-        )
+    return Response(content=twiml, media_type="application/xml")
+
+
+@router.post("/ivr-no-input")
+async def ivr_no_input(request: Request, db: Session = Depends(get_db)):
+    """Twilio redirects here when the IVR <Gather> times out with no digit
+    pressed at all (see telecom.build_ivr_menu_response's docstring - this
+    case never reaches /ivr-select, since Twilio only calls a Gather's
+    action URL when there was at least some input)."""
+    params = await media_service.verify_twilio_webhook(request)
+    to_number = params.get("To", "")
+    owner = media_service.find_number_owner(db, to_number)
+    twiml = _default_call_twiml(request, db, owner, to_number)
     return Response(content=twiml, media_type="application/xml")
 
 

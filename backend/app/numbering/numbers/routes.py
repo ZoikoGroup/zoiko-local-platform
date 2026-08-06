@@ -9,12 +9,14 @@ from app.numbering.identity.models import User
 from app.numbering.numbers import service
 from app.numbering.numbers.schemas import (
     AssignNumberRequest,
+    IVRMenuResponse,
     NumberSearchResult,
     PhoneNumberResponse,
     PurchaseNumberRequest,
     ReserveNumberRequest,
     RingGroupDestinationResponse,
     RoutingConfigRequest,
+    SetIVRMenuRequest,
     SetRingGroupRequest,
     SuspendNumberRequest,
 )
@@ -181,3 +183,45 @@ def get_ring_group(
     except NumberConflictError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
     return service.list_ring_group(db, e164)
+
+
+@router.put("/{e164}/ivr", response_model=IVRMenuResponse)
+def set_ivr_menu(
+    e164: str,
+    payload: SetIVRMenuRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_writer),
+):
+    try:
+        number, options = service.set_ivr_menu(db, current_user, e164, payload.greeting, payload.options)
+    except NumberConflictError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e
+    except service.InvalidIVROptionError as e:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e)) from e
+    return IVRMenuResponse(greeting=number.ivr_greeting, options=options)
+
+
+@router.get("/{e164}/ivr", response_model=IVRMenuResponse)
+def get_ivr_menu(
+    e164: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    try:
+        service.assert_owns_number(db, current_user, e164)
+    except NumberConflictError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
+    number, options = service.get_ivr_menu(db, e164)
+    return IVRMenuResponse(greeting=number.ivr_greeting if number else None, options=options)
+
+
+@router.delete("/{e164}/ivr", status_code=status.HTTP_204_NO_CONTENT)
+def clear_ivr_menu(
+    e164: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_writer),
+):
+    try:
+        service.clear_ivr_menu(db, current_user, e164)
+    except NumberConflictError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e

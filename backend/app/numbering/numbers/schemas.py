@@ -28,6 +28,24 @@ class RingGroupDestinationResponse(BaseModel):
     ring_order: int
 
 
+class SetIVRMenuRequest(BaseModel):
+    greeting: str
+    options: dict[str, str]
+
+
+class IVROptionResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    digit: str
+    destination_number: str
+
+
+class IVRMenuResponse(BaseModel):
+    greeting: str | None
+    options: list[IVROptionResponse]
+
+
 class NumberSearchResult(BaseModel):
     phone_number: str
     locality: str | None = None

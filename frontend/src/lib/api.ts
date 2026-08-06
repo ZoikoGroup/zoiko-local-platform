@@ -705,6 +705,43 @@ export function setRingGroup(token: string, e164: string, destinations: string[]
   });
 }
 
+export type IVROption = {
+  id: string;
+  digit: string;
+  destination_number: string;
+};
+
+export type IVRMenu = {
+  greeting: string | null;
+  options: IVROption[];
+};
+
+export function getIvrMenu(token: string, e164: string): Promise<IVRMenu> {
+  return request<IVRMenu>(`/numbers/${encodeURIComponent(e164)}/ivr`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export function setIvrMenu(
+  token: string,
+  e164: string,
+  greeting: string,
+  options: Record<string, string>
+): Promise<IVRMenu> {
+  return request<IVRMenu>(`/numbers/${encodeURIComponent(e164)}/ivr`, {
+    method: "PUT",
+    headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ greeting, options }),
+  });
+}
+
+export function clearIvrMenu(token: string, e164: string): Promise<void> {
+  return request<void>(`/numbers/${encodeURIComponent(e164)}/ivr`, {
+    method: "DELETE",
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
 export type CallLogEntry = {
   id: string;
   sid: string | null;
