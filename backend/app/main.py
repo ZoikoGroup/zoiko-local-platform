@@ -12,6 +12,7 @@ from app.billing.routes import router as billing_router
 from app.compliance.routes import router as compliance_router
 from app.consent.routes import router as consent_router
 from app.contacts.routes import router as contacts_router
+from app.crm.routes import router as crm_router
 from app.core.config import settings
 from app.core.database import engine
 from app.core.error_logging import ErrorLoggingMiddleware
@@ -92,6 +93,7 @@ app.include_router(porting_router)
 app.include_router(webhooks_router)
 app.include_router(apikeys_router)
 app.include_router(public_api_router)
+app.include_router(crm_router)
 
 
 @app.get("/health")

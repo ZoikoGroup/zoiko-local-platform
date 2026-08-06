@@ -15,6 +15,7 @@ from app.billing import models as billing_models  # noqa: F401
 from app.compliance import models as compliance_models  # noqa: F401
 from app.consent import models as consent_models  # noqa: F401
 from app.contacts import models as contacts_models  # noqa: F401
+from app.crm import models as crm_models  # noqa: F401
 from app.core.config import settings
 from app.core.database import Base
 from app.intelligence import models as intelligence_models  # noqa: F401

@@ -12,12 +12,19 @@ import {
   listApiKeys,
   createApiKey,
   revokeApiKey,
+  getCrmConnection,
+  connectCrm,
+  disconnectCrm,
+  listCrmSyncEvents,
   ApiError,
   type PublicStatus,
   type MyPhoneNumber,
   type WebhookEndpoint,
   type WebhookDelivery,
   type ApiKey,
+  type CrmConnection,
+  type CrmSyncEvent,
+  type CrmProvider,
 } from "@/lib/api";
 import { getToken } from "@/lib/auth";
 
@@ -147,6 +154,57 @@ export default function IntegrationsPage() {
       await loadApiKeys();
     } catch (err) {
       setApiKeysError(err instanceof ApiError ? err.message : "Couldn't revoke the API key.");
+    }
+  }
+
+  const [crmConnection, setCrmConnection] = useState<CrmConnection | null>(null);
+  const [crmSyncEvents, setCrmSyncEvents] = useState<CrmSyncEvent[]>([]);
+  const [crmLoading, setCrmLoading] = useState(true);
+  const [crmError, setCrmError] = useState<string | null>(null);
+  const [crmProviderChoice, setCrmProviderChoice] = useState<CrmProvider>("hubspot");
+  const [crmBusy, setCrmBusy] = useState(false);
+
+  const loadCrm = useCallback(() => {
+    if (!token) return;
+    return Promise.all([getCrmConnection(token), listCrmSyncEvents(token)])
+      .then(([connection, events]) => {
+        setCrmConnection(connection);
+        setCrmSyncEvents(events);
+        setCrmError(null);
+      })
+      .catch(() => setCrmError("Couldn't load the CRM connection."))
+      .finally(() => setCrmLoading(false));
+  }, [token]);
+
+  useEffect(() => {
+    loadCrm();
+  }, [loadCrm]);
+
+  async function handleConnectCrm() {
+    if (!token) return;
+    setCrmBusy(true);
+    setCrmError(null);
+    try {
+      await connectCrm(token, crmProviderChoice);
+      await loadCrm();
+    } catch (err) {
+      setCrmError(err instanceof ApiError ? err.message : "Couldn't connect the CRM.");
+    } finally {
+      setCrmBusy(false);
+    }
+  }
+
+  async function handleDisconnectCrm() {
+    if (!token) return;
+    setCrmBusy(true);
+    setCrmError(null);
+    try {
+      await disconnectCrm(token);
+      await loadCrm();
+    } catch (err) {
+      setCrmError(err instanceof ApiError ? err.message : "Couldn't disconnect the CRM.");
+    } finally {
+      setCrmBusy(false);
     }
   }
 
@@ -438,6 +496,81 @@ export default function IntegrationsPage() {
               <p className="text-xs text-slate-400">Only an account Owner or Admin can manage API keys.</p>
             )}
           </>
+        )}
+      </div>
+
+      <div className="bg-white rounded-xl border border-slate-200 p-5 space-y-4">
+        <div>
+          <h3 className="font-semibold text-slate-900">CRM Connection</h3>
+          <p className="text-sm text-slate-500 mt-1">
+            Mock integration — no real HubSpot, Salesforce, or Pipedrive connection exists yet. This lets contacts
+            and call activity sync into a simulated CRM so the integration shape is ready once a real one is built.
+          </p>
+        </div>
+
+        {crmError && <p className="text-sm text-red-600 bg-red-50 rounded-lg px-3 py-2">{crmError}</p>}
+
+        {crmLoading ? (
+          <p className="text-sm text-slate-500">Loading...</p>
+        ) : crmConnection ? (
+          <>
+            <div className="flex items-center justify-between rounded-lg border border-slate-200 px-4 py-3 text-sm">
+              <div>
+                <div className="text-slate-800 font-medium capitalize">{crmConnection.provider}</div>
+                <div className="text-xs text-slate-400 mt-0.5">
+                  {crmConnection.external_account_label} · connected{" "}
+                  {new Date(crmConnection.connected_at).toLocaleDateString()}
+                </div>
+              </div>
+              {isAdmin && (
+                <button
+                  onClick={handleDisconnectCrm}
+                  disabled={crmBusy}
+                  className="text-xs font-medium text-red-600 hover:text-red-800 disabled:opacity-50"
+                >
+                  {crmBusy ? "Disconnecting..." : "Disconnect"}
+                </button>
+              )}
+            </div>
+
+            {crmSyncEvents.length > 0 && (
+              <div className="pt-1">
+                <h4 className="text-xs font-medium text-slate-500 mb-2">Recent sync events</h4>
+                <ul className="space-y-1.5">
+                  {crmSyncEvents.slice(0, 10).map((e) => (
+                    <li
+                      key={e.id}
+                      className="flex items-center justify-between text-xs bg-slate-50 rounded-lg px-3 py-2"
+                    >
+                      <span className="text-slate-700 capitalize">{e.event_type.replaceAll("_", " ")}</span>
+                      <span className="text-slate-400">{new Date(e.created_at).toLocaleString()}</span>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+          </>
+        ) : isAdmin ? (
+          <div className="flex items-center gap-2">
+            <select
+              value={crmProviderChoice}
+              onChange={(e) => setCrmProviderChoice(e.target.value as CrmProvider)}
+              className="text-sm rounded-lg border border-slate-200 px-3 py-1.5"
+            >
+              <option value="hubspot">HubSpot</option>
+              <option value="salesforce">Salesforce</option>
+              <option value="pipedrive">Pipedrive</option>
+            </select>
+            <button
+              onClick={handleConnectCrm}
+              disabled={crmBusy}
+              className="text-xs font-medium rounded-lg px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-60 text-white"
+            >
+              {crmBusy ? "Connecting..." : "Connect"}
+            </button>
+          </div>
+        ) : (
+          <p className="text-xs text-slate-400">Only an account Owner or Admin can connect a CRM.</p>
         )}
       </div>
 

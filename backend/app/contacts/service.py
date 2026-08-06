@@ -3,6 +3,7 @@ from sqlalchemy.orm import Session
 
 from app.audit.service import log_event
 from app.contacts.models import Contact
+from app.crm.service import sync_contact_to_crm
 from app.media.models import CallRecord, Voicemail
 from app.numbering.identity.models import User
 from app.numbering.numbers.service import assigned_number_ids
@@ -38,6 +39,7 @@ def create_contact(
         db, actor=user_id, action="contacts.created", target=f"contact:{contact.id}",
         after={"name": name, "phone_number": phone_number},
     )
+    sync_contact_to_crm(db, account_id=account_id, contact_id=contact.id, name=name, phone_number=phone_number)
     return contact
 
 
@@ -57,6 +59,7 @@ def update_contact(
         db, actor=user_id, action="contacts.updated", target=f"contact:{contact.id}",
         before=before, after={"name": name, "phone_number": phone_number},
     )
+    sync_contact_to_crm(db, account_id=account_id, contact_id=contact.id, name=name, phone_number=phone_number)
     return contact
 
 

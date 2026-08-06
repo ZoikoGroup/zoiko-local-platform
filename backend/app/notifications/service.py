@@ -161,14 +161,19 @@ def send_notification(
     db.commit()
     db.refresh(delivery)
 
-    # Webhook counterpart to email - see app.webhooks.service.dispatch_
-    # webhook_event's docstring for why this lives here rather than at
-    # each of the ~40 call sites that already call send_notification.
-    # account_id=None calls (pre-signup) have no account to dispatch to.
+    # Webhook and CRM-activity-sync counterparts to email - both live here
+    # rather than at each of the ~40 call sites that already call
+    # send_notification (see app.webhooks.service.dispatch_webhook_event's
+    # docstring). account_id=None calls (pre-signup) have no account to
+    # dispatch to.
     if account_id is not None:
+        from app.crm.service import sync_activity_to_crm
         from app.webhooks.service import dispatch_webhook_event
 
         dispatch_webhook_event(db, account_id=account_id, event_type=event_name, payload=context)
+        sync_activity_to_crm(
+            db, account_id=account_id, event_type=event_name, contact_phone=context.get("e164"),
+        )
 
     log_event(
         db,

@@ -1414,3 +1414,49 @@ export function revokeApiKey(token: string, keyId: string): Promise<void> {
     headers: { Authorization: `Bearer ${token}` },
   });
 }
+
+// --- CRM connection (mock - see backend/app/integrations/crm/mock.py) ---
+
+export type CrmProvider = "hubspot" | "salesforce" | "pipedrive";
+
+export type CrmConnection = {
+  id: string;
+  provider: CrmProvider;
+  external_account_label: string;
+  connected_at: string;
+};
+
+export type CrmSyncEvent = {
+  id: string;
+  event_type: "contact_sync" | "activity_sync";
+  external_ref: string;
+  payload: Record<string, unknown>;
+  created_at: string;
+};
+
+export function getCrmConnection(token: string): Promise<CrmConnection | null> {
+  return request<CrmConnection | null>("/crm/connection", {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export function connectCrm(token: string, provider: CrmProvider): Promise<CrmConnection> {
+  return request<CrmConnection>("/crm/connect", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ provider }),
+  });
+}
+
+export function disconnectCrm(token: string): Promise<void> {
+  return request<void>("/crm/disconnect", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export function listCrmSyncEvents(token: string): Promise<CrmSyncEvent[]> {
+  return request<CrmSyncEvent[]>("/crm/sync-log", {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
