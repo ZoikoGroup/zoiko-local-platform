@@ -26,6 +26,7 @@ class SubscriptionResponse(BaseModel):
     current_period_start: datetime
     current_period_end: datetime
     zoikonex_ref: str | None
+    grace_period_ends_at: datetime | None
 
 
 class ChangePlanRequest(BaseModel):
@@ -46,3 +47,28 @@ class UsageSummaryResponse(BaseModel):
     current_period_start: datetime
     current_period_end: datetime
     resources: list[UsageResourceSummary]
+
+
+class SimulatePaymentEventRequest(BaseModel):
+    account_id: str
+    event_type: str  # "payment_failed" | "payment_retry" | "payment_restored"
+
+
+class ZoikoNexSyncEventResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    account_id: str
+    event_type: str
+    zoikonex_ref: str | None
+    payload: dict
+    created_at: datetime
+
+
+class ZoikoNexReconciliationSummary(BaseModel):
+    total_subscriptions: int
+    synced_subscriptions: int
+    unsynced_subscriptions: int
+    total_usage_events: int
+    synced_usage_events: int
+    unsynced_usage_events: int

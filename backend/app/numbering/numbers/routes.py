@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
-from app.billing.service import NumberQuotaExceededError
+from app.billing.service import BillingSuspendedError, NumberQuotaExceededError
 from app.core.database import get_db
 from app.core.deps import get_current_user, require_admin, require_writer
 from app.integrations.telecom.twilio import TelecomError
@@ -60,7 +60,7 @@ def purchase_number(
         return service.purchase_number(db, current_user.account_id, payload.e164)
     except NumberConflictError as e:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e
-    except NumberQuotaExceededError as e:
+    except (NumberQuotaExceededError, BillingSuspendedError) as e:
         raise HTTPException(status_code=status.HTTP_402_PAYMENT_REQUIRED, detail=str(e)) from e
     except (ComplianceRequiredError, EmergencyDisclosureRequiredError) as e:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e)) from e

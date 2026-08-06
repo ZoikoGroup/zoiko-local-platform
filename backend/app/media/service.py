@@ -6,6 +6,7 @@ from fastapi import HTTPException, Request
 from sqlalchemy.orm import Session
 
 from app.audit.service import log_event
+from app.billing import service as billing_service
 from app.consent.models import ConsentType
 from app.consent.service import has_active_consent
 from app.integrations.llm.groq import LLMError
@@ -154,6 +155,11 @@ def place_outbound_call(
         assert_number_access(owner, user)
     except NumberConflictError as e:
         raise CallAuthorizationError(str(e)) from e
+
+    # Graceful degradation (Architecture doc §9) - outbound calling pauses
+    # once a payment grace period expires; inbound calls are deliberately
+    # never gated this way (see billing_service.assert_billing_not_suspended).
+    billing_service.assert_billing_not_suspended(db, user.account_id)
 
     # Fraud/Risk gates (Architecture doc §5 "Fraud and Risk", §13 "blocked
     # destinations; fraud thresholds") - checked before ever reaching Twilio.
@@ -306,6 +312,10 @@ def _find_account_video_session(db: Session, account_id: str, room_name: str) ->
 async def create_video_session(
     db: Session, account_id: str, host_user_id: str, confidential: bool = False
 ) -> VideoSession:
+    # Graceful degradation (Architecture doc §9) - new video calls pause
+    # once a payment grace period expires.
+    billing_service.assert_billing_not_suspended(db, account_id)
+
     room_name = f"zl-{uuid.uuid4().hex[:16]}"
     await video.create_room(room_name)
 

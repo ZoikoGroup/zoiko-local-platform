@@ -4,10 +4,16 @@ import sqlalchemy as sa
 from sqlalchemy.orm import Session
 
 from app.audit.service import log_event
-from app.billing.models import Plan, Subscription, SubscriptionStatus
+from app.billing.models import Plan, Subscription, SubscriptionStatus, ZoikoNexSyncEvent, ZoikoNexSyncEventType
+from app.integrations.billing import zoikonex as zoikonex_adapter
 
 DEFAULT_PLAN_CODE = "free_trial"
 _PERIOD_LENGTH = timedelta(days=30)
+# Architecture doc §9 "Graceful degradation" - no specific number is given
+# in the spec, so this is a reasonable Phase-1 default, stored as a
+# constant (not per-plan) since the doc describes it as a platform-wide
+# policy, not a plan feature.
+GRACE_PERIOD_DAYS = 7
 
 
 def _db_now(db: Session) -> datetime:
@@ -52,6 +58,53 @@ def _new_period(now: datetime) -> tuple[datetime, datetime]:
     return now, now + _PERIOD_LENGTH
 
 
+def sync_subscription_to_zoikonex(db: Session, sub: Subscription) -> Subscription:
+    """Architecture doc §9 "Subscription sync". Best-effort in spirit (the
+    real adapter will eventually need retry/dead-letter handling), but
+    since this is a mock with no way to fail, it always succeeds - the
+    seam is what matters, not fault-tolerance for a call that never
+    actually goes over the network yet."""
+    result = zoikonex_adapter.sync_subscription(
+        subscription_id=sub.id, account_id=sub.account_id, plan_code=sub.plan_code, status=sub.status.value,
+    )
+    sub.zoikonex_ref = result["zoikonex_ref"]
+    db.add(
+        ZoikoNexSyncEvent(
+            account_id=sub.account_id,
+            event_type=ZoikoNexSyncEventType.SUBSCRIPTION_SYNC,
+            zoikonex_ref=result["zoikonex_ref"],
+            payload={"subscription_id": sub.id, "plan_code": sub.plan_code, "status": sub.status.value},
+        )
+    )
+    db.commit()
+    db.refresh(sub)
+    return sub
+
+
+def sync_usage_event_to_zoikonex(db: Session, usage_event) -> None:
+    """Architecture doc §9 "Usage sync". Takes the already-committed
+    UsageEvent (see app.usage.service.record_usage_event) and mirrors it
+    into the sync ledger - a separate write, not part of the same
+    transaction, since usage capture must never fail or roll back because
+    a downstream billing sync (mock or real) had a problem."""
+    result = zoikonex_adapter.sync_usage_event(
+        usage_event_id=usage_event.id, account_id=usage_event.account_id,
+        event_type=usage_event.event_type, quantity=float(usage_event.quantity), unit=usage_event.unit,
+    )
+    db.add(
+        ZoikoNexSyncEvent(
+            account_id=usage_event.account_id,
+            event_type=ZoikoNexSyncEventType.USAGE_SYNC,
+            zoikonex_ref=result["zoikonex_ref"],
+            payload={
+                "usage_event_id": usage_event.id, "event_type": usage_event.event_type,
+                "quantity": float(usage_event.quantity), "unit": usage_event.unit,
+            },
+        )
+    )
+    db.commit()
+
+
 def get_or_create_subscription(db: Session, account_id: str) -> Subscription:
     """Created lazily on first access (same pattern as
     NotificationPreference), defaulting to the free trial plan - every
@@ -77,7 +130,7 @@ def get_or_create_subscription(db: Session, account_id: str) -> Subscription:
         db.add(sub)
         db.commit()
         db.refresh(sub)
-        return sub
+        return sync_subscription_to_zoikonex(db, sub)
 
     changed = False
     if sub.current_period_end < now:
@@ -109,6 +162,7 @@ def change_plan(db: Session, account_id: str, plan_code: str, *, actor: str) -> 
         sub.trial_ends_at = None
     db.commit()
     db.refresh(sub)
+    sync_subscription_to_zoikonex(db, sub)
 
     log_event(
         db, actor=actor, action="subscription.plan_changed", target=f"subscription:{sub.id}",
@@ -158,6 +212,113 @@ def assert_seat_quota_available(db: Session, account_id: str) -> None:
             f"Your {plan.name} plan allows up to {plan.max_team_seats} team seat(s) - "
             f"upgrade your plan to add another member."
         )
+
+
+class InvalidPaymentEventError(Exception):
+    """Raised for an unrecognized simulated payment event type."""
+
+
+class BillingSuspendedError(Exception):
+    """Raised when an account's grace period has expired with unresolved
+    PAST_DUE status - Architecture doc §9 "Graceful degradation": outbound
+    calling, video, new purchases, and AI features may pause after dunning
+    thresholds. Deliberately never raised for inbound calls or existing
+    number ownership - see assert_billing_not_suspended's docstring."""
+
+
+_PAYMENT_EVENT_TYPES = {"payment_failed", "payment_retry", "payment_restored"}
+
+
+def simulate_zoikonex_payment_event(db: Session, account_id: str, event_type: str, *, actor: str) -> Subscription:
+    """Mocks ZoikoNex -> Zoiko Local payment-state webhook (Architecture doc
+    §9: "ZoikoNex sends payment success, failure, retry, grace-period,
+    suspension, and restoration events back to Zoiko Local"). Staff-
+    triggered here (see routes.py) since there's no real ZoikoNex to send
+    this for real - see app.integrations.billing.zoikonex's docstring."""
+    if event_type not in _PAYMENT_EVENT_TYPES:
+        raise InvalidPaymentEventError(f"Unknown payment event type: {event_type!r}")
+
+    sub = get_or_create_subscription(db, account_id)
+    now = _db_now(db)
+    before_status = sub.status
+
+    if event_type == "payment_failed":
+        sub.status = SubscriptionStatus.PAST_DUE
+        sub.grace_period_ends_at = now + timedelta(days=GRACE_PERIOD_DAYS)
+    elif event_type == "payment_restored":
+        sub.status = SubscriptionStatus.ACTIVE
+        sub.grace_period_ends_at = None
+    # payment_retry intentionally changes nothing but is still logged below -
+    # it's evidence ZoikoNex is still trying, not a state transition itself.
+
+    db.commit()
+    db.refresh(sub)
+
+    db.add(
+        ZoikoNexSyncEvent(
+            account_id=account_id,
+            event_type=ZoikoNexSyncEventType.PAYMENT_EVENT_RECEIVED,
+            zoikonex_ref=sub.zoikonex_ref,
+            payload={"event_type": event_type, "grace_period_ends_at": sub.grace_period_ends_at.isoformat() if sub.grace_period_ends_at else None},
+        )
+    )
+    db.commit()
+
+    log_event(
+        db, actor=actor, action="subscription.payment_event_simulated", target=f"subscription:{sub.id}",
+        before={"status": before_status.value}, after={"status": sub.status.value, "event_type": event_type},
+    )
+    return sub
+
+
+def assert_billing_not_suspended(db: Session, account_id: str) -> None:
+    """Gates outbound calling, video room creation, number purchases, and AI
+    summary generation - deliberately NOT called for inbound calls or
+    anything that would strand an existing number, per the graceful-
+    degradation policy's explicit carve-out (Architecture doc §9)."""
+    sub = get_or_create_subscription(db, account_id)
+    if sub.status != SubscriptionStatus.PAST_DUE or sub.grace_period_ends_at is None:
+        return
+    now = _db_now(db)
+    if now > sub.grace_period_ends_at:
+        raise BillingSuspendedError(
+            "This account's payment is past due and its grace period has ended - "
+            "resolve billing to resume outbound calling, video, purchases, and AI features."
+        )
+
+
+def list_zoikonex_sync_events(db: Session, *, account_id: str | None = None, limit: int = 200) -> list[ZoikoNexSyncEvent]:
+    query = db.query(ZoikoNexSyncEvent)
+    if account_id:
+        query = query.filter(ZoikoNexSyncEvent.account_id == account_id)
+    return query.order_by(ZoikoNexSyncEvent.created_at.desc()).limit(limit).all()
+
+
+def get_zoikonex_reconciliation_summary(db: Session) -> dict:
+    """Architecture doc §9 "Reconciliation: daily reconciliation jobs
+    compare Zoiko Local entitlements and usage events with ZoikoNex
+    invoices, payments, and ledger state. Exceptions must enter an
+    operations queue." Even mocked, this is a real check: every
+    Subscription should have a zoikonex_ref, and every UsageEvent should
+    have a matching sync ledger row - if either count is ever off, that's
+    a genuine bug in the sync wiring, exactly what this is meant to catch
+    once a real ZoikoNex exists."""
+    from app.usage.models import UsageEvent
+
+    total_subscriptions = db.query(Subscription).count()
+    synced_subscriptions = db.query(Subscription).filter(Subscription.zoikonex_ref.isnot(None)).count()
+    total_usage_events = db.query(UsageEvent).count()
+    synced_usage_events = (
+        db.query(ZoikoNexSyncEvent).filter(ZoikoNexSyncEvent.event_type == ZoikoNexSyncEventType.USAGE_SYNC).count()
+    )
+    return {
+        "total_subscriptions": total_subscriptions,
+        "synced_subscriptions": synced_subscriptions,
+        "unsynced_subscriptions": total_subscriptions - synced_subscriptions,
+        "total_usage_events": total_usage_events,
+        "synced_usage_events": synced_usage_events,
+        "unsynced_usage_events": total_usage_events - synced_usage_events,
+    }
 
 
 def get_usage_summary(db: Session, account_id: str) -> dict:

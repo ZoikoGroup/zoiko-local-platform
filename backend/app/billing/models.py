@@ -2,7 +2,7 @@ import enum
 from datetime import datetime
 
 from sqlalchemy import DateTime, Enum, ForeignKey, Integer, String, func
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import Base
@@ -52,11 +52,11 @@ class Subscription(Base):
     no billing cycle yet where a snapshot would diverge from the current
     plan definition.
 
-    zoikonex_ref stays NULL until the ZoikoNex event contract is locked
-    (see docs/Zoiko_Local_Phase_1_Engineering_Build_Roadmap.docx §15,
-    "Lock ZoikoNex billing event contract and entitlement model" - still an
-    open CTO action item, not yet done) - this table only tracks Zoiko
-    Local's own entitlements, never talks to ZoikoNex.
+    zoikonex_ref is populated by the MOCK adapter (app.integrations.billing
+    .zoikonex) since there is no real ZoikoNex API yet — see that module's
+    docstring for why this exists at all despite the event contract never
+    being locked. Swapping the mock for a real client later needs no schema
+    change here.
     """
 
     __tablename__ = "subscriptions"
@@ -72,7 +72,36 @@ class Subscription(Base):
     trial_ends_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     current_period_start: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     current_period_end: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    # Deliberately nullable, deliberately unused until a real ZoikoNex
-    # connection exists - see class docstring.
     zoikonex_ref: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    # Architecture doc §9 "Graceful degradation": set when a (mock) payment
+    # failure is received, cleared on restoration. Incoming calls and number
+    # ownership stay active regardless; outbound calling/video/purchases/AI
+    # are gated once this passes (see app.billing.service.
+    # assert_billing_not_suspended) - NULL means "no grace period in effect."
+    grace_period_ends_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class ZoikoNexSyncEventType(str, enum.Enum):
+    SUBSCRIPTION_SYNC = "subscription_sync"
+    USAGE_SYNC = "usage_sync"
+    PAYMENT_EVENT_RECEIVED = "payment_event_received"
+
+
+class ZoikoNexSyncEvent(Base):
+    """Outbound/inbound sync ledger for the mock ZoikoNex adapter - real
+    even though the adapter itself is mocked, this is what a reconciliation
+    job (Architecture doc §9's "daily reconciliation jobs... exceptions
+    enter an operations queue") would actually compare against once a real
+    ZoikoNex exists. See app.integrations.billing.zoikonex's docstring."""
+
+    __tablename__ = "zoikonex_sync_events"
+
+    id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=new_uuid)
+    account_id: Mapped[str] = mapped_column(UUID(as_uuid=False), nullable=False, index=True)
+    event_type: Mapped[ZoikoNexSyncEventType] = mapped_column(
+        Enum(ZoikoNexSyncEventType, name="zoikonex_sync_event_type_enum"), nullable=False, index=True
+    )
+    zoikonex_ref: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    payload: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)

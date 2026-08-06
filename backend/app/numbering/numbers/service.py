@@ -126,6 +126,10 @@ def purchase_number(db: Session, account_id: str, e164: str) -> PhoneNumber:
     # below since it's the cheapest possible reason to reject, and unlike
     # those, has nothing to persist on rejection.
     billing_service.assert_number_quota_available(db, account_id, exclude_number_id=number.id)
+    # Graceful degradation (Architecture doc §9) - new number purchases
+    # pause once a payment grace period expires; already-owned numbers are
+    # never affected.
+    billing_service.assert_billing_not_suspended(db, account_id)
 
     if not has_active_consent(db, account_id, ConsentType.EMERGENCY_CALLING_ACKNOWLEDGED):
         raise EmergencyDisclosureRequiredError(

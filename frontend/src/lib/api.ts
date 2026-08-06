@@ -506,6 +506,61 @@ export function getProviderTraceSummary(staffToken: string, hours: number = 24):
   });
 }
 
+// --- ZoikoNex mock billing adapter (staff-only) ---
+// No real ZoikoNex API exists yet - these routes simulate the webhook a
+// real ZoikoNex would eventually send, so the graceful-degradation
+// mechanism can be exercised. See backend app/integrations/billing/
+// zoikonex.py's docstring.
+
+export type ZoikoNexSyncEvent = {
+  id: string;
+  account_id: string;
+  event_type: "subscription_sync" | "usage_sync" | "payment_event_received";
+  zoikonex_ref: string | null;
+  payload: Record<string, unknown>;
+  created_at: string;
+};
+
+export type ZoikoNexReconciliationSummary = {
+  total_subscriptions: number;
+  synced_subscriptions: number;
+  unsynced_subscriptions: number;
+  total_usage_events: number;
+  synced_usage_events: number;
+  unsynced_usage_events: number;
+};
+
+export function simulateZoikoNexPaymentEvent(
+  staffToken: string,
+  accountId: string,
+  eventType: "payment_failed" | "payment_retry" | "payment_restored"
+): Promise<Subscription> {
+  return request<Subscription>("/billing/zoikonex/simulate-payment-event", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${staffToken}` },
+    body: JSON.stringify({ account_id: accountId, event_type: eventType }),
+  });
+}
+
+export function listZoikoNexSyncLog(
+  staffToken: string,
+  filters: { accountId?: string; limit?: number } = {}
+): Promise<ZoikoNexSyncEvent[]> {
+  const params = new URLSearchParams();
+  if (filters.accountId) params.set("account_id", filters.accountId);
+  if (filters.limit) params.set("limit", String(filters.limit));
+  const query = params.toString() ? `?${params.toString()}` : "";
+  return request<ZoikoNexSyncEvent[]>(`/billing/zoikonex/sync-log${query}`, {
+    headers: { Authorization: `Bearer ${staffToken}` },
+  });
+}
+
+export function getZoikoNexReconciliation(staffToken: string): Promise<ZoikoNexReconciliationSummary> {
+  return request<ZoikoNexReconciliationSummary>("/billing/zoikonex/reconciliation", {
+    headers: { Authorization: `Bearer ${staffToken}` },
+  });
+}
+
 // --- Public status page (no auth) ---
 
 export type PublicStatus = {
@@ -993,6 +1048,7 @@ export type Subscription = {
   current_period_start: string;
   current_period_end: string;
   zoikonex_ref: string | null;
+  grace_period_ends_at: string | null;
 };
 
 export type UsageResourceSummary = {

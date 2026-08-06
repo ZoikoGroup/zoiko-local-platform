@@ -4,6 +4,7 @@ import sqlalchemy as sa
 from sqlalchemy.orm import Session
 
 from app.audit.service import log_event
+from app.billing import service as billing_service
 from app.consent.models import GLOBAL_JURISDICTION, ConsentType
 from app.consent.service import has_active_consent
 from app.integrations.embeddings.cohere import EmbeddingError, generate_embedding
@@ -74,6 +75,11 @@ def _download_and_transcribe_video(room_name: str) -> str:
 def _analyze_and_store(
     db: Session, *, account_id: str, source_type: SummarySourceType, source_id: str, transcript: str
 ) -> ConversationSummary:
+    # Graceful degradation (Architecture doc §9) - AI features pause once a
+    # payment grace period expires. Checked before spending a real Groq
+    # call, not just before storing the result.
+    billing_service.assert_billing_not_suspended(db, account_id)
+
     analysis = extract_conversation_summary(transcript)
 
     urgency_raw = analysis.get("urgency")

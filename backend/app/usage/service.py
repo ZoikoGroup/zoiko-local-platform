@@ -1,6 +1,7 @@
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.billing.service import sync_usage_event_to_zoikonex
 from app.usage.models import UsageEvent
 
 
@@ -38,6 +39,7 @@ def record_usage_event(
         db.rollback()
         return None
     db.refresh(event)
+    sync_usage_event_to_zoikonex(db, event)
     return event
 
 

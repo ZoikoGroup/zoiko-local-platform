@@ -149,6 +149,15 @@ export default function BillingPage() {
         {summaryLoading && <p className="text-sm text-slate-500">Loading...</p>}
         {summaryError && <p className="text-sm text-red-600 bg-red-50 rounded-lg px-3 py-2">{summaryError}</p>}
 
+        {subscription?.status === "past_due" && subscription.grace_period_ends_at && (
+          <p className="text-sm text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
+            There&apos;s a problem with a recent payment. Outbound calling, video, new number purchases, and AI
+            features will pause on{" "}
+            {new Date(subscription.grace_period_ends_at).toLocaleDateString()} unless this is resolved. Incoming
+            calls and your existing numbers are not affected.
+          </p>
+        )}
+
         {usageSummary && subscription && (
           <>
             <div className="flex items-baseline justify-between">

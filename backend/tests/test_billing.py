@@ -46,7 +46,8 @@ def test_get_or_create_subscription_defaults_to_free_trial(db_session):
     assert sub.plan_code == "free_trial"
     assert sub.status == SubscriptionStatus.TRIALING
     assert sub.trial_ends_at is not None
-    assert sub.zoikonex_ref is None
+    # Synced to the mock ZoikoNex adapter on creation - see test_zoikonex_mock.py.
+    assert sub.zoikonex_ref is not None
 
     # Idempotent - a second call returns the same row.
     again = service.get_or_create_subscription(db_session, account.id)
@@ -182,7 +183,8 @@ def test_get_subscription_returns_default_free_trial(client):
     body = response.json()
     assert body["plan_code"] == "free_trial"
     assert body["status"] == "trialing"
-    assert body["zoikonex_ref"] is None
+    # Synced to the mock ZoikoNex adapter on creation - see test_zoikonex_mock.py.
+    assert body["zoikonex_ref"] is not None
 
 
 def test_change_plan_route_requires_admin(client):
