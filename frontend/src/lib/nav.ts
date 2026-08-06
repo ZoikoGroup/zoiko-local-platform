@@ -11,6 +11,7 @@ export const NAV_ITEMS = [
   { label: "Notifications", href: "/dashboard/notifications" },
   { label: "Business", href: "/dashboard/business" },
   { label: "Security", href: "/dashboard/security" },
+  { label: "Compliance", href: "/dashboard/compliance" },
   { label: "Settings", href: "/dashboard/settings" },
   { label: "Support", href: "/dashboard/support" },
 ];

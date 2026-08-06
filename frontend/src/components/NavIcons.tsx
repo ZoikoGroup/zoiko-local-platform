@@ -144,6 +144,16 @@ export function ShieldIcon({ className = base }: IconProps) {
   );
 }
 
+export function ComplianceIcon({ className = base }: IconProps) {
+  return (
+    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
+      <rect x="5" y="4" width="14" height="17" rx="2" />
+      <path strokeLinecap="round" strokeLinejoin="round" d="M9 3.5h6M9 9l2 2 4-4" />
+      <path strokeLinecap="round" d="M8 15h8" />
+    </svg>
+  );
+}
+
 export function SupportIcon({ className = base }: IconProps) {
   return (
     <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
@@ -167,6 +177,7 @@ export const NAV_ICONS: Record<string, (props: IconProps) => React.JSX.Element> 
   "/dashboard/notifications": BellIcon,
   "/dashboard/business": BriefcaseIcon,
   "/dashboard/security": ShieldIcon,
+  "/dashboard/compliance": ComplianceIcon,
   "/dashboard/settings": SettingsIcon,
   "/dashboard/support": SupportIcon,
 };
