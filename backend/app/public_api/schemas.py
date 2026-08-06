@@ -45,3 +45,33 @@ class PublicSummaryResponse(BaseModel):
     summary: str
     urgency: str | None
     created_at: datetime
+
+
+class PlaceCallRequest(BaseModel):
+    to: str
+    from_number: str
+    message: str = "This is a call from Zoiko Local."
+
+
+class PlaceCallResponse(BaseModel):
+    sid: str
+    status: str
+    to: str
+
+
+class CreateContactRequest(BaseModel):
+    name: str
+    phone_number: str
+    email: str | None = None
+    notes: str | None = None
+
+
+class PublicContactResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    name: str
+    phone_number: str
+    email: str | None
+    notes: str | None
+    created_at: datetime

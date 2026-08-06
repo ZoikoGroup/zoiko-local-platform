@@ -25,9 +25,14 @@ def get_contact(db: Session, account_id: str, contact_id: str) -> Contact:
 
 
 def create_contact(
-    db: Session, *, account_id: str, user_id: str, name: str, phone_number: str,
+    db: Session, *, account_id: str, user_id: str | None, name: str, phone_number: str,
     email: str | None, notes: str | None,
 ) -> Contact:
+    """user_id is None when called from the public API (an API key has no
+    logged-in user to attribute it to) - left off Contact.created_by_user_id
+    too in that case, but the audit log always needs a real actor string,
+    so it falls back to "public_api" (see log_event's actor column, which
+    is free text, not a foreign key)."""
     contact = Contact(
         account_id=account_id, name=name, phone_number=phone_number, email=email, notes=notes,
         created_by_user_id=user_id,
@@ -36,7 +41,7 @@ def create_contact(
     db.commit()
     db.refresh(contact)
     log_event(
-        db, actor=user_id, action="contacts.created", target=f"contact:{contact.id}",
+        db, actor=user_id or "public_api", action="contacts.created", target=f"contact:{contact.id}",
         after={"name": name, "phone_number": phone_number},
     )
     sync_contact_to_crm(db, account_id=account_id, contact_id=contact.id, name=name, phone_number=phone_number)

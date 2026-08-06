@@ -558,9 +558,15 @@ export default function BusinessPage() {
         <div>
           <h3 className="font-semibold text-slate-900">Public API Keys</h3>
           <p className="text-sm text-slate-500 mt-1">
-            Read-only access to your numbers, calls, voicemails, and AI summaries at{" "}
-            <code className="text-xs bg-slate-100 rounded px-1 py-0.5">/public/v1/*</code>. Pass your key as{" "}
+            Read access to your numbers, calls, voicemails, contacts, and AI summaries, plus placing calls and
+            creating contacts, at <code className="text-xs bg-slate-100 rounded px-1 py-0.5">/public/v1/*</code>.
+            Pass your key as{" "}
             <code className="text-xs bg-slate-100 rounded px-1 py-0.5">Authorization: Bearer &lt;key&gt;</code>.
+            See the{" "}
+            <a href="/dashboard/api-docs" className="text-indigo-600 hover:text-indigo-800 font-medium">
+              full API reference
+            </a>
+            .
           </p>
         </div>
 

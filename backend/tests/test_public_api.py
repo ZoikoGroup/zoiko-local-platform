@@ -118,3 +118,95 @@ def test_public_api_calls_voicemails_summaries_endpoints_smoke(client):
     assert client.get("/public/v1/calls", headers=headers).status_code == 200
     assert client.get("/public/v1/voicemails", headers=headers).status_code == 200
     assert client.get("/public/v1/summaries", headers=headers).status_code == 200
+
+
+# --- Write/action endpoints ---
+
+
+def _make_active_number(client, db_session, token, e164: str):
+    from app.numbering.numbers.models import PhoneNumber, PhoneNumberStatus
+
+    account_id = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"}).json()["account_id"]
+    number = PhoneNumber(e164=e164, country="US", status=PhoneNumberStatus.ACTIVE, account_id=account_id)
+    db_session.add(number)
+    db_session.commit()
+
+
+def test_public_api_can_place_an_outbound_call(client, db_session, monkeypatch):
+    token = _signup_and_login(client, "api-call1@example.com")
+    _make_active_number(client, db_session, token, "+15550001111")
+    key = client.post(
+        "/developer/api-keys", json={"label": "Caller"}, headers={"Authorization": f"Bearer {token}"}
+    ).json()["raw_key"]
+
+    monkeypatch.setattr(
+        "app.media.service.telecom.place_call",
+        lambda **kw: {"sid": "CApublicapi1", "status": "queued", "to": kw["to"], "from": kw["from_"]},
+    )
+
+    response = client.post(
+        "/public/v1/calls",
+        json={"to": "+15559998888", "from_number": "+15550001111", "message": "hello"},
+        headers={"Authorization": f"Bearer {key}"},
+    )
+    assert response.status_code == 201
+    body = response.json()
+    assert body["sid"] == "CApublicapi1"
+    assert body["status"] == "queued"
+
+    calls = client.get("/public/v1/calls", headers={"Authorization": f"Bearer {key}"}).json()
+    assert len(calls) == 1
+    assert calls[0]["to_number"] == "+15559998888"
+
+
+def test_public_api_call_rejects_a_number_not_owned_by_the_key_account(client, db_session):
+    token = _signup_and_login(client, "api-call2@example.com")
+    key = client.post(
+        "/developer/api-keys", json={"label": "Caller"}, headers={"Authorization": f"Bearer {token}"}
+    ).json()["raw_key"]
+
+    response = client.post(
+        "/public/v1/calls",
+        json={"to": "+15559998888", "from_number": "+15550009999"},
+        headers={"Authorization": f"Bearer {key}"},
+    )
+    assert response.status_code == 403
+
+
+def test_public_api_can_create_and_list_contacts(client):
+    token = _signup_and_login(client, "api-contact1@example.com")
+    key = client.post(
+        "/developer/api-keys", json={"label": "CRM sync"}, headers={"Authorization": f"Bearer {token}"}
+    ).json()["raw_key"]
+    headers = {"Authorization": f"Bearer {key}"}
+
+    create_response = client.post(
+        "/public/v1/contacts",
+        json={"name": "Jane Doe", "phone_number": "+15551234567", "email": "jane@example.com"},
+        headers=headers,
+    )
+    assert create_response.status_code == 201
+    assert create_response.json()["name"] == "Jane Doe"
+
+    listed = client.get("/public/v1/contacts", headers=headers).json()
+    assert len(listed) == 1
+    assert listed[0]["phone_number"] == "+15551234567"
+
+
+def test_public_api_contacts_are_scoped_to_the_keys_own_account(client):
+    token_a = _signup_and_login(client, "api-contact-a@example.com", "Contact Scope A")
+    token_b = _signup_and_login(client, "api-contact-b@example.com", "Contact Scope B")
+    key_a = client.post(
+        "/developer/api-keys", json={"label": "A"}, headers={"Authorization": f"Bearer {token_a}"}
+    ).json()["raw_key"]
+    key_b = client.post(
+        "/developer/api-keys", json={"label": "B"}, headers={"Authorization": f"Bearer {token_b}"}
+    ).json()["raw_key"]
+
+    client.post(
+        "/public/v1/contacts", json={"name": "A Contact", "phone_number": "+15551110000"},
+        headers={"Authorization": f"Bearer {key_a}"},
+    )
+
+    assert len(client.get("/public/v1/contacts", headers={"Authorization": f"Bearer {key_a}"}).json()) == 1
+    assert client.get("/public/v1/contacts", headers={"Authorization": f"Bearer {key_b}"}).json() == []

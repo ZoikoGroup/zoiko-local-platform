@@ -146,6 +146,46 @@ def record_call(
     return call
 
 
+def _dispatch_outbound_call(
+    db: Session, *, account_id: str, account_email: str, owner: PhoneNumber, to: str, from_number: str,
+    message: str, status_callback_url: str | None,
+) -> dict:
+    """Shared core of place_outbound_call and place_outbound_call_for_account
+    - everything after "is this number really available to the caller" is
+    identical for both a logged-in user and a public API key."""
+    # Graceful degradation (Architecture doc §9) - outbound calling pauses
+    # once a payment grace period expires; inbound calls are deliberately
+    # never gated this way (see billing_service.assert_billing_not_suspended).
+    billing_service.assert_billing_not_suspended(db, account_id)
+
+    # Fraud/Risk gates (Architecture doc §5 "Fraud and Risk", §13 "blocked
+    # destinations; fraud thresholds") - checked before ever reaching Twilio.
+    try:
+        risk_service.assert_destination_allowed(db, to)
+    except risk_service.DestinationBlockedError as e:
+        notify_high_risk_destination_blocked(
+            db, account_id=account_id, account_email=account_email,
+            from_number=from_number, to_number=to, reason=str(e),
+        )
+        raise
+    risk_service.assert_outbound_velocity_ok(db, account_id)
+
+    twiml = telecom.build_say_response(message)
+    result = telecom.place_call(to=to, from_=from_number, twiml=twiml, status_callback_url=status_callback_url)
+
+    record_call(
+        db,
+        account_id=account_id,
+        phone_number_id=owner.id,
+        direction=CallDirection.OUTBOUND,
+        from_number=from_number,
+        to_number=to,
+        provider_call_sid=result["sid"],
+        status=result["status"],
+    )
+    return result
+
+
 def place_outbound_call(
     db: Session, user: User, to: str, from_number: str, message: str, status_callback_url: str | None = None
 ) -> dict:
@@ -157,37 +197,33 @@ def place_outbound_call(
     except NumberConflictError as e:
         raise CallAuthorizationError(str(e)) from e
 
-    # Graceful degradation (Architecture doc §9) - outbound calling pauses
-    # once a payment grace period expires; inbound calls are deliberately
-    # never gated this way (see billing_service.assert_billing_not_suspended).
-    billing_service.assert_billing_not_suspended(db, user.account_id)
-
-    # Fraud/Risk gates (Architecture doc §5 "Fraud and Risk", §13 "blocked
-    # destinations; fraud thresholds") - checked before ever reaching Twilio.
-    try:
-        risk_service.assert_destination_allowed(db, to)
-    except risk_service.DestinationBlockedError as e:
-        notify_high_risk_destination_blocked(
-            db, account_id=user.account_id, account_email=user.email,
-            from_number=from_number, to_number=to, reason=str(e),
-        )
-        raise
-    risk_service.assert_outbound_velocity_ok(db, user.account_id)
-
-    twiml = telecom.build_say_response(message)
-    result = telecom.place_call(to=to, from_=from_number, twiml=twiml, status_callback_url=status_callback_url)
-
-    record_call(
-        db,
-        account_id=user.account_id,
-        phone_number_id=owner.id,
-        direction=CallDirection.OUTBOUND,
-        from_number=from_number,
-        to_number=to,
-        provider_call_sid=result["sid"],
-        status=result["status"],
+    return _dispatch_outbound_call(
+        db, account_id=user.account_id, account_email=user.email, owner=owner, to=to, from_number=from_number,
+        message=message, status_callback_url=status_callback_url,
     )
-    return result
+
+
+def place_outbound_call_for_account(
+    db: Session, *, account_id: str, to: str, from_number: str, message: str,
+    status_callback_url: str | None = None,
+) -> dict:
+    """Public API counterpart to place_outbound_call - an API key represents
+    the whole account (see app.core.deps.get_api_key_account_id), equivalent
+    to Owner/Admin access, so there's no per-Member number-assignment check
+    to make here - there's no specific logged-in user to check it against."""
+    owner = find_number_owner(db, from_number)
+    if owner is None or owner.account_id != account_id or owner.status != PhoneNumberStatus.ACTIVE:
+        raise CallAuthorizationError(f"{from_number} is not an active number owned by your account")
+
+    from app.numbering.identity.models import User, UserRole
+
+    account_owner = db.query(User).filter(User.account_id == account_id, User.role == UserRole.OWNER).first()
+    account_email = account_owner.email if account_owner else ""
+
+    return _dispatch_outbound_call(
+        db, account_id=account_id, account_email=account_email, owner=owner, to=to, from_number=from_number,
+        message=message, status_callback_url=status_callback_url,
+    )
 
 
 def update_call_status(db: Session, provider_call_sid: str, status: str, duration: int | None) -> CallRecord | None:
