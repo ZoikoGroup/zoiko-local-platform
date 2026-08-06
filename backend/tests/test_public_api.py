@@ -19,6 +19,18 @@ def test_owner_can_create_an_api_key(client):
     assert body["key_prefix"] == body["raw_key"][:16]
 
 
+def test_creating_an_api_key_notifies_the_owner(client, monkeypatch):
+    monkeypatch.setattr("app.core.config.settings.resend_api_key", "")
+    token = _signup_and_login(client, "api-owner1b@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    client.post("/developer/api-keys", json={"label": "Notify Me"}, headers=headers)
+
+    notifications = client.get("/notifications/me", headers=headers).json()
+    matches = [n for n in notifications if n["event_name"] == "intg.api_client_created"]
+    assert len(matches) == 1
+    assert matches[0]["status"] == "sent"
+
+
 def test_member_cannot_create_an_api_key(client):
     owner_token = _signup_and_login(client, "api-owner2@example.com")
     client.post(

@@ -22,6 +22,25 @@ def test_owner_can_create_a_webhook_endpoint(client):
     assert len(body["secret"]) == 64
 
 
+def test_creating_an_endpoint_notifies_the_owner(client, monkeypatch):
+    monkeypatch.setattr("app.core.config.settings.resend_api_key", "")
+
+    class FakeResponse:
+        status_code = 200
+        is_success = True
+
+    monkeypatch.setattr("app.webhooks.service.httpx.post", lambda *a, **kw: FakeResponse())
+
+    token = _signup_and_login(client, "wh-owner1b@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    client.post("/webhooks/endpoints", json={"url": "https://example.com/hook"}, headers=headers)
+
+    notifications = client.get("/notifications/me", headers=headers).json()
+    matches = [n for n in notifications if n["event_name"] == "intg.webhook_endpoint_added"]
+    assert len(matches) == 1
+    assert matches[0]["status"] == "sent"
+
+
 def test_creating_an_endpoint_rejects_non_https_urls(client):
     token = _signup_and_login(client, "wh-owner2@example.com")
     response = client.post(
@@ -108,12 +127,6 @@ def test_dispatch_sends_a_signed_post_to_a_registered_endpoint(client, db_sessio
     import json
 
     monkeypatch.setattr("app.core.config.settings.resend_api_key", "")
-    token = _signup_and_login(client, "wh-dispatch1@example.com")
-    created = client.post(
-        "/webhooks/endpoints", json={"url": "https://example.com/hook"},
-        headers={"Authorization": f"Bearer {token}"},
-    ).json()
-    secret = created["secret"]
 
     captured = {}
 
@@ -127,7 +140,18 @@ def test_dispatch_sends_a_signed_post_to_a_registered_endpoint(client, db_sessio
         captured["headers"] = headers
         return FakeResponse()
 
+    # Mocked before the endpoint is created, not after - creating an
+    # endpoint now self-dispatches an intg.webhook_endpoint_added event to
+    # it (see app.webhooks.service.create_endpoint), so a real POST would
+    # otherwise fire against this fake URL before this test ever gets to it.
     monkeypatch.setattr("app.webhooks.service.httpx.post", fake_post)
+
+    token = _signup_and_login(client, "wh-dispatch1@example.com")
+    created = client.post(
+        "/webhooks/endpoints", json={"url": "https://example.com/hook"},
+        headers={"Authorization": f"Bearer {token}"},
+    ).json()
+    secret = created["secret"]
 
     from app.notifications.service import send_notification
 
@@ -151,25 +175,27 @@ def test_dispatch_sends_a_signed_post_to_a_registered_endpoint(client, db_sessio
     assert captured["headers"]["X-Zoiko-Event"] == "number.activated"
 
     deliveries = client.get("/webhooks/deliveries", headers={"Authorization": f"Bearer {token}"}).json()
-    assert len(deliveries) == 1
-    assert deliveries[0]["status"] == "delivered"
-    assert deliveries[0]["response_status_code"] == 200
+    activated_deliveries = [d for d in deliveries if d["event_type"] == "number.activated"]
+    assert len(activated_deliveries) == 1
+    assert activated_deliveries[0]["status"] == "delivered"
+    assert activated_deliveries[0]["response_status_code"] == 200
 
 
 def test_dispatch_records_a_failed_delivery_without_raising(client, db_session, monkeypatch):
     import httpx
 
     monkeypatch.setattr("app.core.config.settings.resend_api_key", "")
-    token = _signup_and_login(client, "wh-dispatch2@example.com")
-    client.post(
-        "/webhooks/endpoints", json={"url": "https://example.com/hook"},
-        headers={"Authorization": f"Bearer {token}"},
-    )
 
     def fake_post(url, *, content, headers, timeout):
         raise httpx.ConnectError("simulated network failure")
 
     monkeypatch.setattr("app.webhooks.service.httpx.post", fake_post)
+
+    token = _signup_and_login(client, "wh-dispatch2@example.com")
+    client.post(
+        "/webhooks/endpoints", json={"url": "https://example.com/hook"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
 
     from app.notifications.service import send_notification
 
@@ -185,13 +211,21 @@ def test_dispatch_records_a_failed_delivery_without_raising(client, db_session, 
     )
 
     deliveries = client.get("/webhooks/deliveries", headers={"Authorization": f"Bearer {token}"}).json()
-    assert len(deliveries) == 1
-    assert deliveries[0]["status"] == "failed"
-    assert "simulated network failure" in deliveries[0]["error"]
+    activated_deliveries = [d for d in deliveries if d["event_type"] == "number.activated"]
+    assert len(activated_deliveries) == 1
+    assert activated_deliveries[0]["status"] == "failed"
+    assert "simulated network failure" in activated_deliveries[0]["error"]
 
 
 def test_inactive_endpoint_receives_no_deliveries(client, db_session, monkeypatch):
     monkeypatch.setattr("app.core.config.settings.resend_api_key", "")
+
+    class FakeResponse:
+        status_code = 200
+        is_success = True
+
+    monkeypatch.setattr("app.webhooks.service.httpx.post", lambda *a, **kw: FakeResponse())
+
     token = _signup_and_login(client, "wh-inactive@example.com")
     client.post(
         "/webhooks/endpoints", json={"url": "https://example.com/hook"},

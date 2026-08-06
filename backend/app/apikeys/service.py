@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 
 from app.apikeys.models import ApiKey
 from app.audit.service import log_event
+from app.notifications.service import notify_api_client_created
 
 _MAX_KEYS_PER_ACCOUNT = 10
 _KEY_PREFIX = "zlk_live_"
@@ -40,6 +41,17 @@ def create_api_key(db: Session, *, account_id: str, label: str, actor: str) -> t
     db.refresh(key)
 
     log_event(db, actor=actor, action="api_key.created", target=f"api_key:{key.id}", after={"label": label})
+
+    from app.numbering.identity.models import User, UserRole
+
+    actor_user = db.query(User).filter(User.id == actor).first()
+    owner = db.query(User).filter(User.account_id == account_id, User.role == UserRole.OWNER).first()
+    if owner is not None:
+        notify_api_client_created(
+            db, account_id=account_id, account_email=owner.email, label=label,
+            actor_display_name=actor_user.email if actor_user else "your account",
+        )
+
     return key, raw_key
 
 

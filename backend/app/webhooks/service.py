@@ -8,6 +8,7 @@ import httpx
 from sqlalchemy.orm import Session
 
 from app.audit.service import log_event
+from app.notifications.service import notify_webhook_endpoint_added
 from app.webhooks.models import WebhookDelivery, WebhookDeliveryStatus, WebhookEndpoint
 
 _DELIVERY_TIMEOUT_SECONDS = 5.0
@@ -53,6 +54,17 @@ def create_endpoint(db: Session, *, account_id: str, url: str, description: str 
         db, actor=actor, action="webhook_endpoint.created", target=f"webhook_endpoint:{endpoint.id}",
         after={"url": url, "description": description},
     )
+
+    from app.numbering.identity.models import User, UserRole
+
+    actor_user = db.query(User).filter(User.id == actor).first()
+    owner = db.query(User).filter(User.account_id == account_id, User.role == UserRole.OWNER).first()
+    if owner is not None:
+        notify_webhook_endpoint_added(
+            db, account_id=account_id, account_email=owner.email, url=url,
+            actor_display_name=actor_user.email if actor_user else "your account",
+        )
+
     return endpoint, secret
 
 

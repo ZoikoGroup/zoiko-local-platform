@@ -770,3 +770,65 @@ def notify_service_restored(db: Session, *, account_id: str, account_email: str)
             "event_occurred_at": _now_str(),
         },
     )
+
+
+def notify_api_client_created(
+    db: Session, *, account_id: str, account_email: str, label: str, actor_display_name: str
+) -> None:
+    send_notification(
+        db, event_name="intg.api_client_created", account_id=account_id, recipient_email=account_email,
+        context={
+            "user_display_name": account_email,
+            "integration_name": label,
+            "environment": "live",
+            "actor_display_name": actor_display_name,
+            "integration_scope_summary": "read/write access to your account's public API",
+        },
+    )
+
+
+def notify_webhook_endpoint_added(
+    db: Session, *, account_id: str, account_email: str, url: str, actor_display_name: str
+) -> None:
+    send_notification(
+        db, event_name="intg.webhook_endpoint_added", account_id=account_id, recipient_email=account_email,
+        context={
+            "user_display_name": account_email,
+            "integration_name": url,
+            "change_action": "added",
+            "actor_display_name": actor_display_name,
+            "integration_destination_safe": url,
+            "integration_event_summary": "all account events",
+            "integration_signing_status": "HMAC-SHA256 signed",
+        },
+    )
+
+
+def notify_integration_installed(
+    db: Session, *, account_id: str, account_email: str, integration_name: str, organization_name: str,
+    actor_display_name: str,
+) -> None:
+    send_notification(
+        db, event_name="intg.integration_installed", account_id=account_id, recipient_email=account_email,
+        context={
+            "user_display_name": account_email,
+            "integration_name": integration_name,
+            "organization_name": organization_name,
+            "actor_display_name": actor_display_name,
+            "integration_scope_summary": "contact and call activity sync",
+        },
+    )
+
+
+def notify_integration_removed(
+    db: Session, *, account_id: str, account_email: str, integration_name: str, organization_name: str,
+) -> None:
+    send_notification(
+        db, event_name="intg.integration_removed", account_id=account_id, recipient_email=account_email,
+        context={
+            "user_display_name": account_email,
+            "integration_name": integration_name,
+            "organization_name": organization_name,
+            "event_occurred_at": _now_str(),
+        },
+    )

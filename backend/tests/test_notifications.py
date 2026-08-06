@@ -2,11 +2,15 @@ import logging
 
 from app.notifications.service import (
     SmsTemplateMissingError,
+    notify_api_client_created,
     notify_compliance_case_approved,
     notify_compliance_case_rejected,
+    notify_integration_installed,
+    notify_integration_removed,
     notify_number_activated,
     notify_number_suspended,
     notify_team_member_added,
+    notify_webhook_endpoint_added,
     send_sms_notification,
 )
 
@@ -57,6 +61,46 @@ def test_notify_team_member_added_logs_when_no_resend_key_configured(db_session,
             db_session, account_id=None, member_email="member@example.com", account_name="Acme Inc", role="admin"
         )
     assert any("Acme Inc" in record.message for record in caplog.records)
+
+
+def test_notify_api_client_created_logs_when_no_resend_key_configured(db_session, monkeypatch, caplog):
+    monkeypatch.setattr("app.core.config.settings.resend_api_key", "")
+    with caplog.at_level(logging.INFO, logger="zoiko.notifications"):
+        notify_api_client_created(
+            db_session, account_id=None, account_email="owner@example.com", label="My Server",
+            actor_display_name="owner@example.com",
+        )
+    assert any("My Server" in record.message for record in caplog.records)
+
+
+def test_notify_webhook_endpoint_added_logs_when_no_resend_key_configured(db_session, monkeypatch, caplog):
+    monkeypatch.setattr("app.core.config.settings.resend_api_key", "")
+    with caplog.at_level(logging.INFO, logger="zoiko.notifications"):
+        notify_webhook_endpoint_added(
+            db_session, account_id=None, account_email="owner@example.com", url="https://example.com/hook",
+            actor_display_name="owner@example.com",
+        )
+    assert any("https://example.com/hook" in record.message for record in caplog.records)
+
+
+def test_notify_integration_installed_logs_when_no_resend_key_configured(db_session, monkeypatch, caplog):
+    monkeypatch.setattr("app.core.config.settings.resend_api_key", "")
+    with caplog.at_level(logging.INFO, logger="zoiko.notifications"):
+        notify_integration_installed(
+            db_session, account_id=None, account_email="owner@example.com", integration_name="Hubspot CRM",
+            organization_name="Acme Inc", actor_display_name="owner@example.com",
+        )
+    assert any("Hubspot CRM" in record.message for record in caplog.records)
+
+
+def test_notify_integration_removed_logs_when_no_resend_key_configured(db_session, monkeypatch, caplog):
+    monkeypatch.setattr("app.core.config.settings.resend_api_key", "")
+    with caplog.at_level(logging.INFO, logger="zoiko.notifications"):
+        notify_integration_removed(
+            db_session, account_id=None, account_email="owner@example.com", integration_name="Hubspot CRM",
+            organization_name="Acme Inc",
+        )
+    assert any("Hubspot CRM" in record.message for record in caplog.records)
 
 
 def test_send_email_raises_cleanly_on_resend_failure(monkeypatch):
