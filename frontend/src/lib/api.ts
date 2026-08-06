@@ -782,6 +782,19 @@ export function acknowledgeEmergencyCallingLimitation(token: string): Promise<{ 
   });
 }
 
+export type ConsentRecordStatus = {
+  consent_type: string;
+  jurisdiction: string;
+  granted_at: string | null;
+  revoked_at: string | null;
+};
+
+export function listConsentStatus(token: string): Promise<ConsentRecordStatus[]> {
+  return request<ConsentRecordStatus[]>("/compliance/consent", {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
 // --- Video ---
 
 export type VideoRoom = {

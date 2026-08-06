@@ -12,6 +12,7 @@ import {
   startKycVerification,
   submitComplianceDocument,
   getComplianceDocumentDownloadUrl,
+  listConsentStatus,
   listRetentionPolicies,
   setRetentionPolicy,
   listMyNotifications,
@@ -21,6 +22,7 @@ import {
   ApiError,
   type User,
   type MyComplianceCase,
+  type ConsentRecordStatus,
   type RetentionPolicies,
   type NotificationDelivery,
   type AuditEvent,
@@ -55,6 +57,10 @@ export default function SettingsPage() {
   const [uploadingCaseId, setUploadingCaseId] = useState<string | null>(null);
   const [uploadError, setUploadError] = useState<string | null>(null);
   const [downloadingDoc, setDownloadingDoc] = useState<string | null>(null);
+
+  const [consentRecords, setConsentRecords] = useState<ConsentRecordStatus[]>([]);
+  const [consentLoading, setConsentLoading] = useState(true);
+  const [consentError, setConsentError] = useState<string | null>(null);
 
   const [auditEvents, setAuditEvents] = useState<AuditEvent[]>([]);
   const [auditLoading, setAuditLoading] = useState(true);
@@ -102,6 +108,13 @@ export default function SettingsPage() {
     listMyComplianceCases(token)
       .then(setCases)
       .finally(() => setCasesLoading(false));
+    listConsentStatus(token)
+      .then((records) => {
+        setConsentRecords(records);
+        setConsentError(null);
+      })
+      .catch(() => setConsentError("Couldn't load consent records."))
+      .finally(() => setConsentLoading(false));
     listRetentionPolicies(token)
       .then(setRetention)
       .catch(() => setRetentionError("Couldn't load retention settings."))
@@ -602,6 +615,52 @@ export default function SettingsPage() {
                 )}
               </li>
             ))}
+          </ul>
+        )}
+      </div>
+
+      <div className="bg-white rounded-xl border border-slate-200 p-6 space-y-4">
+        <div>
+          <h3 className="font-semibold text-slate-900">Consent &amp; Disclosures</h3>
+          <p className="text-xs text-slate-500 mt-0.5">
+            Every consent or disclosure acknowledgment on record for this account - AI processing (used for call
+            summaries and the AI receptionist) and the emergency-calling limitation notice.
+          </p>
+        </div>
+
+        {consentLoading && <p className="text-sm text-slate-500">Loading...</p>}
+        {consentError && <p className="text-sm text-red-600 bg-red-50 rounded-lg px-3 py-2">{consentError}</p>}
+
+        {!consentLoading && consentRecords.length === 0 && (
+          <p className="text-sm text-slate-500">No consent has been granted yet.</p>
+        )}
+
+        {!consentLoading && consentRecords.length > 0 && (
+          <ul className="divide-y divide-slate-100">
+            {consentRecords.map((r) => {
+              const active = r.granted_at && !r.revoked_at;
+              return (
+                <li key={`${r.consent_type}:${r.jurisdiction}`} className="py-3 flex items-center justify-between gap-4">
+                  <div>
+                    <div className="text-sm font-medium text-slate-800 capitalize">
+                      {r.consent_type.replaceAll("_", " ")}
+                    </div>
+                    <div className="text-xs text-slate-500 mt-0.5">
+                      {r.jurisdiction === "GLOBAL" ? "Applies everywhere" : r.jurisdiction}
+                      {r.granted_at && ` · granted ${new Date(r.granted_at).toLocaleDateString()}`}
+                      {r.revoked_at && ` · revoked ${new Date(r.revoked_at).toLocaleDateString()}`}
+                    </div>
+                  </div>
+                  <span
+                    className={`text-xs font-medium rounded-full px-2.5 py-1 shrink-0 ${
+                      active ? "bg-emerald-50 text-emerald-700" : "bg-slate-100 text-slate-600"
+                    }`}
+                  >
+                    {active ? "Active" : "Revoked"}
+                  </span>
+                </li>
+              );
+            })}
           </ul>
         )}
       </div>
