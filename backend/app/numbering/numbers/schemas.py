@@ -52,3 +52,4 @@ class PhoneNumberResponse(BaseModel):
     business_hours_timezone: str
     ai_receptionist_enabled: bool
     escalation_user_id: str | None
+    call_flow_id: str | None

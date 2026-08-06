@@ -25,6 +25,27 @@ export function PhoneIcon({ className = base }: IconProps) {
   );
 }
 
+export function CallFlowIcon({ className = base }: IconProps) {
+  return (
+    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
+      <circle cx="5" cy="6" r="2" />
+      <circle cx="19" cy="6" r="2" />
+      <circle cx="12" cy="18" r="2" />
+      <path strokeLinecap="round" strokeLinejoin="round" d="M5 8v3a3 3 0 0 0 3 3h1M19 8v3a3 3 0 0 1-3 3h-1M12 14v2" />
+    </svg>
+  );
+}
+
+export function QueueIcon({ className = base }: IconProps) {
+  return (
+    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
+      <circle cx="8" cy="8" r="3" />
+      <path strokeLinecap="round" strokeLinejoin="round" d="M3 20c0-3 2-5 5-5s5 2 5 5" />
+      <path strokeLinecap="round" strokeLinejoin="round" d="M16 4a3 3 0 0 1 0 8M18 20c0-2.5-1.5-4.5-4-5" />
+    </svg>
+  );
+}
+
 export function CallLogIcon({ className = base }: IconProps) {
   return (
     <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
@@ -113,6 +134,8 @@ export function SettingsIcon({ className = base }: IconProps) {
 export const NAV_ICONS: Record<string, (props: IconProps) => React.JSX.Element> = {
   "/dashboard": DashboardIcon,
   "/dashboard/numbers": PhoneIcon,
+  "/dashboard/call-flows": CallFlowIcon,
+  "/dashboard/queues": QueueIcon,
   "/dashboard/calls": CallLogIcon,
   "/dashboard/video": VideoIcon,
   "/dashboard/ai-insights": SparkleIcon,

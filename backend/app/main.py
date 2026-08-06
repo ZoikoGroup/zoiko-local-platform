@@ -27,8 +27,11 @@ from app.numbering.numbers.routes import router as numbers_router
 from app.notifications.routes import router as notifications_router
 from app.ops.routes import router as ops_router
 from app.porting.routes import router as porting_router
+from app.queues.routes import router as queues_router
+from app.queues.routes import webhook_router as queues_webhook_router
 from app.retention.routes import router as retention_router
 from app.risk.routes import router as risk_router
+from app.routing.routes import router as call_flows_router
 from app.staff.routes import router as staff_router
 from app.usage.routes import router as usage_router
 
@@ -84,6 +87,9 @@ app.include_router(risk_router)
 app.include_router(usage_router)
 app.include_router(ops_router)
 app.include_router(porting_router)
+app.include_router(call_flows_router)
+app.include_router(queues_router)
+app.include_router(queues_webhook_router)
 
 
 @app.get("/health")

@@ -428,6 +428,7 @@ export type MyPhoneNumber = {
   business_hours_timezone: string;
   ai_receptionist_enabled: boolean;
   escalation_user_id: string | null;
+  call_flow_id: string | null;
 };
 
 export function listMyNumbers(token: string): Promise<MyPhoneNumber[]> {
@@ -997,5 +998,253 @@ export function deleteContact(token: string, contactId: string): Promise<void> {
 export function getContactHistory(token: string, contactId: string): Promise<ContactHistoryEntry[]> {
   return request<ContactHistoryEntry[]>(`/contacts/${encodeURIComponent(contactId)}/history`, {
     headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+// --- Call Flows (Advanced IVR builder, Phase 3) ---
+
+export type CallFlowNodeType =
+  | "menu"
+  | "business_hours"
+  | "forward"
+  | "queue"
+  | "voicemail"
+  | "ai_receptionist"
+  | "hangup";
+
+export type CallFlowNode = {
+  id: string;
+  type: CallFlowNodeType;
+  prompt?: string | null;
+  options?: Record<string, string> | null;
+  invalid_node_id?: string | null;
+  timeout_node_id?: string | null;
+  start?: string | null;
+  end?: string | null;
+  timezone?: string | null;
+  within_node_id?: string | null;
+  outside_node_id?: string | null;
+  destinations?: string[] | null;
+  on_no_answer_node_id?: string | null;
+  queue_id?: string | null;
+  overflow_node_id?: string | null;
+  message?: string | null;
+};
+
+export type CallFlowVersion = {
+  id: string;
+  version: number;
+  status: "draft" | "published" | "archived";
+  entry_node_id: string;
+  nodes: CallFlowNode[];
+  published_at: string | null;
+  rolled_back_from_version: number | null;
+  created_at: string;
+};
+
+export type CallFlowSummary = {
+  id: string;
+  name: string;
+  created_at: string;
+  has_draft: boolean;
+  live_version: number | null;
+  assigned_numbers: string[];
+};
+
+export type CallFlowDetail = {
+  id: string;
+  account_id: string;
+  name: string;
+  created_at: string;
+  draft: CallFlowVersion | null;
+  live: CallFlowVersion | null;
+  version_history: CallFlowVersion[];
+};
+
+export type PublishResult = {
+  published: boolean;
+  errors: string[];
+  version: CallFlowVersion | null;
+};
+
+export function listCallFlows(token: string): Promise<CallFlowSummary[]> {
+  return request<CallFlowSummary[]>("/call-flows", {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export function createCallFlow(token: string, name: string): Promise<CallFlowSummary> {
+  return request<CallFlowSummary>("/call-flows", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ name }),
+  });
+}
+
+export function getCallFlow(token: string, callFlowId: string): Promise<CallFlowDetail> {
+  return request<CallFlowDetail>(`/call-flows/${encodeURIComponent(callFlowId)}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export function saveCallFlowDraft(
+  token: string,
+  callFlowId: string,
+  input: { entry_node_id: string; nodes: CallFlowNode[] }
+): Promise<CallFlowVersion> {
+  return request<CallFlowVersion>(`/call-flows/${encodeURIComponent(callFlowId)}/draft`, {
+    method: "PUT",
+    headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify(input),
+  });
+}
+
+export function validateCallFlowDraft(token: string, callFlowId: string): Promise<PublishResult> {
+  return request<PublishResult>(`/call-flows/${encodeURIComponent(callFlowId)}/validate`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export function publishCallFlow(token: string, callFlowId: string): Promise<PublishResult> {
+  return request<PublishResult>(`/call-flows/${encodeURIComponent(callFlowId)}/publish`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export function rollbackCallFlow(token: string, callFlowId: string, version: number): Promise<CallFlowVersion> {
+  return request<CallFlowVersion>(`/call-flows/${encodeURIComponent(callFlowId)}/rollback`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ version }),
+  });
+}
+
+export function assignCallFlow(
+  token: string,
+  callFlowId: string,
+  phoneNumberId: string
+): Promise<{ phone_number_id: string; call_flow_id: string | null }> {
+  return request(`/call-flows/${encodeURIComponent(callFlowId)}/assign`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ phone_number_id: phoneNumberId }),
+  });
+}
+
+export function unassignCallFlow(
+  token: string,
+  phoneNumberId: string
+): Promise<{ phone_number_id: string; call_flow_id: string | null }> {
+  return request(`/call-flows/unassign/${encodeURIComponent(phoneNumberId)}`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+// --- Call Queues (contact-center-lite, Phase 3) ---
+
+export type QueueMember = { user_id: string; email: string };
+
+export type CallQueue = {
+  id: string;
+  account_id: string;
+  name: string;
+  max_wait_seconds: number;
+  wrap_up_seconds: number;
+  created_at: string;
+  members: QueueMember[];
+};
+
+export type QueueStatus = {
+  queue_id: string;
+  waiting_count: number;
+  in_progress_count: number;
+  longest_wait_seconds: number;
+  sla_breached: boolean;
+};
+
+export type AgentPresence = {
+  status: "available" | "wrap_up" | "offline";
+  changed_at: string;
+  wrap_up_until: string | null;
+  effectively_available: boolean;
+};
+
+export type PullNextResult = {
+  call_sid: string;
+  caller_number: string;
+  queue_call_log_id: string;
+};
+
+export function listQueues(token: string): Promise<CallQueue[]> {
+  return request<CallQueue[]>("/queues", {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export function createQueue(
+  token: string,
+  input: { name: string; max_wait_seconds?: number; wrap_up_seconds?: number }
+): Promise<CallQueue> {
+  return request<CallQueue>("/queues", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify(input),
+  });
+}
+
+export function updateQueue(
+  token: string,
+  queueId: string,
+  input: { name?: string; max_wait_seconds?: number; wrap_up_seconds?: number }
+): Promise<CallQueue> {
+  return request<CallQueue>(`/queues/${encodeURIComponent(queueId)}`, {
+    method: "PUT",
+    headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify(input),
+  });
+}
+
+export function addQueueMember(token: string, queueId: string, userId: string): Promise<CallQueue> {
+  return request<CallQueue>(`/queues/${encodeURIComponent(queueId)}/members`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ user_id: userId }),
+  });
+}
+
+export function removeQueueMember(token: string, queueId: string, userId: string): Promise<CallQueue> {
+  return request<CallQueue>(`/queues/${encodeURIComponent(queueId)}/members/${encodeURIComponent(userId)}`, {
+    method: "DELETE",
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export function getQueueStatus(token: string, queueId: string): Promise<QueueStatus> {
+  return request<QueueStatus>(`/queues/${encodeURIComponent(queueId)}/status`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export function pullNextCaller(token: string, queueId: string): Promise<PullNextResult> {
+  return request<PullNextResult>(`/queues/${encodeURIComponent(queueId)}/pull-next`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export function getMyPresence(token: string): Promise<AgentPresence> {
+  return request<AgentPresence>("/queues/presence/me", {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export function setMyPresence(token: string, status: "available" | "offline"): Promise<AgentPresence> {
+  return request<AgentPresence>("/queues/presence/me", {
+    method: "PUT",
+    headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ status }),
   });
 }

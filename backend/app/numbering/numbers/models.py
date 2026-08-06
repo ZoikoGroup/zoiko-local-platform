@@ -86,4 +86,14 @@ class PhoneNumber(Base):
         UUID(as_uuid=False), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
     )
 
+    # Phase 3 "Advanced IVR builder" (Call Flow Designer) - when set, an
+    # inbound call is routed through this flow's *live* version instead of
+    # the plain forwarding_number/ai_receptionist_enabled/ring-group logic
+    # above. NULL (the default for every existing number) preserves the
+    # exact pre-existing behavior untouched - same non-breaking pattern as
+    # ring_group_destinations.
+    call_flow_id: Mapped[str | None] = mapped_column(
+        UUID(as_uuid=False), ForeignKey("call_flows.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

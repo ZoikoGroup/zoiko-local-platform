@@ -299,6 +299,70 @@ def build_gather_response(prompt: str, action_url: str) -> str:
     return str(response)
 
 
+def build_enqueue_response(queue_name: str, wait_url: str, action_url: str, overflow_inner_xml: str) -> str:
+    """Contact-center-lite (Phase 3) - puts the caller in a real Twilio
+    Queue (auto-created on first use, no separate REST provisioning step)
+    and appends the overflow node's own TwiML verbs right after </Enqueue>
+    in the SAME document: that's what lets Twilio's <Leave/> (returned by
+    /media/voice/queue/wait once max_wait_seconds is exceeded) fall through
+    to the queue node's configured overflow instead of just hanging up.
+    `action_url` fires once the call leaves the queue for any OTHER reason
+    (bridged+ended, hangup while waiting) - see /media/voice/queue/left.
+    `overflow_inner_xml` is raw TwiML *without* its own <Response> wrapper -
+    see media/voice.py's _inner_verbs().
+    """
+    response = VoiceResponse()
+    response.enqueue(queue_name, wait_url=wait_url, wait_url_method="POST", action=action_url, method="POST")
+    xml = str(response)
+    return xml.replace("</Response>", overflow_inner_xml + "</Response>")
+
+
+def build_hold_response() -> str:
+    """waitUrl TwiML played on a loop (Twilio automatically re-requests
+    waitUrl once this finishes, for as long as the call remains enqueued) -
+    a spoken hold message rather than sourcing actual hold music."""
+    response = VoiceResponse()
+    response.say("Please hold, you're next in line. We'll be with you shortly.")
+    response.pause(length=8)
+    return str(response)
+
+
+def build_leave_response() -> str:
+    """Ends the queue wait once max_wait_seconds is exceeded - control
+    returns to whatever TwiML follows the original <Enqueue> verb."""
+    response = VoiceResponse()
+    response.leave()
+    return str(response)
+
+
+def build_dial_queue_response(queue_name: str) -> str:
+    """The agent-facing leg's TwiML once they answer - bridges them to
+    whichever call is currently oldest in this Twilio queue."""
+    response = VoiceResponse()
+    response.dial().queue(queue_name)
+    return str(response)
+
+
+def build_dtmf_menu_response(prompt: str, action_url: str, num_digits: int = 1, timeout: int = 5) -> str:
+    """Advanced IVR builder (Phase 3 Call Flow Designer) - the touch-tone
+    menu primitive. Twilio collects up to `num_digits` keypresses itself and
+    POSTs them as `Digits` to `action_url`; a caller who presses nothing
+    within `timeout` seconds also hits `action_url`, just with no Digits
+    param, which routing.service.resolve_menu_input() treats as a timeout.
+    """
+    response = VoiceResponse()
+    gather = response.gather(
+        input="dtmf", action=action_url, method="POST", num_digits=num_digits, timeout=timeout
+    )
+    gather.say(prompt)
+    # If num_digits is never reached and timeout elapses with a Gather still
+    # open, Twilio falls through to whatever comes after it - point that at
+    # the same action_url so a silent/empty response still reaches the
+    # server as a timeout instead of just hanging up.
+    response.redirect(action_url, method="POST")
+    return str(response)
+
+
 def build_receptionist_reply_response(
     message: str, forward_to: str | None = None, status_callback_url: str | None = None
 ) -> str:
