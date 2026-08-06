@@ -82,3 +82,65 @@ def publish_video_room_created(account_id: str, *, room_name: str) -> None:
 
 def publish_video_room_ended(account_id: str, *, room_name: str) -> None:
     publish_event("zoiko.video", "video.room.ended", account_id, {"room_name": room_name})
+
+
+def publish_voicemail_created(account_id: str, *, voicemail_id: str, phone_number_id: str) -> None:
+    publish_event(
+        "zoiko.voicemail", "voicemail.created", account_id,
+        {"voicemail_id": voicemail_id, "phone_number_id": phone_number_id},
+    )
+
+
+def publish_transcript_completed(
+    account_id: str, *, summary_id: str, source_type: str, source_id: str, model_version: str
+) -> None:
+    publish_event(
+        "zoiko.intelligence", "transcript.completed", account_id,
+        {"summary_id": summary_id, "source_type": source_type, "source_id": source_id, "model_version": model_version},
+    )
+
+
+def publish_ai_summary_completed(
+    account_id: str, *, summary_id: str, source_type: str, source_id: str, urgency: str | None
+) -> None:
+    publish_event(
+        "zoiko.intelligence", "ai.summary.completed", account_id,
+        {"summary_id": summary_id, "source_type": source_type, "source_id": source_id, "urgency": urgency},
+    )
+
+
+def publish_usage_rated(
+    account_id: str, *, usage_event_id: str, event_type: str, quantity: float, unit: str, country_band: str | None
+) -> None:
+    publish_event(
+        "zoiko.usage", "usage.rated", account_id,
+        {
+            "usage_event_id": usage_event_id, "event_type": event_type, "quantity": quantity,
+            "unit": unit, "country_band": country_band,
+        },
+    )
+
+
+def publish_compliance_case_required(
+    account_id: str, *, case_id: str, jurisdiction: str, requirement_type: str
+) -> None:
+    publish_event(
+        "zoiko.compliance", "compliance.case_required", account_id,
+        {"case_id": case_id, "jurisdiction": jurisdiction, "requirement_type": requirement_type},
+    )
+
+
+def publish_compliance_case_approved(account_id: str, *, case_id: str, jurisdiction: str, requirement_type: str) -> None:
+    publish_event(
+        "zoiko.compliance", "compliance.case_approved", account_id,
+        {"case_id": case_id, "jurisdiction": jurisdiction, "requirement_type": requirement_type},
+    )
+
+
+def publish_compliance_case_rejected(
+    account_id: str, *, case_id: str, jurisdiction: str, requirement_type: str, reason: str | None
+) -> None:
+    publish_event(
+        "zoiko.compliance", "compliance.case_rejected", account_id,
+        {"case_id": case_id, "jurisdiction": jurisdiction, "requirement_type": requirement_type, "reason": reason},
+    )

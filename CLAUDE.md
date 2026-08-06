@@ -80,3 +80,54 @@ own dedicated capture — a receptionist transcript or a voicemail recording —
 the outer call too would just duplicate audio already on file). Full AI Receptionist
 (answering, routing, escalation per the roadmap doc) is still not built — only
 summarization exists so far.
+
+**Exception (2026-08-06):** Three follow-up completions, all backend-only, no frontend changes.
+
+*Kafka event coverage extended.* `backend/app/events/service.py` now also publishes
+`voicemail.created` (`media/service.py:record_voicemail`), `transcript.completed` +
+`ai.summary.completed` (`intelligence/service.py:_analyze_and_store`), `usage.rated`
+(`usage/service.py:record_usage_event`), and `compliance.case_required`/`case_approved`/
+`case_rejected` (`compliance/service.py`) — closing most of the gap against the
+Architecture doc's §8 event table. `compliance.case_expired` is still not published: there
+is no expiry-checking job anywhere in the codebase (only an `expires_at` column with
+nothing that reads it), so there was no real call site to wire — that's a new feature
+(a retention-style purge/expiry sweep), not event wiring, and is out of scope here.
+`backend/app/events/consumer.py`'s `TOPICS` list was extended to match (`zoiko.voicemail`,
+`zoiko.intelligence`, `zoiko.usage`, `zoiko.compliance`).
+
+*Fraud/Risk: account scoring + auto-suspend.* `backend/app/risk/models.py` adds a
+`RiskSignal` table (migration `a80b7b11ce8e`) — every time `assert_destination_allowed`/
+`assert_outbound_velocity_ok` blocks a call, it now records a weighted signal (audited)
+instead of leaving no trace beyond a rejected request. `compute_account_risk_score`
+(`backend/app/risk/service.py`) sums weighted signals over a trailing 24h window
+(conservative first-pass weights/threshold, same caveat as the pre-existing velocity
+limit); crossing `AUTO_SUSPEND_THRESHOLD` calls a new
+`suspend_numbers_for_account_by_system` (`numbering/numbers/service.py`) that suspends
+every active number on the account with no `User` in the loop (a system actor, not a
+customer/staff one). Staff can inspect via `GET /risk/accounts/{id}/score` and reverse via
+`POST /risk/accounts/{id}/reinstate` (new `reactivate_numbers_for_account_by_staff`,
+SUPER_ADMIN/COMPLIANCE_OFFICER only). Payment risk and device fingerprinting from the
+Architecture doc's §5 "Fraud and Risk" are still not built — there's no billing/payment
+system yet for the former, and fingerprinting needs frontend instrumentation for the latter.
+
+*Provider Gateway secondaries are now real vendor clients, not stubs.* Every
+`_secondary_stub.py` (telecom→Vonage, video→Daily.co, llm→OpenAI, transcription→Deepgram,
+kyc→Sumsub, storage→a second S3-compatible bucket e.g. Backblaze B2, email→SendGrid,
+webpush→OneSignal) now makes a real, correctly-shaped API call instead of unconditionally
+raising. **None of these are tested against a live account** — no real secondary-vendor
+credentials exist yet, same situation the primaries were in before Twilio/LiveKit/Groq/
+Stripe/Resend got real keys. Each `*_FAILOVER_ENABLED` flag still defaults `false`; flip it
+only after filling in the matching `*_secondary_stub.py` module's credentials in `.env`
+(new blank vars added there, grouped under "Multi-provider failover secondaries"). A few
+functions genuinely can't fail over given how the domain models are built today — e.g.
+Vonage can't act on a Twilio-issued call/recording SID or interpret Twilio TwiML as its
+own NCCO call-control format — those raise a clearly-labeled error explaining the
+architectural gap rather than pretending compatibility; seeing that error means the primary
+is down AND the operation is one of the ones without a real cross-vendor equivalent, not a
+misconfiguration.
+
+Not run: the backend test suite. This sandbox has no network route to the Neon Postgres
+in `DATABASE_URL` (`alembic current` and pytest's session-scoped schema fixture both need a
+live DB connection), so none of the above was verified beyond `python -m py_compile`/import
+checks and building the full FastAPI app object. Run `pytest` from an environment with real
+DB access before trusting this beyond "it imports."

@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 from app.audit.service import log_event
 from app.consent.models import GLOBAL_JURISDICTION, ConsentType
 from app.consent.service import has_active_consent
+from app.events.service import publish_ai_summary_completed, publish_transcript_completed
 from app.integrations.embeddings.cohere import EmbeddingError, generate_embedding
 from app.integrations.llm.groq import MODEL_VERSION as LLM_MODEL_VERSION
 from app.integrations.llm.groq import extract_conversation_summary, extract_receptionist_qualification
@@ -118,6 +119,14 @@ def _analyze_and_store(
             "source_id": source_id,
             "urgency": urgency.value if urgency else None,
         },
+    )
+    publish_transcript_completed(
+        account_id, summary_id=record.id, source_type=source_type.value, source_id=source_id,
+        model_version=record.model_version,
+    )
+    publish_ai_summary_completed(
+        account_id, summary_id=record.id, source_type=source_type.value, source_id=source_id,
+        urgency=urgency.value if urgency else None,
     )
     return record
 

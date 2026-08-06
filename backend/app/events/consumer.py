@@ -20,7 +20,10 @@ from app.integrations.eventbus.kafka import EventBusError
 
 logger = logging.getLogger("zoiko.events")
 
-TOPICS = ["zoiko.numbers", "zoiko.calls", "zoiko.notifications", "zoiko.video"]
+TOPICS = [
+    "zoiko.numbers", "zoiko.calls", "zoiko.notifications", "zoiko.video",
+    "zoiko.voicemail", "zoiko.intelligence", "zoiko.usage", "zoiko.compliance",
+]
 GROUP_ID = "event-log-writer"
 DLQ_TOPIC = "zoiko.dlq"
 MAX_ATTEMPTS = 3

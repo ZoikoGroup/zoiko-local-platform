@@ -5,7 +5,6 @@ import { clearToken } from "@/lib/auth";
 import { currentPageLabel } from "@/lib/nav";
 import NotificationBell from "@/components/NotificationBell";
 import type { User } from "@/lib/api";
-import NotificationBell from "@/components/NotificationBell";
 
 export default function Topbar({ user }: { user: User | null }) {
   const router = useRouter();

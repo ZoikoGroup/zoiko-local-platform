@@ -655,6 +655,18 @@ export function startVideoRecording(
   });
 }
 
+// No auth token - this is the shareable-link path anyone can use to join a
+// call without a Zoiko account, gated only on knowing the room name.
+export function joinVideoRoomAsGuest(
+  roomName: string,
+  displayName: string
+): Promise<{ token: string; url: string; recording: boolean }> {
+  return request(`/media/video/rooms/${encodeURIComponent(roomName)}/guest-token`, {
+    method: "POST",
+    body: JSON.stringify({ display_name: displayName }),
+  });
+}
+
 // --- Data retention ---
 
 export type RetentionPolicies = {

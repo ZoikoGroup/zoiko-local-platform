@@ -331,6 +331,75 @@ def suspend_number(db: Session, user: User, e164: str, reason: str | None = None
     return number
 
 
+def suspend_numbers_for_account_by_system(db: Session, account_id: str, *, reason: str) -> list[PhoneNumber]:
+    """System-initiated counterpart to suspend_number, with no User in the
+    loop - used by the risk engine's auto-suspend workflow (Roadmap doc §13
+    Risk Register: "rapid suspension workflow"), which acts across accounts
+    on its own trigger rather than a customer/staff request. Suspends every
+    ACTIVE number on the account; already-suspended/cancelled numbers are
+    left alone."""
+    numbers = (
+        db.query(PhoneNumber)
+        .filter(PhoneNumber.account_id == account_id, PhoneNumber.status == PhoneNumberStatus.ACTIVE)
+        .with_for_update()
+        .all()
+    )
+    for number in numbers:
+        number.status = PhoneNumberStatus.SUSPENDED
+    db.commit()
+
+    for number in numbers:
+        db.refresh(number)
+        log_event(
+            db, actor="system:risk_engine", action="number.suspended",
+            target=f"phone_number:{number.id}", reason=reason, after={"e164": number.e164},
+        )
+        publish_number_suspended(account_id, number_id=number.id, e164=number.e164, reason=reason)
+
+    if numbers:
+        owner = db.query(User).filter(User.account_id == account_id, User.role == UserRole.OWNER).first()
+        if owner is not None:
+            for number in numbers:
+                notify_number_suspended(
+                    db, account_id=account_id, account_email=owner.email, e164=number.e164, reason=reason,
+                    account_phone=owner.phone_number,
+                )
+
+    return numbers
+
+
+def reactivate_numbers_for_account_by_staff(
+    db: Session, account_id: str, *, staff_id: str, reason: str | None = None
+) -> list[PhoneNumber]:
+    """Staff-initiated reversal of a suspension - the review/reversal half
+    of the risk engine's auto-suspend workflow (a false positive or a
+    resolved dispute shouldn't need engineering intervention to undo).
+    Reactivates every SUSPENDED number on the account; numbers already
+    cancelled or never suspended are left alone."""
+    numbers = (
+        db.query(PhoneNumber)
+        .filter(PhoneNumber.account_id == account_id, PhoneNumber.status == PhoneNumberStatus.SUSPENDED)
+        .with_for_update()
+        .all()
+    )
+    for number in numbers:
+        number.status = PhoneNumberStatus.ACTIVE
+    db.commit()
+
+    owner = db.query(User).filter(User.account_id == account_id, User.role == UserRole.OWNER).first()
+    for number in numbers:
+        db.refresh(number)
+        log_event(
+            db, actor_id=staff_id, action="number.reactivated",
+            target_type="phone_number", target_id=number.id, reason=reason, metadata={"e164": number.e164},
+        )
+        publish_number_activated(account_id, number_id=number.id, e164=number.e164)
+        if owner is not None:
+            notify_number_activated(db, account_id=account_id, account_email=owner.email, e164=number.e164)
+
+    return numbers
+
+
 def cancel_number(db: Session, user: User, e164: str) -> PhoneNumber:
     number = db.query(PhoneNumber).filter(PhoneNumber.e164 == e164).with_for_update().first()
     if number is None or number.account_id != user.account_id or number.status not in (

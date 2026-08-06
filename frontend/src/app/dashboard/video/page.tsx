@@ -41,6 +41,7 @@ export default function VideoPage() {
   const [summaries, setSummaries] = useState<Record<string, ConversationSummary>>({});
   const [summarizingRoom, setSummarizingRoom] = useState<string | null>(null);
   const [summaryErrors, setSummaryErrors] = useState<Record<string, string>>({});
+  const [copiedRoom, setCopiedRoom] = useState<string | null>(null);
 
   const roomRef = useRef<Room | null>(null);
   const localVideoRef = useRef<HTMLVideoElement>(null);
@@ -155,6 +156,17 @@ export default function VideoPage() {
       // room is already disconnected locally either way - not worth surfacing
     }
     await loadRooms();
+  }
+
+  async function handleCopyInviteLink(targetRoomName: string) {
+    const link = `${window.location.origin}/join/${targetRoomName}`;
+    try {
+      await navigator.clipboard.writeText(link);
+      setCopiedRoom(targetRoomName);
+      setTimeout(() => setCopiedRoom((current) => (current === targetRoomName ? null : current)), 2000);
+    } catch {
+      // clipboard permission denied or unavailable - not worth surfacing an error for
+    }
   }
 
   function handleToggleCamera() {
@@ -309,6 +321,14 @@ export default function VideoPage() {
           <div className="flex items-center justify-between text-xs text-slate-400 px-1">
             <span className="font-mono">{roomName}</span>
             <div className="flex items-center gap-3">
+              {roomName && (
+                <button
+                  onClick={() => handleCopyInviteLink(roomName)}
+                  className="font-medium text-indigo-400 hover:text-indigo-300"
+                >
+                  {copiedRoom === roomName ? "Copied!" : "Copy invite link"}
+                </button>
+              )}
               {recordingState === "active" && (
                 <span className="flex items-center gap-1.5 text-red-400">
                   <span className="w-1.5 h-1.5 rounded-full bg-red-500 animate-pulse" />
@@ -451,6 +471,14 @@ export default function VideoPage() {
                     >
                       {r.status}
                     </span>
+                    {r.status === "active" && (
+                      <button
+                        onClick={() => handleCopyInviteLink(r.room_name)}
+                        className="text-xs font-medium text-indigo-600 hover:text-indigo-800"
+                      >
+                        {copiedRoom === r.room_name ? "Copied!" : "Copy invite link"}
+                      </button>
+                    )}
                     {r.status === "active" && callState === "idle" && (
                       <button
                         onClick={() => connectToRoom(r.room_name)}

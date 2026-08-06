@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.core.database import get_db
 from app.core.deps import get_current_user
+from app.core.rate_limit import limiter
 from app.integrations.video.livekit import VideoError, verify_webhook_event
 from app.media import service as media_service
 from app.numbering.identity.models import User
@@ -19,6 +20,10 @@ router = APIRouter(prefix="/media/video", tags=["video"])
 
 
 class JoinTokenRequest(BaseModel):
+    display_name: str
+
+
+class GuestJoinTokenRequest(BaseModel):
     display_name: str
 
 
@@ -51,6 +56,26 @@ async def join_room(
     # token above - returned here so the frontend doesn't need its own
     # separate copy of the same LiveKit project URL configured.
     return {"token": token, "url": settings.livekit_url}
+
+
+@router.post("/rooms/{room_name}/guest-token")
+@limiter.limit("20/minute")
+async def guest_join_token(
+    request: Request,
+    room_name: str,
+    body: GuestJoinTokenRequest,
+    db: Session = Depends(get_db),
+):
+    """The shareable-link path — no login required. Anyone who has the room
+    name (a 64-bit-entropy value, not guessable/enumerable) can request a
+    token, same trust model as a Zoom/Meet link. Rate-limited per IP since
+    this bypasses get_current_user entirely."""
+    display_name = body.display_name.strip()[:60] or "Guest"
+    try:
+        token, recording = media_service.generate_guest_video_join_token(db, room_name, display_name)
+    except media_service.VideoSessionNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    return {"token": token, "url": settings.livekit_url, "recording": recording}
 
 
 @router.post("/rooms/{room_name}/end")

@@ -13,6 +13,7 @@ from app.events.service import (
     publish_call_started,
     publish_video_room_created,
     publish_video_room_ended,
+    publish_voicemail_created,
 )
 from app.integrations.llm.groq import LLMError
 from app.integrations.storage.s3 import StorageError, generate_presigned_url
@@ -152,7 +153,7 @@ def place_outbound_call(
 
     # Fraud/Risk gates (Architecture doc §5 "Fraud and Risk", §13 "blocked
     # destinations; fraud thresholds") - checked before ever reaching Twilio.
-    risk_service.assert_destination_allowed(db, to)
+    risk_service.assert_destination_allowed(db, to, user.account_id)
     risk_service.assert_outbound_velocity_ok(db, user.account_id)
 
     twiml = telecom.build_say_response(message)
@@ -280,6 +281,7 @@ def record_voicemail(
         db, actor_id=account_id, action="voicemail.created",
         target_type="voicemail", target_id=voicemail.id, metadata={"from": from_number},
     )
+    publish_voicemail_created(account_id, voicemail_id=voicemail.id, phone_number_id=phone_number_id)
     return voicemail
 
 
@@ -379,6 +381,33 @@ def generate_video_join_token(
     if session.status != VideoSessionStatus.ACTIVE:
         raise VideoSessionAuthorizationError(f"{room_name} is not an active session")
     return video.build_participant_token(room_name, identity, display_name)
+
+
+class VideoSessionNotFoundError(Exception):
+    """Raised when a guest requests a token for a room that doesn't exist or isn't active."""
+
+
+def generate_guest_video_join_token(db: Session, room_name: str, display_name: str) -> tuple[str, bool]:
+    """No account_id scoping — this is the shareable-link path (anyone with
+    the room name can request a token), unlike generate_video_join_token
+    above which is for a logged-in teammate on the account that owns the
+    call. room_name is a 64-bit-entropy value (see create_video_session),
+    so knowing it is the access control - same trust model a Zoom/Meet
+    link uses. Returns (token, currently_recording) so the join page can
+    show a recording notice - it does NOT itself constitute the guest's
+    recording consent; that's a disclosure shown before they connect, not
+    a consent record (guests have no account to attach one to)."""
+    session = db.query(VideoSession).filter(VideoSession.room_name == room_name).first()
+    if session is None or session.status != VideoSessionStatus.ACTIVE:
+        raise VideoSessionNotFoundError(f"{room_name} is not an active video call")
+
+    identity = f"guest:{uuid.uuid4().hex[:8]}"
+    token = video.build_participant_token(room_name, identity, display_name)
+    log_event(
+        db, actor=identity, action="video.guest_joined",
+        target=f"video_session:{session.id}", after={"room_name": room_name, "display_name": display_name},
+    )
+    return token, session.recording_egress_id is not None
 
 
 def list_account_video_sessions(db: Session, account_id: str) -> list[VideoSession]:

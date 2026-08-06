@@ -81,10 +81,13 @@ class Settings(BaseSettings):
 
     # Multi-provider failover (integrations/_shared/circuit_breaker.py) - per
     # category, a circuit breaker wraps the primary vendor call and falls
-    # back to a secondary provider if one is enabled. No real second-vendor
-    # credentials exist yet for any category, so every secondary is an
-    # honestly-labeled stub that raises a clear "not configured" error until
-    # real credentials are supplied - these flags all default off.
+    # back to a secondary provider if one is enabled. Every secondary below
+    # is a real vendor client (not a mock) that activates once its
+    # credentials are set; each flag still defaults off because no real
+    # second-vendor account exists yet for any category - flipping a flag on
+    # without the matching credentials below fails loudly via the same
+    # "not configured" error as an unconfigured primary, rather than
+    # silently no-opping.
     telecom_failover_enabled: bool = False
     video_failover_enabled: bool = False
     llm_failover_enabled: bool = False
@@ -93,6 +96,52 @@ class Settings(BaseSettings):
     storage_failover_enabled: bool = False
     email_failover_enabled: bool = False
     webpush_failover_enabled: bool = False
+
+    # Secondary telecom provider (integrations/telecom/_secondary_stub.py) -
+    # Vonage SMS/Voice/Number Insight REST API. Voice calls are placed via a
+    # JWT-signed request; vonage_private_key is the PEM contents copied from
+    # a Vonage Application's generated private key file.
+    vonage_api_key: str = ""
+    vonage_api_secret: str = ""
+    vonage_application_id: str = ""
+    vonage_private_key: str = ""
+    vonage_sms_from: str = ""
+
+    # Secondary video provider (integrations/video/_secondary_stub.py) -
+    # Daily.co REST API.
+    daily_api_key: str = ""
+
+    # Secondary LLM provider (integrations/llm/_secondary_stub.py) - OpenAI
+    # chat completions API.
+    openai_api_key: str = ""
+
+    # Secondary transcription provider (integrations/transcription/_secondary_stub.py) - Deepgram.
+    deepgram_api_key: str = ""
+
+    # Secondary KYC provider (integrations/kyc/_secondary_stub.py) - Sumsub,
+    # HMAC-signed REST API (app token + secret key, not a bearer token).
+    sumsub_app_token: str = ""
+    sumsub_secret_key: str = ""
+    sumsub_level_name: str = "basic-kyc-level"
+
+    # Secondary object storage (integrations/storage/_secondary_stub.py) -
+    # any second S3-compatible bucket (Backblaze B2, a different-region R2
+    # bucket, ...), reusing the same boto3 client as the primary - only the
+    # endpoint/credentials/bucket differ.
+    storage_secondary_access_key_id: str = ""
+    storage_secondary_secret_access_key: str = ""
+    storage_secondary_bucket: str = ""
+    storage_secondary_endpoint: str = ""
+    storage_secondary_region: str = "auto"
+
+    # Secondary email provider (integrations/notifications/_email_secondary_stub.py) - SendGrid.
+    sendgrid_api_key: str = ""
+
+    # Secondary web push relay (integrations/notifications/_webpush_secondary_stub.py) -
+    # OneSignal, used as an alternate delivery path when raw Web Push
+    # (pywebpush straight to the browser's push service) is unavailable.
+    onesignal_app_id: str = ""
+    onesignal_api_key: str = ""
 
     # Observability (core/telemetry.py, core/logging.py) - OpenTelemetry
     # tracing/metrics + structured JSON logging. Off by default so pytest and
