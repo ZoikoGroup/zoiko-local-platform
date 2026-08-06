@@ -240,6 +240,43 @@ def build_forward_response(
     return str(response)
 
 
+def build_empty_response() -> str:
+    """No further instructions - Twilio hangs up. Used as the <Dial>
+    action's reply when DialCallStatus is "completed" (the call was
+    genuinely answered and has already ended normally)."""
+    return str(VoiceResponse())
+
+
+def build_ring_group_response(
+    destinations: list[str],
+    fallback_action_url: str,
+    status_callback_url: str | None = None,
+    recording_callback_url: str | None = None,
+) -> str:
+    """Enhanced business routing (Architecture doc Phase 2) - a superset of
+    build_forward_response: rings every destination in `destinations`
+    simultaneously (multiple <Number> children under one <Dial> - Twilio's
+    native ring-group primitive, first to answer wins, the rest stop
+    ringing) instead of a single number. `fallback_action_url` is always
+    set (unlike build_forward_response's optional action) - see
+    voice.py's /forward-fallback route, which routes to voicemail only
+    when the dial genuinely wasn't answered."""
+    response = VoiceResponse()
+    dial_kwargs = {"action": fallback_action_url}
+    if status_callback_url:
+        dial_kwargs["status_callback"] = status_callback_url
+        dial_kwargs["status_callback_event"] = "completed"
+    if recording_callback_url:
+        dial_kwargs["record"] = "record-from-answer-dual"
+        dial_kwargs["recording_status_callback"] = recording_callback_url
+        dial_kwargs["recording_status_callback_method"] = "POST"
+        dial_kwargs["recording_status_callback_event"] = "completed"
+    dial = response.dial(**dial_kwargs)
+    for destination in destinations:
+        dial.number(destination)
+    return str(response)
+
+
 def build_gather_response(prompt: str, action_url: str) -> str:
     """Builds TwiML for the AI Receptionist's single free-form capture: Twilio
     transcribes the caller's speech itself (no vendor call needed for this

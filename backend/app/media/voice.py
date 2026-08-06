@@ -20,6 +20,7 @@ from app.integrations.telecom.twilio import TelecomError
 from app.media import service as media_service
 from app.media.models import CallDirection
 from app.numbering.identity.models import User
+from app.numbering.numbers import service as numbers_service
 from app.risk import service as risk_service
 
 router = APIRouter(prefix="/media/voice", tags=["voice"])
@@ -60,12 +61,21 @@ async def incoming_call(request: Request, db: Session = Depends(get_db)):
 
     if owner is not None and media_service.should_forward_call(owner):
         status_callback_url = str(request.base_url) + "media/voice/status-callback"
+        fallback_action_url = str(request.base_url) + "media/voice/forward-fallback"
         recording_callback_url = (
             str(request.base_url) + "media/voice/recording-callback"
             if media_service.should_record_forwarded_call(db, owner.account_id)
             else None
         )
-        twiml = telecom.build_forward_response(owner.forwarding_number, status_callback_url, recording_callback_url)
+        # Enhanced business routing: ring every configured destination
+        # simultaneously if a ring group is set, otherwise fall back to
+        # the plain single forwarding_number - identical behavior to
+        # before this feature existed for any number that never sets one.
+        ring_group = numbers_service.list_ring_group(db, to_number)
+        destinations = [d.destination_number for d in ring_group] or [owner.forwarding_number]
+        twiml = telecom.build_ring_group_response(
+            destinations, fallback_action_url, status_callback_url, recording_callback_url
+        )
     elif owner is not None and owner.ai_receptionist_enabled:
         action_url = str(request.base_url) + "media/receptionist/respond"
         twiml = telecom.build_gather_response(
@@ -122,6 +132,25 @@ async def status_callback(request: Request, db: Session = Depends(get_db)):
         duration=int(duration_raw) if duration_raw else None,
     )
     return Response(status_code=204)
+
+
+@router.post("/forward-fallback")
+async def forward_fallback(request: Request, db: Session = Depends(get_db)):
+    """Twilio requests this as the forwarded/ring-group <Dial>'s `action`
+    URL once the dial resolves (see telecom.build_ring_group_response).
+    `DialCallStatus` is "completed" for a call that was actually answered
+    and has now ended normally - nothing further to do there. Any other
+    status (no-answer, busy, failed) means nobody picked up, so the
+    caller is routed to voicemail instead of just hearing silence -
+    "overflow handling" (Architecture doc Phase 2), previously missing
+    for both the single-forwarding-number and ring-group cases."""
+    params = await media_service.verify_twilio_webhook(request)
+    if params.get("DialCallStatus") == "completed":
+        return Response(content=telecom.build_empty_response(), media_type="application/xml")
+
+    callback_url = str(request.base_url) + "media/voicemail/recording-complete"
+    twiml = telecom.build_record_response(callback_url)
+    return Response(content=twiml, media_type="application/xml")
 
 
 @router.post("/recording-callback")

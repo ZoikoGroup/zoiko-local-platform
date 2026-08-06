@@ -16,6 +16,18 @@ class SuspendNumberRequest(BaseModel):
     reason: str | None = None
 
 
+class SetRingGroupRequest(BaseModel):
+    destinations: list[str]
+
+
+class RingGroupDestinationResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    destination_number: str
+    ring_order: int
+
+
 class NumberSearchResult(BaseModel):
     phone_number: str
     locality: str | None = None

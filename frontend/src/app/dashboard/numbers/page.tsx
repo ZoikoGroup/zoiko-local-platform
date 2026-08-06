@@ -17,6 +17,8 @@ import {
   createPortingRequest,
   listMyPortingRequests,
   cancelPortingRequest,
+  getRingGroup,
+  setRingGroup,
   ApiError,
   type ComplianceRule,
   type MyPhoneNumber,
@@ -78,6 +80,10 @@ export default function NumbersPage() {
   const [routingEscalationUserId, setRoutingEscalationUserId] = useState("");
   const [routingBusy, setRoutingBusy] = useState(false);
   const [routingError, setRoutingError] = useState<string | null>(null);
+
+  const [ringGroupInput, setRingGroupInput] = useState("");
+  const [ringGroupBusy, setRingGroupBusy] = useState(false);
+  const [ringGroupError, setRingGroupError] = useState<string | null>(null);
 
   const [step, setStep] = useState<Step>("search");
   const [countryCode, setCountryCode] = useState("US");
@@ -309,6 +315,31 @@ export default function NumbersPage() {
     setRoutingTimezone(number.business_hours_timezone || "UTC");
     setRoutingReceptionist(number.ai_receptionist_enabled);
     setRoutingEscalationUserId(number.escalation_user_id ?? "");
+
+    setRingGroupError(null);
+    setRingGroupInput("");
+    if (token) {
+      getRingGroup(token, number.e164)
+        .then((destinations) => setRingGroupInput(destinations.map((d) => d.destination_number).join(", ")))
+        .catch(() => setRingGroupError("Couldn't load the ring group."));
+    }
+  }
+
+  async function handleSaveRingGroup(e164: string) {
+    if (!token) return;
+    setRingGroupBusy(true);
+    setRingGroupError(null);
+    try {
+      const destinations = ringGroupInput
+        .split(",")
+        .map((n) => n.trim())
+        .filter(Boolean);
+      await setRingGroup(token, e164, destinations);
+    } catch (err) {
+      setRingGroupError(err instanceof ApiError ? err.message : "Couldn't save the ring group.");
+    } finally {
+      setRingGroupBusy(false);
+    }
   }
 
   async function handleSaveRouting(e164: string) {
@@ -518,6 +549,29 @@ export default function NumbersPage() {
                   >
                     {routingBusy ? "Saving..." : "Save routing"}
                   </button>
+
+                  <div className="border-t border-slate-200 pt-3 space-y-2">
+                    <label className="block text-xs font-medium text-slate-500">
+                      Ring group (rings all of these at once instead of the single forwarding number above)
+                    </label>
+                    {ringGroupError && <p className="text-xs text-red-600">{ringGroupError}</p>}
+                    <input
+                      value={ringGroupInput}
+                      onChange={(e) => setRingGroupInput(e.target.value)}
+                      placeholder="+15551112222, +15553334444"
+                      className="w-full rounded-lg border border-slate-300 px-3 py-1.5 text-sm font-mono placeholder:text-slate-400"
+                    />
+                    <p className="text-xs text-slate-400">
+                      Comma-separated, up to 5 numbers. Leave empty to use the forwarding number instead.
+                    </p>
+                    <button
+                      onClick={() => handleSaveRingGroup(n.e164)}
+                      disabled={ringGroupBusy}
+                      className="bg-slate-700 hover:bg-slate-800 disabled:opacity-60 text-white text-sm font-medium rounded-lg px-4 py-2"
+                    >
+                      {ringGroupBusy ? "Saving..." : "Save ring group"}
+                    </button>
+                  </div>
                 </div>
               )}
             </div>

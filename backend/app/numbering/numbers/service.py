@@ -21,7 +21,7 @@ from app.notifications.service import (
     notify_number_verification_required,
 )
 from app.numbering.identity.models import Account, AccountType, User, UserRole
-from app.numbering.numbers.models import PhoneNumber, PhoneNumberStatus
+from app.numbering.numbers.models import PhoneNumber, PhoneNumberStatus, RingGroupDestination
 
 RESERVATION_TTL_MINUTES = 12
 QUARANTINE_DAYS = 90
@@ -442,6 +442,52 @@ def configure_routing(
     return number
 
 
+MAX_RING_GROUP_SIZE = 5
+
+
+class RingGroupTooLargeError(Exception):
+    """Raised when trying to set more than MAX_RING_GROUP_SIZE destinations."""
+
+
+def set_ring_group(db: Session, user: User, e164: str, destinations: list[str]) -> list[RingGroupDestination]:
+    """Replaces the number's entire ring group in one call - simpler and
+    less error-prone for a customer-facing "these are my destinations,
+    in this order" form than incremental add/remove endpoints. An empty
+    list clears the ring group entirely, reverting the number to plain
+    single-forwarding_number behavior (see voice.py's incoming_call)."""
+    number = db.query(PhoneNumber).filter(PhoneNumber.e164 == e164).first()
+    if number is None or number.account_id != user.account_id:
+        raise NumberConflictError(f"{e164} is not a number owned by your account")
+    assert_number_access(number, user)
+
+    if len(destinations) > MAX_RING_GROUP_SIZE:
+        raise RingGroupTooLargeError(f"A ring group may have up to {MAX_RING_GROUP_SIZE} destinations")
+
+    db.query(RingGroupDestination).filter(RingGroupDestination.phone_number_id == number.id).delete()
+    rows = [
+        RingGroupDestination(phone_number_id=number.id, destination_number=dest, ring_order=i)
+        for i, dest in enumerate(destinations)
+    ]
+    db.add_all(rows)
+    db.commit()
+
+    log_event(
+        db, actor_id=user.account_id, action="number.ring_group_updated",
+        target_type="phone_number", target_id=number.id, metadata={"e164": e164, "destinations": destinations},
+    )
+    return list_ring_group(db, e164)
+
+
+def list_ring_group(db: Session, e164: str) -> list[RingGroupDestination]:
+    return (
+        db.query(RingGroupDestination)
+        .join(PhoneNumber, PhoneNumber.id == RingGroupDestination.phone_number_id)
+        .filter(PhoneNumber.e164 == e164)
+        .order_by(RingGroupDestination.ring_order.asc())
+        .all()
+    )
+
+
 def sync_webhook(db: Session, user: User, e164: str) -> PhoneNumber:
     """(Re)points this number's Twilio voice webhook at the current
     PUBLIC_BASE_URL - needed whenever that URL changes (e.g. a fresh ngrok
@@ -528,6 +574,18 @@ def assign_number(db: Session, *, account_id: str, e164: str, user_id: str | Non
                     f"forward to {number.forwarding_number}" if number.forwarding_number else "no configured forwarding route"
                 ),
             )
+    return number
+
+
+def assert_owns_number(db: Session, user: User, e164: str) -> PhoneNumber:
+    """Looks up a number by e164 and confirms the caller's account owns
+    it - the read-path counterpart to the account_id checks every
+    write path already does inline. Used by GET routes (e.g. ring group)
+    that would otherwise leak which destinations another account's
+    number forwards to."""
+    number = db.query(PhoneNumber).filter(PhoneNumber.e164 == e164).first()
+    if number is None or number.account_id != user.account_id:
+        raise NumberConflictError(f"{e164} is not a number owned by your account")
     return number
 
 

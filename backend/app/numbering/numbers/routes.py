@@ -13,7 +13,9 @@ from app.numbering.numbers.schemas import (
     PhoneNumberResponse,
     PurchaseNumberRequest,
     ReserveNumberRequest,
+    RingGroupDestinationResponse,
     RoutingConfigRequest,
+    SetRingGroupRequest,
     SuspendNumberRequest,
 )
 from app.numbering.numbers.service import (
@@ -151,3 +153,31 @@ def configure_routing(
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e)) from e
+
+
+@router.put("/{e164}/ring-group", response_model=list[RingGroupDestinationResponse])
+def set_ring_group(
+    e164: str,
+    payload: SetRingGroupRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_writer),
+):
+    try:
+        return service.set_ring_group(db, current_user, e164, payload.destinations)
+    except NumberConflictError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e
+    except service.RingGroupTooLargeError as e:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e)) from e
+
+
+@router.get("/{e164}/ring-group", response_model=list[RingGroupDestinationResponse])
+def get_ring_group(
+    e164: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    try:
+        service.assert_owns_number(db, current_user, e164)
+    except NumberConflictError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
+    return service.list_ring_group(db, e164)

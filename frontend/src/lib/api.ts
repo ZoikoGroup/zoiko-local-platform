@@ -667,6 +667,26 @@ export function configureRouting(
   });
 }
 
+export type RingGroupDestination = {
+  id: string;
+  destination_number: string;
+  ring_order: number;
+};
+
+export function getRingGroup(token: string, e164: string): Promise<RingGroupDestination[]> {
+  return request<RingGroupDestination[]>(`/numbers/${encodeURIComponent(e164)}/ring-group`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export function setRingGroup(token: string, e164: string, destinations: string[]): Promise<RingGroupDestination[]> {
+  return request<RingGroupDestination[]>(`/numbers/${encodeURIComponent(e164)}/ring-group`, {
+    method: "PUT",
+    headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ destinations }),
+  });
+}
+
 export type CallLogEntry = {
   id: string;
   sid: string | null;

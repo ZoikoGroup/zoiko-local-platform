@@ -2,7 +2,7 @@ import enum
 import uuid
 from datetime import datetime, time
 
-from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, String, Time, func
+from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, Integer, String, Time, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -86,4 +86,24 @@ class PhoneNumber(Base):
         UUID(as_uuid=False), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
     )
 
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class RingGroupDestination(Base):
+    """Architecture doc Phase 2 "enhanced business routing" - additive to
+    forwarding_number, not a replacement: when a number has rows here,
+    inbound forwarded calls ring all of them simultaneously (a Twilio
+    <Dial> with multiple <Number> children - first to answer wins, the
+    rest stop ringing) instead of the single forwarding_number. A number
+    with zero rows here behaves exactly as before this feature existed.
+    """
+
+    __tablename__ = "ring_group_destinations"
+
+    id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=new_uuid)
+    phone_number_id: Mapped[str] = mapped_column(
+        UUID(as_uuid=False), ForeignKey("phone_numbers.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    destination_number: Mapped[str] = mapped_column(String(20), nullable=False)
+    ring_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
