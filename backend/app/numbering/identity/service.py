@@ -12,7 +12,14 @@ from app.core.security import (
     verify_password,
     verify_totp_code,
 )
-from app.notifications.service import notify_password_reset_requested, notify_team_member_added
+from app.notifications.service import (
+    notify_account_activated,
+    notify_mfa_disabled,
+    notify_mfa_enabled,
+    notify_password_changed,
+    notify_password_reset_requested,
+    notify_team_member_added,
+)
 from app.numbering.identity.models import Account, AccountType, User, UserRole
 
 PASSWORD_RESET_TOKEN_EXPIRE_MINUTES = 30
@@ -46,6 +53,7 @@ def create_account_with_owner(
         target=f"account:{account.id}",
         after={"account_id": account.id, "user_id": user.id, "email": user.email, "role": user.role},
     )
+    notify_account_activated(db, account_id=account.id, user_email=user.email)
     return user
 
 
@@ -119,6 +127,7 @@ def reset_password(db: Session, token: str, new_password: str) -> User:
     db.commit()
     db.refresh(user)
     log_event(db, actor=user.id, action="user.password_reset_completed", target=f"user:{user.id}")
+    notify_password_changed(db, account_id=user.account_id, user_email=user.email)
     return user
 
 
@@ -242,6 +251,7 @@ def enable_mfa(db: Session, user: User, code: str, actor: str) -> None:
     user.mfa_enabled = True
     db.commit()
     log_event(db, actor=actor, action="mfa.enabled", target=f"user:{user.id}")
+    notify_mfa_enabled(db, account_id=user.account_id, user_email=user.email)
 
 
 def disable_mfa(db: Session, user: User, code: str, actor: str) -> None:
@@ -254,6 +264,7 @@ def disable_mfa(db: Session, user: User, code: str, actor: str) -> None:
     user.mfa_enabled = False
     db.commit()
     log_event(db, actor=actor, action="mfa.disabled", target=f"user:{user.id}")
+    notify_mfa_disabled(db, account_id=user.account_id, user_email=user.email)
 
 
 def set_phone_number(db: Session, user: User, phone_number: str | None) -> User:

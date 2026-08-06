@@ -15,7 +15,8 @@ from app.integrations.telecom.twilio import download_recording
 from app.integrations.transcription.groq import MODEL_VERSION as TRANSCRIPTION_MODEL_VERSION
 from app.integrations.transcription.groq import transcribe_audio
 from app.intelligence.models import ConversationSummary, SummarySourceType
-from app.media.models import CallRecord, ReceptionistUrgency, Voicemail, VideoSession
+from app.media.models import CallDirection, CallRecord, ReceptionistUrgency, Voicemail, VideoSession
+from app.notifications.service import notify_call_summary_available, notify_voicemail_transcription_ready
 from app.numbering.identity.models import User, UserRole
 from app.numbering.numbers.service import NumberConflictError, assert_number_access, assigned_number_ids
 from app.numbering.numbers.models import PhoneNumber
@@ -161,13 +162,15 @@ def summarize_voicemail(db: Session, user: User, voicemail_id: str) -> Conversat
     jurisdiction = _phone_number_country(db, voicemail.phone_number_id)
     _require_consent(db, user.account_id, "voicemails", jurisdiction)
 
-    return _analyze_and_store(
+    summary = _analyze_and_store(
         db,
         account_id=user.account_id,
         source_type=SummarySourceType.VOICEMAIL,
         source_id=voicemail.id,
         transcript=_download_and_transcribe(voicemail.recording_url),
     )
+    notify_voicemail_transcription_ready(db, account_id=user.account_id, account_email=user.email)
+    return summary
 
 
 def summarize_call(db: Session, user: User, call_id: str) -> ConversationSummary:
@@ -181,13 +184,16 @@ def summarize_call(db: Session, user: User, call_id: str) -> ConversationSummary
     jurisdiction = _phone_number_country(db, call.phone_number_id)
     _require_consent(db, user.account_id, "calls", jurisdiction)
 
-    return _analyze_and_store(
+    summary = _analyze_and_store(
         db,
         account_id=user.account_id,
         source_type=SummarySourceType.CALL,
         source_id=call.id,
         transcript=_download_and_transcribe(call.recording_url),
     )
+    counterparty = call.to_number if call.direction == CallDirection.OUTBOUND else call.from_number
+    notify_call_summary_available(db, account_id=user.account_id, account_email=user.email, counterparty=counterparty)
+    return summary
 
 
 def summarize_video_session(db: Session, user: User, room_name: str) -> ConversationSummary:

@@ -5,6 +5,7 @@ from sqlalchemy.orm import Session
 from app.audit.service import log_event
 from app.notifications.service import (
     notify_porting_request_approved,
+    notify_porting_request_canceled,
     notify_porting_request_completed,
     notify_porting_request_rejected,
     notify_porting_request_submitted,
@@ -77,7 +78,10 @@ def submit_porting_request(
 
     owner_email = _account_owner_email(db, account_id)
     if owner_email:
-        notify_porting_request_submitted(db, account_id=account_id, account_email=owner_email, phone_number=phone_number)
+        notify_porting_request_submitted(
+            db, account_id=account_id, account_email=owner_email, phone_number=phone_number,
+            port_reference=request.id,
+        )
 
     return request
 
@@ -151,6 +155,17 @@ def cancel_porting_request(db: Session, request: PortingRequest, *, account_id: 
         db, actor=actor, action="porting.request_canceled",
         target=f"porting_request:{request.id}", before={"status": before_status}, after={"status": request.status},
     )
+
+    owner_email = _account_owner_email(db, account_id)
+    if owner_email:
+        from app.numbering.identity.models import User
+
+        canceling_user = db.query(User).filter(User.id == actor).first()
+        notify_porting_request_canceled(
+            db, account_id=account_id, account_email=owner_email, port_reference=request.id,
+            canceled_by=canceling_user.email if canceling_user else "your account",
+        )
+
     return request
 
 
@@ -172,7 +187,10 @@ def approve_porting_request(db: Session, request: PortingRequest, *, actor: str)
 
     owner_email = _account_owner_email(db, request.account_id)
     if owner_email:
-        notify_porting_request_approved(db, account_id=request.account_id, account_email=owner_email, phone_number=request.phone_number)
+        notify_porting_request_approved(
+            db, account_id=request.account_id, account_email=owner_email, phone_number=request.phone_number,
+            port_reference=request.id,
+        )
 
     return request
 
@@ -197,7 +215,7 @@ def reject_porting_request(
     if owner_email:
         notify_porting_request_rejected(
             db, account_id=request.account_id, account_email=owner_email,
-            phone_number=request.phone_number, reason=reason,
+            phone_number=request.phone_number, reason=reason, port_reference=request.id,
         )
 
     return request
@@ -244,6 +262,9 @@ def complete_porting_request(
 
     owner_email = _account_owner_email(db, request.account_id)
     if owner_email:
-        notify_porting_request_completed(db, account_id=request.account_id, account_email=owner_email, phone_number=request.phone_number)
+        notify_porting_request_completed(
+            db, account_id=request.account_id, account_email=owner_email, phone_number=request.phone_number,
+            port_reference=request.id,
+        )
 
     return request

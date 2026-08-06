@@ -4,6 +4,7 @@ from sqlalchemy.orm import Session
 
 from app.audit.service import log_event
 from app.consent.models import GLOBAL_JURISDICTION, ConsentRecord, ConsentType
+from app.notifications.service import notify_emergency_calling_notice
 
 
 class ConsentNotFoundError(Exception):
@@ -43,6 +44,18 @@ def grant_consent(
         target_type="consent_record", target_id=record.id,
         metadata={"consent_type": consent_type.value, "jurisdiction": jurisdiction},
     )
+
+    if consent_type == ConsentType.EMERGENCY_CALLING_ACKNOWLEDGED:
+        from app.numbering.identity.models import User, UserRole
+
+        owner = db.query(User).filter(User.account_id == account_id, User.role == UserRole.OWNER).first()
+        if owner is not None:
+            resource_summary = "your account" if jurisdiction == GLOBAL_JURISDICTION else f"numbers in {jurisdiction}"
+            notify_emergency_calling_notice(
+                db, account_id=account_id, account_email=owner.email, resource_summary=resource_summary,
+                capability_status="acknowledged - available where technically supported, not guaranteed",
+            )
+
     return record
 
 

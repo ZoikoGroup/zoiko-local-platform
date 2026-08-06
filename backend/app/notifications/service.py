@@ -36,6 +36,21 @@ class InvalidTimezoneError(Exception):
     notification tries to use it and crashes instead."""
 
 
+def _now_str() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+
+def _mask_number(e164: str) -> str:
+    """Shows enough of a phone number to be recognizable without exposing
+    the full digit string in an email - used by the canonical templates'
+    {{*.masked_or_formatted}} / {{call.*_masked}} tokens (Email
+    Communications System doc's "identify... without exposing unnecessary
+    data" standard)."""
+    if len(e164) <= 6:
+        return e164
+    return f"{e164[:2]}{'*' * (len(e164) - 6)}{e164[-4:]}"
+
+
 def get_or_create_preference(db: Session, account_id: str) -> NotificationPreference:
     pref = db.query(NotificationPreference).filter(NotificationPreference.account_id == account_id).first()
     if pref is None:
@@ -250,13 +265,108 @@ def mark_all_notifications_read(db: Session, account_id: str) -> int:
     return result
 
 
-def notify_number_activated(db: Session, *, account_id: str, account_email: str, e164: str) -> None:
+def notify_number_activated(
+    db: Session, *, account_id: str, account_email: str, e164: str, organization_name: str
+) -> None:
     send_notification(
         db,
         event_name="number.activated",
         account_id=account_id,
         recipient_email=account_email,
-        context={"e164": e164},
+        context={
+            "e164": e164,
+            "number_formatted": e164,
+            "organization_name": organization_name,
+            "user_display_name": account_email,
+        },
+    )
+
+
+def notify_number_order_not_approved(
+    db: Session, *, account_id: str, account_email: str, order_reference: str, reason_category: str
+) -> None:
+    send_notification(
+        db,
+        event_name="number.order_not_approved",
+        account_id=account_id,
+        recipient_email=account_email,
+        context={
+            "user_display_name": account_email,
+            "order_reference": order_reference,
+            "decision_reason_category": reason_category,
+        },
+    )
+
+
+def notify_number_assigned(
+    db: Session, *, account_id: str, account_email: str, e164: str, organization_name: str
+) -> None:
+    send_notification(
+        db,
+        event_name="number.assigned",
+        account_id=account_id,
+        recipient_email=account_email,
+        context={
+            "user_display_name": account_email,
+            "number_formatted": e164,
+            "organization_name": organization_name,
+            "number_assignment_type": "Direct assignment",
+        },
+    )
+
+
+def notify_number_unassigned(
+    db: Session,
+    *,
+    account_id: str,
+    account_email: str,
+    e164: str,
+    previous_target: str,
+    lifecycle_status: str,
+    route_summary: str,
+) -> None:
+    send_notification(
+        db,
+        event_name="number.unassigned",
+        account_id=account_id,
+        recipient_email=account_email,
+        context={
+            "user_display_name": account_email,
+            "number_formatted": e164,
+            "assignment_previous_target": previous_target,
+            "number_lifecycle_status": lifecycle_status,
+            "number_current_route_summary": route_summary,
+        },
+    )
+
+
+def notify_number_verification_required(
+    db: Session, *, account_id: str, account_email: str, e164: str, action_summary: str
+) -> None:
+    send_notification(
+        db,
+        event_name="number.verification_required",
+        account_id=account_id,
+        recipient_email=account_email,
+        context={
+            "user_display_name": account_email,
+            "number_formatted": e164,
+            "case_action_summary": action_summary,
+        },
+    )
+
+
+def notify_number_released(db: Session, *, account_id: str, account_email: str, e164: str) -> None:
+    send_notification(
+        db,
+        event_name="number.released",
+        account_id=account_id,
+        recipient_email=account_email,
+        context={
+            "user_display_name": account_email,
+            "number_formatted": e164,
+            "release_completed_at": _now_str(),
+        },
     )
 
 
@@ -321,33 +431,83 @@ def notify_compliance_case_rejected(
     )
 
 
-def notify_porting_request_submitted(db: Session, *, account_id: str, account_email: str, phone_number: str) -> None:
+def notify_porting_request_submitted(
+    db: Session, *, account_id: str, account_email: str, phone_number: str, port_reference: str
+) -> None:
     send_notification(
         db, event_name="porting.submitted", account_id=account_id, recipient_email=account_email,
-        context={"phone_number": phone_number},
+        context={
+            "phone_number": phone_number,
+            "user_display_name": account_email,
+            "port_reference": port_reference,
+            "number_masked_or_formatted": _mask_number(phone_number),
+        },
     )
 
 
-def notify_porting_request_approved(db: Session, *, account_id: str, account_email: str, phone_number: str) -> None:
+def notify_porting_request_approved(
+    db: Session, *, account_id: str, account_email: str, phone_number: str, port_reference: str
+) -> None:
     send_notification(
         db, event_name="porting.approved", account_id=account_id, recipient_email=account_email,
-        context={"phone_number": phone_number},
+        context={
+            "phone_number": phone_number,
+            "user_display_name": account_email,
+            "port_reference": port_reference,
+            "number_masked_or_formatted": _mask_number(phone_number),
+            "port_submitted_at": _now_str(),
+            "port_estimated_completion": "to be confirmed by the Porting Center",
+        },
     )
 
 
 def notify_porting_request_rejected(
-    db: Session, *, account_id: str, account_email: str, phone_number: str, reason: str | None = None
+    db: Session,
+    *,
+    account_id: str,
+    account_email: str,
+    phone_number: str,
+    port_reference: str,
+    reason: str | None = None,
 ) -> None:
     send_notification(
         db, event_name="porting.rejected", account_id=account_id, recipient_email=account_email,
-        context={"phone_number": phone_number, "reason_line": f" Reason: {reason}" if reason else ""},
+        context={
+            "phone_number": phone_number,
+            "reason_line": f" Reason: {reason}" if reason else "",
+            "user_display_name": account_email,
+            "port_reference": port_reference,
+            "port_rejection_summary": reason or "No reason provided",
+        },
     )
 
 
-def notify_porting_request_completed(db: Session, *, account_id: str, account_email: str, phone_number: str) -> None:
+def notify_porting_request_completed(
+    db: Session, *, account_id: str, account_email: str, phone_number: str, port_reference: str
+) -> None:
     send_notification(
         db, event_name="porting.completed", account_id=account_id, recipient_email=account_email,
-        context={"phone_number": phone_number},
+        context={
+            "phone_number": phone_number,
+            "user_display_name": account_email,
+            "port_reference": port_reference,
+            "number_formatted": phone_number,
+            "port_completed_at": _now_str(),
+        },
+    )
+
+
+def notify_porting_request_canceled(
+    db: Session, *, account_id: str, account_email: str, port_reference: str, canceled_by: str
+) -> None:
+    send_notification(
+        db, event_name="porting.canceled", account_id=account_id, recipient_email=account_email,
+        context={
+            "user_display_name": account_email,
+            "port_reference": port_reference,
+            "port_canceled_at": _now_str(),
+            "port_canceled_by": canceled_by,
+        },
     )
 
 
@@ -370,5 +530,187 @@ def notify_password_reset_requested(db: Session, *, account_id: str, user_email:
         event_name="auth.password_reset",
         account_id=account_id,
         recipient_email=user_email,
-        context={"reset_url": reset_url},
+        context={"reset_url": reset_url, "user_display_name": user_email},
+    )
+
+
+def notify_account_activated(db: Session, *, account_id: str, user_email: str) -> None:
+    send_notification(
+        db, event_name="auth.account_activated", account_id=account_id, recipient_email=user_email,
+        context={"user_display_name": user_email},
+    )
+
+
+def notify_password_changed(db: Session, *, account_id: str, user_email: str) -> None:
+    send_notification(
+        db, event_name="auth.password_changed", account_id=account_id, recipient_email=user_email,
+        context={"user_display_name": user_email, "security_activity_time": _now_str()},
+    )
+
+
+def notify_mfa_enabled(db: Session, *, account_id: str, user_email: str) -> None:
+    send_notification(
+        db, event_name="auth.mfa_enabled", account_id=account_id, recipient_email=user_email,
+        context={"user_display_name": user_email, "security_activity_time": _now_str()},
+    )
+
+
+def notify_mfa_disabled(db: Session, *, account_id: str, user_email: str) -> None:
+    send_notification(
+        db, event_name="auth.mfa_disabled", account_id=account_id, recipient_email=user_email,
+        context={"user_display_name": user_email, "security_activity_time": _now_str()},
+    )
+
+
+def notify_emergency_calling_notice(
+    db: Session, *, account_id: str, account_email: str, resource_summary: str, capability_status: str
+) -> None:
+    send_notification(
+        db, event_name="compliance.emergency_calling_notice", account_id=account_id, recipient_email=account_email,
+        context={
+            "user_display_name": account_email,
+            "resource_summary": resource_summary,
+            "emergency_capability_status": capability_status,
+        },
+    )
+
+
+def notify_high_risk_destination_blocked(
+    db: Session, *, account_id: str, account_email: str, from_number: str, to_number: str, reason: str
+) -> None:
+    send_notification(
+        db, event_name="voice.high_risk_destination_blocked", account_id=account_id, recipient_email=account_email,
+        context={
+            "user_display_name": account_email,
+            "call_source_masked": _mask_number(from_number),
+            "call_destination_masked": _mask_number(to_number),
+            "call_started_at": _now_str(),
+            "decision_reason_category": reason,
+        },
+    )
+
+
+def notify_call_summary_available(
+    db: Session, *, account_id: str, account_email: str, counterparty: str
+) -> None:
+    send_notification(
+        db, event_name="voice.call_summary_available", account_id=account_id, recipient_email=account_email,
+        context={
+            "user_display_name": account_email,
+            "call_started_local": _now_str(),
+            "call_counterparty_safe": counterparty,
+        },
+    )
+
+
+def notify_voicemail_received(
+    db: Session, *, account_id: str, account_email: str, e164: str, from_number: str, duration: int | None
+) -> None:
+    send_notification(
+        db, event_name="voice.voicemail_received", account_id=account_id, recipient_email=account_email,
+        context={
+            "user_display_name": account_email,
+            "number_masked_or_formatted": _mask_number(e164),
+            "voicemail_received_local": _now_str(),
+            "call_caller_display_safe": _mask_number(from_number),
+            "voicemail_duration": f"{duration}s" if duration is not None else "unknown",
+        },
+    )
+
+
+def notify_voicemail_transcription_ready(db: Session, *, account_id: str, account_email: str) -> None:
+    send_notification(
+        db, event_name="voice.voicemail_transcription_ready", account_id=account_id, recipient_email=account_email,
+        context={"user_display_name": account_email, "voicemail_received_local": _now_str()},
+    )
+
+
+def notify_plan_started(
+    db: Session, *, account_id: str, account_email: str, organization_name: str, plan_name: str,
+    billing_interval: str, next_billing_date: str,
+) -> None:
+    send_notification(
+        db, event_name="billing.plan_started", account_id=account_id, recipient_email=account_email,
+        context={
+            "user_display_name": account_email,
+            "organization_name": organization_name,
+            "subscription_plan_name": plan_name,
+            "subscription_billing_interval": billing_interval,
+            "subscription_next_billing_date": next_billing_date,
+        },
+    )
+
+
+def notify_trial_started(
+    db: Session, *, account_id: str, account_email: str, organization_name: str, plan_name: str,
+    trial_end_date: str,
+) -> None:
+    send_notification(
+        db, event_name="billing.trial_started", account_id=account_id, recipient_email=account_email,
+        context={
+            "user_display_name": account_email,
+            "organization_name": organization_name,
+            "subscription_plan_name": plan_name,
+            "subscription_trial_end_date": trial_end_date,
+            "subscription_post_trial_terms": "your plan continues on the standard billing terms shown in Billing",
+        },
+    )
+
+
+def notify_plan_changed(
+    db: Session, *, account_id: str, account_email: str, organization_name: str, previous_plan: str,
+    new_plan: str,
+) -> None:
+    send_notification(
+        db, event_name="billing.plan_changed", account_id=account_id, recipient_email=account_email,
+        context={
+            "user_display_name": account_email,
+            "organization_name": organization_name,
+            "subscription_previous_plan": previous_plan,
+            "subscription_plan_name": new_plan,
+            "subscription_effective_at": _now_str(),
+            "transaction_adjustment_summary": "shown in Billing",
+        },
+    )
+
+
+def notify_payment_failed(db: Session, *, account_id: str, account_email: str, plan_name: str) -> None:
+    send_notification(
+        db, event_name="billing.payment_failed", account_id=account_id, recipient_email=account_email,
+        context={
+            "user_display_name": account_email,
+            "transaction_total": "the subscription",
+            "transaction_currency": "amount",
+            "transaction_description": f"{plan_name} plan services",
+            "transaction_failure_category": "payment method issue",
+        },
+    )
+
+
+def notify_payment_reminder(
+    db: Session, *, account_id: str, account_email: str, plan_name: str, grace_period_ends_at: str
+) -> None:
+    send_notification(
+        db, event_name="billing.payment_reminder", account_id=account_id, recipient_email=account_email,
+        context={
+            "user_display_name": account_email,
+            "transaction_total": "the subscription",
+            "transaction_currency": "amount",
+            "transaction_description": f"{plan_name} plan services",
+            "dunning_suspension_date": grace_period_ends_at,
+            "dunning_consequence_summary": (
+                "Outbound calling, video, number purchases, and AI features will pause"
+            ),
+        },
+    )
+
+
+def notify_service_restored(db: Session, *, account_id: str, account_email: str) -> None:
+    send_notification(
+        db, event_name="billing.service_restored", account_id=account_id, recipient_email=account_email,
+        context={
+            "user_display_name": account_email,
+            "scope_summary": "Outbound calling, video, number purchases, and AI features",
+            "event_occurred_at": _now_str(),
+        },
     )

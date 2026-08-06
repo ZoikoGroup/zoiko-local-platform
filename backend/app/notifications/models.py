@@ -48,6 +48,14 @@ class NotificationTemplate(Base):
 
     id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=new_uuid)
     key: Mapped[str] = mapped_column(String(100), nullable=False, unique=True, index=True)
+    # Maps this row to its entry in the Email Communications System spec
+    # doc (e.g. "ZLOC-EM-BILL-011") - nullable because several templates
+    # predate that registry effort and have no canonical doc entry (e.g.
+    # team_member.added, which is ORG domain, not yet imported). Lets the
+    # staff console show "matches spec vX.Y.Z" vs "custom" per template.
+    canonical_id: Mapped[str | None] = mapped_column(String(30), nullable=True, unique=True, index=True)
+    domain: Mapped[str | None] = mapped_column(String(20), nullable=True, index=True)
+    spec_version: Mapped[str | None] = mapped_column(String(20), nullable=True)
     category: Mapped[NotificationCategory] = mapped_column(
         Enum(NotificationCategory, name="notification_category_enum"), nullable=False
     )

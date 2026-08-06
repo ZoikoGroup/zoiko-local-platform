@@ -14,7 +14,10 @@ from app.notifications.service import (
 def test_notify_number_activated_logs_when_no_resend_key_configured(db_session, monkeypatch, caplog):
     monkeypatch.setattr("app.core.config.settings.resend_api_key", "")
     with caplog.at_level(logging.INFO, logger="zoiko.notifications"):
-        notify_number_activated(db_session, account_id=None, account_email="owner@example.com", e164="+15550001111")
+        notify_number_activated(
+            db_session, account_id=None, account_email="owner@example.com", e164="+15550001111",
+            organization_name="Acme Inc",
+        )
     assert any("+15550001111" in record.message for record in caplog.records)
 
 
@@ -185,21 +188,27 @@ def test_notification_delivery_is_recorded_and_listable(client, db_session, monk
         event_name="number.activated",
         account_id=account_id,
         recipient_email="notifylist@example.com",
-        context={"e164": "+15550009999"},
+        context={
+            "e164": "+15550009999", "number_formatted": "+15550009999",
+            "organization_name": "Notify Test Co", "user_display_name": "notifylist@example.com",
+        },
     )
 
+    # Two deliveries now: signup itself sends auth.account_activated, plus
+    # the number.activated sent explicitly above - the account's
+    # notification list is account-wide, not filtered to one event.
     deliveries = list_account_notifications(db_session, account_id)
-    assert len(deliveries) == 1
-    assert deliveries[0].event_name == "number.activated"
-    assert deliveries[0].status == "sent"
+    assert len(deliveries) == 2
+    number_activated = next(d for d in deliveries if d.event_name == "number.activated")
+    assert number_activated.status == "sent"
 
     response = client.get("/notifications/me", headers={"Authorization": f"Bearer {token}"})
     assert response.status_code == 200
     body = response.json()
-    assert len(body) == 1
-    assert body[0]["subject"] == "+15550009999 is active on Zoiko Local"
-    assert body[0]["channel"] == "email"
-    assert body[0]["read_at"] is None
+    assert len(body) == 2
+    number_activated_row = next(r for r in body if r["subject"] == "+15550009999 is active on Zoiko Local")
+    assert number_activated_row["channel"] == "email"
+    assert number_activated_row["read_at"] is None
 
 
 def _signup_and_login(client, email: str) -> tuple[str, str]:
@@ -224,7 +233,11 @@ def test_mark_notification_read(client, db_session, monkeypatch):
     token, account_id = _signup_and_login(client, "notifyread1@example.com")
     delivery = send_notification(
         db_session, event_name="number.activated", account_id=account_id,
-        recipient_email="notifyread1@example.com", context={"e164": "+15550001234"},
+        recipient_email="notifyread1@example.com",
+        context={
+            "e164": "+15550001234", "number_formatted": "+15550001234",
+            "organization_name": "Notify Read Test Co", "user_display_name": "notifyread1@example.com",
+        },
     )
 
     response = client.post(
@@ -234,7 +247,8 @@ def test_mark_notification_read(client, db_session, monkeypatch):
     assert response.json()["read_at"] is not None
 
     listed = client.get("/notifications/me", headers={"Authorization": f"Bearer {token}"}).json()
-    assert listed[0]["read_at"] is not None
+    marked = next(r for r in listed if r["id"] == delivery.id)
+    assert marked["read_at"] is not None
 
 
 def test_mark_notification_read_rejects_other_account(client, db_session, monkeypatch):
@@ -244,7 +258,11 @@ def test_mark_notification_read_rejects_other_account(client, db_session, monkey
     _, owner_account_id = _signup_and_login(client, "notifyread2owner@example.com")
     delivery = send_notification(
         db_session, event_name="number.activated", account_id=owner_account_id,
-        recipient_email="notifyread2owner@example.com", context={"e164": "+15550005678"},
+        recipient_email="notifyread2owner@example.com",
+        context={
+            "e164": "+15550005678", "number_formatted": "+15550005678",
+            "organization_name": "Notify Read Test Co", "user_display_name": "notifyread2owner@example.com",
+        },
     )
 
     intruder_token, _ = _signup_and_login(client, "notifyread2intruder@example.com")
@@ -261,16 +279,26 @@ def test_mark_all_notifications_read(client, db_session, monkeypatch):
     token, account_id = _signup_and_login(client, "notifyreadall@example.com")
     send_notification(
         db_session, event_name="number.activated", account_id=account_id,
-        recipient_email="notifyreadall@example.com", context={"e164": "+15550001111"},
+        recipient_email="notifyreadall@example.com",
+        context={
+            "e164": "+15550001111", "number_formatted": "+15550001111",
+            "organization_name": "Notify Read Test Co", "user_display_name": "notifyreadall@example.com",
+        },
     )
     send_notification(
         db_session, event_name="number.activated", account_id=account_id,
-        recipient_email="notifyreadall@example.com", context={"e164": "+15550002222"},
+        recipient_email="notifyreadall@example.com",
+        context={
+            "e164": "+15550002222", "number_formatted": "+15550002222",
+            "organization_name": "Notify Read Test Co", "user_display_name": "notifyreadall@example.com",
+        },
     )
 
+    # 3, not 2 - signup itself sends auth.account_activated in addition to
+    # the two number.activated notifications sent explicitly above.
     response = client.post("/notifications/read-all", headers={"Authorization": f"Bearer {token}"})
     assert response.status_code == 200
-    assert response.json()["marked_read"] == 2
+    assert response.json()["marked_read"] == 3
 
     listed = client.get("/notifications/me", headers={"Authorization": f"Bearer {token}"}).json()
     assert all(n["read_at"] is not None for n in listed)
@@ -384,7 +412,11 @@ def test_transactional_email_is_suppressed_when_opted_out(db_session, monkeypatc
 
     delivery = send_notification(
         db_session, event_name="number.activated", account_id=account.id,
-        recipient_email="x@example.com", context={"e164": "+15550001111"},
+        recipient_email="x@example.com",
+        context={
+            "e164": "+15550001111", "number_formatted": "+15550001111",
+            "organization_name": "Suppress Email Co", "user_display_name": "x@example.com",
+        },
     )
     assert delivery.status == "suppressed"
     assert sent == []

@@ -15,6 +15,7 @@ from app.integrations.telecom import twilio as telecom
 from app.integrations.video import livekit as video
 from app.intelligence.guardrails import check_for_disallowed_commitments
 from app.intelligence.service import qualify_caller
+from app.notifications.service import notify_high_risk_destination_blocked, notify_voicemail_received
 from app.media.models import (
     CallDirection,
     CallRecord,
@@ -163,7 +164,14 @@ def place_outbound_call(
 
     # Fraud/Risk gates (Architecture doc §5 "Fraud and Risk", §13 "blocked
     # destinations; fraud thresholds") - checked before ever reaching Twilio.
-    risk_service.assert_destination_allowed(db, to)
+    try:
+        risk_service.assert_destination_allowed(db, to)
+    except risk_service.DestinationBlockedError as e:
+        notify_high_risk_destination_blocked(
+            db, account_id=user.account_id, account_email=user.email,
+            from_number=from_number, to_number=to, reason=str(e),
+        )
+        raise
     risk_service.assert_outbound_velocity_ok(db, user.account_id)
 
     twiml = telecom.build_say_response(message)
@@ -289,6 +297,15 @@ def record_voicemail(
         db, actor_id=account_id, action="voicemail.created",
         target_type="voicemail", target_id=voicemail.id, metadata={"from": from_number},
     )
+
+    owner = db.query(User).filter(User.account_id == account_id, User.role == UserRole.OWNER).first()
+    if owner is not None:
+        number = db.query(PhoneNumber).filter(PhoneNumber.id == phone_number_id).first()
+        notify_voicemail_received(
+            db, account_id=account_id, account_email=owner.email,
+            e164=number.e164 if number else "", from_number=from_number, duration=duration,
+        )
+
     return voicemail
 
 

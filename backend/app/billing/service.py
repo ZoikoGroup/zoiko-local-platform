@@ -6,6 +6,14 @@ from sqlalchemy.orm import Session
 from app.audit.service import log_event
 from app.billing.models import Plan, Subscription, SubscriptionStatus, ZoikoNexSyncEvent, ZoikoNexSyncEventType
 from app.integrations.billing import zoikonex as zoikonex_adapter
+from app.notifications.service import (
+    notify_payment_failed,
+    notify_payment_reminder,
+    notify_plan_changed,
+    notify_plan_started,
+    notify_service_restored,
+    notify_trial_started,
+)
 
 DEFAULT_PLAN_CODE = "free_trial"
 _PERIOD_LENGTH = timedelta(days=30)
@@ -130,7 +138,26 @@ def get_or_create_subscription(db: Session, account_id: str) -> Subscription:
         db.add(sub)
         db.commit()
         db.refresh(sub)
-        return sync_subscription_to_zoikonex(db, sub)
+        sub = sync_subscription_to_zoikonex(db, sub)
+
+        from app.numbering.identity.models import Account, User, UserRole
+
+        owner = db.query(User).filter(User.account_id == account_id, User.role == UserRole.OWNER).first()
+        if owner is not None:
+            account = db.query(Account).filter(Account.id == account_id).first()
+            organization_name = account.name if account else "your organization"
+            if plan.trial_days > 0:
+                notify_trial_started(
+                    db, account_id=account_id, account_email=owner.email, organization_name=organization_name,
+                    plan_name=plan.name, trial_end_date=sub.trial_ends_at.strftime("%Y-%m-%d") if sub.trial_ends_at else "",
+                )
+            else:
+                notify_plan_started(
+                    db, account_id=account_id, account_email=owner.email, organization_name=organization_name,
+                    plan_name=plan.name, billing_interval="monthly",
+                    next_billing_date=sub.current_period_end.strftime("%Y-%m-%d"),
+                )
+        return sub
 
     changed = False
     if sub.current_period_end < now:
@@ -168,6 +195,19 @@ def change_plan(db: Session, account_id: str, plan_code: str, *, actor: str) -> 
         db, actor=actor, action="subscription.plan_changed", target=f"subscription:{sub.id}",
         before={"plan_code": before_plan}, after={"plan_code": sub.plan_code},
     )
+
+    from app.numbering.identity.models import Account, User, UserRole
+
+    owner = db.query(User).filter(User.account_id == account_id, User.role == UserRole.OWNER).first()
+    if owner is not None:
+        account = db.query(Account).filter(Account.id == account_id).first()
+        before_plan_obj = db.query(Plan).filter(Plan.plan_code == before_plan).first()
+        notify_plan_changed(
+            db, account_id=account_id, account_email=owner.email,
+            organization_name=account.name if account else "your organization",
+            previous_plan=before_plan_obj.name if before_plan_obj else before_plan,
+            new_plan=plan.name,
+        )
     return sub
 
 
@@ -268,6 +308,22 @@ def simulate_zoikonex_payment_event(db: Session, account_id: str, event_type: st
         db, actor=actor, action="subscription.payment_event_simulated", target=f"subscription:{sub.id}",
         before={"status": before_status.value}, after={"status": sub.status.value, "event_type": event_type},
     )
+
+    from app.numbering.identity.models import User, UserRole
+
+    owner = db.query(User).filter(User.account_id == account_id, User.role == UserRole.OWNER).first()
+    if owner is not None:
+        plan = get_plan(db, sub.plan_code)
+        if event_type == "payment_failed":
+            notify_payment_failed(db, account_id=account_id, account_email=owner.email, plan_name=plan.name)
+        elif event_type == "payment_retry":
+            notify_payment_reminder(
+                db, account_id=account_id, account_email=owner.email, plan_name=plan.name,
+                grace_period_ends_at=sub.grace_period_ends_at.strftime("%Y-%m-%d") if sub.grace_period_ends_at else "",
+            )
+        elif event_type == "payment_restored":
+            notify_service_restored(db, account_id=account_id, account_email=owner.email)
+
     return sub
 
 

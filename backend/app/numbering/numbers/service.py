@@ -11,7 +11,15 @@ from app.consent.models import ConsentType
 from app.consent.service import has_active_consent
 from app.core.config import settings
 from app.integrations.telecom import twilio as telecom
-from app.notifications.service import notify_number_activated, notify_number_suspended
+from app.notifications.service import (
+    notify_number_activated,
+    notify_number_assigned,
+    notify_number_order_not_approved,
+    notify_number_released,
+    notify_number_suspended,
+    notify_number_unassigned,
+    notify_number_verification_required,
+)
 from app.numbering.identity.models import Account, AccountType, User, UserRole
 from app.numbering.numbers.models import PhoneNumber, PhoneNumberStatus
 
@@ -152,6 +160,12 @@ def purchase_number(db: Session, account_id: str, e164: str) -> PhoneNumber:
             target_type="phone_number", target_id=number.id,
             metadata={"e164": e164, "requirement_type": requirement_type},
         )
+        owner = db.query(User).filter(User.account_id == account_id, User.role == UserRole.OWNER).first()
+        if owner is not None:
+            notify_number_verification_required(
+                db, account_id=account_id, account_email=owner.email, e164=e164,
+                action_summary=f"An approved {requirement_type} compliance case for {number.country}",
+            )
         raise ComplianceRequiredError(
             f"An approved {requirement_type} compliance case for {number.country} "
             "is required before purchasing a number there"
@@ -189,6 +203,12 @@ def purchase_number(db: Session, account_id: str, e164: str) -> PhoneNumber:
             db, actor_id=account_id, action="number.purchase_failed",
             target_type="phone_number", target_id=number.id, metadata={"e164": e164},
         )
+        owner = db.query(User).filter(User.account_id == account_id, User.role == UserRole.OWNER).first()
+        if owner is not None:
+            notify_number_order_not_approved(
+                db, account_id=account_id, account_email=owner.email,
+                order_reference=number.id, reason_category="provider unable to complete purchase",
+            )
         raise
 
     number.status = PhoneNumberStatus.ACTIVE
@@ -204,7 +224,11 @@ def purchase_number(db: Session, account_id: str, e164: str) -> PhoneNumber:
 
     owner = db.query(User).filter(User.account_id == account_id, User.role == UserRole.OWNER).first()
     if owner is not None:
-        notify_number_activated(db, account_id=account_id, account_email=owner.email, e164=e164)
+        account = db.query(Account).filter(Account.id == account_id).first()
+        notify_number_activated(
+            db, account_id=account_id, account_email=owner.email, e164=e164,
+            organization_name=account.name if account else "your organization",
+        )
 
     return number
 
@@ -289,7 +313,11 @@ def retry_provisioning(db: Session, staff_id: str, number_id: str) -> PhoneNumbe
 
     owner = db.query(User).filter(User.account_id == number.account_id, User.role == UserRole.OWNER).first()
     if owner is not None:
-        notify_number_activated(db, account_id=number.account_id, account_email=owner.email, e164=number.e164)
+        account = db.query(Account).filter(Account.id == number.account_id).first()
+        notify_number_activated(
+            db, account_id=number.account_id, account_email=owner.email, e164=number.e164,
+            organization_name=account.name if account else "your organization",
+        )
 
     return number
 
@@ -360,6 +388,11 @@ def cancel_number(db: Session, user: User, e164: str) -> PhoneNumber:
         db, actor_id=user.id, action="number.cancelled",
         target_type="phone_number", target_id=number.id, metadata={"e164": e164},
     )
+
+    owner = db.query(User).filter(User.account_id == user.account_id, User.role == UserRole.OWNER).first()
+    if owner is not None:
+        notify_number_released(db, account_id=user.account_id, account_email=owner.email, e164=e164)
+
     return number
 
 
@@ -477,6 +510,24 @@ def assign_number(db: Session, *, account_id: str, e164: str, user_id: str | Non
         before={"assigned_user_id": before_assignee},
         after={"assigned_user_id": user_id},
     )
+
+    account = db.query(Account).filter(Account.id == account_id).first()
+    organization_name = account.name if account else "your organization"
+    if user_id is not None:
+        notify_number_assigned(
+            db, account_id=account_id, account_email=assignee.email, e164=e164, organization_name=organization_name,
+        )
+    if before_assignee is not None and before_assignee != user_id:
+        previous_user = db.query(User).filter(User.id == before_assignee).first()
+        if previous_user is not None:
+            notify_number_unassigned(
+                db, account_id=account_id, account_email=previous_user.email, e164=e164,
+                previous_target=previous_user.email,
+                lifecycle_status=number.status.value,
+                route_summary=(
+                    f"forward to {number.forwarding_number}" if number.forwarding_number else "no configured forwarding route"
+                ),
+            )
     return number
 
 
