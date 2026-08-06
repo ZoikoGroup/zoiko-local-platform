@@ -31,6 +31,7 @@ from app.retention.routes import router as retention_router
 from app.risk.routes import router as risk_router
 from app.staff.routes import router as staff_router
 from app.usage.routes import router as usage_router
+from app.webhooks.routes import router as webhooks_router
 
 app = FastAPI(title="Zoiko Local API")
 app.state.limiter = limiter
@@ -86,6 +87,7 @@ app.include_router(risk_router)
 app.include_router(usage_router)
 app.include_router(ops_router)
 app.include_router(porting_router)
+app.include_router(webhooks_router)
 
 
 @app.get("/health")

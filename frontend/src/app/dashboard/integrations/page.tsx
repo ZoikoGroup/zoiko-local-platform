@@ -1,7 +1,20 @@
 "use client";
 
-import { useEffect, useState, useCallback } from "react";
-import { getPublicStatus, listMyNumbers, ApiError, type PublicStatus, type MyPhoneNumber } from "@/lib/api";
+import { useEffect, useState, useCallback, type FormEvent } from "react";
+import {
+  getPublicStatus,
+  listMyNumbers,
+  getCurrentUser,
+  listWebhookEndpoints,
+  createWebhookEndpoint,
+  deleteWebhookEndpoint,
+  listWebhookDeliveries,
+  ApiError,
+  type PublicStatus,
+  type MyPhoneNumber,
+  type WebhookEndpoint,
+  type WebhookDelivery,
+} from "@/lib/api";
 import { getToken } from "@/lib/auth";
 
 function Dot({ status }: { status: "operational" | "degraded" }) {
@@ -24,6 +37,65 @@ export default function IntegrationsPage() {
   const [statusError, setStatusError] = useState<string | null>(null);
   const [numbers, setNumbers] = useState<MyPhoneNumber[]>([]);
   const [loading, setLoading] = useState(true);
+
+  const [isAdmin, setIsAdmin] = useState(false);
+  const [endpoints, setEndpoints] = useState<WebhookEndpoint[]>([]);
+  const [deliveries, setDeliveries] = useState<WebhookDelivery[]>([]);
+  const [webhooksLoading, setWebhooksLoading] = useState(true);
+  const [webhooksError, setWebhooksError] = useState<string | null>(null);
+  const [newUrl, setNewUrl] = useState("");
+  const [newDescription, setNewDescription] = useState("");
+  const [creating, setCreating] = useState(false);
+  const [revealedSecret, setRevealedSecret] = useState<string | null>(null);
+
+  const loadWebhooks = useCallback(() => {
+    if (!token) return;
+    return Promise.all([listWebhookEndpoints(token), listWebhookDeliveries(token)])
+      .then(([endpointList, deliveryList]) => {
+        setEndpoints(endpointList);
+        setDeliveries(deliveryList);
+        setWebhooksError(null);
+      })
+      .catch(() => setWebhooksError("Couldn't load webhook endpoints."))
+      .finally(() => setWebhooksLoading(false));
+  }, [token]);
+
+  useEffect(() => {
+    if (!token) return;
+    getCurrentUser(token).then((me) => setIsAdmin(me.role === "owner" || me.role === "admin"));
+    loadWebhooks();
+  }, [token, loadWebhooks]);
+
+  async function handleCreateEndpoint(e: FormEvent) {
+    e.preventDefault();
+    if (!token || !newUrl) return;
+    setCreating(true);
+    setWebhooksError(null);
+    try {
+      const created = await createWebhookEndpoint(token, {
+        url: newUrl,
+        description: newDescription || undefined,
+      });
+      setRevealedSecret(created.secret);
+      setNewUrl("");
+      setNewDescription("");
+      await loadWebhooks();
+    } catch (err) {
+      setWebhooksError(err instanceof ApiError ? err.message : "Couldn't create the webhook endpoint.");
+    } finally {
+      setCreating(false);
+    }
+  }
+
+  async function handleDeleteEndpoint(endpointId: string) {
+    if (!token) return;
+    try {
+      await deleteWebhookEndpoint(token, endpointId);
+      await loadWebhooks();
+    } catch (err) {
+      setWebhooksError(err instanceof ApiError ? err.message : "Couldn't remove the webhook endpoint.");
+    }
+  }
 
   const loadStatus = useCallback(() => {
     return getPublicStatus()
@@ -57,7 +129,7 @@ export default function IntegrationsPage() {
         <h2 className="text-xl font-semibold text-slate-900">Integrations</h2>
         <p className="text-sm text-slate-500">
           Zoiko Local runs your calling, video, and AI on our managed provider connections — there&apos;s nothing
-          for you to configure or connect yourself.
+          for you to configure there. Below, you can register your own webhook endpoints to receive events.
         </p>
       </div>
 
@@ -119,6 +191,119 @@ export default function IntegrationsPage() {
               <div className="text-xs text-slate-500">With AI Receptionist</div>
             </div>
           </div>
+        )}
+      </div>
+
+      <div className="bg-white rounded-xl border border-slate-200 p-5 space-y-4">
+        <div>
+          <h3 className="font-semibold text-slate-900">Developer Webhooks</h3>
+          <p className="text-sm text-slate-500 mt-1">
+            Register a URL to receive a real-time POST for account events — number activated, call summary
+            available, porting completed, and more. Each request is signed with your endpoint&apos;s secret via an
+            <code className="mx-1 text-xs bg-slate-100 rounded px-1 py-0.5">X-Zoiko-Signature</code>
+            header (HMAC-SHA256) so you can verify it came from Zoiko Local.
+          </p>
+        </div>
+
+        {webhooksError && <p className="text-sm text-red-600 bg-red-50 rounded-lg px-3 py-2">{webhooksError}</p>}
+
+        {revealedSecret && (
+          <div className="bg-amber-50 border border-amber-200 rounded-lg px-3 py-2 text-sm">
+            <p className="font-medium text-amber-800">Save this secret now — it won&apos;t be shown again.</p>
+            <code className="block mt-1 text-xs bg-white border border-amber-200 rounded px-2 py-1 break-all">
+              {revealedSecret}
+            </code>
+            <button
+              onClick={() => setRevealedSecret(null)}
+              className="mt-2 text-xs font-medium text-amber-700 hover:text-amber-900"
+            >
+              Dismiss
+            </button>
+          </div>
+        )}
+
+        {webhooksLoading ? (
+          <p className="text-sm text-slate-500">Loading...</p>
+        ) : (
+          <>
+            {endpoints.length === 0 ? (
+              <p className="text-sm text-slate-500">No webhook endpoints registered yet.</p>
+            ) : (
+              <div className="divide-y divide-slate-100 rounded-lg border border-slate-200">
+                {endpoints.map((ep) => (
+                  <div key={ep.id} className="flex items-center justify-between px-4 py-3 text-sm">
+                    <div>
+                      <div className="text-slate-800 font-mono text-xs">{ep.url}</div>
+                      {ep.description && <div className="text-xs text-slate-400 mt-0.5">{ep.description}</div>}
+                    </div>
+                    {isAdmin && (
+                      <button
+                        onClick={() => handleDeleteEndpoint(ep.id)}
+                        className="text-xs font-medium text-red-600 hover:text-red-800"
+                      >
+                        Remove
+                      </button>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {isAdmin ? (
+              <form onSubmit={handleCreateEndpoint} className="flex flex-wrap items-center gap-2 pt-1">
+                <input
+                  type="url"
+                  required
+                  placeholder="https://your-server.com/webhook"
+                  value={newUrl}
+                  onChange={(e) => setNewUrl(e.target.value)}
+                  className="flex-1 min-w-[220px] text-sm rounded-lg border border-slate-200 px-3 py-1.5"
+                />
+                <input
+                  type="text"
+                  placeholder="Description (optional)"
+                  value={newDescription}
+                  onChange={(e) => setNewDescription(e.target.value)}
+                  className="text-sm rounded-lg border border-slate-200 px-3 py-1.5 w-48"
+                />
+                <button
+                  type="submit"
+                  disabled={creating}
+                  className="text-xs font-medium rounded-lg px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-60 text-white"
+                >
+                  {creating ? "Adding..." : "Add endpoint"}
+                </button>
+              </form>
+            ) : (
+              <p className="text-xs text-slate-400">Only an account Owner or Admin can manage webhook endpoints.</p>
+            )}
+
+            {deliveries.length > 0 && (
+              <div className="pt-2">
+                <h4 className="text-xs font-medium text-slate-500 mb-2">Recent deliveries</h4>
+                <ul className="space-y-1.5">
+                  {deliveries.slice(0, 10).map((d) => (
+                    <li
+                      key={d.id}
+                      className="flex items-center justify-between text-xs bg-slate-50 rounded-lg px-3 py-2"
+                    >
+                      <span className="text-slate-700">{d.event_type}</span>
+                      <span className="flex items-center gap-2 text-slate-400">
+                        <span
+                          className={
+                            d.status === "delivered" ? "text-emerald-600 font-medium" : "text-red-600 font-medium"
+                          }
+                        >
+                          {d.status}
+                        </span>
+                        {new Date(d.created_at).toLocaleString()}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+          </>
         )}
       </div>
 

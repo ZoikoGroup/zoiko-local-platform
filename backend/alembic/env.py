@@ -27,6 +27,7 @@ from app.retention import models as retention_models  # noqa: F401
 from app.risk import models as risk_models  # noqa: F401
 from app.staff import models as staff_models  # noqa: F401
 from app.usage import models as usage_models  # noqa: F401
+from app.webhooks import models as webhooks_models  # noqa: F401
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.

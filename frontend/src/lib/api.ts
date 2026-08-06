@@ -1294,3 +1294,56 @@ export function getContactHistory(token: string, contactId: string): Promise<Con
     headers: { Authorization: `Bearer ${token}` },
   });
 }
+
+// --- Developer Webhooks ---
+
+export type WebhookEndpoint = {
+  id: string;
+  url: string;
+  description: string | null;
+  is_active: boolean;
+  created_at: string;
+};
+
+export type WebhookEndpointCreated = WebhookEndpoint & { secret: string };
+
+export type WebhookDelivery = {
+  id: string;
+  endpoint_id: string;
+  event_type: string;
+  status: "delivered" | "failed";
+  response_status_code: number | null;
+  error: string | null;
+  created_at: string;
+};
+
+export function listWebhookEndpoints(token: string): Promise<WebhookEndpoint[]> {
+  return request<WebhookEndpoint[]>("/webhooks/endpoints", {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export function createWebhookEndpoint(
+  token: string,
+  input: { url: string; description?: string }
+): Promise<WebhookEndpointCreated> {
+  return request<WebhookEndpointCreated>("/webhooks/endpoints", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify(input),
+  });
+}
+
+export function deleteWebhookEndpoint(token: string, endpointId: string): Promise<void> {
+  return request<void>(`/webhooks/endpoints/${encodeURIComponent(endpointId)}`, {
+    method: "DELETE",
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export function listWebhookDeliveries(token: string, endpointId?: string): Promise<WebhookDelivery[]> {
+  const qs = endpointId ? `?endpoint_id=${encodeURIComponent(endpointId)}` : "";
+  return request<WebhookDelivery[]>(`/webhooks/deliveries${qs}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
