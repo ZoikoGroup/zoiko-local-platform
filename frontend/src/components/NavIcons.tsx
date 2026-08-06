@@ -77,18 +77,6 @@ export function BillingIcon({ className = base }: IconProps) {
   );
 }
 
-export function IntegrationsIcon({ className = base }: IconProps) {
-  return (
-    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
-      <path
-        strokeLinecap="round"
-        strokeLinejoin="round"
-        d="M9 3h2v2.5a1.5 1.5 0 1 0 2 0V3h2a2 2 0 0 1 2 2v2h2.5a1.5 1.5 0 1 1 0 2H17v2a2 2 0 0 1-2 2h-2v2.5a1.5 1.5 0 1 1-2 0V13H9a2 2 0 0 1-2-2v-2H4.5a1.5 1.5 0 1 1 0-2H7V5a2 2 0 0 1 2-2Z"
-      />
-    </svg>
-  );
-}
-
 export function ReportsIcon({ className = base }: IconProps) {
   return (
     <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
@@ -110,15 +98,75 @@ export function SettingsIcon({ className = base }: IconProps) {
   );
 }
 
+export function VoicemailIcon({ className = base }: IconProps) {
+  return (
+    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
+      <circle cx="6" cy="15" r="3" />
+      <circle cx="18" cy="15" r="3" />
+      <path strokeLinecap="round" d="M6 12h12" />
+    </svg>
+  );
+}
+
+export function BellIcon({ className = base }: IconProps) {
+  return (
+    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
+      <path
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        d="M6 10a6 6 0 1 1 12 0c0 4 1.5 5.5 1.5 5.5H4.5S6 14 6 10Z"
+      />
+      <path strokeLinecap="round" strokeLinejoin="round" d="M10 19a2 2 0 0 0 4 0" />
+    </svg>
+  );
+}
+
+export function BriefcaseIcon({ className = base }: IconProps) {
+  return (
+    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
+      <rect x="3" y="7" width="18" height="12" rx="2" />
+      <path strokeLinecap="round" strokeLinejoin="round" d="M8 7V5a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
+      <path strokeLinecap="round" d="M3 12h18" />
+    </svg>
+  );
+}
+
+export function ShieldIcon({ className = base }: IconProps) {
+  return (
+    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
+      <path
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        d="M12 3l7 3v5c0 4.5-3 8-7 10-4-2-7-5.5-7-10V6l7-3Z"
+      />
+      <path strokeLinecap="round" strokeLinejoin="round" d="m9.5 12 2 2 3.5-3.5" />
+    </svg>
+  );
+}
+
+export function SupportIcon({ className = base }: IconProps) {
+  return (
+    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
+      <circle cx="12" cy="12" r="9" />
+      <circle cx="12" cy="12" r="3.5" />
+      <path strokeLinecap="round" d="M5.5 5.5l3 3M18.5 5.5l-3 3M5.5 18.5l3-3M18.5 18.5l-3-3" />
+    </svg>
+  );
+}
+
 export const NAV_ICONS: Record<string, (props: IconProps) => React.JSX.Element> = {
   "/dashboard": DashboardIcon,
   "/dashboard/numbers": PhoneIcon,
   "/dashboard/calls": CallLogIcon,
   "/dashboard/video": VideoIcon,
   "/dashboard/ai-insights": SparkleIcon,
+  "/dashboard/voicemail": VoicemailIcon,
   "/dashboard/contacts": ContactsIcon,
-  "/dashboard/billing": BillingIcon,
-  "/dashboard/integrations": IntegrationsIcon,
   "/dashboard/reports": ReportsIcon,
+  "/dashboard/billing": BillingIcon,
+  "/dashboard/notifications": BellIcon,
+  "/dashboard/business": BriefcaseIcon,
+  "/dashboard/security": ShieldIcon,
   "/dashboard/settings": SettingsIcon,
+  "/dashboard/support": SupportIcon,
 };

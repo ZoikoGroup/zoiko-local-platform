@@ -115,6 +115,24 @@ export function listTeamMembers(token: string): Promise<TeamMember[]> {
   });
 }
 
+export function addTeamMember(
+  token: string,
+  input: { email: string; password: string; role: "admin" | "member" | "viewer" }
+): Promise<TeamMember> {
+  return request<TeamMember>("/team/members", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify(input),
+  });
+}
+
+export function removeTeamMember(token: string, userId: string): Promise<void> {
+  return request<void>(`/team/members/${encodeURIComponent(userId)}`, {
+    method: "DELETE",
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
 export function googleAuth(credential: string): Promise<{ access_token: string; token_type: string }> {
   return request("/auth/google", {
     method: "POST",

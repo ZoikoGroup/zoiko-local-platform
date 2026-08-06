@@ -2,9 +2,12 @@
 
 import { useEffect, useState, useCallback, type FormEvent } from "react";
 import {
+  getCurrentUser,
+  listTeamMembers,
+  addTeamMember,
+  removeTeamMember,
   getPublicStatus,
   listMyNumbers,
-  getCurrentUser,
   listWebhookEndpoints,
   createWebhookEndpoint,
   deleteWebhookEndpoint,
@@ -17,6 +20,7 @@ import {
   disconnectCrm,
   listCrmSyncEvents,
   ApiError,
+  type TeamMember,
   type PublicStatus,
   type MyPhoneNumber,
   type WebhookEndpoint,
@@ -42,21 +46,109 @@ function statusLabel(status: "operational" | "degraded") {
   return status === "operational" ? "Operational" : "Degraded performance";
 }
 
-export default function IntegrationsPage() {
+export default function BusinessPage() {
   const [token] = useState<string | null>(() => getToken());
+  const [isAdmin, setIsAdmin] = useState(false);
+
+  // --- Team ---
+  const [members, setMembers] = useState<TeamMember[]>([]);
+  const [membersLoading, setMembersLoading] = useState(true);
+  const [membersError, setMembersError] = useState<string | null>(null);
+  const [newEmail, setNewEmail] = useState("");
+  const [newPassword, setNewPassword] = useState("");
+  const [newRole, setNewRole] = useState<"admin" | "member" | "viewer">("member");
+  const [addingMember, setAddingMember] = useState(false);
+  const [removingId, setRemovingId] = useState<string | null>(null);
+
+  const loadMembers = useCallback(() => {
+    if (!token) return;
+    return listTeamMembers(token)
+      .then((data) => {
+        setMembers(data);
+        setMembersError(null);
+      })
+      .catch(() => setMembersError("Couldn't load team members."))
+      .finally(() => setMembersLoading(false));
+  }, [token]);
+
+  useEffect(() => {
+    if (!token) return;
+    getCurrentUser(token).then((me) => setIsAdmin(me.role === "owner" || me.role === "admin"));
+    loadMembers();
+  }, [token, loadMembers]);
+
+  async function handleAddMember(e: FormEvent) {
+    e.preventDefault();
+    if (!token || !newEmail || !newPassword) return;
+    setAddingMember(true);
+    setMembersError(null);
+    try {
+      await addTeamMember(token, { email: newEmail, password: newPassword, role: newRole });
+      setNewEmail("");
+      setNewPassword("");
+      setNewRole("member");
+      await loadMembers();
+    } catch (err) {
+      setMembersError(err instanceof ApiError ? err.message : "Couldn't add the team member.");
+    } finally {
+      setAddingMember(false);
+    }
+  }
+
+  async function handleRemoveMember(userId: string) {
+    if (!token) return;
+    setRemovingId(userId);
+    setMembersError(null);
+    try {
+      await removeTeamMember(token, userId);
+      await loadMembers();
+    } catch (err) {
+      setMembersError(err instanceof ApiError ? err.message : "Couldn't remove the team member.");
+    } finally {
+      setRemovingId(null);
+    }
+  }
+
+  // --- Platform status + connected numbers ---
   const [status, setStatus] = useState<PublicStatus | null>(null);
   const [statusError, setStatusError] = useState<string | null>(null);
   const [numbers, setNumbers] = useState<MyPhoneNumber[]>([]);
-  const [loading, setLoading] = useState(true);
+  const [numbersLoading, setNumbersLoading] = useState(true);
 
-  const [isAdmin, setIsAdmin] = useState(false);
+  const loadStatus = useCallback(() => {
+    return getPublicStatus()
+      .then((data) => {
+        setStatus(data);
+        setStatusError(null);
+      })
+      .catch((err) => setStatusError(err instanceof ApiError ? err.message : "Couldn't load provider status."));
+  }, []);
+
+  useEffect(() => {
+    loadStatus();
+    const interval = setInterval(loadStatus, 30_000);
+    return () => clearInterval(interval);
+  }, [loadStatus]);
+
+  useEffect(() => {
+    if (!token) return;
+    listMyNumbers(token)
+      .then(setNumbers)
+      .finally(() => setNumbersLoading(false));
+  }, [token]);
+
+  const activeNumbers = numbers.filter((n) => n.status === "active");
+  const forwardingCount = activeNumbers.filter((n) => n.forwarding_number).length;
+  const receptionistCount = activeNumbers.filter((n) => n.ai_receptionist_enabled).length;
+
+  // --- Webhooks ---
   const [endpoints, setEndpoints] = useState<WebhookEndpoint[]>([]);
   const [deliveries, setDeliveries] = useState<WebhookDelivery[]>([]);
   const [webhooksLoading, setWebhooksLoading] = useState(true);
   const [webhooksError, setWebhooksError] = useState<string | null>(null);
   const [newUrl, setNewUrl] = useState("");
   const [newDescription, setNewDescription] = useState("");
-  const [creating, setCreating] = useState(false);
+  const [creatingEndpoint, setCreatingEndpoint] = useState(false);
   const [revealedSecret, setRevealedSecret] = useState<string | null>(null);
 
   const loadWebhooks = useCallback(() => {
@@ -72,21 +164,16 @@ export default function IntegrationsPage() {
   }, [token]);
 
   useEffect(() => {
-    if (!token) return;
-    getCurrentUser(token).then((me) => setIsAdmin(me.role === "owner" || me.role === "admin"));
     loadWebhooks();
-  }, [token, loadWebhooks]);
+  }, [loadWebhooks]);
 
   async function handleCreateEndpoint(e: FormEvent) {
     e.preventDefault();
     if (!token || !newUrl) return;
-    setCreating(true);
+    setCreatingEndpoint(true);
     setWebhooksError(null);
     try {
-      const created = await createWebhookEndpoint(token, {
-        url: newUrl,
-        description: newDescription || undefined,
-      });
+      const created = await createWebhookEndpoint(token, { url: newUrl, description: newDescription || undefined });
       setRevealedSecret(created.secret);
       setNewUrl("");
       setNewDescription("");
@@ -94,7 +181,7 @@ export default function IntegrationsPage() {
     } catch (err) {
       setWebhooksError(err instanceof ApiError ? err.message : "Couldn't create the webhook endpoint.");
     } finally {
-      setCreating(false);
+      setCreatingEndpoint(false);
     }
   }
 
@@ -108,6 +195,7 @@ export default function IntegrationsPage() {
     }
   }
 
+  // --- API keys ---
   const [apiKeys, setApiKeys] = useState<ApiKey[]>([]);
   const [apiKeysLoading, setApiKeysLoading] = useState(true);
   const [apiKeysError, setApiKeysError] = useState<string | null>(null);
@@ -157,6 +245,7 @@ export default function IntegrationsPage() {
     }
   }
 
+  // --- CRM ---
   const [crmConnection, setCrmConnection] = useState<CrmConnection | null>(null);
   const [crmSyncEvents, setCrmSyncEvents] = useState<CrmSyncEvent[]>([]);
   const [crmLoading, setCrmLoading] = useState(true);
@@ -208,42 +297,86 @@ export default function IntegrationsPage() {
     }
   }
 
-  const loadStatus = useCallback(() => {
-    return getPublicStatus()
-      .then((data) => {
-        setStatus(data);
-        setStatusError(null);
-      })
-      .catch((err) => setStatusError(err instanceof ApiError ? err.message : "Couldn't load provider status."));
-  }, []);
-
-  useEffect(() => {
-    loadStatus();
-    const interval = setInterval(loadStatus, 30_000);
-    return () => clearInterval(interval);
-  }, [loadStatus]);
-
-  useEffect(() => {
-    if (!token) return;
-    listMyNumbers(token)
-      .then(setNumbers)
-      .finally(() => setLoading(false));
-  }, [token]);
-
-  const activeNumbers = numbers.filter((n) => n.status === "active");
-  const forwardingCount = activeNumbers.filter((n) => n.forwarding_number).length;
-  const receptionistCount = activeNumbers.filter((n) => n.ai_receptionist_enabled).length;
-
   return (
     <div className="space-y-6">
       <div>
-        <h2 className="text-xl font-semibold text-slate-900">Integrations</h2>
-        <p className="text-sm text-slate-500">
-          Zoiko Local runs your calling, video, and AI on our managed provider connections — there&apos;s nothing
-          for you to configure there. Below, you can register your own webhook endpoints to receive events.
-        </p>
+        <h2 className="text-xl font-semibold text-slate-900">Business</h2>
+        <p className="text-sm text-slate-500">Your team, platform status, and developer integrations.</p>
       </div>
 
+      {/* Team */}
+      <div className="bg-white rounded-xl border border-slate-200 p-5 space-y-4">
+        <h3 className="font-semibold text-slate-900">Team</h3>
+
+        {membersError && <p className="text-sm text-red-600 bg-red-50 rounded-lg px-3 py-2">{membersError}</p>}
+
+        {membersLoading ? (
+          <p className="text-sm text-slate-500">Loading...</p>
+        ) : (
+          <div className="divide-y divide-slate-100 rounded-lg border border-slate-200">
+            {members.map((m) => (
+              <div key={m.id} className="flex items-center justify-between px-4 py-3 text-sm">
+                <div>
+                  <span className="text-slate-800">{m.email}</span>
+                  <span className="ml-2 text-xs font-medium text-slate-500 capitalize bg-slate-100 rounded-full px-2 py-0.5">
+                    {m.role}
+                  </span>
+                </div>
+                {isAdmin && m.role !== "owner" && (
+                  <button
+                    onClick={() => handleRemoveMember(m.id)}
+                    disabled={removingId === m.id}
+                    className="text-xs font-medium text-red-600 hover:text-red-800 disabled:opacity-50"
+                  >
+                    {removingId === m.id ? "Removing..." : "Remove"}
+                  </button>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+
+        {isAdmin ? (
+          <form onSubmit={handleAddMember} className="flex flex-wrap items-center gap-2 pt-1">
+            <input
+              type="email"
+              required
+              placeholder="Email"
+              value={newEmail}
+              onChange={(e) => setNewEmail(e.target.value)}
+              className="text-sm rounded-lg border border-slate-200 px-3 py-1.5 min-w-[200px]"
+            />
+            <input
+              type="password"
+              required
+              placeholder="Temporary password"
+              value={newPassword}
+              onChange={(e) => setNewPassword(e.target.value)}
+              className="text-sm rounded-lg border border-slate-200 px-3 py-1.5"
+            />
+            <select
+              value={newRole}
+              onChange={(e) => setNewRole(e.target.value as typeof newRole)}
+              className="text-sm rounded-lg border border-slate-200 px-3 py-1.5"
+            >
+              <option value="admin">Admin</option>
+              <option value="member">Member</option>
+              <option value="viewer">Viewer</option>
+            </select>
+            <button
+              type="submit"
+              disabled={addingMember}
+              className="text-xs font-medium rounded-lg px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-60 text-white"
+            >
+              {addingMember ? "Adding..." : "Add member"}
+            </button>
+          </form>
+        ) : (
+          <p className="text-xs text-slate-400">Only an account Owner or Admin can manage team members.</p>
+        )}
+      </div>
+
+      {/* Platform status */}
       <div className="bg-white rounded-xl border border-slate-200 p-5 space-y-4">
         <div className="flex items-center justify-between">
           <h3 className="font-semibold text-slate-900">Platform Services</h3>
@@ -281,12 +414,13 @@ export default function IntegrationsPage() {
         )}
       </div>
 
+      {/* Connected numbers */}
       <div className="bg-white rounded-xl border border-slate-200 p-5 space-y-4">
         <h3 className="font-semibold text-slate-900">Your Connected Numbers</h3>
-        {loading ? (
+        {numbersLoading ? (
           <p className="text-sm text-slate-500">Loading...</p>
         ) : activeNumbers.length === 0 ? (
-          <p className="text-sm text-slate-500">No active numbers yet — add one from the Numbers page.</p>
+          <p className="text-sm text-slate-500">No active numbers yet — add one from My Numbers.</p>
         ) : (
           <div className="grid grid-cols-3 gap-4">
             <div>
@@ -305,6 +439,7 @@ export default function IntegrationsPage() {
         )}
       </div>
 
+      {/* Webhooks */}
       <div className="bg-white rounded-xl border border-slate-200 p-5 space-y-4">
         <div>
           <h3 className="font-semibold text-slate-900">Developer Webhooks</h3>
@@ -379,10 +514,10 @@ export default function IntegrationsPage() {
                 />
                 <button
                   type="submit"
-                  disabled={creating}
+                  disabled={creatingEndpoint}
                   className="text-xs font-medium rounded-lg px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-60 text-white"
                 >
-                  {creating ? "Adding..." : "Add endpoint"}
+                  {creatingEndpoint ? "Adding..." : "Add endpoint"}
                 </button>
               </form>
             ) : (
@@ -418,6 +553,7 @@ export default function IntegrationsPage() {
         )}
       </div>
 
+      {/* API keys */}
       <div className="bg-white rounded-xl border border-slate-200 p-5 space-y-4">
         <div>
           <h3 className="font-semibold text-slate-900">Public API Keys</h3>
@@ -499,6 +635,7 @@ export default function IntegrationsPage() {
         )}
       </div>
 
+      {/* CRM */}
       <div className="bg-white rounded-xl border border-slate-200 p-5 space-y-4">
         <div>
           <h3 className="font-semibold text-slate-900">CRM Connection</h3>
@@ -572,13 +709,6 @@ export default function IntegrationsPage() {
         ) : (
           <p className="text-xs text-slate-400">Only an account Owner or Admin can connect a CRM.</p>
         )}
-      </div>
-
-      <div className="bg-white rounded-xl border border-slate-200 p-5 space-y-2">
-        <h3 className="font-semibold text-slate-900">Billing</h3>
-        <p className="text-sm text-slate-500">
-          Billing and payment integration isn&apos;t connected yet — this account isn&apos;t being charged.
-        </p>
       </div>
     </div>
   );

@@ -5,39 +5,20 @@ import {
   listMyNumbers,
   listCalls,
   placeOutboundCall,
-  listVoicemails,
   summarizeCall,
-  summarizeVoicemail,
   grantAiProcessingConsent,
   ApiError,
   type MyPhoneNumber,
   type CallLogEntry,
-  type VoicemailEntry,
-  type ConversationSummary,
 } from "@/lib/api";
 import { getToken } from "@/lib/auth";
-
-type SummaryKey = string; // `${kind}:${id}`
-type SummaryState =
-  | { status: "idle" }
-  | { status: "busy" }
-  | { status: "consent_required" }
-  | { status: "error"; message: string }
-  | { status: "done"; result: ConversationSummary };
-
-function formatDuration(seconds: number | null): string {
-  if (seconds === null) return "—";
-  const m = Math.floor(seconds / 60);
-  const s = seconds % 60;
-  return `${m}:${s.toString().padStart(2, "0")}`;
-}
+import { CallRow, type SummaryKey, type SummaryState } from "@/components/CallRow";
 
 export default function CallsPage() {
   const [token] = useState<string | null>(() => getToken());
 
   const [numbers, setNumbers] = useState<MyPhoneNumber[]>([]);
   const [calls, setCalls] = useState<CallLogEntry[]>([]);
-  const [voicemails, setVoicemails] = useState<VoicemailEntry[]>([]);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
 
@@ -51,15 +32,14 @@ export default function CallsPage() {
 
   const loadAll = useCallback(() => {
     if (!token) return;
-    return Promise.all([listMyNumbers(token), listCalls(token), listVoicemails(token)])
-      .then(([numbersData, callsData, voicemailsData]) => {
+    return Promise.all([listMyNumbers(token), listCalls(token)])
+      .then(([numbersData, callsData]) => {
         setNumbers(numbersData);
         setCalls(callsData);
-        setVoicemails(voicemailsData);
         setLoadError(null);
         setFromNumber((current) => current || numbersData.find((n) => n.status === "active")?.e164 || "");
       })
-      .catch(() => setLoadError("Couldn't load calls and voicemail."))
+      .catch(() => setLoadError("Couldn't load calls."))
       .finally(() => setLoading(false));
   }, [token]);
 
@@ -85,12 +65,12 @@ export default function CallsPage() {
     }
   }
 
-  async function handleSummarize(kind: "call" | "voicemail", id: string) {
+  async function handleSummarize(id: string) {
     if (!token) return;
-    const key: SummaryKey = `${kind}:${id}`;
+    const key: SummaryKey = `call:${id}`;
     setSummaries((prev) => ({ ...prev, [key]: { status: "busy" } }));
     try {
-      const result = kind === "call" ? await summarizeCall(token, id) : await summarizeVoicemail(token, id);
+      const result = await summarizeCall(token, id);
       setSummaries((prev) => ({ ...prev, [key]: { status: "done", result } }));
     } catch (err) {
       if (err instanceof ApiError && err.status === 403 && err.message.toLowerCase().includes("consent")) {
@@ -102,13 +82,13 @@ export default function CallsPage() {
     }
   }
 
-  async function handleGrantConsent(kind: "call" | "voicemail", id: string) {
+  async function handleGrantConsent(id: string) {
     if (!token) return;
     try {
       await grantAiProcessingConsent(token);
-      await handleSummarize(kind, id);
+      await handleSummarize(id);
     } catch {
-      const key: SummaryKey = `${kind}:${id}`;
+      const key: SummaryKey = `call:${id}`;
       setSummaries((prev) => ({ ...prev, [key]: { status: "error", message: "Couldn't grant AI consent." } }));
     }
   }
@@ -119,9 +99,7 @@ export default function CallsPage() {
     <div className="max-w-3xl mx-auto space-y-6">
       <div>
         <h2 className="text-xl font-semibold text-slate-900">Calls</h2>
-        <p className="text-sm text-slate-500">
-          Inbound and outbound call logs, voicemail, and AI-generated summaries.
-        </p>
+        <p className="text-sm text-slate-500">Inbound and outbound call logs, with AI-generated summaries.</p>
       </div>
 
       {loadError && (
@@ -195,159 +173,12 @@ export default function CallsPage() {
               recordingUrl={c.recording_url}
               suspectedSpam={c.is_suspected_spam}
               summaryState={summaries[`call:${c.id}`] ?? { status: "idle" }}
-              onSummarize={() => handleSummarize("call", c.id)}
-              onGrantConsent={() => handleGrantConsent("call", c.id)}
+              onSummarize={() => handleSummarize(c.id)}
+              onGrantConsent={() => handleGrantConsent(c.id)}
             />
           ))}
         </div>
       </div>
-
-      {/* Voicemail */}
-      <div className="bg-white rounded-xl border border-slate-200 p-6 space-y-4">
-        <h3 className="font-semibold text-slate-900">Voicemail</h3>
-
-        {loading && <p className="text-sm text-slate-500">Loading...</p>}
-        {!loading && voicemails.length === 0 && <p className="text-sm text-slate-500">No voicemails yet.</p>}
-
-        <div className="space-y-3">
-          {voicemails.map((v) => (
-            <CallRow
-              key={v.id}
-              label={`From ${v.from}`}
-              status="left a message"
-              duration={v.duration}
-              createdAt={v.created_at}
-              recordingUrl={v.recording_url}
-              summaryState={summaries[`voicemail:${v.id}`] ?? { status: "idle" }}
-              onSummarize={() => handleSummarize("voicemail", v.id)}
-              onGrantConsent={() => handleGrantConsent("voicemail", v.id)}
-            />
-          ))}
-        </div>
-      </div>
-    </div>
-  );
-}
-
-function CallRow({
-  label,
-  status,
-  duration,
-  createdAt,
-  recordingUrl,
-  suspectedSpam,
-  summaryState,
-  onSummarize,
-  onGrantConsent,
-}: {
-  label: string;
-  status: string;
-  duration: number | null;
-  createdAt: string;
-  recordingUrl: string | null;
-  suspectedSpam?: boolean;
-  summaryState: SummaryState;
-  onSummarize: () => void;
-  onGrantConsent: () => void;
-}) {
-  return (
-    <div className="rounded-lg border border-slate-200 px-4 py-3 space-y-2">
-      <div className="flex items-center justify-between gap-4">
-        <div>
-          <div className="text-sm font-medium text-slate-800 flex items-center gap-2">
-            {label}
-            {suspectedSpam && (
-              <span
-                title="This number called multiple other Zoiko Local accounts in a short window - a pattern typical of spam/robocall traffic, not a confirmed block."
-                className="text-[10px] font-semibold uppercase tracking-wide text-amber-700 bg-amber-100 rounded-full px-2 py-0.5"
-              >
-                Suspected spam
-              </span>
-            )}
-          </div>
-          <div className="text-xs text-slate-500">
-            {status} · {formatDuration(duration)} · {new Date(createdAt).toLocaleString()}
-          </div>
-        </div>
-        <div className="flex items-center gap-3 shrink-0">
-          {recordingUrl && (
-            <a
-              href={recordingUrl}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="text-xs font-medium text-indigo-600 hover:text-indigo-800"
-            >
-              Play
-            </a>
-          )}
-          {recordingUrl && summaryState.status !== "done" && (
-            <button
-              onClick={onSummarize}
-              disabled={summaryState.status === "busy"}
-              className="text-xs font-medium text-indigo-600 hover:text-indigo-800 disabled:opacity-60"
-            >
-              {summaryState.status === "busy" ? "Summarizing..." : "Summarize with AI"}
-            </button>
-          )}
-          {!recordingUrl && <span className="text-xs text-slate-400">No recording</span>}
-        </div>
-      </div>
-
-      {summaryState.status === "consent_required" && (
-        <div className="text-xs bg-amber-50 text-amber-700 rounded-lg px-3 py-2 flex items-center justify-between gap-3">
-          <span>AI summaries need your consent to process call/voicemail audio.</span>
-          <button onClick={onGrantConsent} className="font-medium underline shrink-0">
-            Grant consent &amp; summarize
-          </button>
-        </div>
-      )}
-
-      {summaryState.status === "error" && (
-        <p className="text-xs text-red-600 bg-red-50 rounded-lg px-3 py-2">{summaryState.message}</p>
-      )}
-
-      {summaryState.status === "done" && (
-        <div className="text-xs bg-slate-50 rounded-lg px-3 py-2 space-y-2">
-          <div className="flex items-center gap-2">
-            <span className="text-slate-700 flex-1">{summaryState.result.summary}</span>
-            {summaryState.result.urgency && (
-              <span
-                className={
-                  "shrink-0 rounded-full px-2 py-0.5 font-medium " +
-                  (summaryState.result.urgency === "high"
-                    ? "bg-red-100 text-red-700"
-                    : summaryState.result.urgency === "medium"
-                    ? "bg-amber-100 text-amber-700"
-                    : "bg-slate-200 text-slate-600")
-                }
-              >
-                {summaryState.result.urgency} urgency
-              </span>
-            )}
-          </div>
-
-          {summaryState.result.action_items.length > 0 && (
-            <ul className="list-disc list-inside text-slate-600 space-y-0.5">
-              {summaryState.result.action_items.map((item, i) => (
-                <li key={i}>{item}</li>
-              ))}
-            </ul>
-          )}
-
-          {summaryState.result.suggested_follow_up && (
-            <div className="text-indigo-700">
-              <span className="font-medium">Suggested follow-up:</span> {summaryState.result.suggested_follow_up}
-            </div>
-          )}
-
-          <div className="text-slate-400 flex items-center gap-2">
-            <span>{summaryState.result.disclaimer}</span>
-            {summaryState.result.language && (
-              <span className="uppercase">· {summaryState.result.language}</span>
-            )}
-          </div>
-        </div>
-      )}
     </div>
   );
 }
