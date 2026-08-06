@@ -1347,3 +1347,37 @@ export function listWebhookDeliveries(token: string, endpointId?: string): Promi
     headers: { Authorization: `Bearer ${token}` },
   });
 }
+
+// --- Public API keys ---
+
+export type ApiKey = {
+  id: string;
+  label: string;
+  key_prefix: string;
+  last_used_at: string | null;
+  revoked_at: string | null;
+  created_at: string;
+};
+
+export type ApiKeyCreated = ApiKey & { raw_key: string };
+
+export function listApiKeys(token: string): Promise<ApiKey[]> {
+  return request<ApiKey[]>("/developer/api-keys", {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export function createApiKey(token: string, label: string): Promise<ApiKeyCreated> {
+  return request<ApiKeyCreated>("/developer/api-keys", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ label }),
+  });
+}
+
+export function revokeApiKey(token: string, keyId: string): Promise<void> {
+  return request<void>(`/developer/api-keys/${encodeURIComponent(keyId)}`, {
+    method: "DELETE",
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}

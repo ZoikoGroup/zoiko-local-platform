@@ -1,5 +1,5 @@
 from fastapi import Depends, HTTPException, Request, status
-from fastapi.security import OAuth2PasswordBearer
+from fastapi.security import APIKeyHeader, OAuth2PasswordBearer
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
@@ -8,6 +8,7 @@ from app.numbering.identity.models import User, UserRole
 from app.staff.models import PlatformStaff, PlatformStaffRole
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
+api_key_header = APIKeyHeader(name="Authorization", auto_error=False)
 
 
 def get_current_user(
@@ -84,6 +85,31 @@ def get_current_staff(request: Request, token: str = Depends(oauth2_scheme), db:
     request.state.user_id = staff.id
 
     return staff
+
+
+def get_api_key_account_id(
+    request: Request, authorization: str | None = Depends(api_key_header), db: Session = Depends(get_db)
+) -> str:
+    """Auth for the /public/v1 API surface only - a raw API key (see
+    app.apikeys.service), never a JWT. Distinct from get_current_user
+    because a public API key represents the ACCOUNT, not a specific
+    logged-in user - there's no User object to return, just the
+    account_id every /public/v1 route scopes its query to."""
+    from app.apikeys.service import authenticate_api_key
+
+    credentials_error = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or missing API key",
+    )
+    if not authorization:
+        raise credentials_error
+
+    raw_key = authorization.removeprefix("Bearer ").strip()
+    key = authenticate_api_key(db, raw_key)
+    if key is None:
+        raise credentials_error
+
+    request.state.account_id = key.account_id
+    return key.account_id
 
 
 def require_staff_role(*roles: PlatformStaffRole):

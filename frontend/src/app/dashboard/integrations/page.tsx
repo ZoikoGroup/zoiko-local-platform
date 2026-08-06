@@ -9,11 +9,15 @@ import {
   createWebhookEndpoint,
   deleteWebhookEndpoint,
   listWebhookDeliveries,
+  listApiKeys,
+  createApiKey,
+  revokeApiKey,
   ApiError,
   type PublicStatus,
   type MyPhoneNumber,
   type WebhookEndpoint,
   type WebhookDelivery,
+  type ApiKey,
 } from "@/lib/api";
 import { getToken } from "@/lib/auth";
 
@@ -94,6 +98,55 @@ export default function IntegrationsPage() {
       await loadWebhooks();
     } catch (err) {
       setWebhooksError(err instanceof ApiError ? err.message : "Couldn't remove the webhook endpoint.");
+    }
+  }
+
+  const [apiKeys, setApiKeys] = useState<ApiKey[]>([]);
+  const [apiKeysLoading, setApiKeysLoading] = useState(true);
+  const [apiKeysError, setApiKeysError] = useState<string | null>(null);
+  const [newKeyLabel, setNewKeyLabel] = useState("");
+  const [creatingKey, setCreatingKey] = useState(false);
+  const [revealedKey, setRevealedKey] = useState<string | null>(null);
+
+  const loadApiKeys = useCallback(() => {
+    if (!token) return;
+    return listApiKeys(token)
+      .then((keys) => {
+        setApiKeys(keys);
+        setApiKeysError(null);
+      })
+      .catch(() => setApiKeysError("Couldn't load API keys."))
+      .finally(() => setApiKeysLoading(false));
+  }, [token]);
+
+  useEffect(() => {
+    loadApiKeys();
+  }, [loadApiKeys]);
+
+  async function handleCreateApiKey(e: FormEvent) {
+    e.preventDefault();
+    if (!token || !newKeyLabel) return;
+    setCreatingKey(true);
+    setApiKeysError(null);
+    try {
+      const created = await createApiKey(token, newKeyLabel);
+      setRevealedKey(created.raw_key);
+      setNewKeyLabel("");
+      await loadApiKeys();
+    } catch (err) {
+      setApiKeysError(err instanceof ApiError ? err.message : "Couldn't create the API key.");
+    } finally {
+      setCreatingKey(false);
+    }
+  }
+
+  async function handleRevokeApiKey(keyId: string) {
+    if (!token) return;
+    try {
+      await revokeApiKey(token, keyId);
+      await loadApiKeys();
+    } catch (err) {
+      setApiKeysError(err instanceof ApiError ? err.message : "Couldn't revoke the API key.");
     }
   }
 
@@ -302,6 +355,87 @@ export default function IntegrationsPage() {
                   ))}
                 </ul>
               </div>
+            )}
+          </>
+        )}
+      </div>
+
+      <div className="bg-white rounded-xl border border-slate-200 p-5 space-y-4">
+        <div>
+          <h3 className="font-semibold text-slate-900">Public API Keys</h3>
+          <p className="text-sm text-slate-500 mt-1">
+            Read-only access to your numbers, calls, voicemails, and AI summaries at{" "}
+            <code className="text-xs bg-slate-100 rounded px-1 py-0.5">/public/v1/*</code>. Pass your key as{" "}
+            <code className="text-xs bg-slate-100 rounded px-1 py-0.5">Authorization: Bearer &lt;key&gt;</code>.
+          </p>
+        </div>
+
+        {apiKeysError && <p className="text-sm text-red-600 bg-red-50 rounded-lg px-3 py-2">{apiKeysError}</p>}
+
+        {revealedKey && (
+          <div className="bg-amber-50 border border-amber-200 rounded-lg px-3 py-2 text-sm">
+            <p className="font-medium text-amber-800">Save this key now — it won&apos;t be shown again.</p>
+            <code className="block mt-1 text-xs bg-white border border-amber-200 rounded px-2 py-1 break-all">
+              {revealedKey}
+            </code>
+            <button
+              onClick={() => setRevealedKey(null)}
+              className="mt-2 text-xs font-medium text-amber-700 hover:text-amber-900"
+            >
+              Dismiss
+            </button>
+          </div>
+        )}
+
+        {apiKeysLoading ? (
+          <p className="text-sm text-slate-500">Loading...</p>
+        ) : (
+          <>
+            {apiKeys.length === 0 ? (
+              <p className="text-sm text-slate-500">No API keys created yet.</p>
+            ) : (
+              <div className="divide-y divide-slate-100 rounded-lg border border-slate-200">
+                {apiKeys.map((k) => (
+                  <div key={k.id} className="flex items-center justify-between px-4 py-3 text-sm">
+                    <div>
+                      <div className="text-slate-800">{k.label}</div>
+                      <div className="text-xs text-slate-400 font-mono mt-0.5">
+                        {k.key_prefix}… {k.revoked_at && <span className="text-red-500">(revoked)</span>}
+                      </div>
+                    </div>
+                    {isAdmin && !k.revoked_at && (
+                      <button
+                        onClick={() => handleRevokeApiKey(k.id)}
+                        className="text-xs font-medium text-red-600 hover:text-red-800"
+                      >
+                        Revoke
+                      </button>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {isAdmin ? (
+              <form onSubmit={handleCreateApiKey} className="flex flex-wrap items-center gap-2 pt-1">
+                <input
+                  type="text"
+                  required
+                  placeholder="Key label (e.g. Reporting script)"
+                  value={newKeyLabel}
+                  onChange={(e) => setNewKeyLabel(e.target.value)}
+                  className="flex-1 min-w-[220px] text-sm rounded-lg border border-slate-200 px-3 py-1.5"
+                />
+                <button
+                  type="submit"
+                  disabled={creatingKey}
+                  className="text-xs font-medium rounded-lg px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-60 text-white"
+                >
+                  {creatingKey ? "Creating..." : "Create key"}
+                </button>
+              </form>
+            ) : (
+              <p className="text-xs text-slate-400">Only an account Owner or Admin can manage API keys.</p>
             )}
           </>
         )}

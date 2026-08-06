@@ -1,0 +1,120 @@
+def _signup_and_login(client, email: str, account_name: str = "Public API Test Co") -> str:
+    client.post(
+        "/auth/signup",
+        json={"account_name": account_name, "account_type": "business", "email": email, "password": "supersecret123"},
+    )
+    response = client.post("/auth/login", json={"email": email, "password": "supersecret123"})
+    return response.json()["access_token"]
+
+
+def test_owner_can_create_an_api_key(client):
+    token = _signup_and_login(client, "api-owner1@example.com")
+    response = client.post(
+        "/developer/api-keys", json={"label": "My Server"}, headers={"Authorization": f"Bearer {token}"}
+    )
+    assert response.status_code == 201
+    body = response.json()
+    assert body["label"] == "My Server"
+    assert body["raw_key"].startswith("zlk_live_")
+    assert body["key_prefix"] == body["raw_key"][:16]
+
+
+def test_member_cannot_create_an_api_key(client):
+    owner_token = _signup_and_login(client, "api-owner2@example.com")
+    client.post(
+        "/team/members",
+        json={"email": "api-member2@example.com", "password": "supersecret123", "role": "member"},
+        headers={"Authorization": f"Bearer {owner_token}"},
+    )
+    member_token = client.post(
+        "/auth/login", json={"email": "api-member2@example.com", "password": "supersecret123"}
+    ).json()["access_token"]
+
+    response = client.post(
+        "/developer/api-keys", json={"label": "Nope"}, headers={"Authorization": f"Bearer {member_token}"}
+    )
+    assert response.status_code == 403
+
+
+def test_list_api_keys_does_not_expose_raw_key(client):
+    token = _signup_and_login(client, "api-owner3@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    client.post("/developer/api-keys", json={"label": "Key A"}, headers=headers)
+
+    response = client.get("/developer/api-keys", headers=headers)
+    assert response.status_code == 200
+    body = response.json()
+    assert len(body) == 1
+    assert "raw_key" not in body[0]
+    assert "key_hash" not in body[0]
+
+
+def test_owner_can_revoke_a_key_and_it_stops_authenticating(client):
+    token = _signup_and_login(client, "api-owner4@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    created = client.post("/developer/api-keys", json={"label": "Revoke me"}, headers=headers).json()
+
+    response = client.get(
+        "/public/v1/numbers", headers={"Authorization": f"Bearer {created['raw_key']}"}
+    )
+    assert response.status_code == 200
+
+    delete_response = client.delete(f"/developer/api-keys/{created['id']}", headers=headers)
+    assert delete_response.status_code == 204
+
+    response = client.get(
+        "/public/v1/numbers", headers={"Authorization": f"Bearer {created['raw_key']}"}
+    )
+    assert response.status_code == 401
+
+
+def test_key_limit_is_enforced(client):
+    token = _signup_and_login(client, "api-owner5@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    for i in range(10):
+        response = client.post("/developer/api-keys", json={"label": f"Key {i}"}, headers=headers)
+        assert response.status_code == 201
+
+    response = client.post("/developer/api-keys", json={"label": "Overflow"}, headers=headers)
+    assert response.status_code == 409
+
+
+def test_public_api_rejects_missing_or_invalid_key(client):
+    response = client.get("/public/v1/numbers")
+    assert response.status_code == 401
+
+    response = client.get("/public/v1/numbers", headers={"Authorization": "Bearer zlk_live_totallyfake"})
+    assert response.status_code == 401
+
+
+def test_public_api_scopes_data_to_the_keys_own_account(client):
+    token_a = _signup_and_login(client, "api-scope-a@example.com", "Scope A Co")
+    token_b = _signup_and_login(client, "api-scope-b@example.com", "Scope B Co")
+
+    key_a = client.post(
+        "/developer/api-keys", json={"label": "A"}, headers={"Authorization": f"Bearer {token_a}"}
+    ).json()["raw_key"]
+    key_b = client.post(
+        "/developer/api-keys", json={"label": "B"}, headers={"Authorization": f"Bearer {token_b}"}
+    ).json()["raw_key"]
+
+    resp_a = client.get("/public/v1/numbers", headers={"Authorization": f"Bearer {key_a}"})
+    resp_b = client.get("/public/v1/numbers", headers={"Authorization": f"Bearer {key_b}"})
+    assert resp_a.status_code == 200
+    assert resp_b.status_code == 200
+    # Both accounts have zero numbers, but distinctly - this mainly proves
+    # the auth dependency resolves to the right account without crossing.
+    assert resp_a.json() == []
+    assert resp_b.json() == []
+
+
+def test_public_api_calls_voicemails_summaries_endpoints_smoke(client):
+    token = _signup_and_login(client, "api-smoke@example.com")
+    key = client.post(
+        "/developer/api-keys", json={"label": "Smoke"}, headers={"Authorization": f"Bearer {token}"}
+    ).json()["raw_key"]
+    headers = {"Authorization": f"Bearer {key}"}
+
+    assert client.get("/public/v1/calls", headers=headers).status_code == 200
+    assert client.get("/public/v1/voicemails", headers=headers).status_code == 200
+    assert client.get("/public/v1/summaries", headers=headers).status_code == 200

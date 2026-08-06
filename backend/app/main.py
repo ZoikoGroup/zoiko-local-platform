@@ -6,6 +6,7 @@ from slowapi.errors import RateLimitExceeded
 from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 
+from app.apikeys.routes import router as apikeys_router
 from app.audit.routes import router as audit_router
 from app.billing.routes import router as billing_router
 from app.compliance.routes import router as compliance_router
@@ -27,6 +28,7 @@ from app.numbering.numbers.routes import router as numbers_router
 from app.notifications.routes import router as notifications_router
 from app.ops.routes import router as ops_router
 from app.porting.routes import router as porting_router
+from app.public_api.routes import router as public_api_router
 from app.retention.routes import router as retention_router
 from app.risk.routes import router as risk_router
 from app.staff.routes import router as staff_router
@@ -88,6 +90,8 @@ app.include_router(usage_router)
 app.include_router(ops_router)
 app.include_router(porting_router)
 app.include_router(webhooks_router)
+app.include_router(apikeys_router)
+app.include_router(public_api_router)
 
 
 @app.get("/health")
