@@ -14,6 +14,8 @@ from app.core.security import (
 )
 from app.notifications.service import (
     notify_account_activated,
+    notify_administrator_added,
+    notify_administrator_removed,
     notify_mfa_disabled,
     notify_mfa_enabled,
     notify_password_changed,
@@ -201,6 +203,13 @@ def add_team_member(
         notify_team_member_added(
             db, account_id=account_id, member_email=member.email, account_name=account.name, role=member.role
         )
+        if member.role == UserRole.ADMIN:
+            owner = db.query(User).filter(User.account_id == account_id, User.role == UserRole.OWNER).first()
+            if owner is not None:
+                notify_administrator_added(
+                    db, account_id=account_id, account_email=owner.email, organization_name=account.name,
+                    new_admin_display_name=member.email,
+                )
 
     return member
 
@@ -230,6 +239,15 @@ def remove_team_member(db: Session, *, account_id: str, user_id: str, actor: str
         target=f"user:{user_id}",
         before={"user_id": user_id, "email": removed_email, "role": removed_role},
     )
+
+    if removed_role == UserRole.ADMIN:
+        owner = db.query(User).filter(User.account_id == account_id, User.role == UserRole.OWNER).first()
+        account = db.query(Account).filter(Account.id == account_id).first()
+        if owner is not None and account is not None:
+            notify_administrator_removed(
+                db, account_id=account_id, account_email=owner.email, organization_name=account.name,
+                removed_admin_display_name=removed_email,
+            )
 
 
 def start_mfa_setup(db: Session, user: User) -> tuple[str, str]:

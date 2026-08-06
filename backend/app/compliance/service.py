@@ -7,7 +7,11 @@ from app.audit.service import log_event
 from app.compliance.models import ComplianceCase, ComplianceCaseStatus, ComplianceRule
 from app.integrations.kyc import stripe_identity
 from app.integrations.storage import s3 as storage
-from app.notifications.service import notify_compliance_case_approved, notify_compliance_case_rejected
+from app.notifications.service import (
+    notify_compliance_case_approved,
+    notify_compliance_case_rejected,
+    notify_organization_verification_submitted,
+)
 
 # Kept small and conservative - these are ID/business documents reviewed by
 # a human compliance officer, not a general file-upload feature.
@@ -205,6 +209,18 @@ def submit_document(
         target=f"compliance_case:{case.id}",
         after={"document_type": document_type, "filename": filename},
     )
+
+    owner_email = _account_owner_email(db, case.account_id)
+    if owner_email:
+        from app.numbering.identity.models import Account
+
+        account = db.query(Account).filter(Account.id == case.account_id).first()
+        notify_organization_verification_submitted(
+            db, account_id=case.account_id, account_email=owner_email,
+            organization_name=account.name if account else "your organization",
+            case_reference=case.id,
+        )
+
     return case
 
 

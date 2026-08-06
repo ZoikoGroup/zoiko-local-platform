@@ -705,6 +705,48 @@ def notify_payment_reminder(
     )
 
 
+def notify_organization_verification_submitted(
+    db: Session, *, account_id: str, account_email: str, organization_name: str, case_reference: str
+) -> None:
+    send_notification(
+        db, event_name="org.verification_submitted", account_id=account_id, recipient_email=account_email,
+        context={
+            "user_display_name": account_email,
+            "organization_name": organization_name,
+            "case_reference": case_reference,
+        },
+    )
+
+
+def notify_administrator_added(
+    db: Session, *, account_id: str, account_email: str, organization_name: str, new_admin_display_name: str,
+) -> None:
+    send_notification(
+        db, event_name="org.administrator_added", account_id=account_id, recipient_email=account_email,
+        context={
+            "user_display_name": account_email,
+            "organization_name": organization_name,
+            "actor_display_name": new_admin_display_name,
+            "role_name": "Administrator",
+            "event_occurred_at": _now_str(),
+        },
+    )
+
+
+def notify_administrator_removed(
+    db: Session, *, account_id: str, account_email: str, organization_name: str, removed_admin_display_name: str,
+) -> None:
+    send_notification(
+        db, event_name="org.administrator_removed", account_id=account_id, recipient_email=account_email,
+        context={
+            "user_display_name": account_email,
+            "organization_name": organization_name,
+            "actor_display_name": removed_admin_display_name,
+            "role_name": "Administrator",
+        },
+    )
+
+
 def notify_service_restored(db: Session, *, account_id: str, account_email: str) -> None:
     send_notification(
         db, event_name="billing.service_restored", account_id=account_id, recipient_email=account_email,
