@@ -429,6 +429,8 @@ export type MyPhoneNumber = {
   ai_receptionist_enabled: boolean;
   escalation_user_id: string | null;
   call_flow_id: string | null;
+  whatsapp_enabled: boolean;
+  sms_enabled: boolean;
 };
 
 export function listMyNumbers(token: string): Promise<MyPhoneNumber[]> {
@@ -500,6 +502,8 @@ export function configureRouting(
     business_hours_timezone?: string;
     ai_receptionist_enabled?: boolean;
     escalation_user_id?: string | null;
+    whatsapp_enabled?: boolean;
+    sms_enabled?: boolean;
   }
 ): Promise<MyPhoneNumber> {
   return request<MyPhoneNumber>(`/numbers/${encodeURIComponent(e164)}/routing`, {
@@ -1247,4 +1251,95 @@ export function setMyPresence(token: string, status: "available" | "offline"): P
     headers: { Authorization: `Bearer ${token}` },
     body: JSON.stringify({ status }),
   });
+}
+
+// --- Business messaging: WhatsApp + SMS (Phase 3) ---
+
+export type MessagingChannel = "whatsapp" | "sms";
+
+export type MessagingConversation = {
+  id: string;
+  phone_number_id: string;
+  customer_number: string;
+  channel: MessagingChannel;
+  opted_out: boolean;
+  last_message_at: string;
+  created_at: string;
+};
+
+export type MessagingMessage = {
+  id: string;
+  direction: "inbound" | "outbound";
+  body: string;
+  status: string;
+  created_at: string;
+};
+
+export function listConversations(token: string): Promise<MessagingConversation[]> {
+  return request<MessagingConversation[]>("/messaging/conversations", {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export function listConversationMessages(token: string, conversationId: string): Promise<MessagingMessage[]> {
+  return request<MessagingMessage[]>(`/messaging/conversations/${encodeURIComponent(conversationId)}/messages`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export function sendWhatsAppMessage(
+  token: string,
+  input: { phone_number_id: string; to: string; body: string }
+): Promise<MessagingMessage> {
+  return request<MessagingMessage>("/messaging/whatsapp/send", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify(input),
+  });
+}
+
+export function sendSms(
+  token: string,
+  input: { phone_number_id: string; to: string; body: string }
+): Promise<MessagingMessage> {
+  return request<MessagingMessage>("/messaging/sms/send", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify(input),
+  });
+}
+
+export type AnalyticsDailyPoint = {
+  date: string;
+  calls: number;
+  call_minutes: number;
+  video_minutes: number;
+  messages: number;
+};
+
+export type AnalyticsOverview = {
+  range_days: number;
+  total_calls: number;
+  total_call_minutes: number;
+  total_video_minutes: number;
+  total_messages: number;
+  active_numbers: number;
+  ai_summaries: number;
+  daily: AnalyticsDailyPoint[];
+};
+
+export function getAnalyticsOverview(token: string, days: number): Promise<AnalyticsOverview> {
+  return request<AnalyticsOverview>(`/analytics/overview?days=${days}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export async function exportAnalyticsCsv(token: string, days: number): Promise<Blob> {
+  const response = await fetch(`${API_BASE_URL}/analytics/export.csv?days=${days}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!response.ok) {
+    throw new ApiError("Couldn't export the report.", response.status);
+  }
+  return response.blob();
 }

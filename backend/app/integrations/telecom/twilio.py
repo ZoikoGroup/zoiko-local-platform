@@ -71,6 +71,44 @@ def send_sms(to: str, body: str) -> dict:
     return with_failover(_breaker, _primary, secondary_fn, TelecomError)
 
 
+def send_whatsapp_message(to: str, from_number: str, body: str) -> dict:
+    """Phase 3 "WhatsApp Business integration" - `from_number` is a
+    customer's own PSTN number that has completed WhatsApp Business sender
+    approval out-of-band (see PhoneNumber.whatsapp_enabled); Twilio
+    addresses WhatsApp participants with a `whatsapp:` scheme on both
+    sides of the same Messages API `send_sms` already uses. No secondary
+    provider yet - a WhatsApp-specific failover path doesn't exist in this
+    codebase, so this only gets circuit-breaker protection, not failover.
+    """
+    def _primary() -> dict:
+        try:
+            message = _client().messages.create(
+                to=f"whatsapp:{to}", from_=f"whatsapp:{from_number}", body=body
+            )
+        except TwilioException as e:
+            raise TelecomError(str(e)) from e
+        return {"sid": message.sid, "status": message.status}
+
+    return with_failover(_breaker, _primary, None, TelecomError)
+
+
+def send_customer_sms(to: str, from_number: str, body: str) -> dict:
+    """Phase 3 "SMS by regulated market" - unlike send_sms() above (a fixed
+    Zoiko-owned notification number), `from_number` here is a customer's
+    own PSTN number that has completed A2P 10DLC brand/campaign
+    registration out-of-band (see PhoneNumber.sms_enabled). No secondary
+    provider yet, same posture as send_whatsapp_message.
+    """
+    def _primary() -> dict:
+        try:
+            message = _client().messages.create(to=to, from_=from_number, body=body)
+        except TwilioException as e:
+            raise TelecomError(str(e)) from e
+        return {"sid": message.sid, "status": message.status}
+
+    return with_failover(_breaker, _primary, None, TelecomError)
+
+
 def search_available_numbers(country: str, number_type: str = "local", area_code: str | None = None,
                               contains: str | None = None, limit: int = 10) -> list[dict]:
     """See docs/stage2-twilio-numbering-notes.md for the behavior this wraps:
@@ -285,6 +323,38 @@ def build_forward_response(
         dial_kwargs["recording_status_callback_method"] = "POST"
         dial_kwargs["recording_status_callback_event"] = "completed"
     response.dial(forwarding_number, **dial_kwargs)
+    return str(response)
+
+
+def build_ring_group_response(
+    destinations: list[str],
+    fallback_action_url: str,
+    status_callback_url: str | None = None,
+    recording_callback_url: str | None = None,
+) -> str:
+    """Advanced IVR builder's FORWARD node (Phase 3) - a superset of
+    build_forward_response: rings every destination in `destinations`
+    simultaneously (multiple <Number> children under one <Dial> - Twilio's
+    native ring-group primitive, first to answer wins, the rest stop
+    ringing) instead of a single number. `fallback_action_url` is always
+    set (unlike build_forward_response's optional action) - see
+    media.voice.py's /flow-forward-fallback route, which resolves the
+    node's own on_no_answer_node_id only when the dial genuinely wasn't
+    answered.
+    """
+    response = VoiceResponse()
+    dial_kwargs = {"action": fallback_action_url}
+    if status_callback_url:
+        dial_kwargs["status_callback"] = status_callback_url
+        dial_kwargs["status_callback_event"] = "completed"
+    if recording_callback_url:
+        dial_kwargs["record"] = "record-from-answer-dual"
+        dial_kwargs["recording_status_callback"] = recording_callback_url
+        dial_kwargs["recording_status_callback_method"] = "POST"
+        dial_kwargs["recording_status_callback_event"] = "completed"
+    dial = response.dial(**dial_kwargs)
+    for destination in destinations:
+        dial.number(destination)
     return str(response)
 
 

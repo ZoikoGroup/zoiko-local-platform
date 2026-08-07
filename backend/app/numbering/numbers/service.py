@@ -44,6 +44,17 @@ def _kyc_requirement_type(db: Session, account_id: str) -> str:
     return "kyc_individual" if account.account_type == AccountType.INDIVIDUAL else "kyc_business"
 
 
+# Phase 3 "SMS by regulated market" - SMS business messaging is gated by the
+# same country-rule/case engine as KYC (compliance/service.py), not a bare
+# checkbox: e.g. US A2P 10DLC brand/campaign registration, or another
+# market's sender-ID rules. Where a rule is data-defined for a country, the
+# account needs an approved case before SMS can be turned on for a number
+# there - same "rules stored as data, never hardcoded if-statements" pattern
+# the docs require. WhatsApp has no equivalent gate here: its approval is
+# Meta's own out-of-band process, which this system can't request or grant.
+SMS_REQUIREMENT_TYPE = "sms_business_messaging"
+
+
 def search_numbers(country: str, number_type: str = "local", area_code: str | None = None) -> list[dict]:
     return telecom.search_available_numbers(country, number_type=number_type, area_code=area_code)
 
@@ -435,11 +446,23 @@ def configure_routing(
     business_hours_timezone: str,
     ai_receptionist_enabled: bool = False,
     escalation_user_id: str | None = None,
+    whatsapp_enabled: bool = False,
+    sms_enabled: bool = False,
 ) -> PhoneNumber:
     number = db.query(PhoneNumber).filter(PhoneNumber.e164 == e164).first()
     if number is None or number.account_id != user.account_id:
         raise NumberConflictError(f"{e164} is not a number owned by your account")
     assert_number_access(number, user)
+
+    if sms_enabled and not number.sms_enabled and is_requirement_active(
+        db, number.country, SMS_REQUIREMENT_TYPE
+    ) and not has_approved_case(
+        db, account_id=user.account_id, jurisdiction=number.country, requirement_type=SMS_REQUIREMENT_TYPE
+    ):
+        raise ComplianceRequiredError(
+            f"An approved {SMS_REQUIREMENT_TYPE} compliance case for {number.country} "
+            "is required before enabling SMS on this number"
+        )
 
     try:
         ZoneInfo(business_hours_timezone)
@@ -457,6 +480,8 @@ def configure_routing(
     number.business_hours_timezone = business_hours_timezone
     number.ai_receptionist_enabled = ai_receptionist_enabled
     number.escalation_user_id = escalation_user_id
+    number.whatsapp_enabled = whatsapp_enabled
+    number.sms_enabled = sms_enabled
     db.commit()
     db.refresh(number)
     log_event(

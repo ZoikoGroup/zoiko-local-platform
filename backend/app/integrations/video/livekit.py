@@ -24,8 +24,13 @@ class VideoError(Exception):
 # from this module, which would otherwise be a circular import.
 from app.integrations.video import _secondary_stub as secondary  # noqa: E402
 
-# Roadmap doc §8 "Video Calling - Phase 1 Standard": target up to 8 participants.
-MAX_PARTICIPANTS = 8
+# Phase 3 "larger meetings" - raised from the Phase 1 doctrine's "1:1 and
+# small-group, target up to 8 participants" (Roadmap doc §8). 50 is a
+# deliberate mid-point: large enough to be a genuine "larger meeting" tier,
+# not an attempt at Zoom/Teams-scale webinars (architecture doc's own
+# "not a full Zoom, Teams, or call-center clone" boundary) - LiveKit's SFU
+# handles this comfortably without special provisioning.
+MAX_PARTICIPANTS = 50
 
 
 def _client() -> livekit_api.LiveKitAPI:

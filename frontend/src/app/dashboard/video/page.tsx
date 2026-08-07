@@ -35,6 +35,7 @@ export default function VideoPage() {
   const [micOn, setMicOn] = useState(true);
   const [screenSharing, setScreenSharing] = useState(false);
   const [participantCount, setParticipantCount] = useState(0);
+  const [participants, setParticipants] = useState<{ identity: string; name: string }[]>([]);
   const [recordingState, setRecordingState] = useState<RecordingState>("idle");
   const [recordingError, setRecordingError] = useState<string | null>(null);
 
@@ -48,6 +49,31 @@ export default function VideoPage() {
   const localScreenVideoRef = useRef<HTMLVideoElement>(null);
   const remoteContainerRef = useRef<HTMLDivElement>(null);
   const attachedElements = useRef<Map<string, HTMLMediaElement>>(new Map());
+  const participantTiles = useRef<Map<string, HTMLDivElement>>(new Map());
+
+  function getOrCreateTile(identity: string, name: string): HTMLDivElement {
+    const existing = participantTiles.current.get(identity);
+    if (existing) return existing;
+
+    const tile = document.createElement("div");
+    tile.className =
+      "relative aspect-video bg-black rounded-lg overflow-hidden [&>video]:w-full [&>video]:h-full [&>video]:object-cover [&>audio]:hidden";
+    const label = document.createElement("span");
+    label.className =
+      "absolute bottom-2 left-2 text-xs text-white/80 bg-black/40 rounded px-2 py-0.5 pointer-events-none";
+    label.textContent = name;
+    tile.appendChild(label);
+
+    remoteContainerRef.current?.appendChild(tile);
+    participantTiles.current.set(identity, tile);
+    return tile;
+  }
+
+  function clearRemoteTiles() {
+    participantTiles.current.forEach((tile) => tile.remove());
+    participantTiles.current.clear();
+    setParticipants([]);
+  }
 
   const loadRooms = useCallback(() => {
     if (!token) return;
@@ -108,22 +134,39 @@ export default function VideoPage() {
       const room = new Room();
       roomRef.current = room;
 
-      room.on(RoomEvent.TrackSubscribed, (track) => {
+      room.on(RoomEvent.TrackSubscribed, (track, _publication, participant) => {
         if (track.kind === Track.Kind.Video || track.kind === Track.Kind.Audio) {
+          const tile = getOrCreateTile(participant.identity, participant.name || participant.identity);
           const el = track.attach();
           attachedElements.current.set(track.sid ?? el.id, el);
-          remoteContainerRef.current?.appendChild(el);
+          tile.appendChild(el);
         }
       });
       room.on(RoomEvent.TrackUnsubscribed, (track) => {
         track.detach().forEach((el) => el.remove());
       });
-      room.on(RoomEvent.ParticipantConnected, () => setParticipantCount(room.remoteParticipants.size));
-      room.on(RoomEvent.ParticipantDisconnected, () => setParticipantCount(room.remoteParticipants.size));
+      room.on(RoomEvent.ParticipantConnected, (participant) => {
+        setParticipantCount(room.remoteParticipants.size);
+        setParticipants((prev) => [...prev, { identity: participant.identity, name: participant.name || participant.identity }]);
+      });
+      room.on(RoomEvent.ParticipantDisconnected, (participant) => {
+        setParticipantCount(room.remoteParticipants.size);
+        setParticipants((prev) => prev.filter((p) => p.identity !== participant.identity));
+        participantTiles.current.get(participant.identity)?.remove();
+        participantTiles.current.delete(participant.identity);
+      });
+      room.on(RoomEvent.ActiveSpeakersChanged, (speakers) => {
+        const speakingIds = new Set(speakers.map((p) => p.identity));
+        participantTiles.current.forEach((tile, identity) => {
+          tile.classList.toggle("ring-2", speakingIds.has(identity));
+          tile.classList.toggle("ring-emerald-400", speakingIds.has(identity));
+        });
+      });
       room.on(RoomEvent.Disconnected, () => {
         setCallState("idle");
         setRoomName(null);
         roomRef.current = null;
+        clearRemoteTiles();
       });
 
       await room.connect(url, liveKitToken);
@@ -150,6 +193,7 @@ export default function VideoPage() {
     setRoomName(null);
     setScreenSharing(false);
     setRecordingState("idle");
+    clearRemoteTiles();
     try {
       await endVideoRoom(token, endingRoomName);
     } catch {
@@ -264,7 +308,7 @@ export default function VideoPage() {
     <div className="max-w-3xl mx-auto space-y-6">
       <div>
         <h2 className="text-xl font-semibold text-slate-900">Video</h2>
-        <p className="text-sm text-slate-500">1:1 and small-group video calling.</p>
+        <p className="text-sm text-slate-500">1:1 and larger group video calling — up to 50 participants.</p>
       </div>
 
       {callState === "idle" && (
@@ -360,18 +404,35 @@ export default function VideoPage() {
             </div>
           )}
 
-          <div className="grid grid-cols-2 gap-3">
+          <div
+            className="grid gap-2 max-h-[60vh] overflow-y-auto pr-1"
+            style={{ gridTemplateColumns: "repeat(auto-fill, minmax(160px, 1fr))" }}
+          >
             <div className="relative aspect-video bg-black rounded-lg overflow-hidden">
               <video ref={localVideoRef} autoPlay muted playsInline className="w-full h-full object-cover" />
               <span className="absolute bottom-2 left-2 text-xs text-white/80 bg-black/40 rounded px-2 py-0.5">
                 You
               </span>
             </div>
-            <div
-              ref={remoteContainerRef}
-              className="grid grid-cols-1 gap-2 [&>video]:w-full [&>video]:h-full [&>video]:object-cover [&>audio]:hidden"
-            />
+            {/* display:contents makes this wrapper invisible to the grid layout, so
+                the participant tiles appended into it imperatively (see
+                getOrCreateTile) become direct items of the parent grid above,
+                sharing one unified auto-fit layout instead of a fixed side column. */}
+            <div ref={remoteContainerRef} className="contents" />
           </div>
+
+          {participants.length > 0 && (
+            <div className="flex flex-wrap gap-2 px-1">
+              {participants.map((p) => (
+                <span
+                  key={p.identity}
+                  className="text-xs text-slate-300 bg-slate-800 rounded-full px-2.5 py-1"
+                >
+                  {p.name}
+                </span>
+              ))}
+            </div>
+          )}
 
           <div className="flex items-center justify-center gap-3 pt-2">
             <button

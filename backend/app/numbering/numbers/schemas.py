@@ -10,6 +10,8 @@ class RoutingConfigRequest(BaseModel):
     business_hours_timezone: str = "UTC"
     ai_receptionist_enabled: bool = False
     escalation_user_id: str | None = None
+    whatsapp_enabled: bool = False
+    sms_enabled: bool = False
 
 
 class SuspendNumberRequest(BaseModel):
@@ -53,3 +55,5 @@ class PhoneNumberResponse(BaseModel):
     ai_receptionist_enabled: bool
     escalation_user_id: str | None
     call_flow_id: str | None
+    whatsapp_enabled: bool
+    sms_enabled: bool

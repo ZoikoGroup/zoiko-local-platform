@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
-from app.core.deps import get_current_user, require_writer
+from app.core.deps import get_current_user
 from app.numbering.identity.models import User
 from app.routing import service
 from app.routing.schemas import (
@@ -24,7 +24,7 @@ router = APIRouter(prefix="/call-flows", tags=["call-flows"])
 def create_call_flow(
     payload: CreateCallFlowRequest,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_writer),
+    current_user: User = Depends(get_current_user),
 ):
     flow = service.create_flow(db, current_user.account_id, payload.name, current_user.id)
     return {"id": flow.id, "name": flow.name, "created_at": flow.created_at, "has_draft": True,
@@ -53,7 +53,7 @@ def save_draft(
     call_flow_id: str,
     payload: SaveDraftRequest,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_writer),
+    current_user: User = Depends(get_current_user),
 ):
     try:
         # mode="json" - a business_hours node's start/end are pydantic `time`
@@ -88,7 +88,7 @@ def validate_draft(
 def publish_call_flow(
     call_flow_id: str,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_writer),
+    current_user: User = Depends(get_current_user),
 ):
     try:
         published, errors, version = service.publish_flow(db, current_user.account_id, call_flow_id, current_user.id)
@@ -102,7 +102,7 @@ def rollback_call_flow(
     call_flow_id: str,
     payload: RollbackRequest,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_writer),
+    current_user: User = Depends(get_current_user),
 ):
     try:
         return service.rollback_flow(db, current_user.account_id, call_flow_id, payload.version, current_user.id)
@@ -115,7 +115,7 @@ def assign_call_flow(
     call_flow_id: str,
     payload: AssignCallFlowRequest,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_writer),
+    current_user: User = Depends(get_current_user),
 ):
     try:
         number = service.assign_to_number(db, current_user.account_id, call_flow_id, payload.phone_number_id)
@@ -130,7 +130,7 @@ def assign_call_flow(
 def unassign_call_flow(
     phone_number_id: str,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_writer),
+    current_user: User = Depends(get_current_user),
 ):
     try:
         number = service.assign_to_number(db, current_user.account_id, None, phone_number_id)

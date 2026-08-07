@@ -76,8 +76,13 @@ export default function NumbersPage() {
   const [routingTimezone, setRoutingTimezone] = useState("UTC");
   const [routingReceptionist, setRoutingReceptionist] = useState(false);
   const [routingEscalationUserId, setRoutingEscalationUserId] = useState("");
+  const [routingWhatsapp, setRoutingWhatsapp] = useState(false);
+  const [routingSms, setRoutingSms] = useState(false);
   const [routingBusy, setRoutingBusy] = useState(false);
   const [routingError, setRoutingError] = useState<string | null>(null);
+  const [smsCaseBlockedE164, setSmsCaseBlockedE164] = useState<string | null>(null);
+  const [smsCaseBusy, setSmsCaseBusy] = useState(false);
+  const [smsCaseOpened, setSmsCaseOpened] = useState(false);
 
   const [step, setStep] = useState<Step>("search");
   const [countryCode, setCountryCode] = useState("US");
@@ -309,12 +314,17 @@ export default function NumbersPage() {
     setRoutingTimezone(number.business_hours_timezone || "UTC");
     setRoutingReceptionist(number.ai_receptionist_enabled);
     setRoutingEscalationUserId(number.escalation_user_id ?? "");
+    setRoutingWhatsapp(number.whatsapp_enabled);
+    setRoutingSms(number.sms_enabled);
+    setSmsCaseBlockedE164(null);
+    setSmsCaseOpened(false);
   }
 
   async function handleSaveRouting(e164: string) {
     if (!token) return;
     setRoutingBusy(true);
     setRoutingError(null);
+    setSmsCaseBlockedE164(null);
     try {
       await configureRouting(token, e164, {
         forwarding_number: routingForwarding || null,
@@ -323,13 +333,31 @@ export default function NumbersPage() {
         business_hours_timezone: routingTimezone || "UTC",
         ai_receptionist_enabled: routingReceptionist,
         escalation_user_id: routingEscalationUserId || null,
+        whatsapp_enabled: routingWhatsapp,
+        sms_enabled: routingSms,
       });
       setRoutingOpenE164(null);
       await loadMyNumbers();
     } catch (err) {
+      if (err instanceof ApiError && err.status === 403 && err.message.includes("sms_business_messaging")) {
+        setSmsCaseBlockedE164(e164);
+      }
       setRoutingError(err instanceof ApiError ? err.message : "Couldn't save routing settings.");
     } finally {
       setRoutingBusy(false);
+    }
+  }
+
+  async function handleOpenSmsComplianceCase(country: string) {
+    if (!token) return;
+    setSmsCaseBusy(true);
+    try {
+      await openComplianceCase(token, { jurisdiction: country, requirement_type: "sms_business_messaging" });
+      setSmsCaseOpened(true);
+    } catch (err) {
+      setRoutingError(err instanceof ApiError ? err.message : "Couldn't open a compliance case.");
+    } finally {
+      setSmsCaseBusy(false);
     }
   }
 
@@ -442,6 +470,32 @@ export default function NumbersPage() {
                 <div className="bg-slate-50 rounded-lg p-4 space-y-3">
                   {routingError && <p className="text-xs text-red-600">{routingError}</p>}
 
+                  {smsCaseBlockedE164 === n.e164 && (
+                    <div className="text-xs bg-orange-50 text-orange-700 rounded-lg px-3 py-2 space-y-1.5">
+                      {smsCaseOpened ? (
+                        <p>
+                          Compliance case opened for {n.country} SMS registration - it needs staff approval before
+                          SMS can be enabled. Track its status on the{" "}
+                          <a href="/dashboard/settings" className="underline font-medium">
+                            Settings
+                          </a>{" "}
+                          page.
+                        </p>
+                      ) : (
+                        <div className="flex items-center justify-between gap-3">
+                          <span>{n.country} requires an approved SMS business messaging compliance case.</span>
+                          <button
+                            onClick={() => handleOpenSmsComplianceCase(n.country)}
+                            disabled={smsCaseBusy}
+                            className="font-medium underline shrink-0 disabled:opacity-60"
+                          >
+                            {smsCaseBusy ? "Opening…" : "Open compliance case"}
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  )}
+
                   <div className="grid grid-cols-2 gap-3">
                     <div>
                       <label className="block text-xs font-medium text-slate-500 mb-1">Forwarding number</label>
@@ -489,6 +543,32 @@ export default function NumbersPage() {
                     />
                     Enable AI receptionist outside forwarding
                   </label>
+
+                  <label className="flex items-center gap-2 text-sm text-slate-700">
+                    <input
+                      type="checkbox"
+                      checked={routingWhatsapp}
+                      onChange={(e) => setRoutingWhatsapp(e.target.checked)}
+                    />
+                    WhatsApp Business approved for this number
+                  </label>
+                  <p className="text-xs text-slate-400 -mt-2">
+                    Only check this once Meta/Twilio have approved this number as a WhatsApp Business sender -
+                    it does not request or grant that approval itself.
+                  </p>
+
+                  <label className="flex items-center gap-2 text-sm text-slate-700">
+                    <input
+                      type="checkbox"
+                      checked={routingSms}
+                      onChange={(e) => setRoutingSms(e.target.checked)}
+                    />
+                    SMS business messaging registered for this number
+                  </label>
+                  <p className="text-xs text-slate-400 -mt-2">
+                    Only check this once A2P 10DLC brand/campaign registration is complete for this number -
+                    it does not request or grant that registration itself.
+                  </p>
 
                   <div>
                     <label className="block text-xs font-medium text-slate-500 mb-1">

@@ -96,4 +96,19 @@ class PhoneNumber(Base):
         UUID(as_uuid=False), ForeignKey("call_flows.id", ondelete="SET NULL"), nullable=True, index=True
     )
 
+    # Phase 3 "WhatsApp Business integration" - real WhatsApp Business
+    # senders are approved per-number by Meta/Twilio out-of-band (not
+    # something this app can provision itself); this flag just records that
+    # approval has happened, gating app.messaging.service.send_message the
+    # same way ai_receptionist_enabled gates the receptionist above. Off by
+    # default, so no existing number is affected.
+    whatsapp_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
+    # Phase 3 "SMS by regulated market" - gates app.messaging.service the
+    # same way whatsapp_enabled does. Real US business SMS additionally
+    # requires A2P 10DLC brand/campaign registration with the carrier
+    # (architecture doc: "Separate regulated workstream"), which happens
+    # out-of-band; this flag just records that it's done for this number.
+    sms_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

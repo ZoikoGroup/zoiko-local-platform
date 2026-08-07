@@ -1,7 +1,13 @@
 """add call_flows and call_flow_versions (Advanced IVR builder, Phase 3)
 
+Originally authored against venky's history (Revises: b292ad2dad84, the
+ring_group_destinations migration) - retargeted onto fb89ad3b818a when this
+work was cherry-picked onto the anil branch, which never had that
+migration (ring groups are a venky-only feature). No SQL in this file
+changed, only its place in the graph.
+
 Revision ID: 4b2d27efe669
-Revises: b292ad2dad84
+Revises: fb89ad3b818a
 Create Date: 2026-08-06 17:00:00.000000
 
 """
@@ -9,11 +15,12 @@ from typing import Sequence, Union
 
 from alembic import op
 import sqlalchemy as sa
+from sqlalchemy.dialects import postgresql
 
 
 # revision identifiers, used by Alembic.
 revision: str = '4b2d27efe669'
-down_revision: Union[str, None] = 'b292ad2dad84'
+down_revision: Union[str, None] = 'fb89ad3b818a'
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
@@ -32,7 +39,11 @@ def upgrade() -> None:
     )
     op.create_index(op.f('ix_call_flows_account_id'), 'call_flows', ['account_id'], unique=False)
 
-    call_flow_version_status_enum = sa.Enum('draft', 'published', 'archived', name='call_flow_version_status_enum')
+    # Labels are uppercase to match this codebase's existing convention of
+    # storing a Python (str, Enum)'s *member name* in Postgres (see
+    # phone_number_status_enum's 'RESERVED'/'ACTIVE'/... labels) - SQLAlchemy
+    # binds Enum(SomePyEnum) columns by .name, not .value, by default.
+    call_flow_version_status_enum = postgresql.ENUM('DRAFT', 'PUBLISHED', 'ARCHIVED', name='call_flow_version_status_enum', create_type=False)
     call_flow_version_status_enum.create(op.get_bind(), checkfirst=True)
 
     op.create_table(
@@ -69,7 +80,7 @@ def downgrade() -> None:
 
     op.drop_index(op.f('ix_call_flow_versions_call_flow_id'), table_name='call_flow_versions')
     op.drop_table('call_flow_versions')
-    sa.Enum(name='call_flow_version_status_enum').drop(op.get_bind(), checkfirst=True)
+    postgresql.ENUM(name='call_flow_version_status_enum', create_type=False).drop(op.get_bind(), checkfirst=True)
 
     op.drop_index(op.f('ix_call_flows_account_id'), table_name='call_flows')
     op.drop_table('call_flows')

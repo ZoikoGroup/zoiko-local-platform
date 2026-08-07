@@ -6,6 +6,7 @@ from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from sqlalchemy import text
 
+from app.analytics.routes import router as analytics_router
 from app.audit.routes import router as audit_router
 from app.compliance.routes import router as compliance_router
 from app.consent.routes import router as consent_router
@@ -21,6 +22,8 @@ from app.media.receptionist import router as receptionist_router
 from app.media.video import router as video_router
 from app.media.voice import router as voice_router
 from app.media.voicemail import router as voicemail_router
+from app.messaging.routes import router as messaging_router
+from app.messaging.routes import webhook_router as messaging_webhook_router
 from app.numbering.identity.routes import router as identity_router
 from app.numbering.identity.team_routes import router as team_router
 from app.numbering.numbers.routes import router as numbers_router
@@ -90,6 +93,9 @@ app.include_router(porting_router)
 app.include_router(call_flows_router)
 app.include_router(queues_router)
 app.include_router(queues_webhook_router)
+app.include_router(messaging_router)
+app.include_router(messaging_webhook_router)
+app.include_router(analytics_router)
 
 
 @app.get("/health")

@@ -8,6 +8,15 @@ def _twilio_signature(url: str, params: dict) -> str:
     return RequestValidator(settings.twilio_auth_token).compute_signature(url, params)
 
 
+def _strip_none(nodes: list[dict]) -> list[dict]:
+    """CallFlowNode carries every node type's optional fields (queue_id,
+    overflow_node_id, ...); a node round-tripped through the API always
+    comes back with the ones it doesn't use present as null. Strip those
+    before comparing against a fixture that only lists the fields that
+    particular node type actually cares about."""
+    return [{k: v for k, v in node.items() if v is not None} for node in nodes]
+
+
 def _signup_and_login(client, email: str) -> str:
     client.post(
         "/auth/signup",
@@ -109,7 +118,7 @@ def test_publish_creates_live_version_and_a_fresh_draft(client, db_session):
     assert detail["draft"]["version"] == 2
     assert detail["draft"]["status"] == "draft"
     # The new draft starts as a copy of what was just published.
-    assert detail["draft"]["nodes"] == SIMPLE_MENU_NODES
+    assert _strip_none(detail["draft"]["nodes"]) == SIMPLE_MENU_NODES
 
 
 def test_rollback_restores_a_prior_version_as_a_new_version(client, db_session):
@@ -128,10 +137,15 @@ def test_rollback_restores_a_prior_version_as_a_new_version(client, db_session):
     rollback = client.post(f"/call-flows/{flow_id}/rollback", json={"version": 1}, headers=headers)
     assert rollback.status_code == 200
     rolled_back = rollback.json()
-    assert rolled_back["version"] == 3
+    # Three version rows already exist by this point: v1 (created at flow
+    # creation, published first), v2 (the fresh draft publish #1 created,
+    # then itself published), v3 (the fresh draft publish #2 created). The
+    # rollback's new row is therefore v4, not v3 - every version-row
+    # creation consumes the next number, not just explicit publish actions.
+    assert rolled_back["version"] == 4
     assert rolled_back["status"] == "published"
     assert rolled_back["rolled_back_from_version"] == 1
-    assert rolled_back["nodes"] == SIMPLE_MENU_NODES
+    assert _strip_none(rolled_back["nodes"]) == SIMPLE_MENU_NODES
 
 
 def test_assign_and_unassign_call_flow_to_a_number(client, db_session):

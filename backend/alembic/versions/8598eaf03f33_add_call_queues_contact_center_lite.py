@@ -9,6 +9,7 @@ from typing import Sequence, Union
 
 from alembic import op
 import sqlalchemy as sa
+from sqlalchemy.dialects import postgresql
 
 
 # revision identifiers, used by Alembic.
@@ -46,7 +47,10 @@ def upgrade() -> None:
     op.create_index(op.f('ix_queue_members_queue_id'), 'queue_members', ['queue_id'], unique=False)
     op.create_index(op.f('ix_queue_members_user_id'), 'queue_members', ['user_id'], unique=False)
 
-    agent_presence_status_enum = sa.Enum('available', 'wrap_up', 'offline', name='agent_presence_status_enum')
+    # Uppercase labels match this codebase's convention of storing a Python
+    # (str, Enum)'s *member name* in Postgres, since SQLAlchemy's Enum(...)
+    # binds by .name (not .value) when given a Python enum class.
+    agent_presence_status_enum = postgresql.ENUM('AVAILABLE', 'WRAP_UP', 'OFFLINE', name='agent_presence_status_enum', create_type=False)
     agent_presence_status_enum.create(op.get_bind(), checkfirst=True)
 
     op.create_table(
@@ -62,7 +66,7 @@ def upgrade() -> None:
     )
     op.create_index(op.f('ix_agent_presence_user_id'), 'agent_presence', ['user_id'], unique=True)
 
-    queue_call_outcome_enum = sa.Enum('waiting', 'answered', 'abandoned', 'overflowed', name='queue_call_outcome_enum')
+    queue_call_outcome_enum = postgresql.ENUM('WAITING', 'ANSWERED', 'ABANDONED', 'OVERFLOWED', name='queue_call_outcome_enum', create_type=False)
     queue_call_outcome_enum.create(op.get_bind(), checkfirst=True)
 
     op.create_table(
@@ -89,11 +93,11 @@ def downgrade() -> None:
     op.drop_index(op.f('ix_queue_call_logs_call_sid'), table_name='queue_call_logs')
     op.drop_index(op.f('ix_queue_call_logs_queue_id'), table_name='queue_call_logs')
     op.drop_table('queue_call_logs')
-    sa.Enum(name='queue_call_outcome_enum').drop(op.get_bind(), checkfirst=True)
+    postgresql.ENUM(name='queue_call_outcome_enum', create_type=False).drop(op.get_bind(), checkfirst=True)
 
     op.drop_index(op.f('ix_agent_presence_user_id'), table_name='agent_presence')
     op.drop_table('agent_presence')
-    sa.Enum(name='agent_presence_status_enum').drop(op.get_bind(), checkfirst=True)
+    postgresql.ENUM(name='agent_presence_status_enum', create_type=False).drop(op.get_bind(), checkfirst=True)
 
     op.drop_index(op.f('ix_queue_members_user_id'), table_name='queue_members')
     op.drop_index(op.f('ix_queue_members_queue_id'), table_name='queue_members')
