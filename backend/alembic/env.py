@@ -24,6 +24,7 @@ from app.numbering.identity import models as identity_models  # noqa: F401
 from app.numbering.numbers import models as numbers_models  # noqa: F401
 from app.notifications import models as notifications_models  # noqa: F401
 from app.observability import models as observability_models  # noqa: F401
+from app.ops import models as ops_models  # noqa: F401
 from app.porting import models as porting_models  # noqa: F401
 from app.retention import models as retention_models  # noqa: F401
 from app.risk import models as risk_models  # noqa: F401

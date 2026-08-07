@@ -12,6 +12,7 @@ from app.observability.schemas import (
     ProviderLatencySummary,
 )
 from app.ops import service
+from app.ops.schemas import SyntheticCheckRunResponse, SyntheticCheckSummaryResponse
 from app.staff.models import PlatformStaff
 
 router = APIRouter(prefix="/ops", tags=["ops"])
@@ -89,6 +90,42 @@ def trace_summary(
     """Grouped by provider+operation - avg/max latency and failure count
     over the window, the "what's slow or flaky right now" view."""
     return observability_service.provider_call_latency_summary(db, hours=hours)
+
+
+@router.post("/synthetic-checks/run", response_model=list[SyntheticCheckRunResponse])
+async def run_synthetic_checks(
+    db: Session = Depends(get_db),
+    _staff: PlatformStaff = Depends(get_current_staff),
+):
+    """Roadmap Month 5 launch-readiness gate: "synthetic call monitoring" -
+    runs now, on demand, and persists the results (see
+    app.ops.service.run_synthetic_checks's docstring for exactly what's
+    covered). No scheduler exists in this codebase to run this
+    automatically yet - same manual-trigger posture as the ZoikoNex
+    reconciliation summary. Any staff role can trigger this, same
+    diagnostic (not approval-action) posture as /provider-status."""
+    return await service.run_synthetic_checks(db)
+
+
+@router.get("/synthetic-checks", response_model=list[SyntheticCheckRunResponse])
+def list_synthetic_checks(
+    check_name: str | None = None,
+    limit: int = 200,
+    db: Session = Depends(get_db),
+    _staff: PlatformStaff = Depends(get_current_staff),
+):
+    return service.list_synthetic_check_runs(db, check_name=check_name, limit=limit)
+
+
+@router.get("/synthetic-checks/summary", response_model=SyntheticCheckSummaryResponse)
+def synthetic_checks_summary(
+    db: Session = Depends(get_db),
+    _staff: PlatformStaff = Depends(get_current_staff),
+):
+    """Most recent result per check, plus an overall pass/fail - the
+    at-a-glance view; /synthetic-checks (plural, no /summary) has the full
+    history for trend-spotting."""
+    return service.get_synthetic_check_summary(db)
 
 
 @router.get("/status")
