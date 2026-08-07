@@ -1,8 +1,45 @@
+import math
+
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.billing.service import sync_usage_event_to_zoikonex
-from app.usage.models import UsageEvent
+from app.usage.models import DEFAULT_RATE_COUNTRY, CallingRate, UsageEvent
+
+
+def get_calling_rate(db: Session, country: str | None) -> CallingRate | None:
+    """country-specific rate if one's configured, else the DEFAULT_RATE_
+    COUNTRY fallback, else None (no rate configured at all yet)."""
+    if country is not None:
+        rate = db.query(CallingRate).filter(CallingRate.country == country).first()
+        if rate is not None:
+            return rate
+    return db.query(CallingRate).filter(CallingRate.country == DEFAULT_RATE_COUNTRY).first()
+
+
+def list_calling_rates(db: Session) -> list[CallingRate]:
+    return db.query(CallingRate).order_by(CallingRate.country.asc()).all()
+
+
+def upsert_calling_rate(db: Session, *, country: str, price_per_minute_cents: int, currency: str = "USD") -> CallingRate:
+    rate = db.query(CallingRate).filter(CallingRate.country == country).first()
+    if rate is None:
+        rate = CallingRate(country=country, price_per_minute_cents=price_per_minute_cents, currency=currency)
+        db.add(rate)
+    else:
+        rate.price_per_minute_cents = price_per_minute_cents
+        rate.currency = currency
+    db.commit()
+    db.refresh(rate)
+    return rate
+
+
+def _estimate_call_cost_cents(db: Session, *, country_band: str | None, duration_seconds: float) -> int | None:
+    rate = get_calling_rate(db, country_band)
+    if rate is None:
+        return None
+    minutes = math.ceil(duration_seconds / 60)
+    return minutes * rate.price_per_minute_cents
 
 
 def record_usage_event(
@@ -22,12 +59,17 @@ def record_usage_event(
     if existing is not None:
         return None
 
+    estimated_cost_cents = None
+    if event_type == "call_seconds":
+        estimated_cost_cents = _estimate_call_cost_cents(db, country_band=country_band, duration_seconds=quantity)
+
     event = UsageEvent(
         account_id=account_id,
         event_type=event_type,
         quantity=quantity,
         unit=unit,
         country_band=country_band,
+        estimated_cost_cents=estimated_cost_cents,
         idempotency_key=idempotency_key,
     )
     db.add(event)
