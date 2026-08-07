@@ -1,4 +1,6 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+import json
+
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.orm import Session
 
 from app.billing import service
@@ -13,6 +15,7 @@ from app.billing.schemas import (
 )
 from app.core.database import get_db
 from app.core.deps import get_current_staff, get_current_user, require_admin, require_staff_role
+from app.integrations.billing import zoikonex as zoikonex_adapter
 from app.numbering.identity.models import User
 from app.staff.models import PlatformStaff, PlatformStaffRole
 
@@ -49,6 +52,44 @@ def change_plan(
 @router.get("/usage-summary", response_model=UsageSummaryResponse)
 def usage_summary(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     return service.get_usage_summary(db, current_user.account_id)
+
+
+@router.post("/zoikonex/webhook", status_code=status.HTTP_204_NO_CONTENT)
+async def zoikonex_payment_webhook(request: Request, db: Session = Depends(get_db)):
+    """Real inbound ZoikoNex -> Zoiko Local payment-state webhook (Architecture
+    doc §9). Unauthenticated by user session (ZoikoNex isn't one of our users)
+    - trust comes entirely from the HMAC signature, same posture as the
+    Stripe Identity webhook at compliance/routes.py. Expected payload shape
+    ({event_id, event_type, zoikonex_ref}) and the X-ZoikoNex-Signature
+    scheme are both placeholders pending ZoikoNex's actual locked contract -
+    see app.integrations.billing.zoikonex's docstring."""
+    body = await request.body()
+    signature = request.headers.get("X-ZoikoNex-Signature")
+
+    try:
+        zoikonex_adapter.verify_webhook_signature(body, signature)
+    except zoikonex_adapter.ZoikoNexWebhookError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e)) from e
+
+    try:
+        payload = json.loads(body)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Malformed JSON body") from e
+
+    zoikonex_ref = payload.get("zoikonex_ref")
+    event_type = payload.get("event_type")
+    if not zoikonex_ref or not event_type:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="zoikonex_ref and event_type are required")
+
+    try:
+        service.handle_zoikonex_payment_webhook(
+            db, zoikonex_ref=zoikonex_ref, event_type=event_type, external_event_id=payload.get("event_id"),
+        )
+    except service.ZoikoNexRefNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
+    except service.InvalidPaymentEventError as e:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e)) from e
+    return None
 
 
 # --- Staff-only: mock ZoikoNex operations console ---

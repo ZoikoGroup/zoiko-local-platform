@@ -1,3 +1,6 @@
+import hashlib
+import hmac
+import json
 from datetime import datetime, timedelta, timezone
 
 from app.billing import service
@@ -228,6 +231,92 @@ def test_number_purchase_is_blocked_when_billing_suspended(client, db_session):
 
     response = client.post("/numbers/purchase", json={"e164": "+15550009999"}, headers=headers)
     assert response.status_code == 402
+
+
+# --- Real inbound payment webhook ---
+
+
+def _sign_zoikonex_webhook(secret: str, body: bytes) -> str:
+    return f"sha256={hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()}"
+
+
+def test_zoikonex_webhook_rejects_missing_secret_configured(client, db_session, monkeypatch):
+    monkeypatch.setattr("app.integrations.billing.zoikonex.settings.zoikonex_webhook_secret", "")
+    body = json.dumps({"zoikonex_ref": "zn_sub_x", "event_type": "payment_failed"}).encode()
+    response = client.post(
+        "/billing/zoikonex/webhook", content=body, headers={"X-ZoikoNex-Signature": "sha256=whatever"}
+    )
+    assert response.status_code == 403
+
+
+def test_zoikonex_webhook_rejects_invalid_signature(client, db_session, monkeypatch):
+    monkeypatch.setattr("app.integrations.billing.zoikonex.settings.zoikonex_webhook_secret", "whsec_zn_test")
+    body = json.dumps({"zoikonex_ref": "zn_sub_x", "event_type": "payment_failed"}).encode()
+    response = client.post(
+        "/billing/zoikonex/webhook", content=body, headers={"X-ZoikoNex-Signature": "sha256=not-the-real-signature"}
+    )
+    assert response.status_code == 403
+
+
+def test_zoikonex_webhook_rejects_missing_signature_header(client, db_session, monkeypatch):
+    monkeypatch.setattr("app.integrations.billing.zoikonex.settings.zoikonex_webhook_secret", "whsec_zn_test")
+    body = json.dumps({"zoikonex_ref": "zn_sub_x", "event_type": "payment_failed"}).encode()
+    response = client.post("/billing/zoikonex/webhook", content=body)
+    assert response.status_code == 403
+
+
+def test_zoikonex_webhook_returns_404_for_unknown_zoikonex_ref(client, db_session, monkeypatch):
+    monkeypatch.setattr("app.integrations.billing.zoikonex.settings.zoikonex_webhook_secret", "whsec_zn_test")
+    body = json.dumps({"zoikonex_ref": "zn_sub_does_not_exist", "event_type": "payment_failed"}).encode()
+    response = client.post(
+        "/billing/zoikonex/webhook",
+        content=body,
+        headers={"X-ZoikoNex-Signature": _sign_zoikonex_webhook("whsec_zn_test", body)},
+    )
+    assert response.status_code == 404
+
+
+def test_zoikonex_webhook_applies_payment_failed_event(client, db_session, monkeypatch):
+    monkeypatch.setattr("app.integrations.billing.zoikonex.settings.zoikonex_webhook_secret", "whsec_zn_test")
+    account = _make_account(db_session, "Real Webhook Payment Co")
+    sub = service.get_or_create_subscription(db_session, account.id)
+
+    body = json.dumps(
+        {"event_id": "evt_1", "zoikonex_ref": sub.zoikonex_ref, "event_type": "payment_failed"}
+    ).encode()
+    response = client.post(
+        "/billing/zoikonex/webhook",
+        content=body,
+        headers={"X-ZoikoNex-Signature": _sign_zoikonex_webhook("whsec_zn_test", body)},
+    )
+    assert response.status_code == 204
+
+    db_session.refresh(sub)
+    assert sub.status == SubscriptionStatus.PAST_DUE
+    assert sub.grace_period_ends_at is not None
+
+
+def test_zoikonex_webhook_is_idempotent_on_duplicate_event_id(client, db_session, monkeypatch):
+    monkeypatch.setattr("app.integrations.billing.zoikonex.settings.zoikonex_webhook_secret", "whsec_zn_test")
+    account = _make_account(db_session, "Real Webhook Idempotent Co")
+    sub = service.get_or_create_subscription(db_session, account.id)
+
+    body = json.dumps(
+        {"event_id": "evt_dup_1", "zoikonex_ref": sub.zoikonex_ref, "event_type": "payment_failed"}
+    ).encode()
+    headers = {"X-ZoikoNex-Signature": _sign_zoikonex_webhook("whsec_zn_test", body)}
+
+    first = client.post("/billing/zoikonex/webhook", content=body, headers=headers)
+    assert first.status_code == 204
+    second = client.post("/billing/zoikonex/webhook", content=body, headers=headers)
+    assert second.status_code == 204
+
+    events = (
+        db_session.query(ZoikoNexSyncEvent)
+        .filter(ZoikoNexSyncEvent.account_id == account.id, ZoikoNexSyncEvent.event_type == ZoikoNexSyncEventType.PAYMENT_EVENT_RECEIVED)
+        .all()
+    )
+    assert len(events) == 1  # the duplicate delivery was skipped, not double-applied
 
 
 # --- Staff routes ---

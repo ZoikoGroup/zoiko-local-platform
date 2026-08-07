@@ -258,6 +258,11 @@ class InvalidPaymentEventError(Exception):
     """Raised for an unrecognized simulated payment event type."""
 
 
+class ZoikoNexRefNotFoundError(Exception):
+    """Raised when an inbound ZoikoNex webhook references a zoikonex_ref
+    that doesn't match any local Subscription."""
+
+
 class BillingSuspendedError(Exception):
     """Raised when an account's grace period has expired with unresolved
     PAST_DUE status - Architecture doc §9 "Graceful degradation": outbound
@@ -269,16 +274,23 @@ class BillingSuspendedError(Exception):
 _PAYMENT_EVENT_TYPES = {"payment_failed", "payment_retry", "payment_restored"}
 
 
-def simulate_zoikonex_payment_event(db: Session, account_id: str, event_type: str, *, actor: str) -> Subscription:
-    """Mocks ZoikoNex -> Zoiko Local payment-state webhook (Architecture doc
-    §9: "ZoikoNex sends payment success, failure, retry, grace-period,
-    suspension, and restoration events back to Zoiko Local"). Staff-
-    triggered here (see routes.py) since there's no real ZoikoNex to send
-    this for real - see app.integrations.billing.zoikonex's docstring."""
+def _apply_zoikonex_payment_event(
+    db: Session,
+    sub: Subscription,
+    event_type: str,
+    *,
+    actor: str,
+    action: str,
+    external_event_id: str | None = None,
+) -> Subscription:
+    """Shared state transition for an inbound ZoikoNex payment event
+    (Architecture doc §9: "ZoikoNex sends payment success, failure, retry,
+    grace-period, suspension, and restoration events back to Zoiko Local"),
+    used by both the staff-triggered simulator and the real webhook."""
     if event_type not in _PAYMENT_EVENT_TYPES:
         raise InvalidPaymentEventError(f"Unknown payment event type: {event_type!r}")
 
-    sub = get_or_create_subscription(db, account_id)
+    account_id = sub.account_id
     now = _db_now(db)
     before_status = sub.status
 
@@ -299,13 +311,14 @@ def simulate_zoikonex_payment_event(db: Session, account_id: str, event_type: st
             account_id=account_id,
             event_type=ZoikoNexSyncEventType.PAYMENT_EVENT_RECEIVED,
             zoikonex_ref=sub.zoikonex_ref,
+            external_event_id=external_event_id,
             payload={"event_type": event_type, "grace_period_ends_at": sub.grace_period_ends_at.isoformat() if sub.grace_period_ends_at else None},
         )
     )
     db.commit()
 
     log_event(
-        db, actor=actor, action="subscription.payment_event_simulated", target=f"subscription:{sub.id}",
+        db, actor=actor, action=action, target=f"subscription:{sub.id}",
         before={"status": before_status.value}, after={"status": sub.status.value, "event_type": event_type},
     )
 
@@ -325,6 +338,41 @@ def simulate_zoikonex_payment_event(db: Session, account_id: str, event_type: st
             notify_service_restored(db, account_id=account_id, account_email=owner.email)
 
     return sub
+
+
+def simulate_zoikonex_payment_event(db: Session, account_id: str, event_type: str, *, actor: str) -> Subscription:
+    """Staff-triggered stand-in (see routes.py) for the real webhook below,
+    kept around since there's no real ZoikoNex sending these yet for most
+    environments - see app.integrations.billing.zoikonex's docstring."""
+    sub = get_or_create_subscription(db, account_id)
+    return _apply_zoikonex_payment_event(
+        db, sub, event_type, actor=actor, action="subscription.payment_event_simulated"
+    )
+
+
+def handle_zoikonex_payment_webhook(
+    db: Session, *, zoikonex_ref: str, event_type: str, external_event_id: str | None
+) -> Subscription:
+    """Real inbound ZoikoNex -> Zoiko Local payment-state webhook. Looks the
+    subscription up by zoikonex_ref (ZoikoNex has no notion of our internal
+    account_id) and, if external_event_id was provided, skips re-applying an
+    event already recorded - the Architecture doc §9 requires this
+    integration be "idempotent" since webhook deliveries can be retried."""
+    sub = db.query(Subscription).filter(Subscription.zoikonex_ref == zoikonex_ref).first()
+    if sub is None:
+        raise ZoikoNexRefNotFoundError(f"No subscription found for zoikonex_ref={zoikonex_ref!r}")
+
+    if external_event_id is not None:
+        already_applied = (
+            db.query(ZoikoNexSyncEvent).filter(ZoikoNexSyncEvent.external_event_id == external_event_id).first()
+        )
+        if already_applied is not None:
+            return sub
+
+    return _apply_zoikonex_payment_event(
+        db, sub, event_type, actor="zoikonex_webhook",
+        action="subscription.payment_event_received", external_event_id=external_event_id,
+    )
 
 
 def assert_billing_not_suspended(db: Session, account_id: str) -> None:

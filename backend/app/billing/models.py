@@ -104,4 +104,10 @@ class ZoikoNexSyncEvent(Base):
     )
     zoikonex_ref: Mapped[str | None] = mapped_column(String(100), nullable=True)
     payload: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    # ZoikoNex's own event id for inbound webhook deliveries (Architecture doc
+    # §9: integration "must be event-based, idempotent, and reconcilable") -
+    # NULL for our own outbound sync events, which have no such id to dedupe
+    # against. A unique index lets a replayed webhook delivery be detected
+    # and skipped instead of double-applying a payment-state transition.
+    external_event_id: Mapped[str | None] = mapped_column(String(100), nullable=True, unique=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)

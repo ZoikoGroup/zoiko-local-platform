@@ -71,11 +71,55 @@ class Settings(BaseSettings):
     stripe_secret_key: str = ""
     stripe_identity_webhook_secret: str = ""
 
+    # ZoikoNex (integrations/billing) - shared-secret HMAC for the inbound
+    # payment-event webhook. Empty until a real ZoikoNex connection issues
+    # one; see app.integrations.billing.zoikonex's docstring.
+    zoikonex_webhook_secret: str = ""
+
     # Resend (integrations/notifications) - real transactional email sending.
     # email_from_address must be on a domain verified in Resend once one is
     # set up; Resend's shared onboarding@resend.dev address works
     # immediately with no domain verification, for testing before that.
     resend_api_key: str = ""
     email_from_address: str = "onboarding@resend.dev"
+
+    # HubSpot (integrations/crm) - real OAuth app credentials, from a
+    # HubSpot developer account's app settings. Empty until one is created;
+    # see app.integrations.crm.hubspot's docstring. hubspot_redirect_uri
+    # must exactly match the "Redirect URL" configured in that HubSpot app
+    # (typically {public_base_url}/crm/hubspot/callback).
+    hubspot_client_id: str = ""
+    hubspot_client_secret: str = ""
+    hubspot_redirect_uri: str = ""
+
+    # Symmetric key (Fernet, base64-encoded - generate with
+    # cryptography.fernet.Fernet.generate_key()) for encrypting OAuth
+    # tokens at rest, e.g. CrmConnection's HubSpot/Salesforce tokens - see
+    # app.core.crypto. Empty in dev is fine for the mock-only providers;
+    # required before any real OAuth connection can be stored.
+    token_encryption_key: str = ""
+
+    # Salesforce (integrations/crm) - real OAuth "Connected App" credentials
+    # from a Salesforce org (a free Developer Edition org works). Empty
+    # until one is created; see app.integrations.crm.salesforce's
+    # docstring. salesforce_redirect_uri must exactly match the Connected
+    # App's configured Callback URL (typically
+    # {public_base_url}/crm/salesforce/callback). salesforce_login_base_url
+    # is the login domain to authenticate against - login.salesforce.com
+    # for production/Developer Edition orgs, test.salesforce.com for
+    # sandboxes.
+    salesforce_client_id: str = ""
+    salesforce_client_secret: str = ""
+    salesforce_redirect_uri: str = ""
+    salesforce_login_base_url: str = "https://login.salesforce.com"
+
+    # Pipedrive (integrations/crm) - real OAuth app credentials, from a
+    # Pipedrive Developer Hub app. Empty until one is created; see
+    # app.integrations.crm.pipedrive's docstring. pipedrive_redirect_uri
+    # must exactly match that app's configured Callback URL (typically
+    # {public_base_url}/crm/pipedrive/callback).
+    pipedrive_client_id: str = ""
+    pipedrive_client_secret: str = ""
+    pipedrive_redirect_uri: str = ""
 
 settings = Settings()
