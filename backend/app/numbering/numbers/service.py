@@ -21,15 +21,32 @@ from app.notifications.service import (
     notify_number_verification_required,
 )
 from app.numbering.identity.models import Account, AccountType, User, UserRole
+from app.numbering.numbers.countries import SUPPORTED_COUNTRIES, SUPPORTED_COUNTRY_CODES
 from app.numbering.numbers.models import IVROption, PhoneNumber, PhoneNumberStatus, RingGroupDestination
 
 RESERVATION_TTL_MINUTES = 12
 QUARANTINE_DAYS = 90
+RENEWAL_PERIOD_DAYS = 30
 
 
 class NumberConflictError(Exception):
     """Raised when a number can't be reserved/purchased because another
     account already holds it, or the caller's own reservation lapsed."""
+
+
+class UnsupportedCountryError(Exception):
+    """Raised for a country outside Zoiko Local's curated launch list -
+    see app.numbering.numbers.countries for why this is narrower than
+    Twilio's own coverage."""
+
+
+def list_supported_countries() -> list[dict]:
+    return SUPPORTED_COUNTRIES
+
+
+def _assert_supported_country(country: str) -> None:
+    if country not in SUPPORTED_COUNTRY_CODES:
+        raise UnsupportedCountryError(f"{country!r} is not on Zoiko Local's supported country list yet")
 
 
 class ComplianceRequiredError(Exception):
@@ -53,6 +70,7 @@ def _kyc_requirement_type(db: Session, account_id: str) -> str:
 
 
 def search_numbers(country: str, number_type: str = "local", area_code: str | None = None) -> list[dict]:
+    _assert_supported_country(country)
     return telecom.search_available_numbers(country, number_type=number_type, area_code=area_code)
 
 
@@ -62,6 +80,7 @@ def reserve_number(db: Session, account_id: str, e164: str, country: str) -> Pho
     existing row; the unique constraint on `e164` catches the race where two
     requests both try to INSERT a brand-new row for the same number.
     """
+    _assert_supported_country(country)
     now = datetime.now(timezone.utc)
     number = db.query(PhoneNumber).filter(PhoneNumber.e164 == e164).with_for_update().first()
 
@@ -215,6 +234,7 @@ def purchase_number(db: Session, account_id: str, e164: str) -> PhoneNumber:
     number.provider_sid = bought["sid"]
     number.reserved_until = None
     number.provisioning_started_at = None
+    number.next_renewal_at = now + timedelta(days=RENEWAL_PERIOD_DAYS)
     db.commit()
     db.refresh(number)
     log_event(
@@ -303,6 +323,7 @@ def retry_provisioning(db: Session, staff_id: str, number_id: str) -> PhoneNumbe
     number.provider_sid = bought["sid"]
     number.reserved_until = None
     number.provisioning_started_at = None
+    number.next_renewal_at = datetime.now(timezone.utc) + timedelta(days=RENEWAL_PERIOD_DAYS)
     db.commit()
     db.refresh(number)
     log_event(
@@ -338,6 +359,54 @@ def release_stuck_provisioning(db: Session, staff_id: str, number_id: str) -> Ph
     log_event(
         db, actor_id=staff_id, action="number.provisioning_released",
         target_type="phone_number", target_id=number.id, metadata={"e164": number.e164},
+    )
+    return number
+
+
+class NotDueForRenewalError(Exception):
+    """Raised when trying to mark a number renewed that isn't ACTIVE or
+    doesn't have a next_renewal_at in the past."""
+
+
+def list_due_renewals(db: Session) -> list[PhoneNumber]:
+    """Numbers whose lifecycle renewal date has passed. There's no real
+    payment gateway to charge yet (same gap purchase_number's docstring
+    flags), so this is a staff-visible worklist, not an automated billing
+    run - see mark_number_renewed."""
+    now = datetime.now(timezone.utc)
+    return (
+        db.query(PhoneNumber)
+        .filter(
+            PhoneNumber.status == PhoneNumberStatus.ACTIVE,
+            PhoneNumber.next_renewal_at.isnot(None),
+            PhoneNumber.next_renewal_at <= now,
+        )
+        .order_by(PhoneNumber.next_renewal_at.asc())
+        .all()
+    )
+
+
+def mark_number_renewed(db: Session, staff_id: str, number_id: str) -> PhoneNumber:
+    """Staff bookkeeping action - advances a number's renewal date by one
+    period. Deliberately does not touch billing/suspension: existing number
+    ownership is explicitly exempt from billing-suspension effects
+    (app.billing.service.assert_billing_not_suspended's docstring), and
+    there's no real per-number payment step to fail against yet, so this
+    must not invent a punitive failure mode that isn't backed by one."""
+    number = db.query(PhoneNumber).filter(PhoneNumber.id == number_id).with_for_update().first()
+    now = datetime.now(timezone.utc)
+    if number is None or number.status != PhoneNumberStatus.ACTIVE or (
+        number.next_renewal_at is None or number.next_renewal_at > now
+    ):
+        raise NotDueForRenewalError(f"{number_id} is not currently due for renewal")
+
+    number.next_renewal_at = now + timedelta(days=RENEWAL_PERIOD_DAYS)
+    db.commit()
+    db.refresh(number)
+    log_event(
+        db, actor_id=staff_id, action="number.renewed",
+        target_type="phone_number", target_id=number.id,
+        metadata={"e164": number.e164, "next_renewal_at": number.next_renewal_at.isoformat()},
     )
     return number
 

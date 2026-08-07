@@ -494,4 +494,107 @@ def test_purchase_succeeds_once_emergency_calling_disclosure_is_acknowledged(cli
         "/compliance/consent", json={"consent_type": "emergency_calling_acknowledged"}, headers=headers
     )
     response = client.post("/numbers/purchase", json={"e164": "+15550009922"}, headers=headers)
-    assert response.status_code == 200, response.text
+    assert response.status_code == 200
+
+
+# --- Curated country list ---
+
+
+def test_list_supported_countries_returns_the_curated_list(client):
+    token = _signup_and_login(client, "countrieslist1@example.com")
+    response = client.get("/numbers/countries", headers={"Authorization": f"Bearer {token}"})
+    assert response.status_code == 200
+    codes = {c["code"] for c in response.json()}
+    assert "US" in codes
+    assert "GB" in codes
+    # Not an arbitrary country Twilio may have coverage for but this
+    # platform hasn't curated yet.
+    assert "ZZ" not in codes
+
+
+def test_search_rejects_an_uncurated_country(client):
+    token = _signup_and_login(client, "countriessearch1@example.com")
+    response = client.get(
+        "/numbers/search", params={"country": "ZZ"}, headers={"Authorization": f"Bearer {token}"}
+    )
+    assert response.status_code == 422
+
+
+def test_reserve_rejects_an_uncurated_country(client):
+    token = _signup_and_login(client, "countriesreserve1@example.com")
+    response = client.post(
+        "/numbers/reserve", json={"e164": "+9990001111", "country": "ZZ"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert response.status_code == 422
+
+
+# --- Renewal flow ---
+
+
+def test_purchase_sets_a_next_renewal_date_about_30_days_out(client, monkeypatch):
+    from datetime import datetime, timedelta, timezone
+
+    _stub_buy_number(monkeypatch)
+    token = _signup_and_login(client, "renewalpurchase1@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    _reserve(client, headers, "+15550011001")
+
+    response = client.post("/numbers/purchase", json={"e164": "+15550011001"}, headers=headers)
+    assert response.status_code == 200
+    next_renewal_at = datetime.fromisoformat(response.json()["next_renewal_at"].replace("Z", "+00:00"))
+    expected = datetime.now(timezone.utc) + timedelta(days=30)
+    assert abs((next_renewal_at - expected).total_seconds()) < 60
+
+
+def _create_staff_and_login(client, db_session, email: str) -> str:
+    from app.staff import service as staff_service
+    from app.staff.models import PlatformStaffRole
+
+    staff_service.create_staff(db_session, email=email, password="staffpass123", role=PlatformStaffRole.SUPER_ADMIN)
+    return client.post("/staff/login", json={"email": email, "password": "staffpass123"}).json()["access_token"]
+
+
+def test_staff_can_list_and_mark_a_due_renewal(client, db_session, monkeypatch):
+    from datetime import datetime, timedelta, timezone
+
+    from app.numbering.numbers.models import PhoneNumber
+
+    _stub_buy_number(monkeypatch)
+    token = _signup_and_login(client, "renewalstaff1@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    _reserve(client, headers, "+15550011002")
+    client.post("/numbers/purchase", json={"e164": "+15550011002"}, headers=headers)
+
+    number = db_session.query(PhoneNumber).filter(PhoneNumber.e164 == "+15550011002").first()
+    number.next_renewal_at = datetime.now(timezone.utc) - timedelta(days=1)
+    db_session.commit()
+
+    staff_token = _create_staff_and_login(client, db_session, "staffrenewal1@zoikolocal.com")
+    staff_headers = {"Authorization": f"Bearer {staff_token}"}
+
+    due = client.get("/staff/numbers/due-for-renewal", headers=staff_headers)
+    assert due.status_code == 200
+    assert any(n["e164"] == "+15550011002" for n in due.json())
+
+    response = client.post(f"/staff/numbers/{number.id}/mark-renewed", headers=staff_headers)
+    assert response.status_code == 200
+    new_next_renewal_at = datetime.fromisoformat(response.json()["next_renewal_at"].replace("Z", "+00:00"))
+    assert new_next_renewal_at > datetime.now(timezone.utc) + timedelta(days=29)
+
+    due_after = client.get("/staff/numbers/due-for-renewal", headers=staff_headers)
+    assert not any(n["e164"] == "+15550011002" for n in due_after.json())
+
+
+def test_staff_cannot_mark_renewed_a_number_not_yet_due(client, db_session, monkeypatch):
+    _stub_buy_number(monkeypatch)
+    token = _signup_and_login(client, "renewalstaff2@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    _reserve(client, headers, "+15550011003")
+    purchased = client.post("/numbers/purchase", json={"e164": "+15550011003"}, headers=headers).json()
+
+    staff_token = _create_staff_and_login(client, db_session, "staffrenewal2@zoikolocal.com")
+    response = client.post(
+        f"/staff/numbers/{purchased['id']}/mark-renewed", headers={"Authorization": f"Bearer {staff_token}"}
+    )
+    assert response.status_code == 409

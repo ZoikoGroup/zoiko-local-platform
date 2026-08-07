@@ -18,15 +18,24 @@ from app.numbering.numbers.schemas import (
     RoutingConfigRequest,
     SetIVRMenuRequest,
     SetRingGroupRequest,
+    SupportedCountryResponse,
     SuspendNumberRequest,
 )
 from app.numbering.numbers.service import (
     ComplianceRequiredError,
     EmergencyDisclosureRequiredError,
     NumberConflictError,
+    UnsupportedCountryError,
 )
 
 router = APIRouter(prefix="/numbers", tags=["numbers"])
+
+
+@router.get("/countries", response_model=list[SupportedCountryResponse])
+def list_supported_countries(
+    current_user: User = Depends(get_current_user),
+):
+    return service.list_supported_countries()
 
 
 @router.get("/search", response_model=list[NumberSearchResult])
@@ -38,6 +47,8 @@ def search_numbers(
 ):
     try:
         return service.search_numbers(country, number_type=number_type, area_code=area_code)
+    except UnsupportedCountryError as e:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e)) from e
     except TelecomError as e:
         raise HTTPException(status_code=502, detail=str(e)) from e
 
@@ -50,6 +61,8 @@ def reserve_number(
 ):
     try:
         return service.reserve_number(db, current_user.account_id, payload.e164, payload.country)
+    except UnsupportedCountryError as e:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e)) from e
     except NumberConflictError as e:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e
 

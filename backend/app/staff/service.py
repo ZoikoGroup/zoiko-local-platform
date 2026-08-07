@@ -4,6 +4,7 @@ from sqlalchemy.orm import Session
 from app.core.security import hash_password, verify_password
 from app.numbering.identity.models import Account, User, UserRole
 from app.numbering.numbers.models import PhoneNumber
+from app.numbering.numbers.service import list_due_renewals as _list_due_renewals
 from app.numbering.numbers.service import list_stuck_provisioning as _list_stuck_provisioning
 from app.staff.models import PlatformStaff, PlatformStaffRole
 
@@ -85,6 +86,33 @@ def list_stuck_provisioning(db: Session) -> list[dict]:
             "account_name": accounts[n.account_id].name if n.account_id in accounts else None,
             "account_owner_email": owners.get(n.account_id),
             "provisioning_started_at": n.provisioning_started_at,
+        }
+        for n in numbers
+    ]
+
+
+def list_due_renewals(db: Session) -> list[dict]:
+    """Staff worklist of numbers past their renewal date - see
+    app.numbering.numbers.service.list_due_renewals's docstring on why
+    this is a manual worklist rather than automated billing. Same
+    join-in-context shape as list_stuck_provisioning."""
+    numbers = _list_due_renewals(db)
+    account_ids = {n.account_id for n in numbers}
+    accounts = {a.id: a for a in db.query(Account).filter(Account.id.in_(account_ids)).all()}
+    owners = {
+        u.account_id: u.email
+        for u in db.query(User).filter(User.account_id.in_(account_ids), User.role == UserRole.OWNER).all()
+    }
+    return [
+        {
+            "id": n.id,
+            "e164": n.e164,
+            "country": n.country,
+            "status": n.status,
+            "account_id": n.account_id,
+            "account_name": accounts[n.account_id].name if n.account_id in accounts else None,
+            "account_owner_email": owners.get(n.account_id),
+            "next_renewal_at": n.next_renewal_at,
         }
         for n in numbers
     ]

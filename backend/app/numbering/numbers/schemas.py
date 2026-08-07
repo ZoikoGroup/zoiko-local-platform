@@ -82,3 +82,9 @@ class PhoneNumberResponse(BaseModel):
     business_hours_timezone: str
     ai_receptionist_enabled: bool
     escalation_user_id: str | None
+    next_renewal_at: datetime | None
+
+
+class SupportedCountryResponse(BaseModel):
+    code: str
+    name: str

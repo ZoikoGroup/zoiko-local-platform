@@ -94,6 +94,17 @@ class PhoneNumber(Base):
     # greeting set behaves exactly as before this feature existed.
     ivr_greeting: Mapped[str | None] = mapped_column(String(500), nullable=True)
 
+    # Number lifecycle "renewal" date - set to purchase time + the renewal
+    # period whenever the number becomes ACTIVE (initial purchase or a
+    # staff-recovered stuck purchase), advanced by the same period each
+    # time app.numbering.numbers.service.mark_number_renewed runs. NULL for
+    # numbers that have never been ACTIVE (reserved/cancelled/pending).
+    # There's no real payment gateway yet (see purchase_number's docstring
+    # on that same gap), so this only tracks the date and gives staff a
+    # manual bookkeeping action - it does not enforce anything or suspend
+    # numbers on its own.
+    next_renewal_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
