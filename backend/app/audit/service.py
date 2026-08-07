@@ -1,8 +1,8 @@
 import hashlib
 import json
+import uuid
 from typing import Any
 
-import sqlalchemy as sa
 from sqlalchemy.orm import Session
 
 from app.audit.models import AuditEvent
@@ -15,6 +15,59 @@ def _hash_state(state: dict[str, Any] | None) -> str | None:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def _is_uuid(value: str) -> bool:
+    try:
+        uuid.UUID(value)
+        return True
+    except ValueError:
+        return False
+
+
+def _resolve_account_id(db: Session, *, actor: str, target: str) -> str | None:
+    """Best-effort account attribution, computed once at write time instead
+    of re-derived on every read. Mirrors the same three shapes the old
+    query-time version of list_account_events used to infer on the fly:
+    actor=account_id directly (numbering/media/compliance events), actor=
+    user.id (signup/login/MFA/team/porting events), and target=
+    "compliance_case:{id}" / "porting_request:{id}" (staff acting on a
+    customer's case or porting request). Not guaranteed-complete - staff/
+    system/cross-account actions correctly resolve to None.
+
+    actor is free text (e.g. "system", "hubspot_oauth_callback", staff
+    ids) - the _is_uuid guards below are load-bearing, not decoration: an
+    id column is UUID-typed in Postgres, so comparing it against a non-
+    UUID string raises InvalidTextRepresentation and aborts the caller's
+    transaction, which previously took down every notification-triggering
+    endpoint in the app, including signup itself."""
+    from app.compliance.models import ComplianceCase
+    from app.numbering.identity.models import Account, User
+    from app.porting.models import PortingRequest
+
+    if _is_uuid(actor):
+        if db.query(Account.id).filter(Account.id == actor).first() is not None:
+            return actor
+
+        user = db.query(User).filter(User.id == actor).first()
+        if user is not None:
+            return user.account_id
+
+    if target.startswith("compliance_case:"):
+        case_id = target.split(":", 1)[1]
+        if _is_uuid(case_id):
+            case = db.query(ComplianceCase).filter(ComplianceCase.id == case_id).first()
+            if case is not None:
+                return case.account_id
+
+    if target.startswith("porting_request:"):
+        request_id = target.split(":", 1)[1]
+        if _is_uuid(request_id):
+            request = db.query(PortingRequest).filter(PortingRequest.id == request_id).first()
+            if request is not None:
+                return request.account_id
+
+    return None
+
+
 def log_event(
     db: Session,
     *,
@@ -25,6 +78,7 @@ def log_event(
     correlation_id: str | None = None,
     before: dict[str, Any] | None = None,
     after: dict[str, Any] | None = None,
+    account_id: str | None = None,
     # Compatibility with the actor_id/target_type+target_id/metadata calling
     # convention used by media/intelligence (merged from a parallel branch) -
     # same table, just a different shape at the call site. New code should
@@ -46,10 +100,15 @@ def log_event(
     if resolved_actor is None or resolved_target is None:
         raise ValueError("log_event requires actor+target (or actor_id+target_type+target_id)")
 
+    resolved_account_id = account_id
+    if resolved_account_id is None:
+        resolved_account_id = _resolve_account_id(db, actor=resolved_actor, target=resolved_target)
+
     event = AuditEvent(
         actor=resolved_actor,
         action=action,
         target=resolved_target,
+        account_id=resolved_account_id,
         reason=reason,
         correlation_id=correlation_id,
         before_hash=_hash_state(before),
@@ -63,36 +122,12 @@ def log_event(
 
 def list_account_events(db: Session, account_id: str, limit: int = 200) -> list[AuditEvent]:
     """Customer-facing subset of the audit trail (Owner/Admin only - see
-    require_admin on the route). AuditEvent.actor/target are free-text (see
-    log_event's docstring on the two calling conventions), so there's no
-    single account_id column to filter on. This covers the shapes actually
-    used in this codebase: actor=account_id (numbering/media/compliance
-    events), actor=user.id (signup/login/MFA/team/porting events - resolved
-    via the account's own users), and target=f"compliance_case:{id}" /
-    f"porting_request:{id}" (the places staff act on a customer's data -
-    case or porting request approve/reject). It is not a guaranteed-complete
-    view of every possible action type.
-    """
-    from app.compliance.models import ComplianceCase
-    from app.numbering.identity.models import User
-    from app.porting.models import PortingRequest
-
-    user_ids = [row[0] for row in db.query(User.id).filter(User.account_id == account_id).all()]
-    case_ids = [row[0] for row in db.query(ComplianceCase.id).filter(ComplianceCase.account_id == account_id).all()]
-    case_targets = [f"compliance_case:{case_id}" for case_id in case_ids]
-    porting_ids = [
-        row[0] for row in db.query(PortingRequest.id).filter(PortingRequest.account_id == account_id).all()
-    ]
-    porting_targets = [f"porting_request:{request_id}" for request_id in porting_ids]
-
+    require_admin on the route). account_id is now a real indexed column,
+    resolved once at write time by log_event/_resolve_account_id - see
+    that function's docstring for what it can and can't attribute."""
     return (
         db.query(AuditEvent)
-        .filter(
-            sa.or_(
-                AuditEvent.actor.in_([account_id, *user_ids]),
-                AuditEvent.target.in_([*case_targets, *porting_targets]),
-            )
-        )
+        .filter(AuditEvent.account_id == account_id)
         .order_by(AuditEvent.created_at.desc())
         .limit(limit)
         .all()

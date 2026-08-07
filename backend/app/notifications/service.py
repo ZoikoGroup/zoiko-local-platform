@@ -180,6 +180,7 @@ def send_notification(
         actor="system",
         action=f"notification.{delivery.status.value}",
         target=f"notification_delivery:{delivery.id}",
+        account_id=account_id,
         after={"event_name": event_name, "recipient_email": recipient_email, "status": delivery.status},
     )
     return delivery
