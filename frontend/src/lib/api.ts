@@ -1470,7 +1470,8 @@ export function revokeApiKey(token: string, keyId: string): Promise<void> {
   });
 }
 
-// --- CRM connection (mock - see backend/app/integrations/crm/mock.py) ---
+// --- CRM connection (HubSpot: real OAuth - see backend/app/integrations/crm/hubspot.py;
+// Salesforce/Pipedrive: still mock - see backend/app/integrations/crm/mock.py) ---
 
 export type CrmProvider = "hubspot" | "salesforce" | "pipedrive";
 
@@ -1500,6 +1501,32 @@ export function connectCrm(token: string, provider: CrmProvider): Promise<CrmCon
     method: "POST",
     headers: { Authorization: `Bearer ${token}` },
     body: JSON.stringify({ provider }),
+  });
+}
+
+// HubSpot has a real OAuth flow - /crm/connect rejects provider="hubspot".
+// This returns HubSpot's own consent-screen URL; the caller redirects the
+// browser there (window.location.href = authorize_url), HubSpot redirects
+// back to /crm/hubspot/callback on the API itself (not this frontend),
+// which then redirects the browser to this page with ?crm=connected|error.
+export function getHubspotAuthorizeUrl(token: string): Promise<{ authorize_url: string }> {
+  return request<{ authorize_url: string }>("/crm/hubspot/authorize", {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+// Same real-OAuth shape as HubSpot above, for Salesforce.
+export function getSalesforceAuthorizeUrl(token: string): Promise<{ authorize_url: string }> {
+  return request<{ authorize_url: string }>("/crm/salesforce/authorize", {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+// Same real-OAuth shape as HubSpot above, for Pipedrive - all three
+// CrmProvider values are real now; /crm/connect rejects all of them.
+export function getPipedriveAuthorizeUrl(token: string): Promise<{ authorize_url: string }> {
+  return request<{ authorize_url: string }>("/crm/pipedrive/authorize", {
+    headers: { Authorization: `Bearer ${token}` },
   });
 }
 

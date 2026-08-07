@@ -1,6 +1,7 @@
 "use client";
 
-import { useEffect, useState, useCallback, type FormEvent } from "react";
+import { useEffect, useState, useCallback, Suspense, type FormEvent } from "react";
+import { useSearchParams, useRouter } from "next/navigation";
 import {
   getCurrentUser,
   listTeamMembers,
@@ -16,9 +17,11 @@ import {
   createApiKey,
   revokeApiKey,
   getCrmConnection,
-  connectCrm,
   disconnectCrm,
   listCrmSyncEvents,
+  getHubspotAuthorizeUrl,
+  getSalesforceAuthorizeUrl,
+  getPipedriveAuthorizeUrl,
   ApiError,
   type TeamMember,
   type PublicStatus,
@@ -46,9 +49,11 @@ function statusLabel(status: "operational" | "degraded") {
   return status === "operational" ? "Operational" : "Degraded performance";
 }
 
-export default function BusinessPage() {
+function BusinessPageContent() {
   const [token] = useState<string | null>(() => getToken());
   const [isAdmin, setIsAdmin] = useState(false);
+  const searchParams = useSearchParams();
+  const router = useRouter();
 
   // --- Team ---
   const [members, setMembers] = useState<TeamMember[]>([]);
@@ -269,13 +274,36 @@ export default function BusinessPage() {
     loadCrm();
   }, [loadCrm]);
 
+  // Landing back here after HubSpot's OAuth redirect - the backend already
+  // completed (or failed) the connection at /crm/hubspot/callback before
+  // sending the browser back here with this query param.
+  useEffect(() => {
+    const crmResult = searchParams.get("crm");
+    if (!crmResult) return;
+    if (crmResult === "connected") {
+      loadCrm();
+    } else if (crmResult === "error") {
+      setCrmError("Couldn't complete the HubSpot connection - the link may have expired. Try connecting again.");
+    }
+    router.replace("/dashboard/business");
+  }, [searchParams, router, loadCrm]);
+
   async function handleConnectCrm() {
     if (!token) return;
     setCrmBusy(true);
     setCrmError(null);
     try {
-      await connectCrm(token, crmProviderChoice);
-      await loadCrm();
+      // All three providers are real OAuth now - redirect the browser to
+      // the provider's own consent screen. It redirects back to the API's
+      // callback route, which redirects back here with ?crm=connected|error.
+      const getAuthorizeUrl =
+        crmProviderChoice === "hubspot"
+          ? getHubspotAuthorizeUrl
+          : crmProviderChoice === "salesforce"
+            ? getSalesforceAuthorizeUrl
+            : getPipedriveAuthorizeUrl;
+      const { authorize_url } = await getAuthorizeUrl(token);
+      window.location.href = authorize_url;
     } catch (err) {
       setCrmError(err instanceof ApiError ? err.message : "Couldn't connect the CRM.");
     } finally {
@@ -646,8 +674,8 @@ export default function BusinessPage() {
         <div>
           <h3 className="font-semibold text-slate-900">CRM Connection</h3>
           <p className="text-sm text-slate-500 mt-1">
-            Mock integration — no real HubSpot, Salesforce, or Pipedrive connection exists yet. This lets contacts
-            and call activity sync into a simulated CRM so the integration shape is ready once a real one is built.
+            HubSpot, Salesforce, and Pipedrive all connect for real via OAuth — contacts and call activity sync
+            straight into whichever one you pick.
           </p>
         </div>
 
@@ -717,5 +745,13 @@ export default function BusinessPage() {
         )}
       </div>
     </div>
+  );
+}
+
+export default function BusinessPage() {
+  return (
+    <Suspense fallback={null}>
+      <BusinessPageContent />
+    </Suspense>
   );
 }

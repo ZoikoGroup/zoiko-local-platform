@@ -45,6 +45,25 @@ class CrmConnection(Base):
     external_account_label: Mapped[str] = mapped_column(String(255), nullable=False)
     connected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     disconnected_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Real OAuth token storage - only ever populated for a real integration
+    # (currently: HubSpot via app.integrations.crm.hubspot). NULL for mock
+    # connections (Salesforce, Pipedrive, or HubSpot before real credentials
+    # exist), which is how app.crm.service tells a real connection from a
+    # mock one. Encrypted at rest via app.core.crypto - never store OAuth
+    # tokens as plaintext. access_token_encrypted is refreshed in place
+    # using refresh_token_encrypted once token_expires_at passes.
+    access_token_encrypted: Mapped[str | None] = mapped_column(String(2000), nullable=True)
+    refresh_token_encrypted: Mapped[str | None] = mapped_column(String(2000), nullable=True)
+    # HubSpot's tokens have a fixed, told-to-you lifetime (see
+    # token_expires_at); Salesforce's don't, so Salesforce leaves this NULL
+    # and instead refreshes reactively on a 401 - see
+    # app.crm.service._call_salesforce_with_reauth.
+    token_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Salesforce-specific: every API call must target the customer's own
+    # org domain (e.g. https://mycompany.my.salesforce.com), returned once
+    # at OAuth time - there's no single fixed API host the way HubSpot has
+    # api.hubapi.com. NULL for every other provider.
+    instance_url: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
 
 class CrmSyncEvent(Base):

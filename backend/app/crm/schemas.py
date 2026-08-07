@@ -7,6 +7,18 @@ class ConnectCrmRequest(BaseModel):
     provider: str
 
 
+class HubSpotAuthorizeResponse(BaseModel):
+    authorize_url: str
+
+
+class SalesforceAuthorizeResponse(BaseModel):
+    authorize_url: str
+
+
+class PipedriveAuthorizeResponse(BaseModel):
+    authorize_url: str
+
+
 class CrmConnectionResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
