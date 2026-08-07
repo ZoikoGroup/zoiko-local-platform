@@ -222,3 +222,149 @@ def test_public_api_contacts_are_scoped_to_the_keys_own_account(client):
 
     assert len(client.get("/public/v1/contacts", headers={"Authorization": f"Bearer {key_a}"}).json()) == 1
     assert client.get("/public/v1/contacts", headers={"Authorization": f"Bearer {key_b}"}).json() == []
+
+
+# --- Usage summary ---
+
+
+def test_public_api_returns_usage_summary(client):
+    token = _signup_and_login(client, "api-usage1@example.com")
+    key = client.post(
+        "/developer/api-keys", json={"label": "Usage"}, headers={"Authorization": f"Bearer {token}"}
+    ).json()["raw_key"]
+
+    response = client.get("/public/v1/usage", headers={"Authorization": f"Bearer {key}"})
+    assert response.status_code == 200
+    body = response.json()
+    assert "plan_code" in body
+    assert "resources" in body
+
+
+# --- Webhook management ---
+
+
+def _mock_webhook_delivery(monkeypatch):
+    """Avoids a real network call (and its multi-second timeout) to
+    https://example.com on every webhook-creating test - same pattern
+    test_webhooks.py's test_creating_an_endpoint_notifies_the_owner uses.
+    Also blanks resend_api_key: httpx.post is a single shared module-level
+    function, so patching app.webhooks.service.httpx.post patches it for
+    every other httpx.post call in the process too (e.g. Resend's real
+    send_email) - without this, signup's real welcome-email attempt would
+    hit the fake response and crash on a missing raise_for_status()."""
+
+    class FakeResponse:
+        status_code = 200
+        is_success = True
+
+    monkeypatch.setattr("app.core.config.settings.resend_api_key", "")
+    monkeypatch.setattr("app.webhooks.service.httpx.post", lambda *a, **kw: FakeResponse())
+
+
+def test_public_api_can_create_list_and_delete_a_webhook(client, monkeypatch):
+    _mock_webhook_delivery(monkeypatch)
+    token = _signup_and_login(client, "api-webhook1@example.com")
+    key = client.post(
+        "/developer/api-keys", json={"label": "Webhooks"}, headers={"Authorization": f"Bearer {token}"}
+    ).json()["raw_key"]
+    headers = {"Authorization": f"Bearer {key}"}
+
+    create_response = client.post(
+        "/public/v1/webhooks", json={"url": "https://example.com/hook", "description": "test hook"}, headers=headers
+    )
+    assert create_response.status_code == 201
+    body = create_response.json()
+    assert body["url"] == "https://example.com/hook"
+    assert "secret" in body
+
+    listed = client.get("/public/v1/webhooks", headers=headers).json()
+    assert len(listed) == 1
+    assert "secret" not in listed[0]
+
+    delete_response = client.delete(f"/public/v1/webhooks/{body['id']}", headers=headers)
+    assert delete_response.status_code == 204
+    assert client.get("/public/v1/webhooks", headers=headers).json() == []
+
+
+def test_public_api_rejects_a_non_https_webhook_url(client):
+    token = _signup_and_login(client, "api-webhook2@example.com")
+    key = client.post(
+        "/developer/api-keys", json={"label": "Webhooks"}, headers={"Authorization": f"Bearer {token}"}
+    ).json()["raw_key"]
+
+    response = client.post(
+        "/public/v1/webhooks", json={"url": "http://not-https.example.com"},
+        headers={"Authorization": f"Bearer {key}"},
+    )
+    assert response.status_code == 422
+
+
+def test_public_api_cannot_delete_another_accounts_webhook(client, monkeypatch):
+    _mock_webhook_delivery(monkeypatch)
+    token_a = _signup_and_login(client, "api-webhook-a@example.com", "Webhook Scope A")
+    token_b = _signup_and_login(client, "api-webhook-b@example.com", "Webhook Scope B")
+    key_a = client.post(
+        "/developer/api-keys", json={"label": "A"}, headers={"Authorization": f"Bearer {token_a}"}
+    ).json()["raw_key"]
+    key_b = client.post(
+        "/developer/api-keys", json={"label": "B"}, headers={"Authorization": f"Bearer {token_b}"}
+    ).json()["raw_key"]
+
+    endpoint = client.post(
+        "/public/v1/webhooks", json={"url": "https://a.example.com/hook"},
+        headers={"Authorization": f"Bearer {key_a}"},
+    ).json()
+
+    response = client.delete(f"/public/v1/webhooks/{endpoint['id']}", headers={"Authorization": f"Bearer {key_b}"})
+    assert response.status_code == 404
+
+
+def test_public_api_webhook_creation_notifies_the_owner(client, monkeypatch):
+    _mock_webhook_delivery(monkeypatch)
+    token = _signup_and_login(client, "api-webhook3@example.com")
+    key = client.post(
+        "/developer/api-keys", json={"label": "Webhooks"}, headers={"Authorization": f"Bearer {token}"}
+    ).json()["raw_key"]
+
+    client.post(
+        "/public/v1/webhooks", json={"url": "https://example.com/hook"},
+        headers={"Authorization": f"Bearer {key}"},
+    )
+
+    notifications = client.get("/notifications/me", headers={"Authorization": f"Bearer {token}"}).json()
+    matches = [n for n in notifications if n["event_name"] == "intg.webhook_endpoint_added"]
+    assert len(matches) == 1
+
+
+def test_public_api_lists_webhook_deliveries(client, db_session, monkeypatch):
+    _mock_webhook_delivery(monkeypatch)
+    token = _signup_and_login(client, "api-webhook4@example.com")
+    headers_session = {"Authorization": f"Bearer {token}"}
+    key = client.post(
+        "/developer/api-keys", json={"label": "Webhooks"}, headers=headers_session
+    ).json()["raw_key"]
+    headers = {"Authorization": f"Bearer {key}"}
+
+    endpoint = client.post(
+        "/public/v1/webhooks", json={"url": "https://example.com/hook"}, headers=headers
+    ).json()
+
+    from app.webhooks import service as webhooks_service
+
+    me = client.get("/auth/me", headers=headers_session).json()
+    webhooks_service.dispatch_webhook_event(
+        db_session, account_id=me["account_id"], event_type="test.event", payload={"foo": "bar"}
+    )
+
+    deliveries = client.get("/public/v1/webhooks/deliveries", headers=headers).json()
+    # Creating the endpoint itself already fired one delivery (the
+    # "webhook endpoint added" notification dispatches to endpoints that
+    # already exist by the time it sends, including this one) - filter for
+    # the explicit test event rather than assuming it's the only delivery.
+    test_deliveries = [d for d in deliveries if d["event_type"] == "test.event"]
+    assert len(test_deliveries) == 1
+
+    filtered = client.get(
+        "/public/v1/webhooks/deliveries", params={"endpoint_id": endpoint["id"]}, headers=headers
+    ).json()
+    assert any(d["event_type"] == "test.event" for d in filtered)

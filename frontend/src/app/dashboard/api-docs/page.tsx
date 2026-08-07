@@ -1,5 +1,5 @@
 type Endpoint = {
-  method: "GET" | "POST";
+  method: "GET" | "POST" | "DELETE";
   path: string;
   summary: string;
   requestBody?: string;
@@ -62,18 +62,54 @@ const ENDPOINTS: Endpoint[] = [
     responseShape: "{ id, name, phone_number, email, notes, created_at }",
     curl: `curl -X POST ${BASE_URL}/public/v1/contacts \\\n  -H "Authorization: Bearer $ZOIKO_API_KEY" \\\n  -H "Content-Type: application/json" \\\n  -d '{"name": "Jane Doe", "phone_number": "+15551234567"}'`,
   },
+  {
+    method: "GET",
+    path: "/public/v1/usage",
+    summary: "This billing period's usage against your plan limits - the same data the dashboard Billing page shows.",
+    responseShape:
+      "{ plan_code, plan_name, status, trial_ends_at, current_period_start, current_period_end, resources: [{ resource, used, limit }] }",
+    curl: `curl ${BASE_URL}/public/v1/usage \\\n  -H "Authorization: Bearer $ZOIKO_API_KEY"`,
+  },
+  {
+    method: "GET",
+    path: "/public/v1/webhooks",
+    summary: "List your registered webhook endpoints.",
+    responseShape: "[{ id, url, description, is_active, created_at }]",
+    curl: `curl ${BASE_URL}/public/v1/webhooks \\\n  -H "Authorization: Bearer $ZOIKO_API_KEY"`,
+  },
+  {
+    method: "POST",
+    path: "/public/v1/webhooks",
+    summary:
+      "Register a webhook endpoint - Zoiko Local will POST a real-time event (number activated, call summary available, porting completed, and more) to it, signed with an X-Zoiko-Signature header (HMAC-SHA256) so you can verify it came from Zoiko Local. The signing secret is returned once, at creation - it is never shown again.",
+    requestBody: '{ "url": "https://your-server.com/webhook", "description": "optional label" }',
+    responseShape: "{ id, url, description, is_active, created_at, secret }",
+    curl: `curl -X POST ${BASE_URL}/public/v1/webhooks \\\n  -H "Authorization: Bearer $ZOIKO_API_KEY" \\\n  -H "Content-Type: application/json" \\\n  -d '{"url": "https://your-server.com/webhook"}'`,
+  },
+  {
+    method: "DELETE",
+    path: "/public/v1/webhooks/{id}",
+    summary: "Remove a webhook endpoint.",
+    responseShape: "204 No Content",
+    curl: `curl -X DELETE ${BASE_URL}/public/v1/webhooks/{id} \\\n  -H "Authorization: Bearer $ZOIKO_API_KEY"`,
+  },
+  {
+    method: "GET",
+    path: "/public/v1/webhooks/deliveries",
+    summary: "Delivery history across all your webhook endpoints - optionally filter with ?endpoint_id=.",
+    responseShape: "[{ id, endpoint_id, event_type, status, response_status_code, error, created_at }]",
+    curl: `curl ${BASE_URL}/public/v1/webhooks/deliveries \\\n  -H "Authorization: Bearer $ZOIKO_API_KEY"`,
+  },
 ];
 
-function MethodBadge({ method }: { method: "GET" | "POST" }) {
-  return (
-    <span
-      className={`text-xs font-mono font-semibold rounded px-1.5 py-0.5 ${
-        method === "GET" ? "bg-emerald-50 text-emerald-700" : "bg-indigo-50 text-indigo-700"
-      }`}
-    >
-      {method}
-    </span>
-  );
+function MethodBadge({ method }: { method: "GET" | "POST" | "DELETE" }) {
+  const colors =
+    method === "GET"
+      ? "bg-emerald-50 text-emerald-700"
+      : method === "DELETE"
+        ? "bg-red-50 text-red-700"
+        : "bg-indigo-50 text-indigo-700";
+  return <span className={`text-xs font-mono font-semibold rounded px-1.5 py-0.5 ${colors}`}>{method}</span>;
 }
 
 export default function ApiDocsPage() {
@@ -82,9 +118,10 @@ export default function ApiDocsPage() {
       <div>
         <h2 className="text-xl font-semibold text-slate-900">API Reference</h2>
         <p className="text-sm text-slate-500">
-          A small, curated public surface — read access to your numbers, calls, voicemails, contacts, and AI
-          summaries, plus two write actions (placing a call, creating a contact). Everything else about your
-          account (billing, team, number purchasing) is managed through the dashboard only, not this API.
+          A small, curated public surface — read access to your numbers, calls, voicemails, contacts, AI summaries,
+          and usage, plus write actions for placing a call, creating a contact, and managing webhook subscriptions.
+          Number purchasing, routing/business-hours configuration, and account/team management are managed through
+          the dashboard only, not this API — those need role-scoped access control an API key doesn&apos;t carry.
         </p>
       </div>
 
@@ -147,11 +184,15 @@ export default function ApiDocsPage() {
           Standard HTTP status codes: <code className="text-xs bg-slate-100 rounded px-1 py-0.5">401</code> for a
           missing/invalid/revoked key, <code className="text-xs bg-slate-100 rounded px-1 py-0.5">402</code> if
           billing is suspended, <code className="text-xs bg-slate-100 rounded px-1 py-0.5">403</code> for an
-          authorization failure (e.g. calling from a number your account doesn&apos;t own, or a blocked
-          destination), <code className="text-xs bg-slate-100 rounded px-1 py-0.5">429</code> for rate limiting,
-          and <code className="text-xs bg-slate-100 rounded px-1 py-0.5">422</code> for a validation error. Error
-          responses have a <code className="text-xs bg-slate-100 rounded px-1 py-0.5">detail</code> field
-          describing what went wrong.
+          authorization failure (e.g. calling from a number your account doesn&apos;t own, or deleting another
+          account&apos;s webhook), <code className="text-xs bg-slate-100 rounded px-1 py-0.5">404</code> for a
+          webhook endpoint that doesn&apos;t exist on your account,{" "}
+          <code className="text-xs bg-slate-100 rounded px-1 py-0.5">409</code> if you&apos;ve hit the 10-webhook-
+          endpoint limit, <code className="text-xs bg-slate-100 rounded px-1 py-0.5">429</code> for rate limiting,
+          and <code className="text-xs bg-slate-100 rounded px-1 py-0.5">422</code> for a validation error (e.g. a
+          non-HTTPS webhook URL). Error responses have a{" "}
+          <code className="text-xs bg-slate-100 rounded px-1 py-0.5">detail</code> field describing what went
+          wrong.
         </p>
       </div>
     </div>
