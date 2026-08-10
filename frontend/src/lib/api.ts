@@ -55,14 +55,42 @@ async function request<T>(
   return response.json();
 }
 
-export function signup(input: {
+// Architecture doc §5 "Fraud and Risk: device fingerprinting" - a coarse,
+// no-third-party-SDK client fingerprint (not a real anti-tampering
+// fingerprint like FingerprintJS) built from a few stable, low-invasiveness
+// signals. Sent as an optional header; the backend never requires it and
+// never blocks signup on it (see backend app.risk.service.
+// check_fingerprint_on_signup's docstring) - this is a detection signal,
+// not an access gate.
+async function computeDeviceFingerprint(): Promise<string | null> {
+  if (typeof window === "undefined" || !window.crypto?.subtle) return null;
+  try {
+    const raw = [
+      navigator.userAgent,
+      navigator.language,
+      `${screen.width}x${screen.height}x${screen.colorDepth}`,
+      Intl.DateTimeFormat().resolvedOptions().timeZone,
+      String(navigator.hardwareConcurrency ?? ""),
+    ].join("|");
+    const digest = await window.crypto.subtle.digest("SHA-256", new TextEncoder().encode(raw));
+    return Array.from(new Uint8Array(digest))
+      .map((b) => b.toString(16).padStart(2, "0"))
+      .join("");
+  } catch {
+    return null;
+  }
+}
+
+export async function signup(input: {
   account_name: string;
   account_type: "individual" | "business";
   email: string;
   password: string;
 }): Promise<User> {
+  const fingerprint = await computeDeviceFingerprint();
   return request<User>("/auth/signup", {
     method: "POST",
+    headers: fingerprint ? { "X-Device-Fingerprint": fingerprint } : {},
     body: JSON.stringify(input),
   });
 }
@@ -419,6 +447,22 @@ export function listStaffAccounts(token: string): Promise<AccountOverview[]> {
   });
 }
 
+// The role x capability grid that actually gates every sensitive staff
+// action (Commercial Billing Operating Standard doc's "formal RBAC/
+// segregation-of-duties matrix" ask) - see backend app.staff.models.
+// StaffCapabilityGrant's docstring.
+
+export type AccessMatrixEntry = {
+  capability: string;
+  roles: string[];
+};
+
+export function getAccessMatrix(staffToken: string): Promise<AccessMatrixEntry[]> {
+  return request<AccessMatrixEntry[]>("/staff/access-matrix", {
+    headers: { Authorization: `Bearer ${staffToken}` },
+  });
+}
+
 export type StaffNumberSearchResult = {
   id: string;
   e164: string;
@@ -604,6 +648,77 @@ export function getZoikoNexReconciliation(staffToken: string): Promise<ZoikoNexR
   });
 }
 
+// Architecture doc §9 "daily reconciliation jobs... exceptions must enter
+// an operations queue" - unlike ZoikoNexReconciliationSummary above (a live
+// aggregate), each run here is persisted history, and each specific
+// out-of-sync record becomes an individually resolvable exception.
+
+export type ZoikoNexReconciliationRun = {
+  id: string;
+  total_subscriptions: number;
+  unsynced_subscriptions: number;
+  total_usage_events: number;
+  unsynced_usage_events: number;
+  total_completed_calls: number;
+  unmatched_completed_calls: number;
+  exceptions_found: number;
+  created_at: string;
+};
+
+export type ZoikoNexReconciliationException = {
+  id: string;
+  run_id: string;
+  account_id: string;
+  exception_type: "subscription_missing_zoikonex_ref" | "usage_event_missing_sync";
+  subject_id: string;
+  detail: string;
+  resolved_at: string | null;
+  resolved_by: string | null;
+  resolution_reason: string | null;
+  created_at: string;
+};
+
+export function runZoikoNexReconciliation(staffToken: string): Promise<ZoikoNexReconciliationRun> {
+  return request<ZoikoNexReconciliationRun>("/billing/zoikonex/reconciliation/run", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${staffToken}` },
+  });
+}
+
+export function listZoikoNexReconciliationRuns(staffToken: string, limit = 50): Promise<ZoikoNexReconciliationRun[]> {
+  return request<ZoikoNexReconciliationRun[]>(`/billing/zoikonex/reconciliation/runs?limit=${limit}`, {
+    headers: { Authorization: `Bearer ${staffToken}` },
+  });
+}
+
+export function listZoikoNexReconciliationExceptions(
+  staffToken: string,
+  filters: { resolved?: boolean; limit?: number } = {}
+): Promise<ZoikoNexReconciliationException[]> {
+  const params = new URLSearchParams();
+  if (filters.resolved !== undefined) params.set("resolved", String(filters.resolved));
+  if (filters.limit) params.set("limit", String(filters.limit));
+  const query = params.toString() ? `?${params.toString()}` : "";
+  return request<ZoikoNexReconciliationException[]>(`/billing/zoikonex/reconciliation/exceptions${query}`, {
+    headers: { Authorization: `Bearer ${staffToken}` },
+  });
+}
+
+export function resolveZoikoNexReconciliationException(
+  staffToken: string,
+  exceptionId: string,
+  reason: string
+): Promise<ZoikoNexReconciliationException> {
+  return request<ZoikoNexReconciliationException>(
+    `/billing/zoikonex/reconciliation/exceptions/${exceptionId}/resolve`,
+    {
+      method: "POST",
+      headers: { Authorization: `Bearer ${staffToken}` },
+      body: JSON.stringify({ reason }),
+    }
+  );
+}
+
 // --- Public status page (no auth) ---
 
 export type PublicStatus = {
@@ -676,6 +791,23 @@ export function purchaseNumber(token: string, e164: string): Promise<MyPhoneNumb
     method: "POST",
     headers: { Authorization: `Bearer ${token}` },
     body: JSON.stringify({ e164 }),
+  });
+}
+
+// Real Stripe Checkout (test mode) - the customer-facing purchase button
+// now goes through this instead of calling purchaseNumber() directly. The
+// number only actually activates once Stripe confirms payment via the
+// backend's webhook - see app.numbering.numbers.service.
+// complete_number_purchase_from_checkout.
+export type CheckoutSession = {
+  id: string;
+  url: string;
+};
+
+export function createNumberCheckoutSession(token: string, e164: string): Promise<CheckoutSession> {
+  return request<CheckoutSession>(`/numbers/${encodeURIComponent(e164)}/checkout-session`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
   });
 }
 
@@ -1337,6 +1469,40 @@ export function removeBlockedDestination(staffToken: string, ruleId: string): Pr
   return request<void>(`/risk/blocked-destinations/${encodeURIComponent(ruleId)}`, {
     method: "DELETE",
     headers: { Authorization: `Bearer ${staffToken}` },
+  });
+}
+
+// Roadmap doc §13 Risk Register "anomalous usage" review queue - opened
+// automatically when an account's risk score crosses REVIEW_THRESHOLD
+// (below the auto-suspend threshold), for a human to confirm or clear.
+
+export type FraudCase = {
+  id: string;
+  account_id: string;
+  score_at_open: number;
+  status: "open" | "confirmed" | "cleared";
+  resolved_by: string | null;
+  resolution_notes: string | null;
+  created_at: string;
+  resolved_at: string | null;
+};
+
+export function listFraudCases(staffToken: string, caseStatus?: string): Promise<FraudCase[]> {
+  const query = caseStatus ? `?case_status=${encodeURIComponent(caseStatus)}` : "";
+  return request<FraudCase[]>(`/risk/fraud-cases${query}`, {
+    headers: { Authorization: `Bearer ${staffToken}` },
+  });
+}
+
+export function resolveFraudCase(
+  staffToken: string,
+  caseId: string,
+  input: { status: "confirmed" | "cleared"; notes: string }
+): Promise<FraudCase> {
+  return request<FraudCase>(`/risk/fraud-cases/${encodeURIComponent(caseId)}/resolve`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${staffToken}` },
+    body: JSON.stringify(input),
   });
 }
 
