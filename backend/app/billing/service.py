@@ -4,7 +4,16 @@ import sqlalchemy as sa
 from sqlalchemy.orm import Session
 
 from app.audit.service import log_event
-from app.billing.models import Plan, Subscription, SubscriptionStatus, ZoikoNexSyncEvent, ZoikoNexSyncEventType
+from app.billing.models import (
+    Plan,
+    Subscription,
+    SubscriptionStatus,
+    ZoikoNexReconciliationException,
+    ZoikoNexReconciliationExceptionType,
+    ZoikoNexReconciliationRun,
+    ZoikoNexSyncEvent,
+    ZoikoNexSyncEventType,
+)
 from app.integrations.billing import zoikonex as zoikonex_adapter
 from app.notifications.service import (
     notify_payment_failed,
@@ -435,6 +444,177 @@ def get_zoikonex_reconciliation_summary(db: Session) -> dict:
         "synced_usage_events": synced_usage_events,
         "unsynced_usage_events": total_usage_events - synced_usage_events,
     }
+
+
+class ReconciliationExceptionNotFoundError(Exception):
+    """Raised when resolving a reconciliation exception id that doesn't exist."""
+
+
+def run_zoikonex_reconciliation(db: Session) -> ZoikoNexReconciliationRun:
+    """Architecture doc §9: "daily reconciliation jobs... exceptions must
+    enter an operations queue." Turns the same drift
+    get_zoikonex_reconciliation_summary already counts into individual,
+    resolvable ZoikoNexReconciliationException rows, and persists the run
+    itself (see ZoikoNexReconciliationRun's docstring for why). Idempotent
+    against repeated drift: a record already sitting in an unresolved
+    exception from a prior run does not get a duplicate row here - only
+    genuinely new drift is added, so exceptions_found on this run means
+    "newly found," not "total open"."""
+    from app.media.models import CallRecord
+    from app.usage.models import UsageEvent
+
+    already_open: dict[ZoikoNexReconciliationExceptionType, set[str]] = {
+        ZoikoNexReconciliationExceptionType.SUBSCRIPTION_MISSING_ZOIKONEX_REF: set(),
+        ZoikoNexReconciliationExceptionType.USAGE_EVENT_MISSING_SYNC: set(),
+        ZoikoNexReconciliationExceptionType.CALL_RECORD_MISSING_USAGE_EVENT: set(),
+    }
+    for exc in db.query(ZoikoNexReconciliationException).filter(
+        ZoikoNexReconciliationException.resolved_at.is_(None)
+    ):
+        already_open[exc.exception_type].add(exc.subject_id)
+
+    run = ZoikoNexReconciliationRun()
+    db.add(run)
+    db.flush()  # populate run.id (Python-side default) for the exceptions' FK
+
+    new_exceptions: list[ZoikoNexReconciliationException] = []
+
+    subscriptions = db.query(Subscription).all()
+    run.total_subscriptions = len(subscriptions)
+    for sub in subscriptions:
+        if sub.zoikonex_ref is not None:
+            continue
+        run.unsynced_subscriptions += 1
+        if sub.id in already_open[ZoikoNexReconciliationExceptionType.SUBSCRIPTION_MISSING_ZOIKONEX_REF]:
+            continue
+        new_exceptions.append(
+            ZoikoNexReconciliationException(
+                run_id=run.id,
+                account_id=sub.account_id,
+                exception_type=ZoikoNexReconciliationExceptionType.SUBSCRIPTION_MISSING_ZOIKONEX_REF,
+                subject_id=sub.id,
+                detail=f"Subscription {sub.id} has no zoikonex_ref - subscription sync never completed.",
+            )
+        )
+
+    synced_usage_event_ids = {
+        row[0]
+        for row in db.query(ZoikoNexSyncEvent.payload["usage_event_id"].astext)
+        .filter(ZoikoNexSyncEvent.event_type == ZoikoNexSyncEventType.USAGE_SYNC)
+        .all()
+    }
+    usage_events = db.query(UsageEvent).all()
+    run.total_usage_events = len(usage_events)
+    for event in usage_events:
+        if event.id in synced_usage_event_ids:
+            continue
+        run.unsynced_usage_events += 1
+        if event.id in already_open[ZoikoNexReconciliationExceptionType.USAGE_EVENT_MISSING_SYNC]:
+            continue
+        new_exceptions.append(
+            ZoikoNexReconciliationException(
+                run_id=run.id,
+                account_id=event.account_id,
+                exception_type=ZoikoNexReconciliationExceptionType.USAGE_EVENT_MISSING_SYNC,
+                subject_id=event.id,
+                detail=f"Usage event {event.id} ({event.event_type}) has no matching ZoikoNex usage-sync ledger row.",
+            )
+        )
+
+    # Third leg: carrier evidence (CallRecord, written from Twilio's own
+    # status-callback webhook - see app.media.service.update_call_status)
+    # vs. Zoiko Local's own usage metering for that same call. The
+    # matching UsageEvent's idempotency_key is always
+    # f"call_seconds:{provider_call_sid}" (see update_call_status) - no
+    # join table needed, just that exact string.
+    existing_call_usage_keys = {
+        row[0] for row in db.query(UsageEvent.idempotency_key).filter(UsageEvent.event_type == "call_seconds").all()
+    }
+    completed_calls = (
+        db.query(CallRecord)
+        .filter(
+            CallRecord.status == "completed",
+            CallRecord.duration.isnot(None),
+            CallRecord.account_id.isnot(None),
+            CallRecord.provider_call_sid.isnot(None),
+        )
+        .all()
+    )
+    run.total_completed_calls = len(completed_calls)
+    for call in completed_calls:
+        if f"call_seconds:{call.provider_call_sid}" in existing_call_usage_keys:
+            continue
+        run.unmatched_completed_calls += 1
+        if call.id in already_open[ZoikoNexReconciliationExceptionType.CALL_RECORD_MISSING_USAGE_EVENT]:
+            continue
+        new_exceptions.append(
+            ZoikoNexReconciliationException(
+                run_id=run.id,
+                account_id=call.account_id,
+                exception_type=ZoikoNexReconciliationExceptionType.CALL_RECORD_MISSING_USAGE_EVENT,
+                subject_id=call.id,
+                detail=(
+                    f"Call {call.provider_call_sid} completed ({call.duration}s, carrier-confirmed) "
+                    f"but has no matching call_seconds usage event."
+                ),
+            )
+        )
+
+    run.exceptions_found = len(new_exceptions)
+    for exc in new_exceptions:
+        db.add(exc)
+    db.commit()
+    db.refresh(run)
+    return run
+
+
+def list_zoikonex_reconciliation_runs(db: Session, *, limit: int = 200) -> list[ZoikoNexReconciliationRun]:
+    return (
+        db.query(ZoikoNexReconciliationRun)
+        .order_by(ZoikoNexReconciliationRun.created_at.desc())
+        .limit(limit)
+        .all()
+    )
+
+
+def list_zoikonex_reconciliation_exceptions(
+    db: Session, *, resolved: bool | None = None, limit: int = 200
+) -> list[ZoikoNexReconciliationException]:
+    query = db.query(ZoikoNexReconciliationException)
+    if resolved is True:
+        query = query.filter(ZoikoNexReconciliationException.resolved_at.isnot(None))
+    elif resolved is False:
+        query = query.filter(ZoikoNexReconciliationException.resolved_at.is_(None))
+    return query.order_by(ZoikoNexReconciliationException.created_at.desc()).limit(limit).all()
+
+
+def resolve_zoikonex_reconciliation_exception(
+    db: Session, exception_id: str, *, actor: str, reason: str
+) -> ZoikoNexReconciliationException:
+    """SUPER_ADMIN-only manual override (Architecture doc §10 "manual
+    override reasons" under Business controls) - same bar as
+    simulate_zoikonex_payment_event since both are money-adjacent state
+    changes, not read-only diagnostics."""
+    exc = (
+        db.query(ZoikoNexReconciliationException)
+        .filter(ZoikoNexReconciliationException.id == exception_id)
+        .first()
+    )
+    if exc is None:
+        raise ReconciliationExceptionNotFoundError(f"No reconciliation exception {exception_id!r}")
+
+    exc.resolved_at = _db_now(db)
+    exc.resolved_by = actor
+    exc.resolution_reason = reason
+    db.commit()
+    db.refresh(exc)
+
+    log_event(
+        db, actor=actor, action="zoikonex.reconciliation_exception_resolved",
+        target=f"zoikonex_reconciliation_exception:{exc.id}",
+        after={"exception_type": exc.exception_type.value, "subject_id": exc.subject_id, "reason": reason},
+    )
+    return exc
 
 
 def get_usage_summary(db: Session, account_id: str) -> dict:

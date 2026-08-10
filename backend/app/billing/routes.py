@@ -7,17 +7,20 @@ from app.billing import service
 from app.billing.schemas import (
     ChangePlanRequest,
     PlanResponse,
+    ResolveReconciliationExceptionRequest,
     SimulatePaymentEventRequest,
     SubscriptionResponse,
     UsageSummaryResponse,
+    ZoikoNexReconciliationExceptionResponse,
+    ZoikoNexReconciliationRunResponse,
     ZoikoNexReconciliationSummary,
     ZoikoNexSyncEventResponse,
 )
 from app.core.database import get_db
-from app.core.deps import get_current_staff, get_current_user, require_admin, require_staff_role
+from app.core.deps import get_current_staff, get_current_user, require_admin, require_capability
 from app.integrations.billing import zoikonex as zoikonex_adapter
 from app.numbering.identity.models import User
-from app.staff.models import PlatformStaff, PlatformStaffRole
+from app.staff.models import PlatformStaff
 
 router = APIRouter(prefix="/billing", tags=["billing"])
 
@@ -103,11 +106,12 @@ async def zoikonex_payment_webhook(request: Request, db: Session = Depends(get_d
 def simulate_payment_event(
     payload: SimulatePaymentEventRequest,
     db: Session = Depends(get_db),
-    staff: PlatformStaff = Depends(require_staff_role(PlatformStaffRole.SUPER_ADMIN)),
+    staff: PlatformStaff = Depends(require_capability("billing.simulate_payment_event")),
 ):
-    """SUPER_ADMIN only - this simulates a real billing-state change
-    (Architecture doc §11 "segregation of duties for sensitive actions"),
-    the same bar as KYC approve/reject."""
+    """SUPER_ADMIN only (via the staff_capability_grants matrix) - this
+    simulates a real billing-state change (Architecture doc §11
+    "segregation of duties for sensitive actions"), the same bar as KYC
+    approve/reject."""
     try:
         return service.simulate_zoikonex_payment_event(db, payload.account_id, payload.event_type, actor=staff.id)
     except service.InvalidPaymentEventError as e:
@@ -130,3 +134,57 @@ def zoikonex_reconciliation(
     _staff: PlatformStaff = Depends(get_current_staff),
 ):
     return service.get_zoikonex_reconciliation_summary(db)
+
+
+@router.post("/zoikonex/reconciliation/run", response_model=ZoikoNexReconciliationRunResponse)
+def run_zoikonex_reconciliation(
+    db: Session = Depends(get_db),
+    _staff: PlatformStaff = Depends(get_current_staff),
+):
+    """Architecture doc §9 daily reconciliation job. Any staff role can
+    trigger this - same diagnostic (not approval-action) posture as
+    /ops/synthetic-checks/run; the exceptions it finds are read-only
+    findings until a SUPER_ADMIN resolves one below."""
+    return service.run_zoikonex_reconciliation(db)
+
+
+@router.get("/zoikonex/reconciliation/runs", response_model=list[ZoikoNexReconciliationRunResponse])
+def list_zoikonex_reconciliation_runs(
+    limit: int = 200,
+    db: Session = Depends(get_db),
+    _staff: PlatformStaff = Depends(get_current_staff),
+):
+    return service.list_zoikonex_reconciliation_runs(db, limit=limit)
+
+
+@router.get("/zoikonex/reconciliation/exceptions", response_model=list[ZoikoNexReconciliationExceptionResponse])
+def list_zoikonex_reconciliation_exceptions(
+    resolved: bool | None = None,
+    limit: int = 200,
+    db: Session = Depends(get_db),
+    _staff: PlatformStaff = Depends(get_current_staff),
+):
+    return service.list_zoikonex_reconciliation_exceptions(db, resolved=resolved, limit=limit)
+
+
+@router.post(
+    "/zoikonex/reconciliation/exceptions/{exception_id}/resolve",
+    response_model=ZoikoNexReconciliationExceptionResponse,
+)
+def resolve_zoikonex_reconciliation_exception(
+    exception_id: str,
+    payload: ResolveReconciliationExceptionRequest,
+    db: Session = Depends(get_db),
+    staff: PlatformStaff = Depends(require_capability("billing.resolve_reconciliation_exception")),
+):
+    """SUPER_ADMIN only (via the staff_capability_grants matrix) -
+    resolving a billing-reconciliation exception is a
+    manual override of money-adjacent state (Architecture doc §10
+    "segregation of duties for sensitive actions"), the same bar as
+    simulate_zoikonex_payment_event above."""
+    try:
+        return service.resolve_zoikonex_reconciliation_exception(
+            db, exception_id, actor=staff.id, reason=payload.reason
+        )
+    except service.ReconciliationExceptionNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e

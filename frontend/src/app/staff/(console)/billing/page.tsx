@@ -7,10 +7,16 @@ import {
   simulateZoikoNexPaymentEvent,
   listZoikoNexSyncLog,
   getZoikoNexReconciliation,
+  runZoikoNexReconciliation,
+  listZoikoNexReconciliationRuns,
+  listZoikoNexReconciliationExceptions,
+  resolveZoikoNexReconciliationException,
   ApiError,
   type AccountOverview,
   type ZoikoNexSyncEvent,
   type ZoikoNexReconciliationSummary,
+  type ZoikoNexReconciliationRun,
+  type ZoikoNexReconciliationException,
 } from "@/lib/api";
 import { clearStaffToken, useStaffToken } from "@/lib/staffAuth";
 
@@ -27,6 +33,10 @@ export default function StaffBillingPage() {
   const [accounts, setAccounts] = useState<AccountOverview[]>([]);
   const [reconciliation, setReconciliation] = useState<ZoikoNexReconciliationSummary | null>(null);
   const [syncLog, setSyncLog] = useState<ZoikoNexSyncEvent[]>([]);
+  const [reconciliationRuns, setReconciliationRuns] = useState<ZoikoNexReconciliationRun[]>([]);
+  const [openExceptions, setOpenExceptions] = useState<ZoikoNexReconciliationException[]>([]);
+  const [runningReconciliation, setRunningReconciliation] = useState(false);
+  const [resolvingExceptionId, setResolvingExceptionId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -41,11 +51,19 @@ export default function StaffBillingPage() {
 
   const load = useCallback(() => {
     if (!token) return;
-    return Promise.all([listStaffAccounts(token), getZoikoNexReconciliation(token), listZoikoNexSyncLog(token, { limit: 50 })])
-      .then(([accountsData, reconciliationData, syncLogData]) => {
+    return Promise.all([
+      listStaffAccounts(token),
+      getZoikoNexReconciliation(token),
+      listZoikoNexSyncLog(token, { limit: 50 }),
+      listZoikoNexReconciliationRuns(token, 10),
+      listZoikoNexReconciliationExceptions(token, { resolved: false, limit: 100 }),
+    ])
+      .then(([accountsData, reconciliationData, syncLogData, runsData, exceptionsData]) => {
         setAccounts(accountsData);
         setReconciliation(reconciliationData);
         setSyncLog(syncLogData);
+        setReconciliationRuns(runsData);
+        setOpenExceptions(exceptionsData);
         setError(null);
       })
       .catch((err) => {
@@ -62,6 +80,40 @@ export default function StaffBillingPage() {
   useEffect(() => {
     load();
   }, [load]);
+
+  async function handleRunReconciliation() {
+    if (!token) return;
+    setRunningReconciliation(true);
+    setError(null);
+    try {
+      await runZoikoNexReconciliation(token);
+      await load();
+    } catch {
+      setError("Couldn't run the reconciliation job.");
+    } finally {
+      setRunningReconciliation(false);
+    }
+  }
+
+  async function handleResolveException(exceptionId: string) {
+    if (!token) return;
+    const reason = window.prompt("Reason for resolving this reconciliation exception:");
+    if (!reason) return;
+    setResolvingExceptionId(exceptionId);
+    setError(null);
+    try {
+      await resolveZoikoNexReconciliationException(token, exceptionId, reason);
+      await load();
+    } catch (err) {
+      setError(
+        err instanceof ApiError && err.status === 403
+          ? "Only a Super Admin can resolve a reconciliation exception."
+          : "Couldn't resolve the exception."
+      );
+    } finally {
+      setResolvingExceptionId(null);
+    }
+  }
 
   async function handleSimulate(e: FormEvent) {
     e.preventDefault();
@@ -134,6 +186,75 @@ export default function StaffBillingPage() {
           </div>
         </div>
       )}
+
+      <div className="bg-slate-900 border border-slate-800 rounded-lg p-4 space-y-3">
+        <div className="flex items-center justify-between gap-3">
+          <h3 className="text-sm font-semibold text-white">Reconciliation job</h3>
+          <button
+            type="button"
+            onClick={handleRunReconciliation}
+            disabled={runningReconciliation}
+            className="text-xs font-medium rounded-lg px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 text-white"
+          >
+            {runningReconciliation ? "Running..." : "Run reconciliation now"}
+          </button>
+        </div>
+        <p className="text-xs text-slate-400">
+          Compares subscriptions and usage events against the ZoikoNex sync ledger and turns any drift into a
+          resolvable exception below. No scheduler runs this automatically yet - trigger it manually until one
+          exists.
+        </p>
+
+        <div>
+          <h4 className="text-xs font-semibold text-slate-300 mb-1.5">
+            Open exceptions ({openExceptions.length})
+          </h4>
+          {openExceptions.length === 0 ? (
+            <p className="text-sm text-slate-400">No open reconciliation exceptions.</p>
+          ) : (
+            <ul className="space-y-1.5">
+              {openExceptions.map((exc) => (
+                <li
+                  key={exc.id}
+                  className="flex items-center justify-between gap-3 text-sm bg-amber-950/30 border border-amber-900/50 rounded-lg px-3 py-2"
+                >
+                  <div>
+                    <div className="text-slate-200">{exc.detail}</div>
+                    <div className="text-xs text-slate-500">{new Date(exc.created_at).toLocaleString()}</div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => handleResolveException(exc.id)}
+                    disabled={resolvingExceptionId === exc.id}
+                    className="text-xs font-medium rounded-lg px-2.5 py-1 bg-slate-800 hover:bg-slate-700 disabled:opacity-50 text-white shrink-0"
+                  >
+                    {resolvingExceptionId === exc.id ? "Resolving..." : "Resolve"}
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+
+        {reconciliationRuns.length > 0 && (
+          <div>
+            <h4 className="text-xs font-semibold text-slate-300 mb-1.5">Recent runs</h4>
+            <ul className="space-y-1.5">
+              {reconciliationRuns.map((run) => (
+                <li
+                  key={run.id}
+                  className="flex items-center justify-between gap-3 text-xs bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-slate-400"
+                >
+                  <span>{new Date(run.created_at).toLocaleString()}</span>
+                  <span className={run.exceptions_found > 0 ? "text-amber-400" : "text-slate-400"}>
+                    {run.exceptions_found} new exception{run.exceptions_found === 1 ? "" : "s"}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+      </div>
 
       <div className="bg-slate-900 border border-slate-800 rounded-lg p-4 space-y-3">
         <h3 className="text-sm font-semibold text-white">Simulate a payment event</h3>
