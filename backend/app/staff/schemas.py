@@ -29,3 +29,8 @@ class AccountOverviewResponse(BaseModel):
     member_count: int
     number_count: int
     created_at: datetime
+
+
+class AccessMatrixEntryResponse(BaseModel):
+    capability: str
+    roles: list[str]

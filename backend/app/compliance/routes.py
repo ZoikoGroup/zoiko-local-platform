@@ -12,11 +12,11 @@ from app.compliance.schemas import (
     KYCVerificationStart,
 )
 from app.core.database import get_db
-from app.core.deps import get_current_staff, get_current_user, require_admin, require_staff_role, require_writer
+from app.core.deps import get_current_staff, get_current_user, require_admin, require_capability, require_writer
 from app.integrations.kyc.stripe_identity import KYCError, construct_webhook_event
 from app.integrations.storage.s3 import StorageError
 from app.numbering.identity.models import User
-from app.staff.models import PlatformStaff, PlatformStaffRole
+from app.staff.models import PlatformStaff
 
 router = APIRouter(prefix="/compliance", tags=["compliance"])
 
@@ -176,9 +176,7 @@ async def stripe_identity_webhook(request: Request, db: Session = Depends(get_db
 def approve_case(
     case_id: str,
     db: Session = Depends(get_db),
-    staff: PlatformStaff = Depends(
-        require_staff_role(PlatformStaffRole.COMPLIANCE_OFFICER, PlatformStaffRole.SUPER_ADMIN)
-    ),
+    staff: PlatformStaff = Depends(require_capability("compliance.review_case")),
 ):
     case = _get_case_or_404(db, case_id)
     return service.approve_case(db, case, actor=staff.id)
@@ -189,9 +187,7 @@ def reject_case(
     case_id: str,
     payload: CaseRejectRequest,
     db: Session = Depends(get_db),
-    staff: PlatformStaff = Depends(
-        require_staff_role(PlatformStaffRole.COMPLIANCE_OFFICER, PlatformStaffRole.SUPER_ADMIN)
-    ),
+    staff: PlatformStaff = Depends(require_capability("compliance.review_case")),
 ):
     case = _get_case_or_404(db, case_id)
     return service.reject_case(db, case, actor=staff.id, reason=payload.reason)

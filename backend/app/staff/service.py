@@ -6,7 +6,7 @@ from app.numbering.identity.models import Account, User, UserRole
 from app.numbering.numbers.models import PhoneNumber
 from app.numbering.numbers.service import list_due_renewals as _list_due_renewals
 from app.numbering.numbers.service import list_stuck_provisioning as _list_stuck_provisioning
-from app.staff.models import PlatformStaff, PlatformStaffRole
+from app.staff.models import PlatformStaff, PlatformStaffRole, StaffCapabilityGrant
 
 
 def create_staff(db: Session, email: str, password: str, role: PlatformStaffRole) -> PlatformStaff:
@@ -115,6 +115,23 @@ def list_due_renewals(db: Session) -> list[dict]:
             "next_renewal_at": n.next_renewal_at,
         }
         for n in numbers
+    ]
+
+
+def list_access_matrix(db: Session) -> list[dict]:
+    """The role x capability grid, grouped by capability - one row per
+    capability with every role currently granted it (see
+    app.staff.models.StaffCapabilityGrant's docstring). Grouped in Python
+    rather than SQL since the grid is small (a dozen or so capabilities)
+    and grouping here keeps the response shape simple for the staff
+    console table."""
+    grants = db.query(StaffCapabilityGrant).order_by(StaffCapabilityGrant.capability).all()
+    by_capability: dict[str, list[str]] = {}
+    for grant in grants:
+        by_capability.setdefault(grant.capability, []).append(grant.role.value)
+    return [
+        {"capability": capability, "roles": sorted(roles)}
+        for capability, roles in sorted(by_capability.items())
     ]
 
 

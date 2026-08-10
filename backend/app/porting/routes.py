@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
-from app.core.deps import get_current_staff, get_current_user, require_admin, require_staff_role
+from app.core.deps import get_current_staff, get_current_user, require_admin, require_capability
 from app.numbering.identity.models import User
 from app.porting import service
 from app.porting.schemas import (
@@ -12,7 +12,7 @@ from app.porting.schemas import (
     PortingRequestResponse,
     PortingRequestStaffResponse,
 )
-from app.staff.models import PlatformStaff, PlatformStaffRole
+from app.staff.models import PlatformStaff
 
 router = APIRouter(prefix="/porting", tags=["porting"])
 
@@ -82,7 +82,7 @@ def list_all_requests(
 def approve_request(
     request_id: str,
     db: Session = Depends(get_db),
-    staff: PlatformStaff = Depends(require_staff_role(PlatformStaffRole.SUPPORT, PlatformStaffRole.SUPER_ADMIN)),
+    staff: PlatformStaff = Depends(require_capability("porting.review_request")),
 ):
     request = _get_request_or_404(db, request_id)
     try:
@@ -96,7 +96,7 @@ def reject_request(
     request_id: str,
     payload: PortingRequestRejectRequest,
     db: Session = Depends(get_db),
-    staff: PlatformStaff = Depends(require_staff_role(PlatformStaffRole.SUPPORT, PlatformStaffRole.SUPER_ADMIN)),
+    staff: PlatformStaff = Depends(require_capability("porting.review_request")),
 ):
     request = _get_request_or_404(db, request_id)
     try:
@@ -110,7 +110,7 @@ def complete_request(
     request_id: str,
     payload: PortingRequestCompleteRequest,
     db: Session = Depends(get_db),
-    staff: PlatformStaff = Depends(require_staff_role(PlatformStaffRole.SUPPORT, PlatformStaffRole.SUPER_ADMIN)),
+    staff: PlatformStaff = Depends(require_capability("porting.review_request")),
 ):
     request = _get_request_or_404(db, request_id)
     try:
