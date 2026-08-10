@@ -463,6 +463,20 @@ export function getAccessMatrix(staffToken: string): Promise<AccessMatrixEntry[]
   });
 }
 
+export function grantCapability(staffToken: string, capability: string, role: string): Promise<void> {
+  return request<void>(
+    `/staff/access-matrix/${encodeURIComponent(capability)}/${encodeURIComponent(role)}`,
+    { method: "PUT", headers: { Authorization: `Bearer ${staffToken}` } }
+  );
+}
+
+export function revokeCapability(staffToken: string, capability: string, role: string): Promise<void> {
+  return request<void>(
+    `/staff/access-matrix/${encodeURIComponent(capability)}/${encodeURIComponent(role)}`,
+    { method: "DELETE", headers: { Authorization: `Bearer ${staffToken}` } }
+  );
+}
+
 export type StaffNumberSearchResult = {
   id: string;
   e164: string;

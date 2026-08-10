@@ -18,9 +18,9 @@ from app.numbering.numbers.service import (
     upsert_supported_country,
 )
 from app.staff import service
-from app.staff.models import PlatformStaff
+from app.staff.models import PlatformStaff, PlatformStaffRole
 from app.staff.schemas import AccessMatrixEntryResponse, AccountOverviewResponse, StaffLoginRequest, StaffTokenResponse
-from app.staff.service import list_access_matrix
+from app.staff.service import LastGrantRemovalError, list_access_matrix
 from app.usage.schemas import CallingRateResponse, UpsertCallingRateRequest
 from app.usage.service import list_calling_rates, upsert_calling_rate
 
@@ -184,7 +184,31 @@ def access_matrix_route(
     Standard doc's "formal RBAC/segregation-of-duties matrix" ask, made
     inspectable rather than only living as scattered require_capability(...)
     calls across route files. Any staff role can view it (diagnostic, not
-    an approval action, same posture as /ops/provider-status) - editing
-    the grid is a data change (migration/seed), not an API call, in this
-    first pass."""
+    an approval action, same posture as /ops/provider-status) - granting
+    or revoking a role's access is the sensitive action, gated below."""
     return list_access_matrix(db)
+
+
+@router.put("/access-matrix/{capability}/{role}", status_code=status.HTTP_204_NO_CONTENT)
+def grant_capability_route(
+    capability: str,
+    role: PlatformStaffRole,
+    db: Session = Depends(get_db),
+    staff: PlatformStaff = Depends(require_capability(service.MATRIX_MANAGEMENT_CAPABILITY)),
+):
+    service.grant_capability(db, capability=capability, role=role, actor=staff.id)
+    return None
+
+
+@router.delete("/access-matrix/{capability}/{role}", status_code=status.HTTP_204_NO_CONTENT)
+def revoke_capability_route(
+    capability: str,
+    role: PlatformStaffRole,
+    db: Session = Depends(get_db),
+    staff: PlatformStaff = Depends(require_capability(service.MATRIX_MANAGEMENT_CAPABILITY)),
+):
+    try:
+        service.revoke_capability(db, capability=capability, role=role, actor=staff.id)
+    except LastGrantRemovalError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e
+    return None

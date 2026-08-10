@@ -301,3 +301,103 @@ def test_require_capability_allows_a_granted_role(db_session):
 
     result = dependency(staff=staff, db=db_session)
     assert result is staff
+
+
+# --- Making the access matrix editable ---
+
+
+def test_grant_capability_requires_matrix_management_capability(client, db_session):
+    _create_staff(db_session, "grantauth1@zoikolocal.com", role=PlatformStaffRole.SUPPORT)
+    token = client.post(
+        "/staff/login", json={"email": "grantauth1@zoikolocal.com", "password": "staffpass123"}
+    ).json()["access_token"]
+
+    response = client.put(
+        "/staff/access-matrix/risk.manage_blocked_destinations/support",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert response.status_code == 403
+
+
+def test_grant_capability_adds_a_role_to_an_existing_capability(client, db_session):
+    admin_token = _create_staff_and_login_helper(client, db_session, "grantsuccess1@zoikolocal.com")
+
+    response = client.put(
+        "/staff/access-matrix/risk.manage_blocked_destinations/support",
+        headers={"Authorization": f"Bearer {admin_token}"},
+    )
+    assert response.status_code == 204
+
+    matrix = {
+        row["capability"]: row["roles"]
+        for row in client.get(
+            "/staff/access-matrix", headers={"Authorization": f"Bearer {admin_token}"}
+        ).json()
+    }
+    assert "support" in matrix["risk.manage_blocked_destinations"]
+
+
+def test_grant_capability_is_idempotent(client, db_session):
+    admin_token = _create_staff_and_login_helper(client, db_session, "grantidempotent1@zoikolocal.com")
+
+    first = client.put(
+        "/staff/access-matrix/risk.manage_blocked_destinations/support",
+        headers={"Authorization": f"Bearer {admin_token}"},
+    )
+    second = client.put(
+        "/staff/access-matrix/risk.manage_blocked_destinations/support",
+        headers={"Authorization": f"Bearer {admin_token}"},
+    )
+    assert first.status_code == 204
+    assert second.status_code == 204
+
+    matrix = {
+        row["capability"]: row["roles"]
+        for row in client.get(
+            "/staff/access-matrix", headers={"Authorization": f"Bearer {admin_token}"}
+        ).json()
+    }
+    assert matrix["risk.manage_blocked_destinations"].count("support") == 1
+
+
+def test_revoke_capability_removes_a_role(client, db_session):
+    admin_token = _create_staff_and_login_helper(client, db_session, "revokesuccess1@zoikolocal.com")
+
+    response = client.delete(
+        "/staff/access-matrix/porting.review_request/support",
+        headers={"Authorization": f"Bearer {admin_token}"},
+    )
+    assert response.status_code == 204
+
+    matrix = {
+        row["capability"]: row["roles"]
+        for row in client.get(
+            "/staff/access-matrix", headers={"Authorization": f"Bearer {admin_token}"}
+        ).json()
+    }
+    assert "support" not in matrix["porting.review_request"]
+
+
+def test_revoke_capability_refuses_to_remove_the_last_matrix_manager(client, db_session):
+    admin_token = _create_staff_and_login_helper(client, db_session, "revokelockout1@zoikolocal.com")
+
+    response = client.delete(
+        "/staff/access-matrix/staff.manage_capabilities/super_admin",
+        headers={"Authorization": f"Bearer {admin_token}"},
+    )
+    assert response.status_code == 409
+
+    # Still able to manage the matrix afterward - proves the revoke was
+    # genuinely rejected, not silently accepted then re-granted.
+    matrix = {
+        row["capability"]: row["roles"]
+        for row in client.get(
+            "/staff/access-matrix", headers={"Authorization": f"Bearer {admin_token}"}
+        ).json()
+    }
+    assert "super_admin" in matrix["staff.manage_capabilities"]
+
+
+def _create_staff_and_login_helper(client, db_session, email: str) -> str:
+    _create_staff(db_session, email, role=PlatformStaffRole.SUPER_ADMIN)
+    return client.post("/staff/login", json={"email": email, "password": "staffpass123"}).json()["access_token"]

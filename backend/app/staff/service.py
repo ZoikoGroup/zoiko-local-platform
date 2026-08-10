@@ -1,12 +1,26 @@
 from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
+from app.audit.service import log_event
 from app.core.security import hash_password, verify_password
 from app.numbering.identity.models import Account, User, UserRole
 from app.numbering.numbers.models import PhoneNumber
 from app.numbering.numbers.service import list_due_renewals as _list_due_renewals
 from app.numbering.numbers.service import list_stuck_provisioning as _list_stuck_provisioning
 from app.staff.models import PlatformStaff, PlatformStaffRole, StaffCapabilityGrant
+
+# The capability that governs the grant/revoke endpoints below. Protected
+# against ever reaching zero grants (see revoke_capability) - if no role
+# could manage the matrix anymore, fixing that would need direct database
+# access instead of the UI meant to make this a data change, not a
+# redeploy.
+MATRIX_MANAGEMENT_CAPABILITY = "staff.manage_capabilities"
+
+
+class LastGrantRemovalError(Exception):
+    """Raised when revoking a grant would leave MATRIX_MANAGEMENT_CAPABILITY
+    with zero roles able to manage the matrix at all - an unrecoverable
+    lockout short of direct database access."""
 
 
 def create_staff(db: Session, email: str, password: str, role: PlatformStaffRole) -> PlatformStaff:
@@ -133,6 +147,58 @@ def list_access_matrix(db: Session) -> list[dict]:
         {"capability": capability, "roles": sorted(roles)}
         for capability, roles in sorted(by_capability.items())
     ]
+
+
+def grant_capability(db: Session, *, capability: str, role: PlatformStaffRole, actor: str) -> None:
+    """Idempotent - granting a role that already has this capability is a
+    no-op, not a duplicate-row error."""
+    existing = (
+        db.query(StaffCapabilityGrant)
+        .filter(StaffCapabilityGrant.capability == capability, StaffCapabilityGrant.role == role)
+        .first()
+    )
+    if existing is not None:
+        return
+
+    db.add(StaffCapabilityGrant(capability=capability, role=role))
+    db.commit()
+    log_event(
+        db, actor=actor, action="staff.capability_granted", target=f"capability:{capability}",
+        after={"role": role.value},
+    )
+
+
+def revoke_capability(db: Session, *, capability: str, role: PlatformStaffRole, actor: str) -> None:
+    """Idempotent - revoking a grant that doesn't exist is a no-op.
+    Refuses to remove the last remaining grant of
+    MATRIX_MANAGEMENT_CAPABILITY (see LastGrantRemovalError's docstring) -
+    every other capability, including one this exact staff member relies
+    on for something else, can be revoked down to zero roles."""
+    grant = (
+        db.query(StaffCapabilityGrant)
+        .filter(StaffCapabilityGrant.capability == capability, StaffCapabilityGrant.role == role)
+        .first()
+    )
+    if grant is None:
+        return
+
+    if capability == MATRIX_MANAGEMENT_CAPABILITY:
+        remaining = (
+            db.query(StaffCapabilityGrant)
+            .filter(StaffCapabilityGrant.capability == capability, StaffCapabilityGrant.id != grant.id)
+            .count()
+        )
+        if remaining == 0:
+            raise LastGrantRemovalError(
+                f"Cannot revoke the last role able to manage the capability matrix ({role.value})"
+            )
+
+    db.delete(grant)
+    db.commit()
+    log_event(
+        db, actor=actor, action="staff.capability_revoked", target=f"capability:{capability}",
+        before={"role": role.value},
+    )
 
 
 def search_numbers(db: Session, query: str) -> list[dict]:
