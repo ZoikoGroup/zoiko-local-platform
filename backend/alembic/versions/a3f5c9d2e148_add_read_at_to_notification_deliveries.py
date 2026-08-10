@@ -19,8 +19,12 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    op.add_column("notification_deliveries", sa.Column("read_at", sa.DateTime(timezone=True), nullable=True))
+    # No-op: this chain's read_at column is the same one 141799fdba9b
+    # already added on the parallel branch, merged in by a later revision -
+    # applying both would try to add the column twice. Mirrors the identical
+    # fix already made on 141799fdba9b's side of this same duplicate pair.
+    pass
 
 
 def downgrade() -> None:
-    op.drop_column("notification_deliveries", "read_at")
+    pass

@@ -144,7 +144,7 @@ def test_telecom_send_sms_falls_back_to_secondary_stub_when_enabled(monkeypatch)
 
     monkeypatch.setattr(twilio, "_client", _raise_client)
 
-    with pytest.raises(twilio.TelecomError, match="secondary telecom provider not configured"):
+    with pytest.raises(twilio.TelecomError, match="Secondary telecom provider .* is not configured"):
         twilio.send_sms("+15551234567", "hello")
 
 
@@ -195,7 +195,7 @@ def test_llm_extract_conversation_summary_falls_back_to_secondary_stub_when_enab
 
     monkeypatch.setattr(groq.httpx, "post", _raise_post)
 
-    with pytest.raises(groq.LLMError, match="secondary LLM provider not configured"):
+    with pytest.raises(groq.LLMError, match="Secondary LLM provider .* is not configured"):
         groq.extract_conversation_summary("hello world")
 
 

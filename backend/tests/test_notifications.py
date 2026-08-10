@@ -418,11 +418,17 @@ def test_send_notification_fans_out_to_subscribed_push_devices(db_session, monke
 
     send_notification(
         db_session, event_name="number.activated", account_id=account.id,
-        recipient_email="pushfanout@example.com", context={"e164": "+15550001111"},
+        recipient_email="pushfanout@example.com",
+        context={
+            "e164": "+15550001111", "number_formatted": "+15550001111",
+            "organization_name": "Push Fanout Co", "user_display_name": "pushfanout@example.com",
+        },
     )
 
     assert sent == [("https://push.example.com/fanout", "+15550001111 is active on Zoiko Local",
-                      "Your number +15550001111 is now active. You can start making and receiving calls.")]
+                      "Your number is active\n\nHello pushfanout@example.com, +15550001111 is now active for "
+                      "Push Fanout Co. Confirm its inbound route, outbound caller ID rules, emergency address "
+                      "where applicable, voicemail, hours, and failover destination.\n\nNext: Configure Active Number.")]
 
     push_delivery = (
         db_session.query(NotificationDelivery)
@@ -468,7 +474,11 @@ def test_push_fan_out_removes_expired_subscription(db_session, monkeypatch):
 
     send_notification(
         db_session, event_name="number.activated", account_id=account.id,
-        recipient_email=signup_email, context={"e164": "+15550001111"},
+        recipient_email=signup_email,
+        context={
+            "e164": "+15550001111", "number_formatted": "+15550001111",
+            "organization_name": "Push Expired Co", "user_display_name": signup_email,
+        },
     )
 
     remaining = (
@@ -500,7 +510,11 @@ def test_notifications_list_endpoint_serializes_push_deliveries_with_no_email(cl
     from app.notifications.service import send_notification
     send_notification(
         db_session, event_name="number.activated", account_id=account_id,
-        recipient_email="pushlistregression@example.com", context={"e164": "+15550009000"},
+        recipient_email="pushlistregression@example.com",
+        context={
+            "e164": "+15550009000", "number_formatted": "+15550009000",
+            "organization_name": "Notify Read Test Co", "user_display_name": "pushlistregression@example.com",
+        },
     )
 
     response = client.get("/notifications/me", headers=headers)

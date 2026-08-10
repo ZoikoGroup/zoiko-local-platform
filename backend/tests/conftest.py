@@ -36,6 +36,35 @@ def reset_rate_limiter():
 
 
 @pytest.fixture(autouse=True)
+def reset_circuit_breakers():
+    """Each integrations/<category>/ Provider Gateway module holds its own
+    process-wide CircuitBreaker singleton (app.integrations._shared.
+    circuit_breaker.CircuitBreaker) - same "leaks across tests" problem
+    reset_rate_limiter above already documents for the login limiter. A
+    failover test that deliberately trips a breaker open (3+ simulated
+    failures) would otherwise leave it open for its full 30s reset_timeout
+    for every later test in the same process, e.g. making an unrelated
+    /media/voice/outbound call in a risk/velocity test come back 503
+    ("circuit open") instead of exercising the behavior that test actually
+    checks."""
+    from app.integrations.kyc.stripe_identity import _breaker as kyc_breaker
+    from app.integrations.llm.groq import _breaker as llm_breaker
+    from app.integrations.notifications.email import _breaker as email_breaker
+    from app.integrations.notifications.webpush import _breaker as webpush_breaker
+    from app.integrations.storage.s3 import _breaker as storage_breaker
+    from app.integrations.telecom.twilio import _breaker as telecom_breaker
+    from app.integrations.transcription.groq import _breaker as transcription_breaker
+    from app.integrations.video.livekit import _breaker as video_breaker
+
+    for breaker in (
+        kyc_breaker, llm_breaker, email_breaker, webpush_breaker,
+        storage_breaker, telecom_breaker, transcription_breaker, video_breaker,
+    ):
+        breaker.record_success()
+    yield
+
+
+@pytest.fixture(autouse=True)
 def cleanup_error_events():
     """error_events rows are written via a deliberately independent DB
     session (see app.observability.service.record_error_event's docstring -
