@@ -1142,3 +1142,48 @@ def notify_integration_removed(
             "event_occurred_at": _now_str(),
         },
     )
+
+
+def notify_call_flow_published(
+    db: Session, *, account_id: str, account_email: str, flow_name: str, number_summary: str, actor_display_name: str,
+) -> None:
+    send_notification(
+        db, event_name="route.call_flow_published", account_id=account_id, recipient_email=account_email,
+        context={
+            "user_display_name": account_email,
+            "route_name": flow_name,
+            "route_version": "1",
+            "route_number_summary": number_summary,
+            "actor_display_name": actor_display_name,
+            "route_effective_at": _now_str(),
+        },
+    )
+
+
+def notify_call_flow_rolled_back(
+    db: Session, *, account_id: str, account_email: str, flow_name: str, restored_version: int,
+) -> None:
+    send_notification(
+        db, event_name="route.call_flow_rollback", account_id=account_id, recipient_email=account_email,
+        context={
+            "user_display_name": account_email,
+            "route_name": flow_name,
+            "route_version": str(restored_version),
+            "event_occurred_at": _now_str(),
+            "route_rollback_reason": "requested by an account admin",
+        },
+    )
+
+
+def notify_recipient_opted_out(
+    db: Session, *, account_id: str, account_email: str, destination_masked: str, sender_summary: str,
+) -> None:
+    send_notification(
+        db, event_name="msg.recipient_opted_out", account_id=account_id, recipient_email=account_email,
+        context={
+            "user_display_name": account_email,
+            "message_destination_masked": destination_masked,
+            "messaging_sender_summary": sender_summary,
+            "event_occurred_at": _now_str(),
+        },
+    )

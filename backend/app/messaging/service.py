@@ -15,6 +15,8 @@ from sqlalchemy.orm import Session
 from app.audit.service import log_event
 from app.integrations.telecom import twilio as telecom
 from app.messaging.models import Conversation, Message, MessageDirection, MessageStatus, MessagingChannel
+from app.notifications.service import notify_recipient_opted_out
+from app.numbering.identity.models import User, UserRole
 from app.numbering.numbers.models import PhoneNumber
 
 _OPT_OUT_KEYWORDS = {"stop", "unsubscribe", "cancel", "end", "quit"}
@@ -118,8 +120,16 @@ def _record_inbound(
 
     normalized = body.strip().lower()
     if normalized in _OPT_OUT_KEYWORDS:
+        newly_opted_out = not conversation.opted_out
         conversation.opted_out = True
         conversation.opted_out_at = datetime.utcnow()
+        if newly_opted_out:
+            owner = db.query(User).filter(User.account_id == number.account_id, User.role == UserRole.OWNER).first()
+            if owner is not None:
+                notify_recipient_opted_out(
+                    db, account_id=number.account_id, account_email=owner.email,
+                    destination_masked=from_number, sender_summary=f"{channel.value} messaging on {number.e164}",
+                )
     elif normalized in _OPT_IN_KEYWORDS:
         conversation.opted_out = False
         conversation.opted_out_at = None
