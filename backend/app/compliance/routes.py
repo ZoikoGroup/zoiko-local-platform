@@ -8,7 +8,7 @@ from app.compliance.schemas import (
     ComplianceCaseResponse,
     ComplianceCaseStaffResponse,
     ComplianceRuleResponse,
-    DocumentDownloadUrl,
+    DocumentDownloadUrl, 
     KYCVerificationStart,
 )
 from app.core.database import get_db
@@ -32,7 +32,7 @@ def _get_case_or_404(db: Session, case_id: str):
 def list_rules(country: str, db: Session = Depends(get_db)):
     return service.get_active_rules(db, country)
 
-
+  
 @router.post("/cases", response_model=ComplianceCaseResponse, status_code=201)
 def create_case(
     payload: ComplianceCaseCreate,

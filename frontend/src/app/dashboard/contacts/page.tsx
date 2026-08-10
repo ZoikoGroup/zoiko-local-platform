@@ -11,12 +11,18 @@ import {
   ApiError,
   type User,
   type Contact,
-  type ContactHistory,
+  type ContactHistoryEntry,
 } from "@/lib/api";
 import { getToken } from "@/lib/auth";
 
 type FormState = { name: string; phone_number: string; email: string; notes: string };
 const EMPTY_FORM: FormState = { name: "", phone_number: "", email: "", notes: "" };
+
+const HISTORY_TYPE_LABEL: Record<ContactHistoryEntry["type"], string> = {
+  call: "Call",
+  voicemail: "Voicemail",
+  receptionist_call: "Receptionist call",
+};
 
 function formatDuration(seconds: number | null): string {
   if (seconds === null) return "—";
@@ -24,6 +30,11 @@ function formatDuration(seconds: number | null): string {
   const s = seconds % 60;
   return `${m}:${s.toString().padStart(2, "0")}`;
 }
+
+type HistoryState =
+  | { status: "loading" }
+  | { status: "error"; message: string }
+  | { status: "done"; entries: ContactHistoryEntry[] };
 
 export default function ContactsPage() {
   const [token] = useState<string | null>(() => getToken());
@@ -39,8 +50,7 @@ export default function ContactsPage() {
   const [saving, setSaving] = useState(false);
 
   const [expandedId, setExpandedId] = useState<string | null>(null);
-  const [history, setHistory] = useState<Record<string, ContactHistory>>({});
-  const [historyError, setHistoryError] = useState<Record<string, string>>({});
+  const [historyByContact, setHistoryByContact] = useState<Record<string, HistoryState>>({});
   const [search, setSearch] = useState("");
 
   const canWrite = me?.role !== "viewer";
@@ -123,12 +133,17 @@ export default function ContactsPage() {
       return;
     }
     setExpandedId(contactId);
-    if (!token || history[contactId]) return;
+    if (!token || historyByContact[contactId]?.status === "done") return;
+
+    setHistoryByContact((prev) => ({ ...prev, [contactId]: { status: "loading" } }));
     try {
-      const data = await getContactHistory(token, contactId);
-      setHistory((prev) => ({ ...prev, [contactId]: data }));
+      const entries = await getContactHistory(token, contactId);
+      setHistoryByContact((prev) => ({ ...prev, [contactId]: { status: "done", entries } }));
     } catch {
-      setHistoryError((prev) => ({ ...prev, [contactId]: "Couldn't load history for this contact." }));
+      setHistoryByContact((prev) => ({
+        ...prev,
+        [contactId]: { status: "error", message: "Couldn't load history for this contact." },
+      }));
     }
   }
 
@@ -143,7 +158,9 @@ export default function ContactsPage() {
       <div className="flex items-center justify-between">
         <div>
           <h2 className="text-xl font-semibold text-slate-900">Contacts</h2>
-          <p className="text-sm text-slate-500">Your saved contacts and call/message history with each one.</p>
+          <p className="text-sm text-slate-500">
+            Your saved contacts, and call/voicemail/receptionist-call history with each one.
+          </p>
         </div>
         {canWrite && (
           <button
@@ -240,8 +257,6 @@ export default function ContactsPage() {
 
         <ul className="divide-y divide-slate-100">
           {filteredContacts.map((contact) => {
-            const contactHistory = history[contact.id];
-            const historyErr = historyError[contact.id];
             const isExpanded = expandedId === contact.id;
             return (
               <li key={contact.id} className="py-3">
@@ -272,38 +287,57 @@ export default function ContactsPage() {
                   </div>
                 </div>
 
-                {isExpanded && (
-                  <div className="mt-3 bg-slate-50 rounded-lg border border-slate-200 p-3 space-y-2">
-                    {historyErr && <p className="text-xs text-red-600">{historyErr}</p>}
-                    {!contactHistory && !historyErr && <p className="text-xs text-slate-500">Loading history...</p>}
-                    {contactHistory && contactHistory.calls.length === 0 && contactHistory.voicemails.length === 0 && (
-                      <p className="text-xs text-slate-500">No call or voicemail history with this contact yet.</p>
-                    )}
-                    {contactHistory?.calls.map((c) => (
-                      <div key={c.id} className="flex items-center justify-between text-xs">
-                        <span className="text-slate-700">
-                          {c.direction === "inbound" ? "Incoming call" : "Outbound call"} · {c.status}
-                        </span>
-                        <span className="text-slate-400">
-                          {formatDuration(c.duration)} · {new Date(c.created_at).toLocaleString()}
-                        </span>
-                      </div>
-                    ))}
-                    {contactHistory?.voicemails.map((v) => (
-                      <div key={v.id} className="flex items-center justify-between text-xs">
-                        <span className="text-slate-700">Voicemail</span>
-                        <span className="text-slate-400">
-                          {formatDuration(v.duration)} · {new Date(v.created_at).toLocaleString()}
-                        </span>
-                      </div>
-                    ))}
-                  </div>
-                )}
+                {isExpanded && <ContactHistory state={historyByContact[contact.id]} />}
               </li>
             );
           })}
         </ul>
       </div>
+    </div>
+  );
+}
+
+function ContactHistory({ state }: { state: HistoryState | undefined }) {
+  if (!state || state.status === "loading") {
+    return <p className="mt-3 text-xs text-slate-500 bg-slate-50 rounded-lg px-3 py-2">Loading history...</p>;
+  }
+  if (state.status === "error") {
+    return <p className="mt-3 text-xs text-red-600 bg-red-50 rounded-lg px-3 py-2">{state.message}</p>;
+  }
+  if (state.entries.length === 0) {
+    return (
+      <p className="mt-3 text-xs text-slate-500 bg-slate-50 rounded-lg px-3 py-2">
+        No calls, voicemails, or receptionist calls with this number yet.
+      </p>
+    );
+  }
+
+  return (
+    <div className="mt-3 space-y-2">
+      {state.entries.map((entry) => (
+        <div key={`${entry.type}:${entry.id}`} className="rounded-lg border border-slate-200 px-3 py-2">
+          <div className="flex items-center justify-between gap-4">
+            <span className="text-xs font-medium text-slate-700">{HISTORY_TYPE_LABEL[entry.type]}</span>
+            <span className="text-xs text-slate-400">{new Date(entry.created_at).toLocaleString()}</span>
+          </div>
+          <div className="text-xs text-slate-500 mt-0.5">
+            {[entry.status, entry.duration !== null && formatDuration(entry.duration)]
+              .filter(Boolean)
+              .join(" · ")}
+          </div>
+          {entry.summary && <p className="text-xs text-slate-600 mt-1">{entry.summary}</p>}
+          {entry.recording_url && (
+            <a
+              href={entry.recording_url}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="text-xs font-medium text-indigo-600 hover:text-indigo-800 mt-1 inline-block"
+            >
+              Play recording
+            </a>
+          )}
+        </div>
+      ))}
     </div>
   );
 }

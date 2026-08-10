@@ -1,0 +1,137 @@
+# Render Blueprint for the backend API - see render.com/docs/blueprint-spec.
+# Deploys backend/Dockerfile as-is (same image also usable on Fly.io, see
+# backend/fly.toml - both just run the container, no Render-specific code).
+#
+# One-time setup:
+#   1. Render dashboard -> New -> Blueprint -> connect this repo.
+#   2. Render reads this file and creates the service below.
+#   3. Fill in every env var below marked `sync: false` in the dashboard -
+#      Render intentionally does not store secret values in this file.
+#   4. Run `alembic upgrade head` once against the target DATABASE_URL
+#      (Render's Shell tab on the service, or from your own machine) -
+#      migrations are not run automatically on deploy.
+#
+# The frontend deploys separately to Vercel (not Render) - see frontend/
+# README or CLAUDE.md for that side; only NEXT_PUBLIC_API_BASE_URL needs to
+# point at this service's Render URL once it's live.
+
+services:
+  - type: web
+    name: zoiko-local-api
+    runtime: docker
+    dockerfilePath: ./backend/Dockerfile
+    dockerContext: ./backend
+    plan: starter
+    region: oregon
+    healthCheckPath: /health
+    envVars:
+      # Core
+      - key: ENVIRONMENT
+        value: production
+      - key: DATABASE_URL
+        sync: false # real Neon connection string - the checked-in default points at local docker-compose Postgres
+      - key: JWT_SECRET_KEY
+        sync: false # generate with: python -c "import secrets; print(secrets.token_urlsafe(48))"
+      - key: ALLOWED_ORIGINS
+        sync: false # the real deployed Vercel frontend origin(s), comma-separated - never "*"
+      - key: GOOGLE_CLIENT_ID
+        sync: false
+
+      # Twilio (integrations/telecom)
+      - key: TWILIO_ACCOUNT_SID
+        sync: false
+      - key: TWILIO_AUTH_TOKEN
+        sync: false
+      - key: TWILIO_TRIAL_NUMBER
+        sync: false
+      - key: PUBLIC_BASE_URL
+        sync: false # this service's own real Render URL, e.g. https://zoiko-local-api.onrender.com
+
+      # LiveKit (integrations/video)
+      - key: LIVEKIT_URL
+        sync: false
+      - key: LIVEKIT_API_KEY
+        sync: false
+      - key: LIVEKIT_API_SECRET
+        sync: false
+
+      # S3-compatible storage (integrations/storage)
+      - key: S3_ACCESS_KEY_ID
+        sync: false
+      - key: S3_SECRET_ACCESS_KEY
+        sync: false
+      - key: S3_BUCKET
+        sync: false
+      - key: S3_ENDPOINT
+        sync: false
+      - key: S3_REGION
+        value: auto
+
+      # Groq (integrations/transcription, integrations/llm)
+      - key: GROQ_API_KEY
+        sync: false
+
+      # Stripe Identity (integrations/kyc)
+      - key: STRIPE_SECRET_KEY
+        sync: false
+      - key: STRIPE_IDENTITY_WEBHOOK_SECRET
+        sync: false
+
+      # Resend (integrations/notifications)
+      - key: RESEND_API_KEY
+        sync: false
+      - key: EMAIL_FROM_ADDRESS
+        value: onboarding@resend.dev
+
+      # Web Push (integrations/notifications/webpush.py)
+      - key: VAPID_PUBLIC_KEY
+        sync: false
+      - key: VAPID_PRIVATE_KEY
+        sync: false
+      - key: VAPID_CLAIM_EMAIL
+        sync: false
+
+      # Cohere (integrations/embeddings)
+      - key: COHERE_API_KEY
+        sync: false
+
+      # Event bus (integrations/eventbus/kafka.py) - blank disables publishing
+      # (falls back to logging). The local docker-compose Kafka is not
+      # reachable from Render; point this at a real internet-reachable
+      # broker (e.g. Upstash Kafka, Confluent Cloud) if you want this live.
+      - key: KAFKA_BOOTSTRAP_SERVERS
+        value: ""
+
+      # Observability (core/telemetry.py, core/logging.py) - off by default;
+      # flip to true once you have a real OTLP collector endpoint to send to.
+      - key: OTEL_ENABLED
+        value: "false"
+      - key: OTEL_SERVICE_NAME
+        value: zoiko-backend
+      - key: OTEL_EXPORTER_OTLP_ENDPOINT
+        value: ""
+      - key: LOG_LEVEL
+        value: INFO
+      - key: SYNTHETIC_CHECK_INTERVAL_SECONDS
+        value: "0"
+
+      # Multi-provider failover (integrations/_shared/circuit_breaker.py) -
+      # every secondary is a stub until real second-vendor credentials exist
+      # (see each integrations/<category>/_secondary_stub.py), so these all
+      # default off.
+      - key: TELECOM_FAILOVER_ENABLED
+        value: "false"
+      - key: VIDEO_FAILOVER_ENABLED
+        value: "false"
+      - key: LLM_FAILOVER_ENABLED
+        value: "false"
+      - key: TRANSCRIPTION_FAILOVER_ENABLED
+        value: "false"
+      - key: KYC_FAILOVER_ENABLED
+        value: "false"
+      - key: STORAGE_FAILOVER_ENABLED
+        value: "false"
+      - key: EMAIL_FAILOVER_ENABLED
+        value: "false"
+      - key: WEBPUSH_FAILOVER_ENABLED
+        value: "false"

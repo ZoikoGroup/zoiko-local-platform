@@ -105,6 +105,31 @@ class PhoneNumber(Base):
     # numbers on its own.
     next_renewal_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
+    # Phase 3 "Advanced IVR builder" (Call Flow Designer) - when set, an
+    # inbound call is routed through this flow's *live* version instead of
+    # the plain forwarding_number/ai_receptionist_enabled/ring-group logic
+    # above. NULL (the default for every existing number) preserves the
+    # exact pre-existing behavior untouched - same non-breaking pattern as
+    # ring_group_destinations.
+    call_flow_id: Mapped[str | None] = mapped_column(
+        UUID(as_uuid=False), ForeignKey("call_flows.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+
+    # Phase 3 "WhatsApp Business integration" - real WhatsApp Business
+    # senders are approved per-number by Meta/Twilio out-of-band (not
+    # something this app can provision itself); this flag just records that
+    # approval has happened, gating app.messaging.service.send_message the
+    # same way ai_receptionist_enabled gates the receptionist above. Off by
+    # default, so no existing number is affected.
+    whatsapp_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
+    # Phase 3 "SMS by regulated market" - gates app.messaging.service the
+    # same way whatsapp_enabled does. Real US business SMS additionally
+    # requires A2P 10DLC brand/campaign registration with the carrier
+    # (architecture doc: "Separate regulated workstream"), which happens
+    # out-of-band; this flag just records that it's done for this number.
+    sms_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 

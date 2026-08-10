@@ -8,11 +8,23 @@ provider decision (staff can still override).
 import stripe
 
 from app.core.config import settings
+from app.integrations._shared.circuit_breaker import CircuitBreaker, with_failover
 from app.observability.service import trace_provider_call
+
+_breaker = CircuitBreaker("kyc")
+
+
+def circuit_state() -> str:
+    return _breaker.state.value
 
 
 class KYCError(Exception):
     """Raised instead of letting a stripe SDK exception escape this module."""
+
+
+# Imported after KYCError is defined - _secondary_stub imports it back from
+# this module, which would otherwise be a circular import.
+from app.integrations.kyc import _secondary_stub as secondary  # noqa: E402
 
 
 def health_check() -> dict:
@@ -36,17 +48,23 @@ def create_verification_session(reference_id: str) -> dict:
     if not settings.stripe_secret_key:
         raise KYCError("Stripe secret key is not configured")
 
-    try:
-        with trace_provider_call("stripe_identity", "create_verification_session"):
-            session = stripe.identity.VerificationSession.create(
-                api_key=settings.stripe_secret_key,
-                type="document",
-                metadata={"case_id": reference_id},
-            )
-    except stripe.error.StripeError as e:
-        raise KYCError(f"Stripe create verification session failed: {e}") from e
+    def _primary() -> dict:
+        try:
+            with trace_provider_call("stripe_identity", "create_verification_session"):
+                session = stripe.identity.VerificationSession.create(
+                    api_key=settings.stripe_secret_key,
+                    type="document",
+                    metadata={"case_id": reference_id},
+                )
+        except stripe.error.StripeError as e:
+            raise KYCError(f"Stripe create verification session failed: {e}") from e
 
-    return {"id": session.id, "url": session.url}
+        return {"id": session.id, "url": session.url}
+
+    secondary_fn = (
+        (lambda: secondary.create_verification_session(reference_id)) if settings.kyc_failover_enabled else None
+    )
+    return with_failover(_breaker, _primary, secondary_fn, KYCError)
 
 
 def construct_webhook_event(payload: bytes, signature_header: str) -> stripe.Event:

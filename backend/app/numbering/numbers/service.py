@@ -10,6 +10,7 @@ from app.compliance.service import has_approved_case, is_requirement_active
 from app.consent.models import ConsentType
 from app.consent.service import has_active_consent
 from app.core.config import settings
+from app.events.service import publish_number_activated, publish_number_reserved, publish_number_suspended
 from app.integrations.telecom import twilio as telecom
 from app.notifications.service import (
     notify_number_activated,
@@ -67,6 +68,17 @@ class EmergencyDisclosureRequiredError(Exception):
 def _kyc_requirement_type(db: Session, account_id: str) -> str:
     account = db.query(Account).filter(Account.id == account_id).first()
     return "kyc_individual" if account.account_type == AccountType.INDIVIDUAL else "kyc_business"
+
+
+# Phase 3 "SMS by regulated market" - SMS business messaging is gated by the
+# same country-rule/case engine as KYC (compliance/service.py), not a bare
+# checkbox: e.g. US A2P 10DLC brand/campaign registration, or another
+# market's sender-ID rules. Where a rule is data-defined for a country, the
+# account needs an approved case before SMS can be turned on for a number
+# there - same "rules stored as data, never hardcoded if-statements" pattern
+# the docs require. WhatsApp has no equivalent gate here: its approval is
+# Meta's own out-of-band process, which this system can't request or grant.
+SMS_REQUIREMENT_TYPE = "sms_business_messaging"
 
 
 def search_numbers(country: str, number_type: str = "local", area_code: str | None = None) -> list[dict]:
@@ -132,6 +144,7 @@ def reserve_number(db: Session, account_id: str, e164: str, country: str) -> Pho
         target_id=number.id,
         metadata={"e164": e164},
     )
+    publish_number_reserved(account_id, number_id=number.id, e164=e164, country=country)
     return number
 
 
@@ -241,6 +254,7 @@ def purchase_number(db: Session, account_id: str, e164: str) -> PhoneNumber:
         db, actor_id=account_id, action="number.activated",
         target_type="phone_number", target_id=number.id, metadata={"e164": e164, "provider_sid": bought["sid"]},
     )
+    publish_number_activated(account_id, number_id=number.id, e164=e164)
 
     owner = db.query(User).filter(User.account_id == account_id, User.role == UserRole.OWNER).first()
     if owner is not None:
@@ -424,6 +438,7 @@ def suspend_number(db: Session, user: User, e164: str, reason: str | None = None
         db, actor_id=user.id, action="number.suspended",
         target_type="phone_number", target_id=number.id, metadata={"e164": e164, "reason": reason},
     )
+    publish_number_suspended(user.account_id, number_id=number.id, e164=e164, reason=reason)
 
     owner = db.query(User).filter(User.account_id == user.account_id, User.role == UserRole.OWNER).first()
     if owner is not None:
@@ -433,6 +448,79 @@ def suspend_number(db: Session, user: User, e164: str, reason: str | None = None
         )
 
     return number
+
+
+def suspend_numbers_for_account_by_system(db: Session, account_id: str, *, reason: str) -> list[PhoneNumber]:
+    """System-initiated counterpart to suspend_number, with no User in the
+    loop - used by the risk engine's auto-suspend workflow (Roadmap doc §13
+    Risk Register: "rapid suspension workflow"), which acts across accounts
+    on its own trigger rather than a customer/staff request. Suspends every
+    ACTIVE number on the account; already-suspended/cancelled numbers are
+    left alone."""
+    numbers = (
+        db.query(PhoneNumber)
+        .filter(PhoneNumber.account_id == account_id, PhoneNumber.status == PhoneNumberStatus.ACTIVE)
+        .with_for_update()
+        .all()
+    )
+    for number in numbers:
+        number.status = PhoneNumberStatus.SUSPENDED
+    db.commit()
+
+    for number in numbers:
+        db.refresh(number)
+        log_event(
+            db, actor="system:risk_engine", action="number.suspended",
+            target=f"phone_number:{number.id}", reason=reason, after={"e164": number.e164},
+        )
+        publish_number_suspended(account_id, number_id=number.id, e164=number.e164, reason=reason)
+
+    if numbers:
+        owner = db.query(User).filter(User.account_id == account_id, User.role == UserRole.OWNER).first()
+        if owner is not None:
+            for number in numbers:
+                notify_number_suspended(
+                    db, account_id=account_id, account_email=owner.email, e164=number.e164, reason=reason,
+                    account_phone=owner.phone_number,
+                )
+
+    return numbers
+
+
+def reactivate_numbers_for_account_by_staff(
+    db: Session, account_id: str, *, staff_id: str, reason: str | None = None
+) -> list[PhoneNumber]:
+    """Staff-initiated reversal of a suspension - the review/reversal half
+    of the risk engine's auto-suspend workflow (a false positive or a
+    resolved dispute shouldn't need engineering intervention to undo).
+    Reactivates every SUSPENDED number on the account; numbers already
+    cancelled or never suspended are left alone."""
+    numbers = (
+        db.query(PhoneNumber)
+        .filter(PhoneNumber.account_id == account_id, PhoneNumber.status == PhoneNumberStatus.SUSPENDED)
+        .with_for_update()
+        .all()
+    )
+    for number in numbers:
+        number.status = PhoneNumberStatus.ACTIVE
+    db.commit()
+
+    owner = db.query(User).filter(User.account_id == account_id, User.role == UserRole.OWNER).first()
+    account = db.query(Account).filter(Account.id == account_id).first()
+    for number in numbers:
+        db.refresh(number)
+        log_event(
+            db, actor_id=staff_id, action="number.reactivated",
+            target_type="phone_number", target_id=number.id, reason=reason, metadata={"e164": number.e164},
+        )
+        publish_number_activated(account_id, number_id=number.id, e164=number.e164)
+        if owner is not None:
+            notify_number_activated(
+                db, account_id=account_id, account_email=owner.email, e164=number.e164,
+                organization_name=account.name if account else "your organization",
+            )
+
+    return numbers
 
 
 def cancel_number(db: Session, user: User, e164: str) -> PhoneNumber:
@@ -475,11 +563,23 @@ def configure_routing(
     business_hours_timezone: str,
     ai_receptionist_enabled: bool = False,
     escalation_user_id: str | None = None,
+    whatsapp_enabled: bool = False,
+    sms_enabled: bool = False,
 ) -> PhoneNumber:
     number = db.query(PhoneNumber).filter(PhoneNumber.e164 == e164).first()
     if number is None or number.account_id != user.account_id:
         raise NumberConflictError(f"{e164} is not a number owned by your account")
     assert_number_access(number, user)
+
+    if sms_enabled and not number.sms_enabled and is_requirement_active(
+        db, number.country, SMS_REQUIREMENT_TYPE
+    ) and not has_approved_case(
+        db, account_id=user.account_id, jurisdiction=number.country, requirement_type=SMS_REQUIREMENT_TYPE
+    ):
+        raise ComplianceRequiredError(
+            f"An approved {SMS_REQUIREMENT_TYPE} compliance case for {number.country} "
+            "is required before enabling SMS on this number"
+        )
 
     try:
         ZoneInfo(business_hours_timezone)
@@ -497,6 +597,8 @@ def configure_routing(
     number.business_hours_timezone = business_hours_timezone
     number.ai_receptionist_enabled = ai_receptionist_enabled
     number.escalation_user_id = escalation_user_id
+    number.whatsapp_enabled = whatsapp_enabled
+    number.sms_enabled = sms_enabled
     db.commit()
     db.refresh(number)
     log_event(

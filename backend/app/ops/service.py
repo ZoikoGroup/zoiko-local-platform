@@ -14,6 +14,19 @@ from app.integrations.telecom import twilio as telecom
 from app.integrations.video import livekit as video
 from app.ops.models import SyntheticCheckRun
 
+# Maps a provider-status entry name to the (circuit_state accessor,
+# failover_enabled setting) of the category it belongs to - only providers
+# with failover infra built (see integrations/_shared/circuit_breaker.py)
+# get these two extra fields; "cohere" (embeddings) has none yet.
+_FAILOVER_INFO = {
+    "twilio": (telecom.circuit_state, "telecom_failover_enabled"),
+    "livekit": (video.circuit_state, "video_failover_enabled"),
+    "groq": (groq_llm.circuit_state, "llm_failover_enabled"),
+    "stripe_identity": (stripe_identity.circuit_state, "kyc_failover_enabled"),
+    "resend": (resend_email.circuit_state, "email_failover_enabled"),
+    "storage_s3": (s3.circuit_state, "storage_failover_enabled"),
+}
+
 
 async def get_provider_statuses() -> list[dict]:
     """Roadmap doc's "Admin operations... provider status" - real
@@ -31,7 +44,15 @@ async def get_provider_statuses() -> list[dict]:
         ("storage_s3", s3.health_check()),
         ("cohere", cohere_embeddings.health_check()),
     ]
-    return [{"name": name, **result} for name, result in checks]
+    statuses = []
+    for name, result in checks:
+        status = {"name": name, **result}
+        if name in _FAILOVER_INFO:
+            circuit_state_fn, failover_setting_name = _FAILOVER_INFO[name]
+            status["circuit_state"] = circuit_state_fn()
+            status["failover_enabled"] = getattr(settings, failover_setting_name)
+        statuses.append(status)
+    return statuses
 
 
 _PUBLIC_COMPONENT_NAMES = {

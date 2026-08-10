@@ -18,6 +18,24 @@ class NotificationDeliveryResponse(BaseModel):
     read_at: datetime | None
 
 
+class PushSubscribeRequest(BaseModel):
+    endpoint: str
+    p256dh: str
+    auth: str
+
+
+class PushUnsubscribeRequest(BaseModel):
+    endpoint: str
+
+
+class PushSubscriptionResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    endpoint: str
+    created_at: datetime
+
+
 class NotificationPreferenceResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 

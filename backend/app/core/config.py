@@ -83,6 +83,99 @@ class Settings(BaseSettings):
     resend_api_key: str = ""
     email_from_address: str = "onboarding@resend.dev"
 
+    # Web Push (integrations/notifications/webpush.py) - browser push
+    # notifications, since no native iOS/Android app exists. Self-generated
+    # VAPID keypair (not a third-party vendor credential) identifying this
+    # server to browser push services; vapid_claim_email is the contact
+    # address push services may use to reach the sender if a key is abused.
+    vapid_public_key: str = ""
+    vapid_private_key: str = ""
+    vapid_claim_email: str = "admin@zoikogroup.com"
+
+    # Event bus (integrations/eventbus/kafka.py, app/events/) - single-node
+    # Kafka in KRaft mode via docker-compose.yml. Approved exception to the
+    # original "no Kafka" Phase 1 scope - see CLAUDE.md. Blank disables
+    # publishing (falls back to logging), same pattern as the other providers.
+    kafka_bootstrap_servers: str = ""
+
+    # Multi-provider failover (integrations/_shared/circuit_breaker.py) - per
+    # category, a circuit breaker wraps the primary vendor call and falls
+    # back to a secondary provider if one is enabled. Every secondary below
+    # is a real vendor client (not a mock) that activates once its
+    # credentials are set; each flag still defaults off because no real
+    # second-vendor account exists yet for any category - flipping a flag on
+    # without the matching credentials below fails loudly via the same
+    # "not configured" error as an unconfigured primary, rather than
+    # silently no-opping.
+    telecom_failover_enabled: bool = False
+    video_failover_enabled: bool = False
+    llm_failover_enabled: bool = False
+    transcription_failover_enabled: bool = False
+    kyc_failover_enabled: bool = False
+    storage_failover_enabled: bool = False
+    email_failover_enabled: bool = False
+    webpush_failover_enabled: bool = False
+
+    # Secondary telecom provider (integrations/telecom/_secondary_stub.py) -
+    # Vonage SMS/Voice/Number Insight REST API. Voice calls are placed via a
+    # JWT-signed request; vonage_private_key is the PEM contents copied from
+    # a Vonage Application's generated private key file.
+    vonage_api_key: str = ""
+    vonage_api_secret: str = ""
+    vonage_application_id: str = ""
+    vonage_private_key: str = ""
+    vonage_sms_from: str = ""
+
+    # Secondary video provider (integrations/video/_secondary_stub.py) -
+    # Daily.co REST API.
+    daily_api_key: str = ""
+
+    # Secondary LLM provider (integrations/llm/_secondary_stub.py) - OpenAI
+    # chat completions API.
+    openai_api_key: str = ""
+
+    # Secondary transcription provider (integrations/transcription/_secondary_stub.py) - Deepgram.
+    deepgram_api_key: str = ""
+
+    # Secondary KYC provider (integrations/kyc/_secondary_stub.py) - Sumsub,
+    # HMAC-signed REST API (app token + secret key, not a bearer token).
+    sumsub_app_token: str = ""
+    sumsub_secret_key: str = ""
+    sumsub_level_name: str = "basic-kyc-level"
+
+    # Secondary object storage (integrations/storage/_secondary_stub.py) -
+    # any second S3-compatible bucket (Backblaze B2, a different-region R2
+    # bucket, ...), reusing the same boto3 client as the primary - only the
+    # endpoint/credentials/bucket differ.
+    storage_secondary_access_key_id: str = ""
+    storage_secondary_secret_access_key: str = ""
+    storage_secondary_bucket: str = ""
+    storage_secondary_endpoint: str = ""
+    storage_secondary_region: str = "auto"
+
+    # Secondary email provider (integrations/notifications/_email_secondary_stub.py) - SendGrid.
+    sendgrid_api_key: str = ""
+
+    # Secondary web push relay (integrations/notifications/_webpush_secondary_stub.py) -
+    # OneSignal, used as an alternate delivery path when raw Web Push
+    # (pywebpush straight to the browser's push service) is unavailable.
+    onesignal_app_id: str = ""
+    onesignal_api_key: str = ""
+
+    # Observability (core/telemetry.py, core/logging.py) - OpenTelemetry
+    # tracing/metrics + structured JSON logging. Off by default so pytest and
+    # local dev are unaffected unless explicitly opted in, same "blank/false
+    # disables" pattern as Kafka above. A blank otel_exporter_otlp_endpoint
+    # with otel_enabled=true prints spans/metrics to the console instead of
+    # requiring a real OTel collector to exist.
+    otel_enabled: bool = False
+    otel_service_name: str = "zoiko-backend"
+    otel_exporter_otlp_endpoint: str = ""
+    log_level: str = "INFO"
+    # Periodic health_check() sweep across every integration
+    # (ops/synthetic.py), logged + emitted as an OTel gauge. 0 disables it.
+    synthetic_check_interval_seconds: int = 0
+
     # HubSpot (integrations/crm) - real OAuth app credentials, from a
     # HubSpot developer account's app settings. Empty until one is created;
     # see app.integrations.crm.hubspot's docstring. hubspot_redirect_uri

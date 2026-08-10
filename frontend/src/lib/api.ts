@@ -272,7 +272,7 @@ export function startKycVerification(
 export type NotificationDelivery = {
   id: string;
   event_name: string;
-  channel: "email" | "sms";
+  channel: "email" | "sms" | "push";
   recipient_email: string | null;
   recipient_phone: string | null;
   subject: string;
@@ -299,6 +299,31 @@ export function markAllNotificationsRead(token: string): Promise<{ marked_read: 
   return request(`/notifications/read-all`, {
     method: "POST",
     headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export type PushSubscriptionInfo = {
+  id: string;
+  endpoint: string;
+  created_at: string;
+};
+
+export function subscribeToPush(
+  token: string,
+  input: { endpoint: string; p256dh: string; auth: string }
+): Promise<PushSubscriptionInfo> {
+  return request<PushSubscriptionInfo>("/notifications/push/subscribe", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify(input),
+  });
+}
+
+export function unsubscribeFromPush(token: string, endpoint: string): Promise<void> {
+  return request<void>("/notifications/push/unsubscribe", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ endpoint }),
   });
 }
 
@@ -605,6 +630,9 @@ export type MyPhoneNumber = {
   business_hours_timezone: string;
   ai_receptionist_enabled: boolean;
   escalation_user_id: string | null;
+  call_flow_id: string | null;
+  whatsapp_enabled: boolean;
+  sms_enabled: boolean;
 };
 
 export function listMyNumbers(token: string): Promise<MyPhoneNumber[]> {
@@ -676,6 +704,8 @@ export function configureRouting(
     business_hours_timezone?: string;
     ai_receptionist_enabled?: boolean;
     escalation_user_id?: string | null;
+    whatsapp_enabled?: boolean;
+    sms_enabled?: boolean;
   }
 ): Promise<MyPhoneNumber> {
   return request<MyPhoneNumber>(`/numbers/${encodeURIComponent(e164)}/routing`, {
@@ -910,6 +940,7 @@ export type WaitingStatus = {
   status: "pending" | "admitted" | "denied";
   token: string | null;
   url: string | null;
+  recording: boolean;
 };
 
 export function checkGuestWaitingStatus(roomName: string, waitingId: string): Promise<WaitingStatus> {
@@ -1329,23 +1360,15 @@ export type ContactInput = {
   notes?: string | null;
 };
 
-export type ContactHistory = {
-  calls: {
-    id: string;
-    direction: "inbound" | "outbound";
-    from: string;
-    to: string;
-    status: string;
-    duration: number | null;
-    created_at: string;
-  }[];
-  voicemails: {
-    id: string;
-    from: string;
-    duration: number | null;
-    recording_url: string;
-    created_at: string;
-  }[];
+export type ContactHistoryEntry = {
+  type: "call" | "voicemail" | "receptionist_call";
+  id: string;
+  direction: string | null;
+  status: string | null;
+  duration: number | null;
+  summary: string | null;
+  recording_url: string | null;
+  created_at: string;
 };
 
 export function listContacts(token: string): Promise<Contact[]> {
@@ -1377,8 +1400,80 @@ export function deleteContact(token: string, contactId: string): Promise<void> {
   });
 }
 
-export function getContactHistory(token: string, contactId: string): Promise<ContactHistory> {
-  return request<ContactHistory>(`/contacts/${encodeURIComponent(contactId)}/history`, {
+export function getContactHistory(token: string, contactId: string): Promise<ContactHistoryEntry[]> {
+  return request<ContactHistoryEntry[]>(`/contacts/${encodeURIComponent(contactId)}/history`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+// --- Call Flows (Advanced IVR builder, Phase 3) ---
+
+export type CallFlowNodeType =
+  | "menu"
+  | "business_hours"
+  | "forward"
+  | "queue"
+  | "voicemail"
+  | "ai_receptionist"
+  | "hangup";
+
+export type CallFlowNode = {
+  id: string;
+  type: CallFlowNodeType;
+  prompt?: string | null;
+  options?: Record<string, string> | null;
+  invalid_node_id?: string | null;
+  timeout_node_id?: string | null;
+  start?: string | null;
+  end?: string | null;
+  timezone?: string | null;
+  within_node_id?: string | null;
+  outside_node_id?: string | null;
+  destinations?: string[] | null;
+  on_no_answer_node_id?: string | null;
+  queue_id?: string | null;
+  overflow_node_id?: string | null;
+  message?: string | null;
+};
+
+export type CallFlowVersion = {
+  id: string;
+  version: number;
+  status: "draft" | "published" | "archived";
+  entry_node_id: string;
+  nodes: CallFlowNode[];
+  published_at: string | null;
+  rolled_back_from_version: number | null;
+  created_at: string;
+};
+
+export type CallFlowSummary = {
+  id: string;
+  name: string;
+  created_at: string;
+  has_draft: boolean;
+  live_version: number | null;
+  assigned_numbers: string[];
+};
+
+export type CallFlowDetail = {
+  id: string;
+  account_id: string;
+  name: string;
+  created_at: string;
+  draft: CallFlowVersion | null;
+  live: CallFlowVersion | null;
+  version_history: CallFlowVersion[];
+};
+
+export type PublishResult = {
+  published: boolean;
+  errors: string[];
+  version: CallFlowVersion | null;
+};
+
+export function listCallFlows(token: string): Promise<CallFlowSummary[]> {
+  return request<CallFlowSummary[]>("/call-flows", {
     headers: { Authorization: `Bearer ${token}` },
   });
 }
@@ -1411,6 +1506,128 @@ export function listWebhookEndpoints(token: string): Promise<WebhookEndpoint[]> 
   });
 }
 
+export function createCallFlow(token: string, name: string): Promise<CallFlowSummary> {
+  return request<CallFlowSummary>("/call-flows", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ name }),
+  });
+}
+
+export function getCallFlow(token: string, callFlowId: string): Promise<CallFlowDetail> {
+  return request<CallFlowDetail>(`/call-flows/${encodeURIComponent(callFlowId)}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export function saveCallFlowDraft(
+  token: string,
+  callFlowId: string,
+  input: { entry_node_id: string; nodes: CallFlowNode[] }
+): Promise<CallFlowVersion> {
+  return request<CallFlowVersion>(`/call-flows/${encodeURIComponent(callFlowId)}/draft`, {
+    method: "PUT",
+    headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify(input),
+  });
+}
+
+export function validateCallFlowDraft(token: string, callFlowId: string): Promise<PublishResult> {
+  return request<PublishResult>(`/call-flows/${encodeURIComponent(callFlowId)}/validate`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export function publishCallFlow(token: string, callFlowId: string): Promise<PublishResult> {
+  return request<PublishResult>(`/call-flows/${encodeURIComponent(callFlowId)}/publish`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export function rollbackCallFlow(token: string, callFlowId: string, version: number): Promise<CallFlowVersion> {
+  return request<CallFlowVersion>(`/call-flows/${encodeURIComponent(callFlowId)}/rollback`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ version }),
+  });
+}
+
+export function assignCallFlow(
+  token: string,
+  callFlowId: string,
+  phoneNumberId: string
+): Promise<{ phone_number_id: string; call_flow_id: string | null }> {
+  return request(`/call-flows/${encodeURIComponent(callFlowId)}/assign`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ phone_number_id: phoneNumberId }),
+  });
+}
+
+export function unassignCallFlow(
+  token: string,
+  phoneNumberId: string
+): Promise<{ phone_number_id: string; call_flow_id: string | null }> {
+  return request(`/call-flows/unassign/${encodeURIComponent(phoneNumberId)}`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+// --- Call Queues (contact-center-lite, Phase 3) ---
+
+export type QueueMember = { user_id: string; email: string };
+
+export type CallQueue = {
+  id: string;
+  account_id: string;
+  name: string;
+  max_wait_seconds: number;
+  wrap_up_seconds: number;
+  created_at: string;
+  members: QueueMember[];
+};
+
+export type QueueStatus = {
+  queue_id: string;
+  waiting_count: number;
+  in_progress_count: number;
+  longest_wait_seconds: number;
+  sla_breached: boolean;
+};
+
+export type AgentPresence = {
+  status: "available" | "wrap_up" | "offline";
+  changed_at: string;
+  wrap_up_until: string | null;
+  effectively_available: boolean;
+};
+
+export type PullNextResult = {
+  call_sid: string;
+  caller_number: string;
+  queue_call_log_id: string;
+};
+
+export function listQueues(token: string): Promise<CallQueue[]> {
+  return request<CallQueue[]>("/queues", {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export function createQueue(
+  token: string,
+  input: { name: string; max_wait_seconds?: number; wrap_up_seconds?: number }
+): Promise<CallQueue> {
+  return request<CallQueue>("/queues", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify(input),
+  });
+}
+
 export function createWebhookEndpoint(
   token: string,
   input: { url: string; description?: string }
@@ -1422,6 +1639,33 @@ export function createWebhookEndpoint(
   });
 }
 
+export function updateQueue(
+  token: string,
+  queueId: string,
+  input: { name?: string; max_wait_seconds?: number; wrap_up_seconds?: number }
+): Promise<CallQueue> {
+  return request<CallQueue>(`/queues/${encodeURIComponent(queueId)}`, {
+    method: "PUT",
+    headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify(input),
+  });
+}
+
+export function addQueueMember(token: string, queueId: string, userId: string): Promise<CallQueue> {
+  return request<CallQueue>(`/queues/${encodeURIComponent(queueId)}/members`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ user_id: userId }),
+  });
+}
+
+export function removeQueueMember(token: string, queueId: string, userId: string): Promise<CallQueue> {
+  return request<CallQueue>(`/queues/${encodeURIComponent(queueId)}/members/${encodeURIComponent(userId)}`, {
+    method: "DELETE",
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
 export function deleteWebhookEndpoint(token: string, endpointId: string): Promise<void> {
   return request<void>(`/webhooks/endpoints/${encodeURIComponent(endpointId)}`, {
     method: "DELETE",
@@ -1429,9 +1673,64 @@ export function deleteWebhookEndpoint(token: string, endpointId: string): Promis
   });
 }
 
+export function getQueueStatus(token: string, queueId: string): Promise<QueueStatus> {
+  return request<QueueStatus>(`/queues/${encodeURIComponent(queueId)}/status`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
 export function listWebhookDeliveries(token: string, endpointId?: string): Promise<WebhookDelivery[]> {
   const qs = endpointId ? `?endpoint_id=${encodeURIComponent(endpointId)}` : "";
   return request<WebhookDelivery[]>(`/webhooks/deliveries${qs}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export function pullNextCaller(token: string, queueId: string): Promise<PullNextResult> {
+  return request<PullNextResult>(`/queues/${encodeURIComponent(queueId)}/pull-next`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export function getMyPresence(token: string): Promise<AgentPresence> {
+  return request<AgentPresence>("/queues/presence/me", {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export function setMyPresence(token: string, status: "available" | "offline"): Promise<AgentPresence> {
+  return request<AgentPresence>("/queues/presence/me", {
+    method: "PUT",
+    headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ status }),
+  });
+}
+
+// --- Business messaging: WhatsApp + SMS (Phase 3) ---
+
+export type MessagingChannel = "whatsapp" | "sms";
+
+export type MessagingConversation = {
+  id: string;
+  phone_number_id: string;
+  customer_number: string;
+  channel: MessagingChannel;
+  opted_out: boolean;
+  last_message_at: string;
+  created_at: string;
+};
+
+export type MessagingMessage = {
+  id: string;
+  direction: "inbound" | "outbound";
+  body: string;
+  status: string;
+  created_at: string;
+};
+
+export function listConversations(token: string): Promise<MessagingConversation[]> {
+  return request<MessagingConversation[]>("/messaging/conversations", {
     headers: { Authorization: `Bearer ${token}` },
   });
 }
@@ -1494,6 +1793,69 @@ export function getCrmConnection(token: string): Promise<CrmConnection | null> {
   return request<CrmConnection | null>("/crm/connection", {
     headers: { Authorization: `Bearer ${token}` },
   });
+}
+
+export function listConversationMessages(token: string, conversationId: string): Promise<MessagingMessage[]> {
+  return request<MessagingMessage[]>(`/messaging/conversations/${encodeURIComponent(conversationId)}/messages`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export function sendWhatsAppMessage(
+  token: string,
+  input: { phone_number_id: string; to: string; body: string }
+): Promise<MessagingMessage> {
+  return request<MessagingMessage>("/messaging/whatsapp/send", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify(input),
+  });
+}
+
+export function sendSms(
+  token: string,
+  input: { phone_number_id: string; to: string; body: string }
+): Promise<MessagingMessage> {
+  return request<MessagingMessage>("/messaging/sms/send", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify(input),
+  });
+}
+
+export type AnalyticsDailyPoint = {
+  date: string;
+  calls: number;
+  call_minutes: number;
+  video_minutes: number;
+  messages: number;
+};
+
+export type AnalyticsOverview = {
+  range_days: number;
+  total_calls: number;
+  total_call_minutes: number;
+  total_video_minutes: number;
+  total_messages: number;
+  active_numbers: number;
+  ai_summaries: number;
+  daily: AnalyticsDailyPoint[];
+};
+
+export function getAnalyticsOverview(token: string, days: number): Promise<AnalyticsOverview> {
+  return request<AnalyticsOverview>(`/analytics/overview?days=${days}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export async function exportAnalyticsCsv(token: string, days: number): Promise<Blob> {
+  const response = await fetch(`${API_BASE_URL}/analytics/export.csv?days=${days}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!response.ok) {
+    throw new ApiError("Couldn't export the report.", response.status);
+  }
+  return response.blob();
 }
 
 export function connectCrm(token: string, provider: CrmProvider): Promise<CrmConnection> {

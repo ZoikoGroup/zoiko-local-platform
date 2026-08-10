@@ -163,9 +163,12 @@ def configure_routing(
             payload.forwarding_number, payload.business_hours_start,
             payload.business_hours_end, payload.business_hours_timezone,
             payload.ai_receptionist_enabled, payload.escalation_user_id,
+            payload.whatsapp_enabled, payload.sms_enabled,
         )
     except NumberConflictError as e:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e
+    except ComplianceRequiredError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e)) from e
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e)) from e
 

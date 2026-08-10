@@ -8,6 +8,9 @@ from app.notifications.schemas import (
     NotificationDeliveryResponse,
     NotificationPreferenceResponse,
     NotificationPreferenceUpdate,
+    PushSubscribeRequest,
+    PushSubscriptionResponse,
+    PushUnsubscribeRequest,
 )
 from app.numbering.identity.models import User
 
@@ -45,6 +48,27 @@ def mark_all_read(
 ):
     count = service.mark_all_notifications_read(db, current_user.account_id)
     return {"marked_read": count}
+
+
+@router.post("/push/subscribe", response_model=PushSubscriptionResponse)
+def subscribe_to_push(
+    payload: PushSubscribeRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    return service.subscribe_to_push(
+        db, account_id=current_user.account_id, user_id=current_user.id,
+        endpoint=payload.endpoint, p256dh=payload.p256dh, auth=payload.auth,
+    )
+
+
+@router.post("/push/unsubscribe", status_code=204)
+def unsubscribe_from_push(
+    payload: PushUnsubscribeRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    service.unsubscribe_from_push(db, account_id=current_user.account_id, endpoint=payload.endpoint)
 
 
 @router.get("/preferences", response_model=NotificationPreferenceResponse)

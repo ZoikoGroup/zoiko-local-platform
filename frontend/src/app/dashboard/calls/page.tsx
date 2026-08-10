@@ -5,11 +5,17 @@ import {
   listMyNumbers,
   listCalls,
   placeOutboundCall,
+  listVoicemails,
   summarizeCall,
+  summarizeVoicemail,
   grantAiProcessingConsent,
+  listContacts,
   ApiError,
   type MyPhoneNumber,
   type CallLogEntry,
+  type VoicemailEntry,
+  type ConversationSummary,
+  type Contact,
 } from "@/lib/api";
 import { getToken } from "@/lib/auth";
 import { CallRow, type SummaryKey, type SummaryState } from "@/components/CallRow";
@@ -19,6 +25,8 @@ export default function CallsPage() {
 
   const [numbers, setNumbers] = useState<MyPhoneNumber[]>([]);
   const [calls, setCalls] = useState<CallLogEntry[]>([]);
+  const [voicemails, setVoicemails] = useState<VoicemailEntry[]>([]);
+  const [contacts, setContacts] = useState<Contact[]>([]);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
 
@@ -32,16 +40,29 @@ export default function CallsPage() {
 
   const loadAll = useCallback(() => {
     if (!token) return;
-    return Promise.all([listMyNumbers(token), listCalls(token)])
-      .then(([numbersData, callsData]) => {
+    return Promise.all([listMyNumbers(token), listCalls(token), listVoicemails(token), listContacts(token)])
+      .then(([numbersData, callsData, voicemailsData, contactsData]) => {
         setNumbers(numbersData);
         setCalls(callsData);
+        setVoicemails(voicemailsData);
+        setContacts(contactsData);
         setLoadError(null);
         setFromNumber((current) => current || numbersData.find((n) => n.status === "active")?.e164 || "");
       })
       .catch(() => setLoadError("Couldn't load calls."))
       .finally(() => setLoading(false));
   }, [token]);
+
+  // Resolves a raw phone number to a saved contact's name, falling back to
+  // the bare number - built once per contacts load rather than searching
+  // the array on every row render.
+  const contactNameByPhone = contacts.reduce<Record<string, string>>((acc, c) => {
+    acc[c.phone_number] = c.name;
+    return acc;
+  }, {});
+  function displayNumber(phone: string): string {
+    return contactNameByPhone[phone] ?? phone;
+  }
 
   useEffect(() => {
     loadAll();
@@ -65,12 +86,12 @@ export default function CallsPage() {
     }
   }
 
-  async function handleSummarize(id: string) {
+  async function handleSummarize(kind: "call" | "voicemail", id: string) {
     if (!token) return;
-    const key: SummaryKey = `call:${id}`;
+    const key: SummaryKey = `${kind}:${id}`;
     setSummaries((prev) => ({ ...prev, [key]: { status: "busy" } }));
     try {
-      const result = await summarizeCall(token, id);
+      const result = kind === "call" ? await summarizeCall(token, id) : await summarizeVoicemail(token, id);
       setSummaries((prev) => ({ ...prev, [key]: { status: "done", result } }));
     } catch (err) {
       if (err instanceof ApiError && err.status === 403 && err.message.toLowerCase().includes("consent")) {
@@ -82,13 +103,13 @@ export default function CallsPage() {
     }
   }
 
-  async function handleGrantConsent(id: string) {
+  async function handleGrantConsent(kind: "call" | "voicemail", id: string) {
     if (!token) return;
     try {
       await grantAiProcessingConsent(token);
-      await handleSummarize(id);
+      await handleSummarize(kind, id);
     } catch {
-      const key: SummaryKey = `call:${id}`;
+      const key: SummaryKey = `${kind}:${id}`;
       setSummaries((prev) => ({ ...prev, [key]: { status: "error", message: "Couldn't grant AI consent." } }));
     }
   }
@@ -99,7 +120,9 @@ export default function CallsPage() {
     <div className="max-w-3xl mx-auto space-y-6">
       <div>
         <h2 className="text-xl font-semibold text-slate-900">Calls</h2>
-        <p className="text-sm text-slate-500">Inbound and outbound call logs, with AI-generated summaries.</p>
+        <p className="text-sm text-slate-500">
+          Inbound and outbound call logs, voicemail, and AI-generated summaries.
+        </p>
       </div>
 
       {loadError && (
@@ -166,15 +189,39 @@ export default function CallsPage() {
           {calls.map((c) => (
             <CallRow
               key={c.id}
-              label={`${c.direction === "inbound" ? c.from : c.to} · ${c.direction}`}
+              label={`${displayNumber(c.direction === "inbound" ? c.from : c.to)} · ${c.direction}`}
               status={c.status}
               duration={c.duration}
               createdAt={c.created_at}
               recordingUrl={c.recording_url}
               suspectedSpam={c.is_suspected_spam}
               summaryState={summaries[`call:${c.id}`] ?? { status: "idle" }}
-              onSummarize={() => handleSummarize(c.id)}
-              onGrantConsent={() => handleGrantConsent(c.id)}
+              onSummarize={() => handleSummarize("call", c.id)}
+              onGrantConsent={() => handleGrantConsent("call", c.id)}
+            />
+          ))}
+        </div>
+      </div>
+
+      {/* Voicemail */}
+      <div className="bg-white rounded-xl border border-slate-200 p-6 space-y-4">
+        <h3 className="font-semibold text-slate-900">Voicemail</h3>
+
+        {loading && <p className="text-sm text-slate-500">Loading...</p>}
+        {!loading && voicemails.length === 0 && <p className="text-sm text-slate-500">No voicemails yet.</p>}
+
+        <div className="space-y-3">
+          {voicemails.map((v) => (
+            <CallRow
+              key={v.id}
+              label={`From ${displayNumber(v.from)}`}
+              status="left a message"
+              duration={v.duration}
+              createdAt={v.created_at}
+              recordingUrl={v.recording_url}
+              summaryState={summaries[`voicemail:${v.id}`] ?? { status: "idle" }}
+              onSummarize={() => handleSummarize("voicemail", v.id)}
+              onGrantConsent={() => handleGrantConsent("voicemail", v.id)}
             />
           ))}
         </div>

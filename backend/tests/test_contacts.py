@@ -1,3 +1,7 @@
+from app.media.models import CallDirection, CallRecord, ReceptionistCall, ReceptionistUrgency, Voicemail
+from app.numbering.numbers.models import PhoneNumber, PhoneNumberStatus
+
+
 def _signup_and_login(client, email: str) -> tuple[str, str]:
     signup = client.post(
         "/auth/signup",
@@ -22,6 +26,11 @@ def _add_viewer(client, owner_headers, email: str) -> str:
     assert add_response.status_code == 201, add_response.text
     login_response = client.post("/auth/login", json={"email": email, "password": "viewersecret123"})
     return login_response.json()["access_token"]
+
+
+def test_create_contact_requires_auth(client):
+    response = client.post("/contacts", json={"name": "Jordan", "phone_number": "+15550001111"})
+    assert response.status_code == 401
 
 
 def test_list_contacts_requires_auth(client):
@@ -126,6 +135,24 @@ def test_contacts_are_scoped_to_the_callers_own_account(client):
     assert cross_update.status_code == 404
 
 
+def test_contact_from_another_account_is_not_found(client):
+    owner_token, _ = _signup_and_login(client, "contacts5owner@example.com")
+    intruder_token, _ = _signup_and_login(client, "contacts5intruder@example.com")
+
+    owner_contact = client.post(
+        "/contacts", headers={"Authorization": f"Bearer {owner_token}"},
+        json={"name": "Owner's Contact", "phone_number": "+15550006666"},
+    ).json()
+
+    intruder_headers = {"Authorization": f"Bearer {intruder_token}"}
+    assert client.get(f"/contacts/{owner_contact['id']}", headers=intruder_headers).status_code == 404
+    assert client.put(
+        f"/contacts/{owner_contact['id']}", headers=intruder_headers,
+        json={"name": "Hijacked", "phone_number": "+15550006666"},
+    ).status_code == 404
+    assert client.delete(f"/contacts/{owner_contact['id']}", headers=intruder_headers).status_code == 404
+
+
 def test_viewer_can_list_contacts_but_not_create_them(client):
     owner_token, _ = _signup_and_login(client, "contactsviewerowner@example.com")
     owner_headers = {"Authorization": f"Bearer {owner_token}"}
@@ -145,30 +172,55 @@ def test_viewer_can_list_contacts_but_not_create_them(client):
     assert create_response.status_code == 403
 
 
-def test_contact_history_matches_calls_by_phone_number(client, db_session):
-    from app.media.models import CallDirection, CallRecord
-
-    token, account_id = _signup_and_login(client, "contactshistory1@example.com")
+def test_contact_history_aggregates_calls_voicemails_and_receptionist_calls(client, db_session):
+    token, account_id = _signup_and_login(client, "contacts6@example.com")
     headers = {"Authorization": f"Bearer {token}"}
-    contact_id = client.post(
-        "/contacts", json={"name": "Has History", "phone_number": "+15559998888"}, headers=headers
-    ).json()["id"]
+    phone = "+15550007777"
 
-    db_session.add(
-        CallRecord(
-            account_id=account_id, phone_number_id=None, direction=CallDirection.INBOUND,
-            from_number="+15559998888", to_number="+15550001111", provider_call_sid="CAcontacthist1",
-            status="completed", duration=42,
-        )
-    )
+    contact = client.post("/contacts", headers=headers, json={"name": "Riley", "phone_number": phone}).json()
+
+    number = PhoneNumber(e164="+15559990000", country="US", status=PhoneNumberStatus.ACTIVE, account_id=account_id)
+    db_session.add(number)
+    db_session.flush()
+
+    db_session.add(CallRecord(
+        account_id=account_id, phone_number_id=number.id, direction=CallDirection.INBOUND,
+        from_number=phone, to_number=number.e164, status="completed", duration=42,
+    ))
+    db_session.add(Voicemail(
+        phone_number_id=number.id, account_id=account_id, from_number=phone,
+        recording_url="https://example.com/vm.mp3", duration=15,
+    ))
+    db_session.add(ReceptionistCall(
+        account_id=account_id, phone_number_id=number.id, call_sid="CAtest123", caller_number=phone,
+        raw_transcript="Hello, calling about an order.", summary="Riley called about an order.",
+        urgency=ReceptionistUrgency.LOW,
+    ))
     db_session.commit()
 
-    history_response = client.get(f"/contacts/{contact_id}/history", headers=headers)
-    assert history_response.status_code == 200
-    body = history_response.json()
-    assert len(body["calls"]) == 1
-    assert body["calls"][0]["from"] == "+15559998888"
-    assert body["voicemails"] == []
+    # unrelated contact/number - must not show up in Riley's history
+    other_phone = "+15550008888"
+    db_session.add(CallRecord(
+        account_id=account_id, phone_number_id=number.id, direction=CallDirection.OUTBOUND,
+        from_number=number.e164, to_number=other_phone, status="completed", duration=5,
+    ))
+    db_session.commit()
+
+    history = client.get(f"/contacts/{contact['id']}/history", headers=headers)
+    assert history.status_code == 200
+    entries = history.json()
+    assert len(entries) == 3
+    assert {e["type"] for e in entries} == {"call", "voicemail", "receptionist_call"}
+
+    receptionist_entry = next(e for e in entries if e["type"] == "receptionist_call")
+    assert receptionist_entry["summary"] == "Riley called about an order."
+    assert receptionist_entry["status"] == "low"
+
+    call_entry = next(e for e in entries if e["type"] == "call")
+    assert call_entry["duration"] == 42
+
+    voicemail_entry = next(e for e in entries if e["type"] == "voicemail")
+    assert voicemail_entry["recording_url"] == "https://example.com/vm.mp3"
 
 
 def test_contact_history_is_empty_for_a_contact_with_no_activity(client):
@@ -180,7 +232,12 @@ def test_contact_history_is_empty_for_a_contact_with_no_activity(client):
 
     response = client.get(f"/contacts/{contact_id}/history", headers=headers)
     assert response.status_code == 200
-    assert response.json() == {"calls": [], "voicemails": []}
+    assert response.json() == []
+
+
+def test_contact_history_requires_auth(client):
+    response = client.get("/contacts/some-id/history")
+    assert response.status_code == 401
 
 
 def test_creating_a_contact_creates_an_audit_event(client, db_session):

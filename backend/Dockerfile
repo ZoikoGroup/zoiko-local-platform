@@ -8,7 +8,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# --retries/--timeout: the dependency set backtracks across many candidate
+# versions during resolution (some transitive package's newer releases need
+# Python >=3.11, which this 3.10 image doesn't have), so the install makes a
+# lot of sequential PyPI requests - a single flaky one otherwise kills the
+# whole command instead of pip just retrying it.
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir --retries 10 --timeout 30 -r requirements.txt
 
 # alembic.ini and alembic/ live inside this directory alongside app/, so a
 # plain COPY . . picks up everything needed to both serve the API and run

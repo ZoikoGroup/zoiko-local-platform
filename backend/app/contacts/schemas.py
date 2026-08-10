@@ -28,3 +28,14 @@ class ContactResponse(BaseModel):
     notes: str | None
     created_by_user_id: str | None
     created_at: datetime
+
+
+class ContactHistoryEntry(BaseModel):
+    type: str  # "call" | "voicemail" | "receptionist_call"
+    id: str
+    direction: str | None = None
+    status: str | None = None
+    duration: int | None = None
+    summary: str | None = None
+    recording_url: str | None = None
+    created_at: datetime

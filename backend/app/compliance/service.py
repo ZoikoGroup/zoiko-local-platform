@@ -5,6 +5,11 @@ from sqlalchemy.orm import Session
 
 from app.audit.service import log_event
 from app.compliance.models import ComplianceCase, ComplianceCaseStatus, ComplianceRule
+from app.events.service import (
+    publish_compliance_case_approved,
+    publish_compliance_case_rejected,
+    publish_compliance_case_required,
+)
 from app.integrations.kyc import stripe_identity
 from app.integrations.storage import s3 as storage
 from app.notifications.service import (
@@ -98,6 +103,9 @@ def open_compliance_case(
         action="compliance.case_opened",
         target=f"compliance_case:{case.id}",
         after={"case_id": case.id, "jurisdiction": case.jurisdiction, "requirement_type": requirement_type},
+    )
+    publish_compliance_case_required(
+        account_id, case_id=case.id, jurisdiction=case.jurisdiction, requirement_type=requirement_type,
     )
     return case
 
@@ -248,6 +256,10 @@ def approve_case(db: Session, case: ComplianceCase, *, actor: str) -> Compliance
         after={"status": case.status},
     )
 
+    publish_compliance_case_approved(
+        case.account_id, case_id=case.id, jurisdiction=case.jurisdiction, requirement_type=case.requirement_type,
+    )
+
     owner_email = _account_owner_email(db, case.account_id)
     if owner_email:
         notify_compliance_case_approved(
@@ -275,6 +287,11 @@ def reject_case(db: Session, case: ComplianceCase, *, actor: str, reason: str | 
         reason=reason,
         before={"status": before_status},
         after={"status": case.status},
+    )
+
+    publish_compliance_case_rejected(
+        case.account_id, case_id=case.id, jurisdiction=case.jurisdiction,
+        requirement_type=case.requirement_type, reason=reason,
     )
 
     owner_email = _account_owner_email(db, case.account_id)

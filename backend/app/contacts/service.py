@@ -3,8 +3,9 @@ from sqlalchemy.orm import Session
 
 from app.audit.service import log_event
 from app.contacts.models import Contact
+from app.contacts.schemas import ContactHistoryEntry
 from app.crm.service import sync_contact_to_crm
-from app.media.models import CallRecord, Voicemail
+from app.media.models import CallRecord, ReceptionistCall, Voicemail
 from app.numbering.identity.models import User
 from app.numbering.numbers.service import assigned_number_ids
 
@@ -76,26 +77,50 @@ def delete_contact(db: Session, *, account_id: str, user_id: str, contact_id: st
     log_event(db, actor=user_id, action="contacts.deleted", target=f"contact:{contact_id}", before=before)
 
 
-def get_contact_history(db: Session, user: User, contact: Contact) -> dict:
-    """Calls and voicemails matched by phone number, not a stored
-    relationship - a contact saved after the fact still shows prior history
-    with the same number. Respects the same Member/assigned-number
+def get_contact_history(db: Session, user: User, contact: Contact) -> list[ContactHistoryEntry]:
+    """Calls, voicemails, and receptionist calls matched by phone number, not
+    a stored relationship - a contact saved after the fact still shows prior
+    history with the same number. Respects the same Member/assigned-number
     restriction as the main Calls page (list_account_calls) - a Member only
     sees history on numbers assigned to them, not the whole account's.
     """
+    phone = contact.phone_number
     calls_query = db.query(CallRecord).filter(
         CallRecord.account_id == contact.account_id,
-        sa.or_(CallRecord.from_number == contact.phone_number, CallRecord.to_number == contact.phone_number),
+        sa.or_(CallRecord.from_number == phone, CallRecord.to_number == phone),
     )
     voicemails_query = db.query(Voicemail).filter(
-        Voicemail.account_id == contact.account_id, Voicemail.from_number == contact.phone_number,
+        Voicemail.account_id == contact.account_id, Voicemail.from_number == phone,
+    )
+    receptionist_calls_query = db.query(ReceptionistCall).filter(
+        ReceptionistCall.account_id == contact.account_id, ReceptionistCall.caller_number == phone,
     )
 
     ids = assigned_number_ids(db, user)
     if ids is not None:
         calls_query = calls_query.filter(CallRecord.phone_number_id.in_(ids))
         voicemails_query = voicemails_query.filter(Voicemail.phone_number_id.in_(ids))
+        receptionist_calls_query = receptionist_calls_query.filter(ReceptionistCall.phone_number_id.in_(ids))
 
-    calls = calls_query.order_by(CallRecord.created_at.desc()).all()
-    voicemails = voicemails_query.order_by(Voicemail.created_at.desc()).all()
-    return {"calls": calls, "voicemails": voicemails}
+    entries = [
+        ContactHistoryEntry(
+            type="call", id=c.id, direction=c.direction.value, status=c.status, duration=c.duration,
+            recording_url=c.recording_url, created_at=c.created_at,
+        )
+        for c in calls_query.all()
+    ] + [
+        ContactHistoryEntry(
+            type="voicemail", id=v.id, duration=v.duration, recording_url=v.recording_url,
+            created_at=v.created_at,
+        )
+        for v in voicemails_query.all()
+    ] + [
+        ContactHistoryEntry(
+            type="receptionist_call", id=r.id, summary=r.summary, status=r.urgency.value if r.urgency else None,
+            created_at=r.created_at,
+        )
+        for r in receptionist_calls_query.all()
+    ]
+
+    entries.sort(key=lambda e: e.created_at, reverse=True)
+    return entries

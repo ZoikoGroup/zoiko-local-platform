@@ -52,6 +52,7 @@ export default function VideoPage() {
   const [micOn, setMicOn] = useState(true);
   const [screenSharing, setScreenSharing] = useState(false);
   const [participantCount, setParticipantCount] = useState(0);
+  const [participants, setParticipants] = useState<{ identity: string; name: string }[]>([]);
   const [inviteLinkCopied, setInviteLinkCopied] = useState(false);
   const [waitingGuests, setWaitingGuests] = useState<WaitingGuest[]>([]);
   const [admittingGuestId, setAdmittingGuestId] = useState<string | null>(null);
@@ -61,6 +62,7 @@ export default function VideoPage() {
   const [summaries, setSummaries] = useState<Record<string, ConversationSummary>>({});
   const [summarizingRoom, setSummarizingRoom] = useState<string | null>(null);
   const [summaryErrors, setSummaryErrors] = useState<Record<string, string>>({});
+  const [copiedRoom, setCopiedRoom] = useState<string | null>(null);
 
   // Pre-join lobby - a device/camera check before actually connecting to the
   // LiveKit room, not just an instant auto-join. lobbyRoomName is null when
@@ -91,6 +93,32 @@ export default function VideoPage() {
   const lobbyVideoRef = useRef<HTMLVideoElement>(null);
   const remoteContainerRef = useRef<HTMLDivElement>(null);
   const attachedElements = useRef<Map<string, HTMLMediaElement>>(new Map());
+  const participantTiles = useRef<Map<string, HTMLDivElement>>(new Map());
+
+  function getOrCreateTile(identity: string, name: string): HTMLDivElement {
+    const existing = participantTiles.current.get(identity);
+    if (existing) return existing;
+
+    const tile = document.createElement("div");
+    tile.className =
+      "relative aspect-video bg-black rounded-lg overflow-hidden [&>video]:w-full [&>video]:h-full [&>video]:object-cover [&>audio]:hidden";
+    const label = document.createElement("span");
+    label.className =
+      "absolute bottom-2 left-2 text-xs text-white/80 bg-black/40 rounded px-2 py-0.5 pointer-events-none";
+    label.textContent = name;
+    tile.appendChild(label);
+
+    remoteContainerRef.current?.appendChild(tile);
+    participantTiles.current.set(identity, tile);
+    return tile;
+  }
+
+  function clearRemoteTiles() {
+    participantTiles.current.forEach((tile) => tile.remove());
+    participantTiles.current.clear();
+    setParticipants([]);
+  }
+
   const chatEndRef = useRef<HTMLDivElement>(null);
   const chatOpenRef = useRef(false);
 
@@ -312,18 +340,34 @@ export default function VideoPage() {
       const room = new Room();
       roomRef.current = room;
 
-      room.on(RoomEvent.TrackSubscribed, (track) => {
+      room.on(RoomEvent.TrackSubscribed, (track, _publication, participant) => {
         if (track.kind === Track.Kind.Video || track.kind === Track.Kind.Audio) {
+          const tile = getOrCreateTile(participant.identity, participant.name || participant.identity);
           const el = track.attach();
           attachedElements.current.set(track.sid ?? el.id, el);
-          remoteContainerRef.current?.appendChild(el);
+          tile.appendChild(el);
         }
       });
       room.on(RoomEvent.TrackUnsubscribed, (track) => {
         track.detach().forEach((el) => el.remove());
       });
-      room.on(RoomEvent.ParticipantConnected, () => setParticipantCount(room.remoteParticipants.size));
-      room.on(RoomEvent.ParticipantDisconnected, () => setParticipantCount(room.remoteParticipants.size));
+      room.on(RoomEvent.ParticipantConnected, (participant) => {
+        setParticipantCount(room.remoteParticipants.size);
+        setParticipants((prev) => [...prev, { identity: participant.identity, name: participant.name || participant.identity }]);
+      });
+      room.on(RoomEvent.ParticipantDisconnected, (participant) => {
+        setParticipantCount(room.remoteParticipants.size);
+        setParticipants((prev) => prev.filter((p) => p.identity !== participant.identity));
+        participantTiles.current.get(participant.identity)?.remove();
+        participantTiles.current.delete(participant.identity);
+      });
+      room.on(RoomEvent.ActiveSpeakersChanged, (speakers) => {
+        const speakingIds = new Set(speakers.map((p) => p.identity));
+        participantTiles.current.forEach((tile, identity) => {
+          tile.classList.toggle("ring-2", speakingIds.has(identity));
+          tile.classList.toggle("ring-emerald-400", speakingIds.has(identity));
+        });
+      });
       room.on(RoomEvent.DataReceived, (payload, participant) => {
         let text: string;
         try {
@@ -357,6 +401,7 @@ export default function VideoPage() {
         setCallState("idle");
         setRoomName(null);
         roomRef.current = null;
+        clearRemoteTiles();
       });
 
       await room.connect(url, liveKitToken);
@@ -446,6 +491,7 @@ export default function VideoPage() {
     setRoomName(null);
     setScreenSharing(false);
     setRecordingState("idle");
+    clearRemoteTiles();
     setWaitingGuests([]);
     setRoomConfidential(false);
     setChatMessages([]);
@@ -458,6 +504,17 @@ export default function VideoPage() {
       // room is already disconnected locally either way - not worth surfacing
     }
     await loadRooms();
+  }
+
+  async function handleCopyRoomInviteLink(targetRoomName: string) {
+    const link = `${window.location.origin}/join/${targetRoomName}`;
+    try {
+      await navigator.clipboard.writeText(link);
+      setCopiedRoom(targetRoomName);
+      setTimeout(() => setCopiedRoom((current) => (current === targetRoomName ? null : current)), 2000);
+    } catch {
+      // clipboard permission denied or unavailable - not worth surfacing an error for
+    }
   }
 
   function handleToggleCamera() {
@@ -555,7 +612,7 @@ export default function VideoPage() {
     <div className="max-w-3xl mx-auto space-y-6">
       <div>
         <h2 className="text-xl font-semibold text-slate-900">Video</h2>
-        <p className="text-sm text-slate-500">1:1 and small-group video calling.</p>
+        <p className="text-sm text-slate-500">1:1 and larger group video calling — up to 50 participants.</p>
       </div>
 
       {callState === "idle" && (
@@ -822,11 +879,17 @@ export default function VideoPage() {
 
               {/* auto-fit grid, not a fixed 2-column split - a fixed split works
                   for 1:1 but squeezes every remote tile into a single narrow
-                  column once a 3rd+ participant joins (up to MAX_PARTICIPANTS=8
-                  per app.integrations.video.livekit). `contents` on the remote
-                  container lets each remote <video> land directly in this grid
-                  as its own sibling cell, sized the same as the local tile. */}
-              <div className="grid gap-3 grid-cols-[repeat(auto-fit,minmax(160px,1fr))]">
+                  column once a 3rd+ participant joins (up to MAX_PARTICIPANTS=50
+                  per app.integrations.video.livekit). display:contents on the
+                  remote container lets each participant tile appended into it
+                  imperatively (see getOrCreateTile) land directly in this grid
+                  as its own sibling cell, sharing one unified auto-fit layout
+                  instead of a fixed side column. max-h + overflow caps how tall
+                  the grid gets once a call has many participants. */}
+              <div
+                className="grid gap-3 max-h-[60vh] overflow-y-auto pr-1"
+                style={{ gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))" }}
+              >
                 <div className="relative aspect-video bg-black rounded-lg overflow-hidden">
                   <video ref={localVideoRef} autoPlay muted playsInline className="w-full h-full object-cover" />
                   <span className="absolute bottom-2 left-2 flex items-center gap-1.5 text-xs text-white/80 bg-black/40 rounded px-2 py-0.5">
@@ -845,10 +908,7 @@ export default function VideoPage() {
                     You
                   </span>
                 </div>
-                <div
-                  ref={remoteContainerRef}
-                  className="contents [&>video]:aspect-video [&>video]:w-full [&>video]:rounded-lg [&>video]:bg-black [&>video]:object-cover [&>audio]:hidden"
-                />
+                <div ref={remoteContainerRef} className="contents" />
               </div>
             </div>
 
@@ -888,6 +948,19 @@ export default function VideoPage() {
               </div>
             )}
           </div>
+
+          {participants.length > 0 && (
+            <div className="flex flex-wrap gap-2 px-1">
+              {participants.map((p) => (
+                <span
+                  key={p.identity}
+                  className="text-xs text-slate-300 bg-slate-800 rounded-full px-2.5 py-1"
+                >
+                  {p.name}
+                </span>
+              ))}
+            </div>
+          )}
 
           <div className="flex items-center justify-center gap-3 pt-2">
             <button
@@ -1018,6 +1091,14 @@ export default function VideoPage() {
                     >
                       {r.status}
                     </span>
+                    {r.status === "active" && (
+                      <button
+                        onClick={() => handleCopyRoomInviteLink(r.room_name)}
+                        className="text-xs font-medium text-indigo-600 hover:text-indigo-800"
+                      >
+                        {copiedRoom === r.room_name ? "Copied!" : "Copy invite link"}
+                      </button>
+                    )}
                     {r.status === "active" && callState === "idle" && (
                       <button
                         onClick={() => openLobby(r.room_name)}

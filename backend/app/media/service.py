@@ -9,6 +9,13 @@ from app.audit.service import log_event
 from app.billing import service as billing_service
 from app.consent.models import ConsentType
 from app.consent.service import has_active_consent
+from app.events.service import (
+    publish_call_ended,
+    publish_call_started,
+    publish_video_room_created,
+    publish_video_room_ended,
+    publish_voicemail_created,
+)
 from app.integrations.llm.groq import LLMError
 from app.integrations.storage.s3 import StorageError, generate_presigned_url
 from app.integrations.telecom import twilio as telecom
@@ -35,6 +42,9 @@ from app.numbering.numbers.service import NumberConflictError, assert_number_acc
 from app.retention.service import PURGED_MARKER
 from app.risk import service as risk_service
 from app.usage import service as usage_service
+
+
+TERMINAL_CALL_STATUSES = {"completed", "failed", "busy", "no-answer", "canceled"}
 
 
 class CallAuthorizationError(Exception):
@@ -143,6 +153,11 @@ def record_call(
         target_id=call.id,
         metadata={"from": from_number, "to": to_number, "status": status},
     )
+    if account_id and provider_call_sid:
+        publish_call_started(
+            account_id, call_sid=provider_call_sid, from_number=from_number, to_number=to_number,
+            direction=direction.value,
+        )
     return call
 
 
@@ -161,7 +176,7 @@ def _dispatch_outbound_call(
     # Fraud/Risk gates (Architecture doc §5 "Fraud and Risk", §13 "blocked
     # destinations; fraud thresholds") - checked before ever reaching Twilio.
     try:
-        risk_service.assert_destination_allowed(db, to)
+        risk_service.assert_destination_allowed(db, to, account_id)
     except risk_service.DestinationBlockedError as e:
         notify_high_risk_destination_blocked(
             db, account_id=account_id, account_email=account_email,
@@ -242,6 +257,8 @@ def update_call_status(db: Session, provider_call_sid: str, status: str, duratio
         db, actor_id=call.account_id, action="call.status_updated",
         target_type="call_record", target_id=call.id, metadata={"status": status, "duration": duration},
     )
+    if call.account_id and status in TERMINAL_CALL_STATUSES:
+        publish_call_ended(call.account_id, call_sid=provider_call_sid, status=status, duration_seconds=duration)
 
     # Usage Metering (Roadmap §2 Voice scope; Architecture §7 "Usage Event"
     # data model) - a completed call with a real duration and a known
@@ -333,6 +350,7 @@ def record_voicemail(
         db, actor_id=account_id, action="voicemail.created",
         target_type="voicemail", target_id=voicemail.id, metadata={"from": from_number},
     )
+    publish_voicemail_created(account_id, voicemail_id=voicemail.id, phone_number_id=phone_number_id)
 
     owner = db.query(User).filter(User.account_id == account_id, User.role == UserRole.OWNER).first()
     if owner is not None:
@@ -388,6 +406,7 @@ async def create_video_session(
         target_type="video_session", target_id=session.id,
         metadata={"room_name": room_name, "confidential": confidential},
     )
+    publish_video_room_created(account_id, room_name=room_name)
     return session
 
 
@@ -412,6 +431,7 @@ async def end_video_session(db: Session, user: User, room_name: str) -> VideoSes
         db, actor_id=user.account_id, action="video.session.ended",
         target_type="video_session", target_id=session.id, metadata={"room_name": room_name},
     )
+    publish_video_room_ended(user.account_id, room_name=room_name)
     return session
 
 
@@ -509,8 +529,11 @@ def check_waiting_status(db: Session, room_name: str, waiting_id: str) -> dict:
 
     if waiting_guest.status == VideoWaitingGuestStatus.ADMITTED:
         token = video.build_participant_token(room_name, waiting_guest.guest_identity, waiting_guest.display_name)
-        return {"status": "admitted", "token": token}
-    return {"status": waiting_guest.status.value, "token": None}
+        # Disclosure only, not the guest's consent record - see the old
+        # generate_guest_video_join_token's docstring this replaced; guests
+        # have no account to attach a real consent record to.
+        return {"status": "admitted", "token": token, "recording": session.recording_egress_id is not None}
+    return {"status": waiting_guest.status.value, "token": None, "recording": False}
 
 
 def _assert_can_manage_video_session(db: Session, user: User, room_name: str) -> VideoSession:

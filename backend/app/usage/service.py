@@ -4,6 +4,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.billing.service import sync_usage_event_to_zoikonex
+from app.events.service import publish_usage_rated
 from app.usage.models import DEFAULT_RATE_COUNTRY, CallingRate, UsageEvent
 
 
@@ -67,7 +68,7 @@ def record_usage_event(
         account_id=account_id,
         event_type=event_type,
         quantity=quantity,
-        unit=unit,
+        unit=unit, 
         country_band=country_band,
         estimated_cost_cents=estimated_cost_cents,
         idempotency_key=idempotency_key,
@@ -81,6 +82,10 @@ def record_usage_event(
         db.rollback()
         return None
     db.refresh(event)
+    publish_usage_rated(
+        account_id, usage_event_id=event.id, event_type=event_type, quantity=quantity,
+        unit=unit, country_band=country_band,
+    )
     sync_usage_event_to_zoikonex(db, event)
     return event
 

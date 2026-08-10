@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
 from app.contacts import service
-from app.contacts.schemas import ContactCreate, ContactResponse, ContactUpdate
+from app.contacts.schemas import ContactCreate, ContactHistoryEntry, ContactResponse, ContactUpdate
 from app.core.database import get_db
 from app.core.deps import get_current_user, require_writer
 from app.numbering.identity.models import User
@@ -33,6 +33,18 @@ def create_contact(
     )
 
 
+@router.get("/{contact_id}", response_model=ContactResponse)
+def get_contact(
+    contact_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    try:
+        return service.get_contact(db, current_user.account_id, contact_id)
+    except service.ContactNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
+
+
 @router.put("/{contact_id}", response_model=ContactResponse)
 def update_contact(
     contact_id: str,
@@ -61,7 +73,7 @@ def delete_contact(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
 
 
-@router.get("/{contact_id}/history")
+@router.get("/{contact_id}/history", response_model=list[ContactHistoryEntry])
 def get_contact_history(
     contact_id: str,
     db: Session = Depends(get_db),
@@ -72,28 +84,4 @@ def get_contact_history(
     except service.ContactNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
 
-    history = service.get_contact_history(db, current_user, contact)
-    return {
-        "calls": [
-            {
-                "id": c.id,
-                "direction": c.direction.value,
-                "from": c.from_number,
-                "to": c.to_number,
-                "status": c.status,
-                "duration": c.duration,
-                "created_at": c.created_at,
-            }
-            for c in history["calls"]
-        ],
-        "voicemails": [
-            {
-                "id": v.id,
-                "from": v.from_number,
-                "duration": v.duration,
-                "recording_url": v.recording_url,
-                "created_at": v.created_at,
-            }
-            for v in history["voicemails"]
-        ],
-    }
+    return service.get_contact_history(db, current_user, contact)

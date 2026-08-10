@@ -23,9 +23,10 @@ const POLL_INTERVAL_MS = 2000;
 
 // Public, unauthenticated page - anyone with the link can land here, no
 // Zoiko account or login involved. Deliberately a much smaller feature set
-// than the dashboard's video page (no create/end room, no recording, no
-// screen share) - a guest can request to join, wait for the host to admit
-// them, then see/hear everyone and leave.
+// than the dashboard's video page (no create/end room, no screen share) -
+// a guest can request to join, wait for the host to admit them, then
+// see/hear everyone and leave. Recording is host-only and consent-gated on
+// the dashboard side; this page only ever displays whether one is active.
 export default function GuestJoinPage() {
   const params = useParams<{ roomName: string }>();
   const roomName = params.roomName;
@@ -40,6 +41,7 @@ export default function GuestJoinPage() {
   const [lobbyVideoStream, setLobbyVideoStream] = useState<MediaStream | null>(null);
   const [participantCount, setParticipantCount] = useState(0);
   const [waitingId, setWaitingId] = useState<string | null>(null);
+  const [recording, setRecording] = useState(false);
   const [chatOpen, setChatOpen] = useState(false);
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
   const [chatInput, setChatInput] = useState("");
@@ -186,6 +188,7 @@ export default function GuestJoinPage() {
         if (cancelled) return;
         if (result.status === "admitted" && result.token && result.url) {
           clearInterval(interval);
+          setRecording(result.recording);
           await connectToRoom(result.token, result.url);
         } else if (result.status === "denied") {
           clearInterval(interval);
@@ -358,6 +361,10 @@ export default function GuestJoinPage() {
               />
             </div>
 
+            <p className="text-xs text-slate-500 bg-slate-800/60 rounded-lg px-3 py-2">
+              This call may be recorded by the host. By joining, you acknowledge that.
+            </p>
+
             {callError && <p className="text-xs text-red-400 bg-red-950/50 rounded-lg px-3 py-2">{callError}</p>}
 
             <button
@@ -374,7 +381,15 @@ export default function GuestJoinPage() {
           <div className="bg-slate-900 rounded-xl border border-slate-800 p-4 space-y-3">
             <div className="flex items-center justify-between text-xs text-slate-400 px-1">
               <span>{displayName}</span>
-              <span>{participantCount} other participant{participantCount === 1 ? "" : "s"}</span>
+              <div className="flex items-center gap-3">
+                {recording && (
+                  <span className="flex items-center gap-1.5 text-red-400">
+                    <span className="w-1.5 h-1.5 rounded-full bg-red-500 animate-pulse" />
+                    Recording
+                  </span>
+                )}
+                <span>{participantCount} other participant{participantCount === 1 ? "" : "s"}</span>
+              </div>
             </div>
 
             <div className="flex gap-3 items-stretch">
