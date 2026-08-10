@@ -94,7 +94,18 @@ def sync_usage_event_to_zoikonex(db: Session, usage_event) -> None:
     UsageEvent (see app.usage.service.record_usage_event) and mirrors it
     into the sync ledger - a separate write, not part of the same
     transaction, since usage capture must never fail or roll back because
-    a downstream billing sync (mock or real) had a problem."""
+    a downstream billing sync (mock or real) had a problem.
+
+    Also asks ZoikoNex to rate the event and applies the result to
+    usage_event.estimated_cost_cents - the actual $ decision must come
+    from here, not be pre-computed by the caller (see
+    zoikonex_adapter.rate_usage_event's docstring)."""
+    rating = zoikonex_adapter.rate_usage_event(
+        db, event_type=usage_event.event_type, quantity=float(usage_event.quantity),
+        unit=usage_event.unit, country_band=usage_event.country_band,
+    )
+    usage_event.estimated_cost_cents = rating["estimated_cost_cents"]
+
     result = zoikonex_adapter.sync_usage_event(
         usage_event_id=usage_event.id, account_id=usage_event.account_id,
         event_type=usage_event.event_type, quantity=float(usage_event.quantity), unit=usage_event.unit,
@@ -107,6 +118,7 @@ def sync_usage_event_to_zoikonex(db: Session, usage_event) -> None:
             payload={
                 "usage_event_id": usage_event.id, "event_type": usage_event.event_type,
                 "quantity": float(usage_event.quantity), "unit": usage_event.unit,
+                "estimated_cost_cents": rating["estimated_cost_cents"],
             },
         )
     )
