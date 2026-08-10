@@ -598,3 +598,136 @@ def test_staff_cannot_mark_renewed_a_number_not_yet_due(client, db_session, monk
         f"/staff/numbers/{purchased['id']}/mark-renewed", headers={"Authorization": f"Bearer {staff_token}"}
     )
     assert response.status_code == 409
+
+
+# --- Real Stripe Checkout for number purchase (test mode) ---
+
+
+def _stripe_webhook_body_and_signature(secret: str, event_type: str, session_object: dict) -> tuple[bytes, str]:
+    import hashlib
+    import hmac
+    import json
+    import time
+
+    body = json.dumps(
+        {"id": "evt_test", "object": "event", "type": event_type, "data": {"object": session_object}}
+    ).encode()
+    timestamp = str(int(time.time()))
+    signed_payload = f"{timestamp}.{body.decode()}"
+    signature = hmac.new(secret.encode(), signed_payload.encode(), hashlib.sha256).hexdigest()
+    return body, f"t={timestamp},v1={signature}"
+
+
+def test_create_checkout_session_requires_auth(client):
+    response = client.post("/numbers/+15550013001/checkout-session")
+    assert response.status_code == 401
+
+
+def test_create_checkout_session_fails_when_number_not_reserved_by_account(client):
+    token = _signup_and_login(client, "checkoutnoreserve@example.com")
+    response = client.post(
+        "/numbers/+15550013002/checkout-session", headers={"Authorization": f"Bearer {token}"}
+    )
+    assert response.status_code == 409
+
+
+def test_create_checkout_session_returns_stripe_hosted_url(client, monkeypatch):
+    monkeypatch.setattr("app.core.config.settings.stripe_payments_secret_key", "rk_test_fake")
+    monkeypatch.setattr(
+        "app.numbering.numbers.service.stripe_checkout.create_checkout_session",
+        lambda **kwargs: {"id": "cs_test_123", "url": "https://checkout.stripe.com/c/pay/cs_test_123"},
+    )
+
+    token = _signup_and_login(client, "checkoutsuccess@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    _reserve(client, headers, "+15550013003")
+
+    response = client.post("/numbers/+15550013003/checkout-session", headers=headers)
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["id"] == "cs_test_123"
+    assert body["url"] == "https://checkout.stripe.com/c/pay/cs_test_123"
+
+
+def test_create_checkout_session_returns_502_when_stripe_call_fails(client, monkeypatch):
+    from app.integrations.billing.stripe_checkout import PaymentError
+
+    monkeypatch.setattr("app.core.config.settings.stripe_payments_secret_key", "rk_test_fake")
+
+    def _raise(**kwargs):
+        raise PaymentError("Stripe create checkout session failed: connection timed out")
+
+    monkeypatch.setattr("app.numbering.numbers.service.stripe_checkout.create_checkout_session", _raise)
+
+    token = _signup_and_login(client, "checkoutstripedown@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    _reserve(client, headers, "+15550013004")
+
+    response = client.post("/numbers/+15550013004/checkout-session", headers=headers)
+    assert response.status_code == 502
+
+
+def test_stripe_payment_webhook_rejects_invalid_signature(client, monkeypatch):
+    monkeypatch.setattr("app.core.config.settings.stripe_payments_webhook_secret", "whsec_test")
+    body, _ = _stripe_webhook_body_and_signature(
+        "whsec_test", "checkout.session.completed", {"id": "cs_test_bad_sig", "metadata": {}}
+    )
+    response = client.post(
+        "/numbers/payments/webhook", content=body, headers={"Stripe-Signature": "t=123,v1=not-real"}
+    )
+    assert response.status_code == 403
+
+
+def test_stripe_payment_webhook_completes_the_purchase(client, db_session, monkeypatch):
+    """End-to-end: reserve -> real (mocked-at-the-SDK-boundary) Stripe
+    webhook fires checkout.session.completed -> the number reaches ACTIVE
+    via the existing purchase_number flow, with no direct call to
+    /numbers/purchase anywhere in this test."""
+    _stub_buy_number(monkeypatch)
+    monkeypatch.setattr("app.core.config.settings.stripe_payments_webhook_secret", "whsec_test")
+
+    token = _signup_and_login(client, "checkoutwebhook@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    account_id = client.get("/auth/me", headers=headers).json()["account_id"]
+    _reserve(client, headers, "+15550013005")
+
+    body, signature = _stripe_webhook_body_and_signature(
+        "whsec_test", "checkout.session.completed",
+        {"id": "cs_test_complete", "metadata": {"e164": "+15550013005", "account_id": account_id}},
+    )
+    response = client.post("/numbers/payments/webhook", content=body, headers={"Stripe-Signature": signature})
+    assert response.status_code == 204
+
+    numbers = client.get("/numbers", headers=headers).json()
+    purchased = next(n for n in numbers if n["e164"] == "+15550013005")
+    assert purchased["status"] == "active"
+
+
+def test_stripe_payment_webhook_is_idempotent_against_retried_delivery(client, db_session, monkeypatch):
+    _stub_buy_number(monkeypatch)
+    monkeypatch.setattr("app.core.config.settings.stripe_payments_webhook_secret", "whsec_test")
+
+    token = _signup_and_login(client, "checkoutwebhookretry@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    account_id = client.get("/auth/me", headers=headers).json()["account_id"]
+    _reserve(client, headers, "+15550013006")
+
+    body, signature = _stripe_webhook_body_and_signature(
+        "whsec_test", "checkout.session.completed",
+        {"id": "cs_test_retry", "metadata": {"e164": "+15550013006", "account_id": account_id}},
+    )
+    first = client.post("/numbers/payments/webhook", content=body, headers={"Stripe-Signature": signature})
+    assert first.status_code == 204
+    # Stripe redelivers the same event (at-least-once delivery) - must not
+    # error even though the number is no longer purchasable.
+    second = client.post("/numbers/payments/webhook", content=body, headers={"Stripe-Signature": signature})
+    assert second.status_code == 204
+
+
+def test_stripe_payment_webhook_ignores_unrelated_event_types(client, monkeypatch):
+    monkeypatch.setattr("app.core.config.settings.stripe_payments_webhook_secret", "whsec_test")
+    body, signature = _stripe_webhook_body_and_signature(
+        "whsec_test", "payment_intent.created", {"id": "pi_test_unrelated"}
+    )
+    response = client.post("/numbers/payments/webhook", content=body, headers={"Stripe-Signature": signature})
+    assert response.status_code == 204

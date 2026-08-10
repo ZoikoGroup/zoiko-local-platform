@@ -20,6 +20,7 @@ const PROVIDER_LABELS: Record<string, string> = {
   groq_llm: "Groq (LLM)",
   groq_transcription: "Groq (transcription)",
   stripe_identity: "Stripe Identity (KYC/KYB)",
+  stripe_payments: "Stripe Payments (number purchase)",
   resend: "Resend (email)",
   storage_s3: "S3-compatible storage (recordings)",
   s3: "S3-compatible storage (recordings)",

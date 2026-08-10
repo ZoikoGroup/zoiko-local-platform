@@ -71,6 +71,20 @@ class Settings(BaseSettings):
     stripe_secret_key: str = ""
     stripe_identity_webhook_secret: str = ""
 
+    # Stripe Payments (integrations/billing/stripe_checkout.py) - separate
+    # key/account scope from stripe_secret_key above (Stripe Identity).
+    # Real Stripe Checkout for number purchases, test mode only for now -
+    # see docs/pci-scope-assessment.md for why hosted Checkout (never a
+    # custom card form) is the locked architectural decision here.
+    stripe_payments_secret_key: str = ""
+    stripe_payments_webhook_secret: str = ""
+
+    # Where Stripe Checkout redirects the customer back to after payment
+    # (success or cancel) - the deployed Next.js frontend origin, or
+    # localhost:3000 in dev. Distinct from public_base_url above, which is
+    # this API's own address for provider webhooks to call back into.
+    frontend_base_url: str = "http://localhost:3000"
+
     # ZoikoNex (integrations/billing) - shared-secret HMAC for the inbound
     # payment-event webhook. Empty until a real ZoikoNex connection issues
     # one; see app.integrations.billing.zoikonex's docstring.

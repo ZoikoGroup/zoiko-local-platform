@@ -13,6 +13,25 @@ def new_uuid() -> str:
     return str(uuid.uuid4())
 
 
+class SupportedCountry(Base):
+    """Zoiko Local's curated launch-country list (Architecture doc's
+    "6-8 priority countries", not "whatever Twilio happens to expose").
+    Stored as data, not a hardcoded Python list - the Commercial Billing
+    Operating Standard doc (§19) names a hardcoded country-availability
+    list as a P0 launch blocker, the same rule it applies to plan names
+    and prices (see app.usage.models.CallingRate for the pricing side of
+    the same discipline). Staff-managed via PUT /staff/countries
+    (SUPER_ADMIN only, same bar as calling-rate changes)."""
+
+    __tablename__ = "supported_countries"
+
+    id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=new_uuid)
+    code: Mapped[str] = mapped_column(String(2), unique=True, nullable=False, index=True)
+    name: Mapped[str] = mapped_column(String(100), nullable=False)
+    sort_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
 class PhoneNumberStatus(str, enum.Enum):
     RESERVED = "reserved"
     COMPLIANCE_PENDING = "compliance_pending"

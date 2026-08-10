@@ -1,14 +1,16 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.orm import Session
 
 from app.billing.service import BillingSuspendedError, NumberQuotaExceededError
 from app.core.database import get_db
 from app.core.deps import get_current_user, require_admin, require_writer
+from app.integrations.billing import stripe_checkout
 from app.integrations.telecom.twilio import TelecomError
 from app.numbering.identity.models import User
 from app.numbering.numbers import service
 from app.numbering.numbers.schemas import (
     AssignNumberRequest,
+    CheckoutSessionResponse,
     IVRMenuResponse,
     NumberSearchResult,
     PhoneNumberResponse,
@@ -33,9 +35,10 @@ router = APIRouter(prefix="/numbers", tags=["numbers"])
 
 @router.get("/countries", response_model=list[SupportedCountryResponse])
 def list_supported_countries(
+    db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    return service.list_supported_countries()
+    return service.list_supported_countries(db)
 
 
 @router.get("/search", response_model=list[NumberSearchResult])
@@ -43,10 +46,11 @@ def search_numbers(
     country: str,
     number_type: str = "local",
     area_code: str | None = None,
+    db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     try:
-        return service.search_numbers(country, number_type=number_type, area_code=area_code)
+        return service.search_numbers(db, country, number_type=number_type, area_code=area_code)
     except UnsupportedCountryError as e:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e)) from e
     except TelecomError as e:
@@ -83,6 +87,55 @@ def purchase_number(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e)) from e
     except TelecomError as e:
         raise HTTPException(status_code=502, detail=str(e)) from e
+
+
+@router.post("/{e164}/checkout-session", response_model=CheckoutSessionResponse)
+def create_checkout_session(
+    e164: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin),
+):
+    """Real Stripe Checkout (test mode) - the customer-facing way to buy a
+    number now goes through here instead of calling POST /purchase
+    directly (that endpoint still exists and still runs unchanged - it's
+    what the payment webhook below calls once Stripe confirms payment, and
+    what a compliance-approval retry still uses for an already-paid
+    number stuck in COMPLIANCE_PENDING)."""
+    try:
+        return service.create_number_purchase_checkout_session(db, current_user.account_id, e164)
+    except NumberConflictError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e
+    except stripe_checkout.PaymentError as e:
+        raise HTTPException(status_code=502, detail=str(e)) from e
+
+
+@router.post("/payments/webhook", status_code=status.HTTP_204_NO_CONTENT)
+async def stripe_payment_webhook(request: Request, db: Session = Depends(get_db)):
+    """Real inbound Stripe -> Zoiko Local webhook. Unauthenticated by user
+    session (Stripe isn't one of our users) - trust comes entirely from
+    the Stripe-Signature header, same posture as the Stripe Identity
+    webhook at compliance/routes.py and the ZoikoNex webhook at
+    billing/routes.py."""
+    body = await request.body()
+    signature = request.headers.get("Stripe-Signature")
+
+    try:
+        event = stripe_checkout.construct_webhook_event(body, signature)
+    except stripe_checkout.PaymentError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e)) from e
+
+    if event["type"] == "checkout.session.completed":
+        session = event["data"]["object"]
+        # StripeObject supports dict-style [] / in but not .get() - see
+        # this route's test coverage for the AttributeError that using
+        # .get() here would raise.
+        metadata = session["metadata"] if "metadata" in session else {}
+        e164 = metadata["e164"] if "e164" in metadata else None
+        account_id = metadata["account_id"] if "account_id" in metadata else None
+        if e164 and account_id:
+            service.complete_number_purchase_from_checkout(db, e164=e164, account_id=account_id)
+
+    return None
 
 
 @router.get("", response_model=list[PhoneNumberResponse])

@@ -64,6 +64,11 @@ class PurchaseNumberRequest(BaseModel):
     e164: str
 
 
+class CheckoutSessionResponse(BaseModel):
+    id: str
+    url: str
+
+
 class AssignNumberRequest(BaseModel):
     user_id: str | None = None  # None unassigns the number
 
@@ -91,5 +96,13 @@ class PhoneNumberResponse(BaseModel):
 
 
 class SupportedCountryResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     code: str
     name: str
+
+
+class UpsertSupportedCountryRequest(BaseModel):
+    code: str
+    name: str
+    sort_order: int = 0
