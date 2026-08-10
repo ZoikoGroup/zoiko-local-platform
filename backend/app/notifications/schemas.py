@@ -44,6 +44,7 @@ class NotificationPreferenceResponse(BaseModel):
     quiet_hours_start: time | None
     quiet_hours_end: time | None
     quiet_hours_timezone: str
+    disabled_domains: list[str]
 
 
 class NotificationPreferenceUpdate(BaseModel):
@@ -56,3 +57,17 @@ class NotificationPreferenceUpdate(BaseModel):
     quiet_hours_start: time | None = None
     quiet_hours_end: time | None = None
     quiet_hours_timezone: str | None = None
+    # Replaces the whole list when provided (not a per-domain add/remove) -
+    # simpler contract, and the Preference Center UI always has the full
+    # current list in hand anyway since it just rendered it.
+    disabled_domains: list[str] | None = None
+
+
+class NotificationSuppressionResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    recipient_email: str
+    domain: str | None
+    reason: str
+    created_at: datetime

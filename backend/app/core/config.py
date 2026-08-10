@@ -82,6 +82,11 @@ class Settings(BaseSettings):
     # immediately with no domain verification, for testing before that.
     resend_api_key: str = ""
     email_from_address: str = "onboarding@resend.dev"
+    # Signing secret for Resend's webhook events (bounce/complaint/delivered/
+    # clicked) - format "whsec_..." like Svix's other webhook products.
+    # Blank until a webhook endpoint is registered in the Resend dashboard;
+    # handle_resend_webhook rejects every event as unverified until it's set.
+    resend_webhook_secret: str = ""
 
     # Web Push (integrations/notifications/webpush.py) - browser push
     # notifications, since no native iOS/Android app exists. Self-generated
@@ -125,6 +130,31 @@ class Settings(BaseSettings):
     vonage_application_id: str = ""
     vonage_private_key: str = ""
     vonage_sms_from: str = ""
+
+    # Direct carrier (integrations/telecom/telnyx.py) - Architecture doc
+    # Phase 4 "direct carrier integrations" / roadmap doc's "margin can be
+    # reclaimed later through direct carrier relationships." Deliberately
+    # NOT wired into twilio.py's telecom_failover_enabled chain - that slot
+    # is for Vonage as a same-shape emergency fallback when Twilio is down,
+    # while this is a standalone alternative carrier for a future
+    # cost/ownership decision (e.g. routing new number purchases here
+    # instead of through Twilio's markup). No real Telnyx account exists
+    # yet - blank until one does, same as every other not-yet-live
+    # secondary integration in this file.
+    telnyx_enabled: bool = False
+    telnyx_api_key: str = ""
+    # A Telnyx "Call Control Application" id - numbers must be assigned to
+    # one to receive calls/SMS; its own webhook_event_url (configured once,
+    # via the Telnyx portal or the Call Control Applications API) is where
+    # inbound call events land, analogous to Twilio's per-number voice_url
+    # but set on the connection, not the number.
+    telnyx_connection_id: str = ""
+    telnyx_messaging_profile_id: str = ""
+    # Base64-encoded Ed25519 public key from the Telnyx portal's webhook
+    # settings - verifies inbound webhook signatures (see
+    # telnyx.validate_webhook_signature). Asymmetric, unlike Twilio's
+    # shared-secret HMAC scheme.
+    telnyx_public_key: str = ""
 
     # Secondary video provider (integrations/video/_secondary_stub.py) -
     # Daily.co REST API.

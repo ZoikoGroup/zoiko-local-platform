@@ -49,6 +49,54 @@ services:
   # It writes every zoiko.numbers/zoiko.calls/zoiko.notifications/zoiko.video
   # message into the event_log table, deduped on the envelope's event_id.
 
+  # Self-hosted media plane (backend/app/integrations/video/livekit.py) -
+  # Architecture doc Phase 4 "owned media components". LiveKit Cloud (the
+  # current LIVEKIT_URL in .env) and this container run the exact same
+  # open-source LiveKit server software and speak the identical client API,
+  # so no application code changes are needed to use this - only pointing
+  # LIVEKIT_URL/LIVEKIT_API_KEY/LIVEKIT_API_SECRET at it instead of Cloud
+  # (see the LIVEKIT_SELF_HOSTED_* vars added to .env). NOT switched over
+  # by default - LiveKit Cloud stays the active configuration (already
+  # tested end-to-end) until that's a deliberate decision, same posture as
+  # every other not-yet-activated integration in this codebase.
+  #
+  # Single-node, no Redis - LiveKit only needs Redis for multi-node
+  # clustering (matching this repo's "single-node Kafka, no Zookeeper"
+  # minimalism). RTC media uses a real UDP port range (not just the
+  # HTTP/WS signaling port) for actual WebRTC connectivity, plus TCP 7881
+  # as a fallback for networks that block UDP - both required for the
+  # doc's "TURN/STUN coverage... failed NAT traversal is a launch blocker"
+  # requirement to mean anything self-hosted.
+  # Not using `--dev` mode: it defaults to the well-known "devkey"/"secret"
+  # keypair and its documented behavior around a caller-supplied LIVEKIT_KEYS
+  # is inconsistent - LIVEKIT_CONFIG (the env binding of --config-body, full
+  # server config as YAML) is LiveKit's own recommended way to pin real
+  # custom credentials outside of a mounted config file.
+  livekit:
+    image: livekit/livekit-server:latest
+    restart: unless-stopped
+    # Real deployment needs a much wider RTC port range for concurrent-call
+    # headroom - narrowed to 100 ports here so `docker compose up` doesn't
+    # try to publish tens of thousands of ports on a dev machine. Widen
+    # port_range_start/end (and the matching port mapping below) before
+    # this goes anywhere near production traffic.
+    environment:
+      # Substituted from the repo-root .env (gitignored) at `docker compose`
+      # parse time - never hardcode real keys directly in this tracked file.
+      LIVEKIT_CONFIG: |
+        port: 7880
+        rtc:
+          tcp_port: 7881
+          port_range_start: 50000
+          port_range_end: 50100
+          use_external_ip: true
+        keys:
+          ${LIVEKIT_SELF_HOSTED_API_KEY}: ${LIVEKIT_SELF_HOSTED_API_SECRET}
+    ports:
+      - "7880:7880"                     # HTTP/WebSocket - client signaling + server API
+      - "7881:7881"                     # TCP fallback for restrictive/UDP-blocking networks
+      - "50000-50100:50000-50100/udp"   # RTC media (WebRTC)
+
 volumes:
   zoiko_pgdata:
   zoiko_kafka_data:

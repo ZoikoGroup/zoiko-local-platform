@@ -56,7 +56,15 @@ class RiskSignal(Base):
     account_id: Mapped[str] = mapped_column(
         UUID(as_uuid=False), ForeignKey("accounts.id", ondelete="CASCADE"), nullable=False, index=True
     )
-    signal_type: Mapped[RiskSignalType] = mapped_column(Enum(RiskSignalType), nullable=False)
+    # values_callable: the risksignaltype Postgres enum type was created
+    # with lowercase .value-style labels ('velocity_exceeded', ...), unlike
+    # this codebase's more common uppercase-.name convention for other
+    # enums - without this, SQLAlchemy's default (the member's .name) would
+    # send 'VELOCITY_EXCEEDED' and every insert/query would fail with
+    # "invalid input value for enum risksignaltype".
+    signal_type: Mapped[RiskSignalType] = mapped_column(
+        Enum(RiskSignalType, values_callable=lambda enum_cls: [e.value for e in enum_cls]), nullable=False
+    )
     detail: Mapped[str] = mapped_column(String(255), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
 
@@ -73,7 +81,13 @@ class FraudRule(Base):
     __tablename__ = "fraud_rules"
 
     id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=new_uuid)
-    signal_type: Mapped[RiskSignalType] = mapped_column(Enum(RiskSignalType), unique=True, nullable=False)
+    # Same values_callable rationale as RiskSignal.signal_type above - must
+    # match the risksignaltype Postgres enum's lowercase labels.
+    signal_type: Mapped[RiskSignalType] = mapped_column(
+        Enum(RiskSignalType, values_callable=lambda enum_cls: [e.value for e in enum_cls]),
+        unique=True,
+        nullable=False,
+    )
     weight: Mapped[int] = mapped_column(nullable=False)
     is_active: Mapped[bool] = mapped_column(nullable=False, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

@@ -8,6 +8,7 @@ const NAV_ITEMS = [
   { href: "/staff/cases", label: "Compliance Cases" },
   { href: "/staff/porting", label: "Number Porting" },
   { href: "/staff/provisioning", label: "Provisioning Recovery" },
+  { href: "/staff/fraud", label: "Fraud Review" },
   { href: "/staff/accounts", label: "Accounts" },
   { href: "/staff/audit", label: "Audit Log" },
   { href: "/staff/providers", label: "Provider Status" },

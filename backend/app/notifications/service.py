@@ -1,6 +1,10 @@
+import hashlib
+import hmac
+import base64
 from datetime import datetime, time, timezone
 from zoneinfo import ZoneInfo
 
+from jose import JWTError, jwt
 from sqlalchemy.orm import Session
 
 from app.audit.service import log_event
@@ -16,8 +20,10 @@ from app.notifications.models import (
     NotificationDeliveryStatus,
     NotificationPreference,
     NotificationPriority,
+    NotificationSuppression,
     NotificationTemplate,
     PushSubscription,
+    SuppressionReason,
 )
 
 
@@ -73,6 +79,7 @@ def update_preference(
     quiet_hours_start: time | None = ...,
     quiet_hours_end: time | None = ...,
     quiet_hours_timezone: str | None = None,
+    disabled_domains: list[str] | None = None,
 ) -> NotificationPreference:
     """Uses `...` (not None) as the "leave unchanged" sentinel for the two
     quiet-hours time fields specifically, since None is itself a meaningful
@@ -93,6 +100,8 @@ def update_preference(
         except Exception as e:
             raise InvalidTimezoneError(f"{quiet_hours_timezone!r} is not a valid timezone") from e
         pref.quiet_hours_timezone = quiet_hours_timezone
+    if disabled_domains is not None:
+        pref.disabled_domains = disabled_domains
     db.commit()
     db.refresh(pref)
     return pref
@@ -115,6 +124,104 @@ def is_within_quiet_hours(pref: NotificationPreference, *, now: datetime | None 
     return now_local >= start or now_local <= end  # overnight range, e.g. 22:00-06:00
 
 
+def check_suppression(
+    db: Session, recipient_email: str, domain: str | None, *, is_exempt: bool
+) -> NotificationSuppression | None:
+    """Email Communications System doc §4.2 "central suppression order" /
+    §11.1 "an invalid address is never overridden". A global row
+    (domain=None - hard bounce or spam complaint) means the address itself
+    is bad and blocks EVERY send regardless of priority, since forcing a
+    send to an address that already bounced/complained just repeats the
+    same reputation damage. A domain-scoped row (one-click unsubscribe from
+    one category) only blocks non-exempt sends - same override SECURITY/
+    CRITICAL templates already get over a plain preference opt-out."""
+    global_row = (
+        db.query(NotificationSuppression)
+        .filter(NotificationSuppression.recipient_email == recipient_email, NotificationSuppression.domain.is_(None))
+        .first()
+    )
+    if global_row is not None:
+        return global_row
+    if is_exempt or domain is None:
+        return None
+    return (
+        db.query(NotificationSuppression)
+        .filter(NotificationSuppression.recipient_email == recipient_email, NotificationSuppression.domain == domain)
+        .first()
+    )
+
+
+def add_suppression(
+    db: Session, *, recipient_email: str, domain: str | None, reason: SuppressionReason
+) -> NotificationSuppression:
+    existing = (
+        db.query(NotificationSuppression)
+        .filter(NotificationSuppression.recipient_email == recipient_email, NotificationSuppression.domain == domain)
+        .first()
+    )
+    if existing is not None:
+        return existing
+
+    suppression = NotificationSuppression(recipient_email=recipient_email, domain=domain, reason=reason)
+    db.add(suppression)
+    db.commit()
+    db.refresh(suppression)
+    log_event(
+        db, actor="system:notifications", action="notification.suppression_added",
+        target=f"suppression:{suppression.id}",
+        after={"recipient_email": recipient_email, "domain": domain, "reason": reason.value},
+    )
+    return suppression
+
+
+def list_suppressions(db: Session, recipient_email: str | None = None) -> list[NotificationSuppression]:
+    """Staff-facing view of the central suppression list - the doc's
+    "Suppression... [is] audited like deliveries" requirement."""
+    query = db.query(NotificationSuppression)
+    if recipient_email is not None:
+        query = query.filter(NotificationSuppression.recipient_email == recipient_email)
+    return query.order_by(NotificationSuppression.created_at.desc()).all()
+
+
+_UNSUBSCRIBE_TOKEN_SCOPE = "notification_unsubscribe"
+
+
+def _create_unsubscribe_token(recipient_email: str, domain: str | None) -> str:
+    """Stateless (no DB row, no expiry) - an old email should still let its
+    recipient unsubscribe years later, matching real-world one-click
+    unsubscribe behavior. Signed with the same secret as login tokens, but
+    scope='notification_unsubscribe' keeps it from ever being accepted as
+    an auth token or vice versa (see core.security.create_access_token's
+    'scope' parameter for the same pattern)."""
+    payload = {"sub": recipient_email, "domain": domain, "scope": _UNSUBSCRIBE_TOKEN_SCOPE}
+    return jwt.encode(payload, settings.jwt_secret_key, algorithm="HS256")
+
+
+def decode_unsubscribe_token(token: str) -> tuple[str, str | None] | None:
+    try:
+        payload = jwt.decode(token, settings.jwt_secret_key, algorithms=["HS256"])
+    except JWTError:
+        return None
+    if payload.get("scope") != _UNSUBSCRIBE_TOKEN_SCOPE:
+        return None
+    return payload["sub"], payload.get("domain")
+
+
+def unsubscribe_via_token(db: Session, token: str) -> tuple[bool, str]:
+    """Powers the one-click unsubscribe link appended to non-essential
+    emails (see send_notification's unsubscribe_url). Domain-scoped by
+    design (doc §11.1: "changing one category never silently changes
+    another") - this only ever adds a suppression for the one domain
+    encoded in the token, never account-wide."""
+    decoded = decode_unsubscribe_token(token)
+    if decoded is None:
+        return False, "This unsubscribe link is invalid."
+    recipient_email, domain = decoded
+    add_suppression(db, recipient_email=recipient_email, domain=domain, reason=SuppressionReason.MANUAL_UNSUBSCRIBE)
+    label = f"{domain} emails" if domain else "these emails"
+    return True, f"You've been unsubscribed from {label} at {recipient_email}."
+
+
 def send_notification(
     db: Session,
     *,
@@ -133,6 +240,7 @@ def send_notification(
     if template is None:
         raise NotificationTemplateMissingError(f"No notification template registered for event {event_name!r}")
 
+    is_exempt = _is_exempt_from_suppression(template)
     subject = template.subject_template.format(**context)
     body = template.body_template.format(**context)
 
@@ -144,18 +252,33 @@ def send_notification(
         status=NotificationDeliveryStatus.SENT,
     )
 
+    suppression = check_suppression(db, recipient_email, template.domain, is_exempt=is_exempt)
+
     # A bare account_id=None call (no account context yet, e.g. pre-signup
     # flows) has no preference to check, so it always sends.
-    is_opted_out = (
-        account_id is not None
-        and not _is_exempt_from_suppression(template)
-        and not get_or_create_preference(db, account_id).transactional_enabled
+    pref = get_or_create_preference(db, account_id) if (account_id is not None and not is_exempt) else None
+    is_opted_out = pref is not None and (
+        not pref.transactional_enabled
+        or (template.domain is not None and template.domain in pref.disabled_domains)
     )
-    if is_opted_out:
+
+    if suppression is not None:
+        delivery.status = NotificationDeliveryStatus.SUPPRESSED
+        delivery.error = f"Suppressed: {suppression.reason.value} on file for this address"
+    elif is_opted_out:
         delivery.status = NotificationDeliveryStatus.SUPPRESSED
     else:
+        outgoing_body = body
+        if not is_exempt:
+            # RFC 8058 one-click unsubscribe (doc §4.1/§11) - appended in
+            # Python rather than requiring every one of the 128 template
+            # bodies to embed a {unsubscribe_url} placeholder themselves.
+            token = _create_unsubscribe_token(recipient_email, template.domain)
+            unsubscribe_url = f"{settings.public_base_url}/notifications/unsubscribe?token={token}"
+            label = template.domain or "these"
+            outgoing_body = f"{body}\n\n---\nDon't want {label} emails like this? Unsubscribe: {unsubscribe_url}"
         try:
-            send_email(to=recipient_email, subject=subject, body=body)
+            delivery.provider_message_id = send_email(to=recipient_email, subject=subject, body=outgoing_body)
         except EmailError as e:
             delivery.status = NotificationDeliveryStatus.FAILED
             delivery.error = str(e)
@@ -232,6 +355,82 @@ def _fan_out_push(db: Session, *, account_id: str, event_name: str, title: str, 
             after={"event_name": event_name, "channel": "push", "status": delivery.status},
         )
         publish_notification_sent(account_id, event_name=event_name, channel="push", status=delivery.status.value)
+
+
+class WebhookSignatureError(Exception):
+    """Raised when a Resend webhook's signature doesn't verify - the
+    payload is discarded without being processed."""
+
+
+def _verify_resend_signature(payload: bytes, svix_id: str, svix_timestamp: str, svix_signature: str) -> bool:
+    """Resend signs webhooks the same way as Svix's other webhook products:
+    HMAC-SHA256 over "{id}.{timestamp}.{body}" using the base64-decoded
+    portion of the whsec_... secret, compared against each space-separated
+    "v1,<sig>" entry in the svix-signature header. Always False while
+    RESEND_WEBHOOK_SECRET is blank (no webhook endpoint registered yet)."""
+    if not settings.resend_webhook_secret:
+        return False
+    secret = settings.resend_webhook_secret
+    secret_bytes = base64.b64decode(secret.split("_", 1)[1] if secret.startswith("whsec_") else secret)
+    signed_content = f"{svix_id}.{svix_timestamp}.{payload.decode('utf-8')}".encode("utf-8")
+    expected = base64.b64encode(hmac.new(secret_bytes, signed_content, hashlib.sha256).digest()).decode("utf-8")
+    for entry in svix_signature.split(" "):
+        if "," not in entry:
+            continue
+        _version, sig = entry.split(",", 1)
+        if hmac.compare_digest(expected, sig):
+            return True
+    return False
+
+
+_RESEND_EVENT_TO_DELIVERY_STATUS = {
+    "email.delivered": NotificationDeliveryStatus.DELIVERED,
+    "email.bounced": NotificationDeliveryStatus.BOUNCED,
+    "email.complained": NotificationDeliveryStatus.COMPLAINED,
+    "email.clicked": NotificationDeliveryStatus.CLICKED,
+}
+
+
+def handle_resend_webhook(
+    db: Session, *, payload: bytes, svix_id: str, svix_timestamp: str, svix_signature: str
+) -> None:
+    """Updates the delivery ledger from Resend's real bounce/complaint/
+    delivered/clicked events, and feeds hard bounces + spam complaints into
+    the central suppression list (doc §4.2) - the only way suppression data
+    enters the system organically, short of a manual unsubscribe click.
+    NOT tested against a live account - no webhook endpoint has been
+    registered in the Resend dashboard yet (RESEND_WEBHOOK_SECRET is
+    blank), same caveat as this codebase's other real-but-unverified
+    integrations. Treats every email.bounced event as suppression-worthy
+    rather than trying to distinguish hard/soft bounce sub-types from an
+    unverified payload shape - matches the doc's stated bias ("an invalid
+    address is never overridden") toward caution over redelivery."""
+    if not _verify_resend_signature(payload, svix_id, svix_timestamp, svix_signature):
+        raise WebhookSignatureError("Resend webhook signature did not verify")
+
+    import json
+
+    event = json.loads(payload)
+    event_type = event.get("type")
+    data = event.get("data", {})
+    message_id = data.get("email_id")
+    recipient_email = (data.get("to") or [None])[0]
+
+    new_status = _RESEND_EVENT_TO_DELIVERY_STATUS.get(event_type)
+    if new_status is not None and message_id:
+        delivery = (
+            db.query(NotificationDelivery)
+            .filter(NotificationDelivery.provider_message_id == message_id)
+            .first()
+        )
+        if delivery is not None:
+            delivery.status = new_status
+            db.commit()
+
+    if recipient_email and event_type == "email.bounced":
+        add_suppression(db, recipient_email=recipient_email, domain=None, reason=SuppressionReason.HARD_BOUNCE)
+    elif recipient_email and event_type == "email.complained":
+        add_suppression(db, recipient_email=recipient_email, domain=None, reason=SuppressionReason.COMPLAINT)
 
 
 def send_sms_notification(

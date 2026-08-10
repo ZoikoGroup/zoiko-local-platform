@@ -46,12 +46,17 @@ def health_check() -> dict:
     return {"configured": True, "ok": True, "detail": None}
 
 
-def send_email(to: str, subject: str, body: str) -> None:
+def send_email(to: str, subject: str, body: str) -> str | None:
+    """Returns Resend's own email id (None in stub/no-API-key mode) - the
+    Email Communications System doc's delivery ledger needs it to match a
+    later bounce/complaint/delivered webhook event back to the
+    NotificationDelivery row it's about (see
+    notifications.service.handle_resend_webhook)."""
     if not settings.resend_api_key:
         logger.info("EMAIL (no Resend API key configured) to=%s subject=%r body=%r", to, subject, body)
-        return
+        return None
 
-    def _primary() -> None:
+    def _primary() -> str | None:
         try:
             with trace_provider_call("resend", "send_email"):
                 response = httpx.post(
@@ -66,8 +71,9 @@ def send_email(to: str, subject: str, body: str) -> None:
                     timeout=15.0,
                 )
                 response.raise_for_status()
+                return response.json().get("id")
         except httpx.HTTPError as e:
             raise EmailError(f"Resend send failed: {e}") from e
 
     secondary_fn = (lambda: secondary.send_email(to, subject, body)) if settings.email_failover_enabled else None
-    with_failover(_breaker, _primary, secondary_fn, EmailError)
+    return with_failover(_breaker, _primary, secondary_fn, EmailError)
