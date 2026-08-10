@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
-from app.core.deps import get_current_user
+from app.core.deps import get_current_user, require_writer
 from app.integrations.telecom.twilio import TelecomError
 from app.media import service as media_service
 from app.messaging import service
@@ -39,14 +39,14 @@ def _send(payload: SendMessageRequest, db: Session, current_user: User, channel:
 
 @router.post("/whatsapp/send", response_model=MessageResponse, status_code=status.HTTP_201_CREATED)
 def send_whatsapp(
-    payload: SendMessageRequest, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)
+    payload: SendMessageRequest, db: Session = Depends(get_db), current_user: User = Depends(require_writer)
 ):
     return _send(payload, db, current_user, MessagingChannel.WHATSAPP)
 
 
 @router.post("/sms/send", response_model=MessageResponse, status_code=status.HTTP_201_CREATED)
 def send_sms(
-    payload: SendMessageRequest, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)
+    payload: SendMessageRequest, db: Session = Depends(get_db), current_user: User = Depends(require_writer)
 ):
     return _send(payload, db, current_user, MessagingChannel.SMS)
 

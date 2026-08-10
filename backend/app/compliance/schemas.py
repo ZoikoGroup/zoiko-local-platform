@@ -19,9 +19,8 @@ class ComplianceCaseCreate(BaseModel):
     number_id: str | None = None
 
 
-class DocumentSubmit(BaseModel):
-    document_type: str
-    reference: str
+class DocumentDownloadUrl(BaseModel):
+    url: str
 
 
 class CaseRejectRequest(BaseModel):

@@ -18,6 +18,13 @@ class UserRole(str, enum.Enum):
     OWNER = "owner"
     ADMIN = "admin"
     MEMBER = "member"
+    # Roadmap §2 Accounts: "Viewer/Auditor... Phase 1.5 unless required."
+    # Full read access account-wide (unlike Member, who's restricted to
+    # numbers assigned to them - every `!= UserRole.MEMBER` check
+    # throughout this codebase already treats Viewer as unrestricted-read
+    # for free), zero write access anywhere (enforced by
+    # app.core.deps.require_writer on every write endpoint).
+    VIEWER = "viewer"
 
 
 class Account(Base):

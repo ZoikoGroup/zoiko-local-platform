@@ -14,18 +14,19 @@ router = APIRouter(prefix="/audit", tags=["audit"])
 
 @router.get("/events", response_model=list[AuditEventResponse])
 def list_events(
+    account_id: str | None = None,
     db: Session = Depends(get_db),
     _staff: PlatformStaff = Depends(get_current_staff),
 ):
     # Lists events across ALL accounts - this is why it's staff-only,
     # not customer-admin: a customer must never see another customer's
     # audit trail, but Zoiko ops legitimately needs cross-account visibility.
-    return (
-        db.query(AuditEvent)
-        .order_by(AuditEvent.created_at.desc())
-        .limit(200)
-        .all()
-    )
+    # account_id is optional - narrows to one customer's history, now that
+    # it's a real indexed column instead of a query-time heuristic.
+    query = db.query(AuditEvent)
+    if account_id is not None:
+        query = query.filter(AuditEvent.account_id == account_id)
+    return query.order_by(AuditEvent.created_at.desc()).limit(200).all()
 
 
 @router.get("/events/me", response_model=list[AuditEventResponse])

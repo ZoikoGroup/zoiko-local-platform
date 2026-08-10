@@ -6,6 +6,7 @@ import {
   listStaffCases,
   staffApproveCase,
   staffRejectCase,
+  getStaffComplianceDocumentDownloadUrl,
   ApiError,
   type StaffComplianceCase,
 } from "@/lib/api";
@@ -24,6 +25,21 @@ export default function StaffCasesPage() {
   const [rejectingId, setRejectingId] = useState<string | null>(null);
   const [rejectReason, setRejectReason] = useState("");
   const [busyId, setBusyId] = useState<string | null>(null);
+  const [downloadingDoc, setDownloadingDoc] = useState<string | null>(null);
+
+  async function handleViewDocument(caseId: string, documentIndex: number) {
+    if (!token) return;
+    const key = `${caseId}:${documentIndex}`;
+    setDownloadingDoc(key);
+    try {
+      const { url } = await getStaffComplianceDocumentDownloadUrl(token, caseId, documentIndex);
+      window.open(url, "_blank", "noopener,noreferrer");
+    } catch {
+      // Not worth a hard error banner - the reviewer can just try again.
+    } finally {
+      setDownloadingDoc(null);
+    }
+  }
 
   useEffect(() => {
     if (ready && !token) router.replace("/staff/login");
@@ -104,10 +120,10 @@ export default function StaffCasesPage() {
         </p>
       )}
 
-      {loading && <p className="text-sm text-slate-500">Loading...</p>}
+      {loading && <p className="text-sm text-slate-400">Loading...</p>}
 
       {!loading && cases.length === 0 && (
-        <p className="text-sm text-slate-500">No {tab === "all" ? "" : tab} cases.</p>
+        <p className="text-sm text-slate-400">No {tab === "all" ? "" : tab} cases.</p>
       )}
 
       <div className="space-y-3">
@@ -116,7 +132,7 @@ export default function StaffCasesPage() {
             <div className="flex items-start justify-between">
               <div>
                 <div className="font-medium text-white">{c.account_name}</div>
-                <div className="text-xs text-slate-500">{c.account_owner_email}</div>
+                <div className="text-xs text-slate-400">{c.account_owner_email}</div>
               </div>
               <span
                 className={`text-xs font-medium rounded-full px-2.5 py-1 capitalize ${
@@ -133,27 +149,39 @@ export default function StaffCasesPage() {
 
             <div className="mt-3 grid grid-cols-2 gap-3 text-sm">
               <div>
-                <div className="text-xs text-slate-500">Jurisdiction</div>
+                <div className="text-xs text-slate-400">Jurisdiction</div>
                 <div className="text-slate-200">{c.jurisdiction}</div>
               </div>
               <div>
-                <div className="text-xs text-slate-500">Requirement</div>
+                <div className="text-xs text-slate-400">Requirement</div>
                 <div className="text-slate-200">{c.requirement_type.replaceAll("_", " ")}</div>
               </div>
             </div>
 
             <div className="mt-3">
-              <div className="text-xs text-slate-500 mb-1">Documents submitted</div>
+              <div className="text-xs text-slate-400 mb-1">Documents submitted</div>
               {c.documents.length === 0 ? (
-                <div className="text-sm text-slate-500 italic">None yet</div>
+                <div className="text-sm text-slate-400 italic">None yet</div>
               ) : (
                 <ul className="text-sm text-slate-200 space-y-0.5">
-                  {c.documents.map((d, i) => (
-                    <li key={i}>
-                      {d.document_type.replaceAll("_", " ")} —{" "}
-                      <span className="text-slate-500 font-mono text-xs">{d.reference}</span>
-                    </li>
-                  ))}
+                  {c.documents.map((d, i) => {
+                    const docKey = `${c.id}:${i}`;
+                    return (
+                      <li key={docKey} className="flex items-center gap-2">
+                        <span>
+                          {d.document_type.replaceAll("_", " ")} —{" "}
+                          <span className="text-slate-400 text-xs">{d.filename}</span>
+                        </span>
+                        <button
+                          onClick={() => handleViewDocument(c.id, i)}
+                          disabled={downloadingDoc === docKey}
+                          className="text-xs font-medium text-indigo-400 hover:text-indigo-300 disabled:opacity-50"
+                        >
+                          {downloadingDoc === docKey ? "Opening…" : "View"}
+                        </button>
+                      </li>
+                    );
+                  })}
                 </ul>
               )}
             </div>

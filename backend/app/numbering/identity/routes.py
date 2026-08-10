@@ -8,12 +8,14 @@ from app.core.security import create_access_token, decode_access_token, verify_g
 from app.numbering.identity import service
 from app.numbering.identity.models import User
 from app.numbering.identity.schemas import (
+    ForgotPasswordRequest,
     GoogleAuthRequest,
     LoginRequest,
     LoginResponse,
     MfaCodeRequest,
     MfaLoginRequest,
     MfaSetupResponse,
+    ResetPasswordRequest,
     SetPhoneNumberRequest,
     SignupRequest,
     TokenResponse,
@@ -42,6 +44,37 @@ def login(request: Request, payload: LoginRequest, db: Session = Depends(get_db)
     if not user:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid email or password")
 
+    if user.mfa_enabled:
+        mfa_token = create_access_token(
+            subject=user.id, scope="mfa_pending", expire_minutes=MFA_TOKEN_EXPIRE_MINUTES
+        )
+        return LoginResponse(mfa_required=True, mfa_token=mfa_token)
+
+    token = create_access_token(subject=user.id, scope="customer")
+    return LoginResponse(access_token=token)
+
+
+@router.post("/forgot-password", status_code=status.HTTP_204_NO_CONTENT)
+@limiter.limit("5/minute")
+def forgot_password(request: Request, payload: ForgotPasswordRequest, db: Session = Depends(get_db)):
+    """Always 204, whether or not the email matches an account - never
+    reveals which, to avoid account enumeration (see
+    service.request_password_reset's docstring)."""
+    service.request_password_reset(db, payload.email)
+    return None
+
+
+@router.post("/reset-password", response_model=LoginResponse)
+def reset_password(payload: ResetPasswordRequest, db: Session = Depends(get_db)):
+    try:
+        user = service.reset_password(db, payload.token, payload.new_password)
+    except service.InvalidResetTokenError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
+
+    # A reset link proves control of the inbox, not the second factor - MFA
+    # must still run if it's enabled, same as a normal login, otherwise
+    # compromising the email account alone would be enough to fully take
+    # over an MFA-protected account.
     if user.mfa_enabled:
         mfa_token = create_access_token(
             subject=user.id, scope="mfa_pending", expire_minutes=MFA_TOKEN_EXPIRE_MINUTES

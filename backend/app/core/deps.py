@@ -1,5 +1,5 @@
-from fastapi import Depends, HTTPException, status
-from fastapi.security import OAuth2PasswordBearer
+from fastapi import Depends, HTTPException, Request, status
+from fastapi.security import APIKeyHeader, OAuth2PasswordBearer
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
@@ -8,10 +8,11 @@ from app.numbering.identity.models import User, UserRole
 from app.staff.models import PlatformStaff, PlatformStaffRole
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
+api_key_header = APIKeyHeader(name="Authorization", auto_error=False)
 
 
 def get_current_user(
-    token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)
+    request: Request, token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)
 ) -> User:
     """A logged-in customer account user (signup/login). Rejects staff
     tokens - a staff login can never be used as if it were a customer."""
@@ -29,6 +30,12 @@ def get_current_user(
     if user is None:
         raise credentials_error
 
+    # For app.core.error_logging.ErrorLoggingMiddleware - lets a 5xx logged
+    # to error_events be traced back to the account/user that hit it,
+    # without every route needing to know about error logging itself.
+    request.state.account_id = user.account_id
+    request.state.user_id = user.id
+
     return user
 
 
@@ -44,7 +51,20 @@ def require_admin(current_user: User = Depends(get_current_user)) -> User:
     return current_user
 
 
-def get_current_staff(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
+def require_writer(current_user: User = Depends(get_current_user)) -> User:
+    """Any account role EXCEPT Viewer - use on every write endpoint that
+    isn't already Owner/Admin-only via require_admin. A Viewer has full
+    read access account-wide (see UserRole.VIEWER's docstring) but must
+    never be able to change anything."""
+    if current_user.role == UserRole.VIEWER:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Viewer role is read-only",
+        )
+    return current_user
+
+
+def get_current_staff(request: Request, token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
     """A logged-in Zoiko platform staff member. Rejects customer tokens -
     no customer, including an account Owner, can act as staff."""
     credentials_error = HTTPException(
@@ -61,7 +81,35 @@ def get_current_staff(token: str = Depends(oauth2_scheme), db: Session = Depends
     if staff is None or not staff.is_active:
         raise credentials_error
 
+    # See get_current_user's identical note - staff has no account_id.
+    request.state.user_id = staff.id
+
     return staff
+
+
+def get_api_key_account_id(
+    request: Request, authorization: str | None = Depends(api_key_header), db: Session = Depends(get_db)
+) -> str:
+    """Auth for the /public/v1 API surface only - a raw API key (see
+    app.apikeys.service), never a JWT. Distinct from get_current_user
+    because a public API key represents the ACCOUNT, not a specific
+    logged-in user - there's no User object to return, just the
+    account_id every /public/v1 route scopes its query to."""
+    from app.apikeys.service import authenticate_api_key
+
+    credentials_error = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or missing API key",
+    )
+    if not authorization:
+        raise credentials_error
+
+    raw_key = authorization.removeprefix("Bearer ").strip()
+    key = authenticate_api_key(db, raw_key)
+    if key is None:
+        raise credentials_error
+
+    request.state.account_id = key.account_id
+    return key.account_id
 
 
 def require_staff_role(*roles: PlatformStaffRole):

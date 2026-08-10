@@ -10,6 +10,7 @@ class AuditEventResponse(BaseModel):
     actor: str
     action: str
     target: str
+    account_id: str | None
     before_hash: str | None
     after_hash: str | None
     reason: str | None

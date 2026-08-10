@@ -18,6 +18,36 @@ class SuspendNumberRequest(BaseModel):
     reason: str | None = None
 
 
+class SetRingGroupRequest(BaseModel):
+    destinations: list[str]
+
+
+class RingGroupDestinationResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    destination_number: str
+    ring_order: int
+
+
+class SetIVRMenuRequest(BaseModel):
+    greeting: str
+    options: dict[str, str]
+
+
+class IVROptionResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    digit: str
+    destination_number: str
+
+
+class IVRMenuResponse(BaseModel):
+    greeting: str | None
+    options: list[IVROptionResponse]
+
+
 class NumberSearchResult(BaseModel):
     phone_number: str
     locality: str | None = None
@@ -57,3 +87,9 @@ class PhoneNumberResponse(BaseModel):
     call_flow_id: str | None
     whatsapp_enabled: bool
     sms_enabled: bool
+    next_renewal_at: datetime | None
+
+
+class SupportedCountryResponse(BaseModel):
+    code: str
+    name: str

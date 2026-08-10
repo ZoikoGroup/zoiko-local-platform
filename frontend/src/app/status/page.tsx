@@ -47,7 +47,7 @@ export default function StatusPage() {
   }, []);
 
   return (
-    <div className="min-h-screen bg-slate-50 flex flex-col items-center px-6 py-16">
+    <main className="min-h-screen bg-slate-50 flex flex-col items-center px-6 py-16">
       <div className="w-full max-w-xl space-y-6">
         <div className="flex items-center gap-2 justify-center">
           <div className="w-8 h-8 rounded-lg bg-indigo-600 text-white flex items-center justify-center font-bold text-sm">
@@ -97,7 +97,7 @@ export default function StatusPage() {
             </>
           )}
 
-          <p className="text-xs text-slate-400 text-center">Updates automatically every 30 seconds.</p>
+          <p className="text-xs text-slate-600 text-center">Updates automatically every 30 seconds.</p>
         </div>
 
         <p className="text-xs text-slate-400 text-center">
@@ -106,6 +106,6 @@ export default function StatusPage() {
           </Link>
         </p>
       </div>
-    </div>
+    </main>
   );
 }

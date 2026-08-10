@@ -63,7 +63,7 @@ export default function SignupPage() {
 
       <div className="flex items-center gap-3 my-5">
         <div className="h-px bg-slate-200 flex-1" />
-        <span className="text-xs text-slate-400">or continue with email</span>
+        <span className="text-xs text-slate-600">or continue with email</span>
         <div className="h-px bg-slate-200 flex-1" />
       </div>
 

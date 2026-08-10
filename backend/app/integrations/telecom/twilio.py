@@ -16,6 +16,7 @@ from twilio.twiml.voice_response import VoiceResponse
 
 from app.core.config import settings
 from app.integrations._shared.circuit_breaker import CircuitBreaker, with_failover
+from app.observability.service import trace_provider_call
 
 _NUMBER_TYPE_PATH = {"local": "Local", "mobile": "Mobile", "tollfree": "TollFree"}
 
@@ -62,7 +63,8 @@ def send_sms(to: str, body: str) -> dict:
 
     def _primary() -> dict:
         try:
-            message = _client().messages.create(to=to, from_=settings.twilio_trial_number, body=body)
+            with trace_provider_call("twilio", "send_sms"):
+                message = _client().messages.create(to=to, from_=settings.twilio_trial_number, body=body)
         except TwilioException as e:
             raise TelecomError(str(e)) from e
         return {"sid": message.sid, "status": message.status}
@@ -82,9 +84,10 @@ def send_whatsapp_message(to: str, from_number: str, body: str) -> dict:
     """
     def _primary() -> dict:
         try:
-            message = _client().messages.create(
-                to=f"whatsapp:{to}", from_=f"whatsapp:{from_number}", body=body
-            )
+            with trace_provider_call("twilio", "send_whatsapp_message"):
+                message = _client().messages.create(
+                    to=f"whatsapp:{to}", from_=f"whatsapp:{from_number}", body=body
+                )
         except TwilioException as e:
             raise TelecomError(str(e)) from e
         return {"sid": message.sid, "status": message.status}
@@ -101,7 +104,8 @@ def send_customer_sms(to: str, from_number: str, body: str) -> dict:
     """
     def _primary() -> dict:
         try:
-            message = _client().messages.create(to=to, from_=from_number, body=body)
+            with trace_provider_call("twilio", "send_customer_sms"):
+                message = _client().messages.create(to=to, from_=from_number, body=body)
         except TwilioException as e:
             raise TelecomError(str(e)) from e
         return {"sid": message.sid, "status": message.status}
@@ -124,8 +128,9 @@ def search_available_numbers(country: str, number_type: str = "local", area_code
 
     def _primary() -> list[dict]:
         try:
-            resource = getattr(_client().available_phone_numbers(country), _NUMBER_TYPE_PATH[number_type].lower())
-            numbers = resource.list(**kwargs)
+            with trace_provider_call("twilio", "search_available_numbers"):
+                resource = getattr(_client().available_phone_numbers(country), _NUMBER_TYPE_PATH[number_type].lower())
+                numbers = resource.list(**kwargs)
         except TwilioException as e:
             # Twilio's SDK raises the bare base class (no .status) for some
             # lower-level failures (e.g. missing/invalid credentials) rather
@@ -155,7 +160,8 @@ def search_available_numbers(country: str, number_type: str = "local", area_code
 def list_owned_numbers() -> list[dict]:
     def _primary() -> list[dict]:
         try:
-            numbers = _client().incoming_phone_numbers.list()
+            with trace_provider_call("twilio", "list_owned_numbers"):
+                numbers = _client().incoming_phone_numbers.list()
         except TwilioException as e:
             raise TelecomError(str(e)) from e
         return [{"sid": n.sid, "phone_number": n.phone_number, "capabilities": n.capabilities} for n in numbers]
@@ -172,12 +178,13 @@ def set_voice_webhook(phone_number_sid: str, public_base_url: str) -> None:
     """
     def _primary() -> None:
         try:
-            _client().incoming_phone_numbers(phone_number_sid).update(
-                voice_url=f"{public_base_url}/media/voice/incoming",
-                voice_method="POST",
-                status_callback=f"{public_base_url}/media/voice/status-callback",
-                status_callback_method="POST",
-            )
+            with trace_provider_call("twilio", "set_voice_webhook"):
+                _client().incoming_phone_numbers(phone_number_sid).update(
+                    voice_url=f"{public_base_url}/media/voice/incoming",
+                    voice_method="POST",
+                    status_callback=f"{public_base_url}/media/voice/status-callback",
+                    status_callback_method="POST",
+                )
         except TwilioException as e:
             raise TelecomError(str(e)) from e
 
@@ -194,7 +201,8 @@ def release_number(phone_number_sid: str) -> None:
     on the real Twilio account forever."""
     def _primary() -> None:
         try:
-            _client().incoming_phone_numbers(phone_number_sid).delete()
+            with trace_provider_call("twilio", "release_number"):
+                _client().incoming_phone_numbers(phone_number_sid).delete()
         except TwilioException as e:
             raise TelecomError(str(e)) from e
 
@@ -221,7 +229,8 @@ def buy_number(phone_number: str) -> dict:
 
     def _primary() -> dict:
         try:
-            number = _client().incoming_phone_numbers.create(**kwargs)
+            with trace_provider_call("twilio", "buy_number"):
+                number = _client().incoming_phone_numbers.create(**kwargs)
         except TwilioException as e:
             raise TelecomError(str(e)) from e
         return {"sid": number.sid, "phone_number": number.phone_number, "capabilities": number.capabilities}
@@ -253,7 +262,8 @@ def place_call(
 
     def _primary() -> dict:
         try:
-            call = _client().calls.create(**kwargs)
+            with trace_provider_call("twilio", "place_call"):
+                call = _client().calls.create(**kwargs)
         except TwilioException as e:
             raise TelecomError(str(e)) from e
         return {"sid": call.sid, "status": call.status, "to": call.to, "from": call.from_}
@@ -268,7 +278,8 @@ def place_call(
 def get_call(call_sid: str) -> dict:
     def _primary() -> dict:
         try:
-            call = _client().calls(call_sid).fetch()
+            with trace_provider_call("twilio", "get_call"):
+                call = _client().calls(call_sid).fetch()
         except TwilioException as e:
             raise TelecomError(str(e)) from e
         return {"sid": call.sid, "status": call.status, "to": call.to, "from": call.from_, "duration": call.duration}
@@ -283,7 +294,8 @@ def list_calls(limit: int = 20) -> list[dict]:
     """
     def _primary() -> list[dict]:
         try:
-            calls = _client().calls.list(limit=limit)
+            with trace_provider_call("twilio", "list_calls"):
+                calls = _client().calls.list(limit=limit)
         except TwilioException as e:
             raise TelecomError(str(e)) from e
         return [{"sid": c.sid, "status": c.status, "to": c.to, "from": c.from_} for c in calls]
@@ -326,20 +338,30 @@ def build_forward_response(
     return str(response)
 
 
+def build_empty_response() -> str:
+    """No further instructions - Twilio hangs up. Used as the <Dial>
+    action's reply when DialCallStatus is "completed" (the call was
+    genuinely answered and has already ended normally)."""
+    return str(VoiceResponse())
+
+
 def build_ring_group_response(
     destinations: list[str],
     fallback_action_url: str,
     status_callback_url: str | None = None,
     recording_callback_url: str | None = None,
 ) -> str:
-    """Advanced IVR builder's FORWARD node (Phase 3) - a superset of
-    build_forward_response: rings every destination in `destinations`
-    simultaneously (multiple <Number> children under one <Dial> - Twilio's
-    native ring-group primitive, first to answer wins, the rest stop
-    ringing) instead of a single number. `fallback_action_url` is always
-    set (unlike build_forward_response's optional action) - see
-    media.voice.py's /flow-forward-fallback route, which resolves the
-    node's own on_no_answer_node_id only when the dial genuinely wasn't
+    """Shared by two Phase 3/Phase 2 features - the Advanced IVR builder's
+    FORWARD node (Phase 3) and enhanced business routing (Architecture doc
+    Phase 2) both use this as a superset of build_forward_response: rings
+    every destination in `destinations` simultaneously (multiple <Number>
+    children under one <Dial> - Twilio's native ring-group primitive, first
+    to answer wins, the rest stop ringing) instead of a single number.
+    `fallback_action_url` is always set (unlike build_forward_response's
+    optional action) - see media/voice.py's /flow-forward-fallback route
+    (IVR builder, resolves the node's own on_no_answer_node_id) and
+    /forward-fallback route (enhanced business routing, routes to
+    voicemail), both of which only fire when the dial genuinely wasn't
     answered.
     """
     response = VoiceResponse()
@@ -355,6 +377,22 @@ def build_ring_group_response(
     dial = response.dial(**dial_kwargs)
     for destination in destinations:
         dial.number(destination)
+    return str(response)
+
+
+def build_ivr_menu_response(greeting: str, action_url: str, no_input_redirect_url: str) -> str:
+    """Enhanced business routing (Architecture doc Phase 2) - "press 1 for
+    sales, 2 for support." Gathers a single DTMF digit; Twilio requests
+    action_url once any digit is pressed (even if the caller hangs up
+    mid-menu, an empty Digits value is posted there - see voice.py's
+    /ivr-select). If nothing is pressed before the gather times out,
+    Twilio does NOT call action_url at all - it falls through to the
+    <Redirect> below instead, which returns the number to its normal
+    (non-IVR) call-handling behavior."""
+    response = VoiceResponse()
+    gather = response.gather(input="dtmf", num_digits=1, action=action_url, method="POST", timeout=6)
+    gather.say(greeting)
+    response.redirect(no_input_redirect_url, method="POST")
     return str(response)
 
 
@@ -468,10 +506,11 @@ def download_recording(recording_url: str) -> bytes:
     unauthenticated fetches get a 401, so this can't just be a plain GET."""
     def _primary() -> bytes:
         try:
-            response = httpx.get(
-                recording_url, auth=(settings.twilio_account_sid, settings.twilio_auth_token), timeout=30.0
-            )
-            response.raise_for_status()
+            with trace_provider_call("twilio", "download_recording"):
+                response = httpx.get(
+                    recording_url, auth=(settings.twilio_account_sid, settings.twilio_auth_token), timeout=30.0
+                )
+                response.raise_for_status()
         except httpx.HTTPError as e:
             raise TelecomError(f"Could not download recording: {e}") from e
         return response.content
@@ -488,7 +527,8 @@ def delete_recording(recording_sid: str) -> None:
     doesn't just sit there forever after we stop linking to it."""
     def _primary() -> None:
         try:
-            _client().recordings(recording_sid).delete()
+            with trace_provider_call("twilio", "delete_recording"):
+                _client().recordings(recording_sid).delete()
         except TwilioException as e:
             raise TelecomError(str(e)) from e
 

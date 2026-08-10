@@ -1,19 +1,25 @@
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError
 
 from app.analytics.routes import router as analytics_router
+from app.apikeys.routes import router as apikeys_router
 from app.audit.routes import router as audit_router
+from app.billing.routes import router as billing_router
 from app.compliance.routes import router as compliance_router
 from app.consent.routes import router as consent_router
 from app.contacts.routes import router as contacts_router
 from app.core.config import settings
 from app.core.database import engine
+from app.core.error_logging import ErrorLoggingMiddleware
 from app.core.logging import configure_logging
+from app.crm.routes import router as crm_router
 from app.core.rate_limit import limiter
 from app.core.startup_checks import assert_jwt_secret_is_configured, parse_allowed_origins
 from app.core.telemetry import setup_telemetry, shutdown_telemetry
@@ -30,6 +36,7 @@ from app.numbering.numbers.routes import router as numbers_router
 from app.notifications.routes import router as notifications_router
 from app.ops.routes import router as ops_router
 from app.porting.routes import router as porting_router
+from app.public_api.routes import router as public_api_router
 from app.queues.routes import router as queues_router
 from app.queues.routes import webhook_router as queues_webhook_router
 from app.retention.routes import router as retention_router
@@ -37,6 +44,7 @@ from app.risk.routes import router as risk_router
 from app.routing.routes import router as call_flows_router
 from app.staff.routes import router as staff_router
 from app.usage.routes import router as usage_router
+from app.webhooks.routes import router as webhooks_router
 
 # Runs once at import time (not per app-instance), before any FastAPI app
 # exists - configure_logging() itself has nothing to do with app.state.
@@ -53,9 +61,28 @@ app = FastAPI(title="Zoiko Local API", lifespan=lifespan)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
+
+@app.exception_handler(DBAPIError)
+async def database_unavailable_handler(request: Request, exc: DBAPIError) -> JSONResponse:
+    """Chaos-testing finding: a plain route with no DB-specific try/except
+    (most list/read endpoints) let a real Postgres outage bubble up as a
+    generic, unhandled 500 - technically not a crash (FastAPI's default
+    debug=False already keeps the traceback out of the response), but a
+    503 correctly tells the caller this is transient and retry-able, which
+    a bare 500 does not. Registered on DBAPIError (not the narrower
+    OperationalError) since a pool-exhaustion or driver-level failure can
+    surface as either, and both mean the same thing to a client: try again
+    shortly, not "your request was invalid."
+    """
+    return JSONResponse(status_code=503, content={"detail": "Service temporarily unavailable - please try again shortly."})
+
 # Fail fast rather than boot insecurely - see app/core/startup_checks.py.
 assert_jwt_secret_is_configured(settings.environment, settings.jwt_secret_key)
 
+# Added before CORSMiddleware so CORS ends up outermost (last added wraps
+# first) - even an error response this middleware logs still needs its CORS
+# headers added by the layer above it.
+app.add_middleware(ErrorLoggingMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=parse_allowed_origins(settings.allowed_origins),
@@ -74,6 +101,7 @@ setup_telemetry(app, engine)
 app.include_router(identity_router)
 app.include_router(team_router)
 app.include_router(audit_router)
+app.include_router(billing_router)
 app.include_router(compliance_router)
 app.include_router(consent_router)
 app.include_router(contacts_router)
@@ -96,6 +124,10 @@ app.include_router(queues_webhook_router)
 app.include_router(messaging_router)
 app.include_router(messaging_webhook_router)
 app.include_router(analytics_router)
+app.include_router(webhooks_router)
+app.include_router(apikeys_router)
+app.include_router(public_api_router)
+app.include_router(crm_router)
 
 
 @app.get("/health")

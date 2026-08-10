@@ -43,7 +43,7 @@ export default function StaffAuditPage() {
   return (
     <>
       <div className="flex items-center justify-between">
-        <p className="text-xs text-slate-500">Most recent 200 events, across every account.</p>
+        <p className="text-xs text-slate-400">Most recent 200 events, across every account.</p>
         <button
           onClick={loadEvents}
           className="text-xs text-slate-400 hover:text-white transition"
@@ -58,10 +58,10 @@ export default function StaffAuditPage() {
         </p>
       )}
 
-      {loading && <p className="text-sm text-slate-500">Loading...</p>}
+      {loading && <p className="text-sm text-slate-400">Loading...</p>}
 
       {!loading && events.length === 0 && (
-        <p className="text-sm text-slate-500">No audit events yet.</p>
+        <p className="text-sm text-slate-400">No audit events yet.</p>
       )}
 
       <div className="space-y-2">
@@ -72,12 +72,12 @@ export default function StaffAuditPage() {
           >
             <div>
               <div className="text-sm text-white font-medium">{e.action}</div>
-              <div className="text-xs text-slate-500 mt-0.5">
+              <div className="text-xs text-slate-400 mt-0.5">
                 {e.target} · actor <span className="font-mono">{e.actor}</span>
               </div>
               {e.reason && <div className="text-xs text-slate-400 mt-1">{e.reason}</div>}
             </div>
-            <div className="text-xs text-slate-500 whitespace-nowrap">
+            <div className="text-xs text-slate-400 whitespace-nowrap">
               {new Date(e.created_at).toLocaleString()}
             </div>
           </div>

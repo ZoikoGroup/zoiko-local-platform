@@ -80,7 +80,7 @@ export default function StaffProvisioningPage() {
 
   return (
     <>
-      <p className="text-xs text-slate-500 bg-slate-900 border border-slate-800 rounded-lg px-3 py-2">
+      <p className="text-xs text-slate-400 bg-slate-900 border border-slate-800 rounded-lg px-3 py-2">
         Number purchases run synchronously - a row still showing here means the backend crashed or restarted
         mid-purchase, not that anything is slow. Retry re-attempts the provider purchase; Release just frees
         the number back to Reserved without contacting the provider again.
@@ -92,10 +92,10 @@ export default function StaffProvisioningPage() {
         </p>
       )}
 
-      {loading && <p className="text-sm text-slate-500">Loading...</p>}
+      {loading && <p className="text-sm text-slate-400">Loading...</p>}
 
       {!loading && entries.length === 0 && (
-        <p className="text-sm text-slate-500">Nothing stuck right now.</p>
+        <p className="text-sm text-slate-400">Nothing stuck right now.</p>
       )}
 
       <div className="space-y-3">
@@ -104,7 +104,7 @@ export default function StaffProvisioningPage() {
             <div className="flex items-start justify-between">
               <div>
                 <div className="font-mono font-medium text-white">{e.e164}</div>
-                <div className="text-xs text-slate-500">
+                <div className="text-xs text-slate-400">
                   {e.account_name ?? "Unknown account"} &middot; {e.account_owner_email ?? "—"}
                 </div>
               </div>

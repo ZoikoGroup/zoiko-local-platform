@@ -116,7 +116,7 @@ export default function StaffPortingPage() {
         ))}
       </div>
 
-      <p className="text-xs text-slate-500 bg-slate-900 border border-slate-800 rounded-lg px-3 py-2">
+      <p className="text-xs text-slate-400 bg-slate-900 border border-slate-800 rounded-lg px-3 py-2">
         Approving vets the request only - the actual port with the losing carrier is performed by hand
         (LOA, carrier coordination), then marked Complete here once the number is live on Twilio.
       </p>
@@ -127,10 +127,10 @@ export default function StaffPortingPage() {
         </p>
       )}
 
-      {loading && <p className="text-sm text-slate-500">Loading...</p>}
+      {loading && <p className="text-sm text-slate-400">Loading...</p>}
 
       {!loading && requests.length === 0 && (
-        <p className="text-sm text-slate-500">No {tab === "all" ? "" : tab} porting requests.</p>
+        <p className="text-sm text-slate-400">No {tab === "all" ? "" : tab} porting requests.</p>
       )}
 
       <div className="space-y-3">
@@ -139,7 +139,7 @@ export default function StaffPortingPage() {
             <div className="flex items-start justify-between">
               <div>
                 <div className="font-mono font-medium text-white">{r.phone_number}</div>
-                <div className="text-xs text-slate-500">
+                <div className="text-xs text-slate-400">
                   {r.account_name} &middot; {r.account_owner_email}
                 </div>
               </div>
@@ -162,23 +162,23 @@ export default function StaffPortingPage() {
 
             <div className="mt-3 grid grid-cols-2 gap-3 text-sm">
               <div>
-                <div className="text-xs text-slate-500">Country</div>
+                <div className="text-xs text-slate-400">Country</div>
                 <div className="text-slate-200">{r.country}</div>
               </div>
               <div>
-                <div className="text-xs text-slate-500">Current carrier</div>
+                <div className="text-xs text-slate-400">Current carrier</div>
                 <div className="text-slate-200">{r.current_carrier}</div>
               </div>
               <div>
-                <div className="text-xs text-slate-500">Carrier account #</div>
+                <div className="text-xs text-slate-400">Carrier account #</div>
                 <div className="text-slate-200 font-mono">{r.carrier_account_number}</div>
               </div>
               <div>
-                <div className="text-xs text-slate-500">Billing name</div>
+                <div className="text-xs text-slate-400">Billing name</div>
                 <div className="text-slate-200">{r.billing_name}</div>
               </div>
               <div className="col-span-2">
-                <div className="text-xs text-slate-500">Billing address</div>
+                <div className="text-xs text-slate-400">Billing address</div>
                 <div className="text-slate-200">{r.billing_address}</div>
               </div>
             </div>
@@ -187,7 +187,7 @@ export default function StaffPortingPage() {
               <p className="mt-3 text-sm text-red-400">Reason: {r.rejection_reason}</p>
             )}
             {r.status === "completed" && r.twilio_incoming_number_sid && (
-              <p className="mt-3 text-xs text-slate-500 font-mono">SID: {r.twilio_incoming_number_sid}</p>
+              <p className="mt-3 text-xs text-slate-400 font-mono">SID: {r.twilio_incoming_number_sid}</p>
             )}
 
             {r.status === "submitted" && (

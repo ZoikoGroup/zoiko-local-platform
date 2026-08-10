@@ -6,10 +6,18 @@ from app.core.deps import get_current_staff, require_staff_role
 from app.core.rate_limit import limiter
 from app.core.security import create_access_token
 from app.integrations.telecom.twilio import TelecomError
-from app.numbering.numbers.service import NoStuckProvisioningError, release_stuck_provisioning, retry_provisioning
+from app.numbering.numbers.service import (
+    NoStuckProvisioningError,
+    NotDueForRenewalError,
+    mark_number_renewed,
+    release_stuck_provisioning,
+    retry_provisioning,
+)
 from app.staff import service
 from app.staff.models import PlatformStaff, PlatformStaffRole
 from app.staff.schemas import AccountOverviewResponse, StaffLoginRequest, StaffTokenResponse
+from app.usage.schemas import CallingRateResponse, UpsertCallingRateRequest
+from app.usage.service import list_calling_rates, upsert_calling_rate
 
 router = APIRouter(prefix="/staff", tags=["staff"])
 
@@ -82,3 +90,49 @@ def release_number_provisioning(
     except NoStuckProvisioningError as e:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e
     return {"id": number.id, "e164": number.e164, "status": number.status}
+
+
+@router.get("/numbers/due-for-renewal")
+def list_due_renewals(
+    db: Session = Depends(get_db),
+    _staff: PlatformStaff = Depends(get_current_staff),
+):
+    """Diagnostic worklist, not a billing run - see
+    app.numbering.numbers.service.list_due_renewals's docstring. No real
+    payment gateway exists yet to charge automatically."""
+    return service.list_due_renewals(db)
+
+
+@router.post("/numbers/{number_id}/mark-renewed")
+def mark_number_renewed_route(
+    number_id: str,
+    db: Session = Depends(get_db),
+    staff: PlatformStaff = Depends(require_staff_role(PlatformStaffRole.SUPPORT, PlatformStaffRole.SUPER_ADMIN)),
+):
+    try:
+        number = mark_number_renewed(db, staff.id, number_id)
+    except NotDueForRenewalError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e
+    return {"id": number.id, "e164": number.e164, "next_renewal_at": number.next_renewal_at}
+
+
+@router.get("/calling-rates", response_model=list[CallingRateResponse])
+def list_calling_rates_route(
+    db: Session = Depends(get_db),
+    _staff: PlatformStaff = Depends(get_current_staff),
+):
+    return list_calling_rates(db)
+
+
+@router.put("/calling-rates", response_model=CallingRateResponse)
+def upsert_calling_rate_route(
+    payload: UpsertCallingRateRequest,
+    db: Session = Depends(get_db),
+    _staff: PlatformStaff = Depends(require_staff_role(PlatformStaffRole.SUPER_ADMIN)),
+):
+    # SUPER_ADMIN only - pricing changes are a platform-wide decision, not
+    # a routine support action like the recovery endpoints above.
+    return upsert_calling_rate(
+        db, country=payload.country, price_per_minute_cents=payload.price_per_minute_cents,
+        currency=payload.currency,
+    )

@@ -1,19 +1,22 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useEffect, useState, useCallback } from "react";
 import {
+  getCurrentUser,
   listContacts,
   createContact,
   updateContact,
   deleteContact,
   getContactHistory,
   ApiError,
+  type User,
   type Contact,
   type ContactHistoryEntry,
 } from "@/lib/api";
 import { getToken } from "@/lib/auth";
 
-const EMPTY_FORM = { name: "", phone_number: "", email: "", notes: "" };
+type FormState = { name: string; phone_number: string; email: string; notes: string };
+const EMPTY_FORM: FormState = { name: "", phone_number: "", email: "", notes: "" };
 
 const HISTORY_TYPE_LABEL: Record<ContactHistoryEntry["type"], string> = {
   call: "Call",
@@ -35,26 +38,29 @@ type HistoryState =
 
 export default function ContactsPage() {
   const [token] = useState<string | null>(() => getToken());
-
+  const [me, setMe] = useState<User | null>(null);
   const [contacts, setContacts] = useState<Contact[]>([]);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
 
-  const [formOpen, setFormOpen] = useState(false);
-  const [form, setForm] = useState(EMPTY_FORM);
+  const [showForm, setShowForm] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
-  const [formBusy, setFormBusy] = useState(false);
+  const [form, setForm] = useState<FormState>(EMPTY_FORM);
   const [formError, setFormError] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
 
-  const [actionBusyId, setActionBusyId] = useState<string | null>(null);
-  const [historyByContact, setHistoryByContact] = useState<Record<string, HistoryState>>({});
   const [expandedId, setExpandedId] = useState<string | null>(null);
+  const [historyByContact, setHistoryByContact] = useState<Record<string, HistoryState>>({});
+  const [search, setSearch] = useState("");
 
-  const loadContacts = useCallback(() => {
+  const canWrite = me?.role !== "viewer";
+
+  const loadAll = useCallback(() => {
     if (!token) return;
-    return listContacts(token)
-      .then((data) => {
-        setContacts(data);
+    return Promise.all([getCurrentUser(token), listContacts(token)])
+      .then(([userData, contactsData]) => {
+        setMe(userData);
+        setContacts(contactsData);
         setLoadError(null);
       })
       .catch(() => setLoadError("Couldn't load contacts."))
@@ -62,17 +68,17 @@ export default function ContactsPage() {
   }, [token]);
 
   useEffect(() => {
-    loadContacts();
-  }, [loadContacts]);
+    loadAll();
+  }, [loadAll]);
 
-  function openCreateForm() {
+  function startCreate() {
     setEditingId(null);
     setForm(EMPTY_FORM);
     setFormError(null);
-    setFormOpen(true);
+    setShowForm(true);
   }
 
-  function openEditForm(contact: Contact) {
+  function startEdit(contact: Contact) {
     setEditingId(contact.id);
     setForm({
       name: contact.name,
@@ -81,74 +87,71 @@ export default function ContactsPage() {
       notes: contact.notes ?? "",
     });
     setFormError(null);
-    setFormOpen(true);
+    setShowForm(true);
   }
 
-  function closeForm() {
-    setFormOpen(false);
-    setEditingId(null);
-    setForm(EMPTY_FORM);
-    setFormError(null);
-  }
-
-  async function handleSubmit(e: React.FormEvent) {
+  async function handleSave(e: React.FormEvent) {
     e.preventDefault();
     if (!token) return;
-    setFormBusy(true);
+    setSaving(true);
     setFormError(null);
     const input = {
-      name: form.name,
-      phone_number: form.phone_number,
-      email: form.email || undefined,
-      notes: form.notes || undefined,
+      name: form.name.trim(),
+      phone_number: form.phone_number.trim(),
+      email: form.email.trim() || null,
+      notes: form.notes.trim() || null,
     };
     try {
       if (editingId) {
-        await updateContact(token, editingId, input);
+        const updated = await updateContact(token, editingId, input);
+        setContacts((prev) => prev.map((c) => (c.id === editingId ? updated : c)));
       } else {
-        await createContact(token, input);
+        const created = await createContact(token, input);
+        setContacts((prev) => [...prev, created].sort((a, b) => a.name.localeCompare(b.name)));
       }
-      closeForm();
-      await loadContacts();
+      setShowForm(false);
     } catch (err) {
       setFormError(err instanceof ApiError ? err.message : "Couldn't save this contact.");
     } finally {
-      setFormBusy(false);
+      setSaving(false);
     }
   }
 
-  async function handleDelete(contact: Contact) {
+  async function handleDelete(contactId: string) {
     if (!token) return;
-    setActionBusyId(contact.id);
     try {
-      await deleteContact(token, contact.id);
-      await loadContacts();
+      await deleteContact(token, contactId);
+      setContacts((prev) => prev.filter((c) => c.id !== contactId));
     } catch {
       setLoadError("Couldn't delete this contact.");
-    } finally {
-      setActionBusyId(null);
     }
   }
 
-  async function handleToggleHistory(contact: Contact) {
-    if (expandedId === contact.id) {
+  async function handleToggleHistory(contactId: string) {
+    if (expandedId === contactId) {
       setExpandedId(null);
       return;
     }
-    setExpandedId(contact.id);
-    if (!token || historyByContact[contact.id]?.status === "done") return;
+    setExpandedId(contactId);
+    if (!token || historyByContact[contactId]?.status === "done") return;
 
-    setHistoryByContact((prev) => ({ ...prev, [contact.id]: { status: "loading" } }));
+    setHistoryByContact((prev) => ({ ...prev, [contactId]: { status: "loading" } }));
     try {
-      const entries = await getContactHistory(token, contact.id);
-      setHistoryByContact((prev) => ({ ...prev, [contact.id]: { status: "done", entries } }));
+      const entries = await getContactHistory(token, contactId);
+      setHistoryByContact((prev) => ({ ...prev, [contactId]: { status: "done", entries } }));
     } catch {
       setHistoryByContact((prev) => ({
         ...prev,
-        [contact.id]: { status: "error", message: "Couldn't load history for this contact." },
+        [contactId]: { status: "error", message: "Couldn't load history for this contact." },
       }));
     }
   }
+
+  const filteredContacts = contacts.filter(
+    (c) =>
+      c.name.toLowerCase().includes(search.toLowerCase()) ||
+      c.phone_number.includes(search)
+  );
 
   return (
     <div className="max-w-3xl mx-auto space-y-6">
@@ -156,32 +159,35 @@ export default function ContactsPage() {
         <div>
           <h2 className="text-xl font-semibold text-slate-900">Contacts</h2>
           <p className="text-sm text-slate-500">
-            Your saved contacts, and call/voicemail history with each one.
+            Your saved contacts, and call/voicemail/receptionist-call history with each one.
           </p>
         </div>
-        {!formOpen && (
+        {canWrite && (
           <button
-            onClick={openCreateForm}
+            onClick={startCreate}
             className="bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-medium rounded-lg px-4 py-2"
           >
-            + Add contact
+            Add Contact
           </button>
         )}
       </div>
 
       {loadError && <p className="text-sm text-red-600 bg-red-50 rounded-lg px-3 py-2">{loadError}</p>}
 
-      {formOpen && (
-        <form onSubmit={handleSubmit} className="bg-white rounded-xl border border-slate-200 p-6 space-y-3">
-          <h3 className="font-semibold text-slate-900">{editingId ? "Edit contact" : "New contact"}</h3>
-          <div className="grid grid-cols-2 gap-3">
+      {showForm && (
+        <form
+          onSubmit={handleSave}
+          className="bg-white rounded-xl border border-slate-200 p-6 space-y-4"
+        >
+          <h3 className="font-semibold text-slate-900">{editingId ? "Edit Contact" : "Add Contact"}</h3>
+          <div className="grid sm:grid-cols-2 gap-3">
             <div>
               <label className="block text-xs font-medium text-slate-500 mb-1">Name</label>
               <input
                 required
                 value={form.name}
-                onChange={(e) => setForm({ ...form, name: e.target.value })}
-                className="w-full rounded-lg border border-slate-300 px-3 py-1.5 text-sm"
+                onChange={(e) => setForm((f) => ({ ...f, name: e.target.value }))}
+                className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"
               />
             </div>
             <div>
@@ -189,9 +195,9 @@ export default function ContactsPage() {
               <input
                 required
                 value={form.phone_number}
-                onChange={(e) => setForm({ ...form, phone_number: e.target.value })}
+                onChange={(e) => setForm((f) => ({ ...f, phone_number: e.target.value }))}
                 placeholder="+15551234567"
-                className="w-full rounded-lg border border-slate-300 px-3 py-1.5 text-sm font-mono placeholder:text-slate-400"
+                className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm font-mono placeholder:text-slate-400"
               />
             </div>
             <div>
@@ -199,80 +205,93 @@ export default function ContactsPage() {
               <input
                 type="email"
                 value={form.email}
-                onChange={(e) => setForm({ ...form, email: e.target.value })}
-                className="w-full rounded-lg border border-slate-300 px-3 py-1.5 text-sm"
+                onChange={(e) => setForm((f) => ({ ...f, email: e.target.value }))}
+                className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"
               />
             </div>
             <div>
               <label className="block text-xs font-medium text-slate-500 mb-1">Notes (optional)</label>
               <input
                 value={form.notes}
-                onChange={(e) => setForm({ ...form, notes: e.target.value })}
-                className="w-full rounded-lg border border-slate-300 px-3 py-1.5 text-sm"
+                onChange={(e) => setForm((f) => ({ ...f, notes: e.target.value }))}
+                className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"
               />
             </div>
           </div>
 
-          {formError && <p className="text-sm text-red-600 bg-red-50 rounded-lg px-3 py-2">{formError}</p>}
+          {formError && <p className="text-sm text-red-600">{formError}</p>}
 
           <div className="flex gap-2">
             <button
               type="submit"
-              disabled={formBusy}
+              disabled={saving}
               className="bg-indigo-600 hover:bg-indigo-700 disabled:opacity-60 text-white text-sm font-medium rounded-lg px-4 py-2"
             >
-              {formBusy ? "Saving..." : editingId ? "Save changes" : "Add contact"}
+              {saving ? "Saving..." : "Save"}
             </button>
-            <button type="button" onClick={closeForm} className="text-sm text-slate-500 hover:text-slate-700 px-2">
+            <button
+              type="button"
+              onClick={() => setShowForm(false)}
+              className="text-sm font-medium rounded-lg px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700"
+            >
               Cancel
             </button>
           </div>
         </form>
       )}
 
-      <div className="bg-white rounded-xl border border-slate-200 p-6 space-y-3">
+      <div className="bg-white rounded-xl border border-slate-200 p-6 space-y-4">
+        <input
+          value={search}
+          onChange={(e) => setSearch(e.target.value)}
+          placeholder="Search by name or number..."
+          className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm placeholder:text-slate-400"
+        />
+
         {loading && <p className="text-sm text-slate-500">Loading...</p>}
-        {!loading && contacts.length === 0 && (
-          <p className="text-sm text-slate-500">No contacts yet — add the people you call or text most.</p>
+        {!loading && filteredContacts.length === 0 && (
+          <p className="text-sm text-slate-500">
+            {contacts.length === 0 ? "No contacts yet." : "No contacts match your search."}
+          </p>
         )}
 
-        {contacts.map((contact) => (
-          <div key={contact.id} className="rounded-lg border border-slate-200 px-4 py-3 space-y-3">
-            <div className="flex items-center justify-between gap-4">
-              <div>
-                <div className="text-sm font-medium text-slate-800">{contact.name}</div>
-                <div className="text-xs text-slate-500 font-mono">{contact.phone_number}</div>
-                {contact.email && <div className="text-xs text-slate-400">{contact.email}</div>}
-                {contact.notes && <div className="text-xs text-slate-400 italic mt-0.5">{contact.notes}</div>}
-              </div>
-              <div className="flex items-center gap-3 shrink-0">
-                <button
-                  onClick={() => handleToggleHistory(contact)}
-                  className="text-xs font-medium text-indigo-600 hover:text-indigo-800"
-                >
-                  {expandedId === contact.id ? "Hide history" : "View history"}
-                </button>
-                <button
-                  onClick={() => openEditForm(contact)}
-                  className="text-xs font-medium text-slate-500 hover:text-slate-800"
-                >
-                  Edit
-                </button>
-                <button
-                  onClick={() => handleDelete(contact)}
-                  disabled={actionBusyId === contact.id}
-                  className="text-xs font-medium text-red-600 hover:text-red-800 disabled:opacity-60"
-                >
-                  Delete
-                </button>
-              </div>
-            </div>
+        <ul className="divide-y divide-slate-100">
+          {filteredContacts.map((contact) => {
+            const isExpanded = expandedId === contact.id;
+            return (
+              <li key={contact.id} className="py-3">
+                <div className="flex items-center justify-between gap-4">
+                  <div className="min-w-0">
+                    <div className="text-sm font-medium text-slate-800 truncate">{contact.name}</div>
+                    <div className="text-xs text-slate-500 font-mono">{contact.phone_number}</div>
+                    {contact.email && <div className="text-xs text-slate-400">{contact.email}</div>}
+                    {contact.notes && <div className="text-xs text-slate-400 italic">{contact.notes}</div>}
+                  </div>
+                  <div className="flex items-center gap-3 shrink-0 text-xs font-medium">
+                    <button
+                      onClick={() => handleToggleHistory(contact.id)}
+                      className="text-indigo-600 hover:text-indigo-800"
+                    >
+                      {isExpanded ? "Hide history" : "History"}
+                    </button>
+                    {canWrite && (
+                      <>
+                        <button onClick={() => startEdit(contact)} className="text-slate-500 hover:text-slate-700">
+                          Edit
+                        </button>
+                        <button onClick={() => handleDelete(contact.id)} className="text-red-600 hover:text-red-700">
+                          Delete
+                        </button>
+                      </>
+                    )}
+                  </div>
+                </div>
 
-            {expandedId === contact.id && (
-              <ContactHistory state={historyByContact[contact.id]} />
-            )}
-          </div>
-        ))}
+                {isExpanded && <ContactHistory state={historyByContact[contact.id]} />}
+              </li>
+            );
+          })}
+        </ul>
       </div>
     </div>
   );
@@ -280,17 +299,21 @@ export default function ContactsPage() {
 
 function ContactHistory({ state }: { state: HistoryState | undefined }) {
   if (!state || state.status === "loading") {
-    return <p className="text-xs text-slate-500 bg-slate-50 rounded-lg px-3 py-2">Loading history...</p>;
+    return <p className="mt-3 text-xs text-slate-500 bg-slate-50 rounded-lg px-3 py-2">Loading history...</p>;
   }
   if (state.status === "error") {
-    return <p className="text-xs text-red-600 bg-red-50 rounded-lg px-3 py-2">{state.message}</p>;
+    return <p className="mt-3 text-xs text-red-600 bg-red-50 rounded-lg px-3 py-2">{state.message}</p>;
   }
   if (state.entries.length === 0) {
-    return <p className="text-xs text-slate-500 bg-slate-50 rounded-lg px-3 py-2">No calls, voicemails, or receptionist calls with this number yet.</p>;
+    return (
+      <p className="mt-3 text-xs text-slate-500 bg-slate-50 rounded-lg px-3 py-2">
+        No calls, voicemails, or receptionist calls with this number yet.
+      </p>
+    );
   }
 
   return (
-    <div className="space-y-2 pt-1 border-t border-slate-100">
+    <div className="mt-3 space-y-2">
       {state.entries.map((entry) => (
         <div key={`${entry.type}:${entry.id}`} className="rounded-lg border border-slate-200 px-3 py-2">
           <div className="flex items-center justify-between gap-4">

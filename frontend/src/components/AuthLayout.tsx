@@ -16,8 +16,10 @@ export default function AuthLayout({
 }) {
   return (
     <div className="min-h-screen flex bg-slate-50">
-      {/* Branded side panel - hidden on small screens */}
-      <div className="hidden lg:flex lg:w-[45%] bg-gradient-to-br from-indigo-700 via-indigo-600 to-slate-900 text-white flex-col justify-between p-12 relative overflow-hidden">
+      {/* Branded side panel - hidden on small screens. Complementary
+          marketing content, not the page's main content, so it's an
+          <aside>, not part of the <main> landmark below. */}
+      <aside className="hidden lg:flex lg:w-[45%] bg-gradient-to-br from-indigo-700 via-indigo-600 to-slate-900 text-white flex-col justify-between p-12 relative overflow-hidden">
         <div className="absolute inset-0 opacity-10 bg-[radial-gradient(circle_at_top_right,white,transparent_60%)]" />
 
         <div className="relative flex items-center gap-2">
@@ -52,10 +54,10 @@ export default function AuthLayout({
             System status
           </a>
         </p>
-      </div>
+      </aside>
 
-      {/* Form panel */}
-      <div className="flex-1 flex items-center justify-center p-6 sm:p-10">
+      {/* Form panel - the page's actual content */}
+      <main className="flex-1 flex items-center justify-center p-6 sm:p-10">
         <div className="w-full max-w-sm">
           <div className="lg:hidden flex items-center gap-2 mb-8 justify-center">
             <div className="w-9 h-9 rounded-lg bg-indigo-600 text-white flex items-center justify-center font-bold">
@@ -73,7 +75,7 @@ export default function AuthLayout({
             {children}
           </div>
         </div>
-      </div>
+      </main>
     </div>
   );
 }

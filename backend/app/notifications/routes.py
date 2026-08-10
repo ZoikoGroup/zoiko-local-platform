@@ -2,10 +2,12 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
-from app.core.deps import get_current_user
+from app.core.deps import get_current_user, require_writer
 from app.notifications import service
 from app.notifications.schemas import (
     NotificationDeliveryResponse,
+    NotificationPreferenceResponse,
+    NotificationPreferenceUpdate,
     PushSubscribeRequest,
     PushSubscriptionResponse,
     PushUnsubscribeRequest,
@@ -31,7 +33,7 @@ def my_notifications(
 def mark_read(
     notification_id: str,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_writer),
 ):
     try:
         return service.mark_notification_read(db, current_user.account_id, notification_id)
@@ -42,7 +44,7 @@ def mark_read(
 @router.post("/read-all")
 def mark_all_read(
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_writer),
 ):
     count = service.mark_all_notifications_read(db, current_user.account_id)
     return {"marked_read": count}
@@ -67,3 +69,32 @@ def unsubscribe_from_push(
     current_user: User = Depends(get_current_user),
 ):
     service.unsubscribe_from_push(db, account_id=current_user.account_id, endpoint=payload.endpoint)
+
+
+@router.get("/preferences", response_model=NotificationPreferenceResponse)
+def get_preferences(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    return service.get_or_create_preference(db, current_user.account_id)
+
+
+@router.put("/preferences", response_model=NotificationPreferenceResponse)
+def put_preferences(
+    payload: NotificationPreferenceUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_writer),
+):
+    fields = payload.model_dump(exclude_unset=True)
+    try:
+        return service.update_preference(
+            db,
+            current_user.account_id,
+            transactional_enabled=fields.get("transactional_enabled"),
+            sms_enabled=fields.get("sms_enabled"),
+            quiet_hours_start=fields["quiet_hours_start"] if "quiet_hours_start" in fields else ...,
+            quiet_hours_end=fields["quiet_hours_end"] if "quiet_hours_end" in fields else ...,
+            quiet_hours_timezone=fields.get("quiet_hours_timezone"),
+        )
+    except service.InvalidTimezoneError as e:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e)) from e

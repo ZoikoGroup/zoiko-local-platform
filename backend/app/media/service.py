@@ -6,6 +6,7 @@ from fastapi import HTTPException, Request
 from sqlalchemy.orm import Session
 
 from app.audit.service import log_event
+from app.billing import service as billing_service
 from app.consent.models import ConsentType
 from app.consent.service import has_active_consent
 from app.events.service import (
@@ -21,14 +22,18 @@ from app.integrations.telecom import twilio as telecom
 from app.integrations.video import livekit as video
 from app.intelligence.guardrails import check_for_disallowed_commitments
 from app.intelligence.service import qualify_caller
+from app.notifications.service import notify_high_risk_destination_blocked, notify_voicemail_received
 from app.media.models import (
     CallDirection,
     CallRecord,
+    ConnectionQuality,
     ReceptionistCall,
     ReceptionistUrgency,
     VideoParticipantSession,
     VideoSession,
     VideoSessionStatus,
+    VideoWaitingGuest,
+    VideoWaitingGuestStatus,
     Voicemail,
 )
 from app.numbering.identity.models import User, UserRole
@@ -58,6 +63,17 @@ class ReceptionistCallAuthorizationError(Exception):
 class RecordingConsentRequiredError(Exception):
     """Raised when starting a video recording without active AI-processing
     consent on file - recording is opt-in and consent-gated, never automatic."""
+
+
+class ConfidentialModeRecordingBlockedError(Exception):
+    """Raised when trying to record a session created with confidential=True.
+    Blocked unconditionally, regardless of consent status - confidential mode
+    is a stronger guarantee than "consent not yet granted", so it's checked
+    first and consent is never even considered."""
+
+
+class WaitingGuestNotFoundError(Exception):
+    """Raised when a waiting-room request id doesn't exist for the given room."""
 
 
 async def verify_twilio_webhook(request: Request) -> dict:
@@ -111,6 +127,10 @@ def record_call(
     status: str,
     duration: int | None = None,
 ) -> CallRecord:
+    is_suspected_spam = (
+        direction == CallDirection.INBOUND
+        and risk_service.is_suspected_spam_caller(db, from_number, candidate_account_id=account_id)
+    )
     call = CallRecord(
         account_id=account_id,
         phone_number_id=phone_number_id,
@@ -120,6 +140,7 @@ def record_call(
         provider_call_sid=provider_call_sid,
         status=status,
         duration=duration,
+        is_suspected_spam=is_suspected_spam,
     )
     db.add(call)
     db.commit()
@@ -140,6 +161,46 @@ def record_call(
     return call
 
 
+def _dispatch_outbound_call(
+    db: Session, *, account_id: str, account_email: str, owner: PhoneNumber, to: str, from_number: str,
+    message: str, status_callback_url: str | None,
+) -> dict:
+    """Shared core of place_outbound_call and place_outbound_call_for_account
+    - everything after "is this number really available to the caller" is
+    identical for both a logged-in user and a public API key."""
+    # Graceful degradation (Architecture doc §9) - outbound calling pauses
+    # once a payment grace period expires; inbound calls are deliberately
+    # never gated this way (see billing_service.assert_billing_not_suspended).
+    billing_service.assert_billing_not_suspended(db, account_id)
+
+    # Fraud/Risk gates (Architecture doc §5 "Fraud and Risk", §13 "blocked
+    # destinations; fraud thresholds") - checked before ever reaching Twilio.
+    try:
+        risk_service.assert_destination_allowed(db, to, account_id)
+    except risk_service.DestinationBlockedError as e:
+        notify_high_risk_destination_blocked(
+            db, account_id=account_id, account_email=account_email,
+            from_number=from_number, to_number=to, reason=str(e),
+        )
+        raise
+    risk_service.assert_outbound_velocity_ok(db, account_id)
+
+    twiml = telecom.build_say_response(message)
+    result = telecom.place_call(to=to, from_=from_number, twiml=twiml, status_callback_url=status_callback_url)
+
+    record_call(
+        db,
+        account_id=account_id,
+        phone_number_id=owner.id,
+        direction=CallDirection.OUTBOUND,
+        from_number=from_number,
+        to_number=to,
+        provider_call_sid=result["sid"],
+        status=result["status"],
+    )
+    return result
+
+
 def place_outbound_call(
     db: Session, user: User, to: str, from_number: str, message: str, status_callback_url: str | None = None
 ) -> dict:
@@ -151,25 +212,33 @@ def place_outbound_call(
     except NumberConflictError as e:
         raise CallAuthorizationError(str(e)) from e
 
-    # Fraud/Risk gates (Architecture doc §5 "Fraud and Risk", §13 "blocked
-    # destinations; fraud thresholds") - checked before ever reaching Twilio.
-    risk_service.assert_destination_allowed(db, to, user.account_id)
-    risk_service.assert_outbound_velocity_ok(db, user.account_id)
-
-    twiml = telecom.build_say_response(message)
-    result = telecom.place_call(to=to, from_=from_number, twiml=twiml, status_callback_url=status_callback_url)
-
-    record_call(
-        db,
-        account_id=user.account_id,
-        phone_number_id=owner.id,
-        direction=CallDirection.OUTBOUND,
-        from_number=from_number,
-        to_number=to,
-        provider_call_sid=result["sid"],
-        status=result["status"],
+    return _dispatch_outbound_call(
+        db, account_id=user.account_id, account_email=user.email, owner=owner, to=to, from_number=from_number,
+        message=message, status_callback_url=status_callback_url,
     )
-    return result
+
+
+def place_outbound_call_for_account(
+    db: Session, *, account_id: str, to: str, from_number: str, message: str,
+    status_callback_url: str | None = None,
+) -> dict:
+    """Public API counterpart to place_outbound_call - an API key represents
+    the whole account (see app.core.deps.get_api_key_account_id), equivalent
+    to Owner/Admin access, so there's no per-Member number-assignment check
+    to make here - there's no specific logged-in user to check it against."""
+    owner = find_number_owner(db, from_number)
+    if owner is None or owner.account_id != account_id or owner.status != PhoneNumberStatus.ACTIVE:
+        raise CallAuthorizationError(f"{from_number} is not an active number owned by your account")
+
+    from app.numbering.identity.models import User, UserRole
+
+    account_owner = db.query(User).filter(User.account_id == account_id, User.role == UserRole.OWNER).first()
+    account_email = account_owner.email if account_owner else ""
+
+    return _dispatch_outbound_call(
+        db, account_id=account_id, account_email=account_email, owner=owner, to=to, from_number=from_number,
+        message=message, status_callback_url=status_callback_url,
+    )
 
 
 def update_call_status(db: Session, provider_call_sid: str, status: str, duration: int | None) -> CallRecord | None:
@@ -282,6 +351,15 @@ def record_voicemail(
         target_type="voicemail", target_id=voicemail.id, metadata={"from": from_number},
     )
     publish_voicemail_created(account_id, voicemail_id=voicemail.id, phone_number_id=phone_number_id)
+
+    owner = db.query(User).filter(User.account_id == account_id, User.role == UserRole.OWNER).first()
+    if owner is not None:
+        number = db.query(PhoneNumber).filter(PhoneNumber.id == phone_number_id).first()
+        notify_voicemail_received(
+            db, account_id=account_id, account_email=owner.email,
+            e164=number.e164 if number else "", from_number=from_number, duration=duration,
+        )
+
     return voicemail
 
 
@@ -302,7 +380,13 @@ def _find_account_video_session(db: Session, account_id: str, room_name: str) ->
     return session
 
 
-async def create_video_session(db: Session, account_id: str, host_user_id: str) -> VideoSession:
+async def create_video_session(
+    db: Session, account_id: str, host_user_id: str, confidential: bool = False
+) -> VideoSession:
+    # Graceful degradation (Architecture doc §9) - new video calls pause
+    # once a payment grace period expires.
+    billing_service.assert_billing_not_suspended(db, account_id)
+
     room_name = f"zl-{uuid.uuid4().hex[:16]}"
     await video.create_room(room_name)
 
@@ -312,13 +396,15 @@ async def create_video_session(db: Session, account_id: str, host_user_id: str) 
         room_name=room_name,
         status=VideoSessionStatus.ACTIVE,
         started_at=datetime.now(timezone.utc),
+        confidential=confidential,
     )
     db.add(session)
     db.commit()
     db.refresh(session)
     log_event(
         db, actor_id=account_id, action="video.session.started",
-        target_type="video_session", target_id=session.id, metadata={"room_name": room_name},
+        target_type="video_session", target_id=session.id,
+        metadata={"room_name": room_name, "confidential": confidential},
     )
     publish_video_room_created(account_id, room_name=room_name)
     return session
@@ -357,6 +443,10 @@ async def start_video_recording(db: Session, user: User, room_name: str) -> Vide
         raise VideoSessionAuthorizationError(f"{room_name} is not an active session")
     if session.recording_egress_id:
         raise VideoSessionAuthorizationError(f"{room_name} is already being recorded")
+    if session.confidential:
+        raise ConfidentialModeRecordingBlockedError(
+            f"{room_name} is a confidential session — recording is disabled and cannot be enabled"
+        )
     if not has_active_consent(db, user.account_id, ConsentType.AI_PROCESSING):
         raise RecordingConsentRequiredError(
             "AI processing consent is required before recording video calls — "
@@ -383,31 +473,121 @@ def generate_video_join_token(
     return video.build_participant_token(room_name, identity, display_name)
 
 
-class VideoSessionNotFoundError(Exception):
-    """Raised when a guest requests a token for a room that doesn't exist or isn't active."""
-
-
-def generate_guest_video_join_token(db: Session, room_name: str, display_name: str) -> tuple[str, bool]:
-    """No account_id scoping — this is the shareable-link path (anyone with
-    the room name can request a token), unlike generate_video_join_token
-    above which is for a logged-in teammate on the account that owns the
-    call. room_name is a 64-bit-entropy value (see create_video_session),
-    so knowing it is the access control - same trust model a Zoom/Meet
-    link uses. Returns (token, currently_recording) so the join page can
-    show a recording notice - it does NOT itself constitute the guest's
-    recording consent; that's a disclosure shown before they connect, not
-    a consent record (guests have no account to attach one to)."""
+def _get_active_session_or_raise(db: Session, room_name: str) -> VideoSession:
     session = db.query(VideoSession).filter(VideoSession.room_name == room_name).first()
     if session is None or session.status != VideoSessionStatus.ACTIVE:
-        raise VideoSessionNotFoundError(f"{room_name} is not an active video call")
+        raise VideoSessionAuthorizationError(f"{room_name} is not an active video session")
+    return session
 
-    identity = f"guest:{uuid.uuid4().hex[:8]}"
-    token = video.build_participant_token(room_name, identity, display_name)
-    log_event(
-        db, actor=identity, action="video.guest_joined",
-        target=f"video_session:{session.id}", after={"room_name": room_name, "display_name": display_name},
+
+def request_guest_join(db: Session, room_name: str, display_name: str) -> VideoWaitingGuest:
+    """Public, unauthenticated request to join - no Zoiko account involved
+    at all. The room_name itself (a random 64-bit-entropy `zl-<uuid hex>`
+    string) is what gates access, the same trust model as sharing a Zoom/
+    Meet invite link. Only an ACTIVE session can be joined, so an ended
+    call's link can't be replayed later and a fabricated room name is
+    rejected the same way a real-but-ended one is - this never reveals
+    which case it was.
+
+    Doesn't return a token - lands the guest in the waiting room instead
+    (see check_waiting_status/admit_waiting_guest). The guest's identity is
+    reserved now, server-generated (never client-supplied) so it can't
+    collide with or impersonate a real user's identity, and prefixed
+    `guest-` so participant records/audit are distinguishable from real
+    account users at a glance.
+    """
+    session = _get_active_session_or_raise(db, room_name)
+
+    guest_identity = f"guest-{uuid.uuid4().hex[:12]}"
+    waiting_guest = VideoWaitingGuest(
+        video_session_id=session.id, display_name=display_name, guest_identity=guest_identity,
     )
-    return token, session.recording_egress_id is not None
+    db.add(waiting_guest)
+    db.commit()
+    db.refresh(waiting_guest)
+    log_event(
+        db, actor_id=session.account_id, action="video.guest_join_requested",
+        target_type="video_session", target_id=session.id,
+        metadata={"display_name": display_name, "guest_identity": guest_identity, "waiting_id": waiting_guest.id},
+    )
+    return waiting_guest
+
+
+def check_waiting_status(db: Session, room_name: str, waiting_id: str) -> dict:
+    """Polled by the guest's browser while waiting for the host to respond.
+    A LiveKit token is only ever generated here, on demand, once admitted -
+    never persisted, since it's itself a bearer credential and there's no
+    reason to store one at rest when it's this cheap to regenerate."""
+    session = _get_active_session_or_raise(db, room_name)
+    waiting_guest = (
+        db.query(VideoWaitingGuest)
+        .filter(VideoWaitingGuest.id == waiting_id, VideoWaitingGuest.video_session_id == session.id)
+        .first()
+    )
+    if waiting_guest is None:
+        raise WaitingGuestNotFoundError(f"{waiting_id} is not a waiting-room request for {room_name}")
+
+    if waiting_guest.status == VideoWaitingGuestStatus.ADMITTED:
+        token = video.build_participant_token(room_name, waiting_guest.guest_identity, waiting_guest.display_name)
+        # Disclosure only, not the guest's consent record - see the old
+        # generate_guest_video_join_token's docstring this replaced; guests
+        # have no account to attach a real consent record to.
+        return {"status": "admitted", "token": token, "recording": session.recording_egress_id is not None}
+    return {"status": waiting_guest.status.value, "token": None, "recording": False}
+
+
+def _assert_can_manage_video_session(db: Session, user: User, room_name: str) -> VideoSession:
+    session = _find_account_video_session(db, user.account_id, room_name)
+    if user.role == UserRole.MEMBER and session.host_user_id != user.id:
+        raise VideoSessionAuthorizationError(f"{room_name} was not started by you")
+    return session
+
+
+def list_waiting_guests(db: Session, user: User, room_name: str) -> list[VideoWaitingGuest]:
+    session = _assert_can_manage_video_session(db, user, room_name)
+    return (
+        db.query(VideoWaitingGuest)
+        .filter(
+            VideoWaitingGuest.video_session_id == session.id,
+            VideoWaitingGuest.status == VideoWaitingGuestStatus.PENDING,
+        )
+        .order_by(VideoWaitingGuest.created_at.asc())
+        .all()
+    )
+
+
+def _get_waiting_guest_for_host(db: Session, user: User, room_name: str, waiting_id: str) -> VideoWaitingGuest:
+    session = _assert_can_manage_video_session(db, user, room_name)
+    waiting_guest = (
+        db.query(VideoWaitingGuest)
+        .filter(VideoWaitingGuest.id == waiting_id, VideoWaitingGuest.video_session_id == session.id)
+        .first()
+    )
+    if waiting_guest is None:
+        raise WaitingGuestNotFoundError(f"{waiting_id} is not a waiting-room request for {room_name}")
+    return waiting_guest
+
+
+def admit_waiting_guest(db: Session, user: User, room_name: str, waiting_id: str) -> None:
+    waiting_guest = _get_waiting_guest_for_host(db, user, room_name, waiting_id)
+    waiting_guest.status = VideoWaitingGuestStatus.ADMITTED
+    db.commit()
+    log_event(
+        db, actor_id=user.id, action="video.guest_admitted",
+        target_type="video_session", target_id=waiting_guest.video_session_id,
+        metadata={"waiting_id": waiting_id, "display_name": waiting_guest.display_name},
+    )
+
+
+def deny_waiting_guest(db: Session, user: User, room_name: str, waiting_id: str) -> None:
+    waiting_guest = _get_waiting_guest_for_host(db, user, room_name, waiting_id)
+    waiting_guest.status = VideoWaitingGuestStatus.DENIED
+    db.commit()
+    log_event(
+        db, actor_id=user.id, action="video.guest_denied",
+        target_type="video_session", target_id=waiting_guest.video_session_id,
+        metadata={"waiting_id": waiting_id, "display_name": waiting_guest.display_name},
+    )
 
 
 def list_account_video_sessions(db: Session, account_id: str) -> list[VideoSession]:
@@ -463,6 +643,20 @@ def handle_video_webhook_event(db: Session, event) -> None:
             row.left_at = session.ended_at or now
         if dangling:
             db.commit()
+
+        # Usage Metering (Architecture doc §7/§5) - room_finished is the one
+        # point where every participant's time is finalized (dangling rows
+        # just closed above), so it's the right moment to rate the whole
+        # call's participant-minutes, not per-participant on each leave.
+        usage_service.record_usage_event(
+            db,
+            account_id=session.account_id,
+            event_type="video_participant_minutes",
+            quantity=get_participant_minutes(db, session.id),
+            unit="minutes",
+            country_band=None,
+            idempotency_key=f"video_participant_minutes:{session.id}",
+        )
     elif event.event == "participant_joined":
         db.add(
             VideoParticipantSession(
@@ -525,6 +719,67 @@ def get_participant_minutes(db: Session, video_session_id: str) -> float:
     return round(total_duration.total_seconds() / 60, 2)
 
 
+# Worse-than ranking, not alphabetical - used to decide whether a new sample
+# should replace the stored "worst quality seen" for a participant.
+_QUALITY_RANK = {ConnectionQuality.EXCELLENT: 0, ConnectionQuality.GOOD: 1, ConnectionQuality.POOR: 2}
+
+
+class ParticipantSessionNotFoundError(Exception):
+    """Raised when a quality sample arrives for a room/identity with no
+    currently-open participant session - most likely a race between the
+    client's first sample and LiveKit's participant_joined webhook, or a
+    stale POST after the participant already left."""
+
+
+def record_call_quality_sample(
+    db: Session, room_name: str, participant_identity: str, *, quality: ConnectionQuality, reconnected: bool
+) -> VideoParticipantSession:
+    row = (
+        db.query(VideoParticipantSession)
+        .join(VideoSession, VideoSession.id == VideoParticipantSession.video_session_id)
+        .filter(
+            VideoSession.room_name == room_name,
+            VideoParticipantSession.participant_identity == participant_identity,
+            VideoParticipantSession.left_at.is_(None),
+        )
+        .order_by(VideoParticipantSession.joined_at.desc())
+        .first()
+    )
+    if row is None:
+        raise ParticipantSessionNotFoundError(
+            f"No open participant session for {participant_identity!r} in {room_name!r}"
+        )
+
+    if row.worst_connection_quality is None or _QUALITY_RANK[quality] > _QUALITY_RANK[row.worst_connection_quality]:
+        row.worst_connection_quality = quality
+    if reconnected:
+        row.reconnect_count += 1
+    db.commit()
+    db.refresh(row)
+    return row
+
+
+def get_call_quality_summary(db: Session, video_session_id: str) -> dict:
+    """Aggregates every participant's telemetry for one call into a single
+    room-level summary for the call-history list - the worst quality any
+    participant experienced, and the total reconnects across all of them."""
+    rows = (
+        db.query(VideoParticipantSession)
+        .filter(VideoParticipantSession.video_session_id == video_session_id)
+        .all()
+    )
+    worst = None
+    for row in rows:
+        if row.worst_connection_quality is None:
+            continue
+        if worst is None or _QUALITY_RANK[row.worst_connection_quality] > _QUALITY_RANK[worst]:
+            worst = row.worst_connection_quality
+    return {
+        "worst_connection_quality": worst.value if worst else None,
+        "reconnect_count": sum(row.reconnect_count for row in rows),
+    }
+
+
 def _handle_egress_ended(db: Session, event) -> None:
     """Attaches the finished recording's file location once LiveKit's egress
     job completes - arrives asynchronously, well after the call itself ends."""
@@ -583,6 +838,8 @@ def capture_receptionist_call(
     # Guardrail check on the AI's OWN generated text, not the caller's raw
     # transcript - see app/intelligence/guardrails.py.
     guardrail_flags = check_for_disallowed_commitments(qualification.get("summary"), qualification.get("reason"))
+    is_likely_spam = bool(qualification.get("is_likely_spam"))
+    spam_reason = qualification.get("spam_reason") if is_likely_spam else None
 
     call = ReceptionistCall(
         account_id=owner.account_id,
@@ -596,6 +853,8 @@ def capture_receptionist_call(
         summary=qualification.get("summary"),
         urgency=urgency,
         guardrail_flags=guardrail_flags,
+        is_likely_spam=is_likely_spam,
+        spam_reason=spam_reason,
         model_version=model_version,
     )
     db.add(call)
@@ -604,7 +863,7 @@ def capture_receptionist_call(
     log_event(
         db, actor_id=owner.account_id, action="receptionist.call_captured",
         target_type="receptionist_call", target_id=call.id,
-        metadata={"urgency": urgency.value if urgency else None, "guardrail_flags": guardrail_flags},
+        metadata={"urgency": urgency.value if urgency else None, "guardrail_flags": guardrail_flags, "is_likely_spam": is_likely_spam},
     )
     return call
 

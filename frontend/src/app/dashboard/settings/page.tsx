@@ -469,6 +469,7 @@ export default function SettingsPage() {
                     <input
                       type="number"
                       min={1}
+                      aria-label={`${RETENTION_LABELS[key]} retention in days`}
                       value={retentionDrafts[key] ?? retention[key]}
                       onChange={(e) =>
                         setRetentionDrafts((prev) => ({ ...prev, [key]: e.target.value }))

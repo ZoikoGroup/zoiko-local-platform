@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
-from app.core.deps import get_current_user
+from app.core.deps import get_current_user, require_writer
 from app.integrations.telecom import twilio as telecom
 from app.integrations.telecom.twilio import TelecomError
 from app.media import service as media_service
@@ -41,7 +41,7 @@ def _presence_response(presence) -> dict:
 
 
 @router.post("", response_model=QueueResponse, status_code=status.HTTP_201_CREATED)
-def create_queue(payload: CreateQueueRequest, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+def create_queue(payload: CreateQueueRequest, db: Session = Depends(get_db), current_user: User = Depends(require_writer)):
     return service.create_queue(
         db, current_user.account_id, payload.name, payload.max_wait_seconds, payload.wrap_up_seconds, current_user.id
     )
@@ -62,7 +62,7 @@ def get_queue(queue_id: str, db: Session = Depends(get_db), current_user: User =
 
 @router.put("/{queue_id}", response_model=QueueResponse)
 def update_queue(
-    queue_id: str, payload: UpdateQueueRequest, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)
+    queue_id: str, payload: UpdateQueueRequest, db: Session = Depends(get_db), current_user: User = Depends(require_writer)
 ):
     try:
         return service.update_queue(
@@ -74,7 +74,7 @@ def update_queue(
 
 @router.post("/{queue_id}/members", response_model=QueueResponse)
 def add_member(
-    queue_id: str, payload: AddMemberRequest, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)
+    queue_id: str, payload: AddMemberRequest, db: Session = Depends(get_db), current_user: User = Depends(require_writer)
 ):
     try:
         return service.add_member(db, current_user.account_id, queue_id, payload.user_id)
@@ -86,7 +86,7 @@ def add_member(
 
 @router.delete("/{queue_id}/members/{user_id}", response_model=QueueResponse)
 def remove_member(
-    queue_id: str, user_id: str, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)
+    queue_id: str, user_id: str, db: Session = Depends(get_db), current_user: User = Depends(require_writer)
 ):
     try:
         return service.remove_member(db, current_user.account_id, queue_id, user_id)
@@ -106,7 +106,7 @@ def get_queue_status(queue_id: str, db: Session = Depends(get_db), current_user:
 
 
 @router.post("/{queue_id}/pull-next", response_model=PullNextResult)
-def pull_next(queue_id: str, request: Request, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+def pull_next(queue_id: str, request: Request, db: Session = Depends(get_db), current_user: User = Depends(require_writer)):
     try:
         queue = db.query(CallQueue).filter(
             CallQueue.id == queue_id, CallQueue.account_id == current_user.account_id
@@ -132,7 +132,7 @@ def get_my_presence(db: Session = Depends(get_db), current_user: User = Depends(
 
 
 @router.put("/presence/me", response_model=PresenceResponse)
-def set_my_presence(payload: SetPresenceRequest, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+def set_my_presence(payload: SetPresenceRequest, db: Session = Depends(get_db), current_user: User = Depends(require_writer)):
     try:
         return _presence_response(service.set_presence(db, current_user.id, payload.status))
     except InvalidPresenceStatusError as e:

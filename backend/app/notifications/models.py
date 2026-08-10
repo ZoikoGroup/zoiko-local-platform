@@ -1,7 +1,7 @@
 import enum
-from datetime import datetime
+from datetime import datetime, time
 
-from sqlalchemy import DateTime, Enum, ForeignKey, String, Text, func
+from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, String, Text, Time, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -14,9 +14,23 @@ class NotificationCategory(str, enum.Enum):
     SECURITY = "security"
 
 
+class NotificationPriority(str, enum.Enum):
+    # CRITICAL bypasses both quiet hours and the transactional-suppression
+    # preference - reserved for events where NOT telling the customer is
+    # itself the harmful outcome (losing access to a number, account
+    # security). Everything else is STANDARD.
+    CRITICAL = "critical"
+    STANDARD = "standard"
+
+
 class NotificationDeliveryStatus(str, enum.Enum):
     SENT = "sent"
     FAILED = "failed"
+    # Not sent on purpose - either the customer opted out of this category
+    # (see NotificationPreference.transactional_enabled) or it landed inside
+    # their configured quiet hours. Kept as its own ledger row (not silently
+    # dropped) so "why didn't I get this" has a real answer.
+    SUPPRESSED = "suppressed"
 
 
 class NotificationChannel(str, enum.Enum):
@@ -35,8 +49,21 @@ class NotificationTemplate(Base):
 
     id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=new_uuid)
     key: Mapped[str] = mapped_column(String(100), nullable=False, unique=True, index=True)
+    # Maps this row to its entry in the Email Communications System spec
+    # doc (e.g. "ZLOC-EM-BILL-011") - nullable because several templates
+    # predate that registry effort and have no canonical doc entry (e.g.
+    # team_member.added, which is ORG domain, not yet imported). Lets the
+    # staff console show "matches spec vX.Y.Z" vs "custom" per template.
+    canonical_id: Mapped[str | None] = mapped_column(String(30), nullable=True, unique=True, index=True)
+    domain: Mapped[str | None] = mapped_column(String(20), nullable=True, index=True)
+    spec_version: Mapped[str | None] = mapped_column(String(20), nullable=True)
     category: Mapped[NotificationCategory] = mapped_column(
         Enum(NotificationCategory, name="notification_category_enum"), nullable=False
+    )
+    priority: Mapped[NotificationPriority] = mapped_column(
+        Enum(NotificationPriority, name="notification_priority_enum"),
+        nullable=False,
+        default=NotificationPriority.STANDARD,
     )
     subject_template: Mapped[str] = mapped_column(String(255), nullable=False)
     body_template: Mapped[str] = mapped_column(Text, nullable=False)
@@ -104,4 +131,27 @@ class PushSubscription(Base):
     endpoint: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
     p256dh: Mapped[str] = mapped_column(String(255), nullable=False)
     auth: Mapped[str] = mapped_column(String(255), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class NotificationPreference(Base):
+    """One row per account (not per user) - notifications go to the account
+    owner's email/phone today, so preferences are scoped the same way.
+    Created lazily on first read/write (see service.get_or_create_preference)
+    rather than at account-creation time, so every account doesn't need a
+    migration-time backfill row."""
+
+    __tablename__ = "notification_preferences"
+
+    account_id: Mapped[str] = mapped_column(
+        UUID(as_uuid=False), ForeignKey("accounts.id", ondelete="CASCADE"), primary_key=True
+    )
+    # SECURITY-category and CRITICAL-priority templates ignore this - opting
+    # out of transactional noise must never silently opt someone out of
+    # "your account access changed" type events.
+    transactional_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    sms_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    quiet_hours_start: Mapped[time | None] = mapped_column(Time, nullable=True)
+    quiet_hours_end: Mapped[time | None] = mapped_column(Time, nullable=True)
+    quiet_hours_timezone: Mapped[str] = mapped_column(String(64), nullable=False, default="UTC")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

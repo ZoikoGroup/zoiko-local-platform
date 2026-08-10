@@ -1,15 +1,30 @@
 from sqlalchemy.orm import Session
 
 from app.audit.service import log_event
+from app.billing.service import assert_seat_quota_available
 from app.core.security import (
+    create_access_token,
+    decode_access_token,
     generate_mfa_secret,
     hash_password,
     mfa_provisioning_uri,
+    password_fingerprint,
     verify_password,
     verify_totp_code,
 )
-from app.notifications.service import notify_team_member_added
+from app.notifications.service import (
+    notify_account_activated,
+    notify_administrator_added,
+    notify_administrator_removed,
+    notify_mfa_disabled,
+    notify_mfa_enabled,
+    notify_password_changed,
+    notify_password_reset_requested,
+    notify_team_member_added,
+)
 from app.numbering.identity.models import Account, AccountType, User, UserRole
+
+PASSWORD_RESET_TOKEN_EXPIRE_MINUTES = 30
 
 
 def create_account_with_owner(
@@ -40,6 +55,7 @@ def create_account_with_owner(
         target=f"account:{account.id}",
         after={"account_id": account.id, "user_id": user.id, "email": user.email, "role": user.role},
     )
+    notify_account_activated(db, account_id=account.id, user_email=user.email)
     return user
 
 
@@ -55,6 +71,65 @@ def authenticate_user(db: Session, email: str, password: str) -> User | None:
     # it once the code is verified, so we don't log an incomplete login.
     if not user.mfa_enabled:
         log_event(db, actor=user.id, action="user.login", target=f"user:{user.id}")
+    return user
+
+
+class InvalidResetTokenError(Exception):
+    """Raised for an expired, malformed, or already-used password reset
+    token - deliberately the same error/message for all three (see
+    reset_password's docstring) so a caller can't distinguish them."""
+
+
+def request_password_reset(db: Session, email: str) -> None:
+    """Always succeeds from the caller's perspective regardless of whether
+    the email matches an account - the route never reveals which (see
+    routes.py), the standard anti-account-enumeration posture for this kind
+    of endpoint. Silently no-ops for an unknown email; still sends for a
+    Google-only account (hashed_password is None) - completing the reset
+    sets one, which is a reasonable bonus (adds password login) rather than
+    a bug."""
+    user = db.query(User).filter(User.email == email).first()
+    if user is None:
+        return
+
+    token = create_access_token(
+        subject=user.id,
+        scope="password_reset",
+        expire_minutes=PASSWORD_RESET_TOKEN_EXPIRE_MINUTES,
+    )
+    fingerprint = password_fingerprint(user.hashed_password or "")
+    notify_password_reset_requested(db, account_id=user.account_id, user_email=user.email, token=f"{token}.{fingerprint}")
+    log_event(db, actor=user.id, action="user.password_reset_requested", target=f"user:{user.id}")
+
+
+def reset_password(db: Session, token: str, new_password: str) -> User:
+    """token is `<jwt>.<fingerprint>` (see request_password_reset) - the JWT
+    proves who requested it and that it hasn't expired; the fingerprint,
+    checked against the user's CURRENT hashed_password, proves the password
+    hasn't already been changed since this token was issued (the one-time-
+    use mechanism - see password_fingerprint's docstring). Both failure
+    modes raise the same InvalidResetTokenError with the same message,
+    so a caller can't distinguish "expired" from "already used" from
+    "malformed" - none of that should be observable to whoever holds the
+    token."""
+    try:
+        jwt_part, fingerprint = token.rsplit(".", 1)
+    except ValueError:
+        raise InvalidResetTokenError("This password reset link is invalid or has expired.")
+
+    payload = decode_access_token(jwt_part)
+    if payload is None or payload.get("scope") != "password_reset":
+        raise InvalidResetTokenError("This password reset link is invalid or has expired.")
+
+    user = db.query(User).filter(User.id == payload["sub"]).first()
+    if user is None or password_fingerprint(user.hashed_password or "") != fingerprint:
+        raise InvalidResetTokenError("This password reset link is invalid or has expired.")
+
+    user.hashed_password = hash_password(new_password)
+    db.commit()
+    db.refresh(user)
+    log_event(db, actor=user.id, action="user.password_reset_completed", target=f"user:{user.id}")
+    notify_password_changed(db, account_id=user.account_id, user_email=user.email)
     return user
 
 
@@ -96,12 +171,14 @@ def add_team_member(
 ) -> User:
     if role == UserRole.OWNER.value:
         raise ValueError("Cannot add a second owner - there is exactly one owner per account")
-    if role not in (UserRole.ADMIN.value, UserRole.MEMBER.value):
-        raise ValueError("role must be 'admin' or 'member'")
+    if role not in (UserRole.ADMIN.value, UserRole.MEMBER.value, UserRole.VIEWER.value):
+        raise ValueError("role must be 'admin', 'member', or 'viewer'")
 
     existing = db.query(User).filter(User.email == email).first()
     if existing:
         raise ValueError("A user with this email already exists")
+
+    assert_seat_quota_available(db, account_id)
 
     member = User(
         account_id=account_id,
@@ -126,6 +203,13 @@ def add_team_member(
         notify_team_member_added(
             db, account_id=account_id, member_email=member.email, account_name=account.name, role=member.role
         )
+        if member.role == UserRole.ADMIN:
+            owner = db.query(User).filter(User.account_id == account_id, User.role == UserRole.OWNER).first()
+            if owner is not None:
+                notify_administrator_added(
+                    db, account_id=account_id, account_email=owner.email, organization_name=account.name,
+                    new_admin_display_name=member.email,
+                )
 
     return member
 
@@ -156,6 +240,15 @@ def remove_team_member(db: Session, *, account_id: str, user_id: str, actor: str
         before={"user_id": user_id, "email": removed_email, "role": removed_role},
     )
 
+    if removed_role == UserRole.ADMIN:
+        owner = db.query(User).filter(User.account_id == account_id, User.role == UserRole.OWNER).first()
+        account = db.query(Account).filter(Account.id == account_id).first()
+        if owner is not None and account is not None:
+            notify_administrator_removed(
+                db, account_id=account_id, account_email=owner.email, organization_name=account.name,
+                removed_admin_display_name=removed_email,
+            )
+
 
 def start_mfa_setup(db: Session, user: User) -> tuple[str, str]:
     """Generates a new pending TOTP secret (not yet enabled). Returns
@@ -176,6 +269,7 @@ def enable_mfa(db: Session, user: User, code: str, actor: str) -> None:
     user.mfa_enabled = True
     db.commit()
     log_event(db, actor=actor, action="mfa.enabled", target=f"user:{user.id}")
+    notify_mfa_enabled(db, account_id=user.account_id, user_email=user.email)
 
 
 def disable_mfa(db: Session, user: User, code: str, actor: str) -> None:
@@ -188,6 +282,7 @@ def disable_mfa(db: Session, user: User, code: str, actor: str) -> None:
     user.mfa_enabled = False
     db.commit()
     log_event(db, actor=actor, action="mfa.disabled", target=f"user:{user.id}")
+    notify_mfa_disabled(db, account_id=user.account_id, user_email=user.email)
 
 
 def set_phone_number(db: Session, user: User, phone_number: str | None) -> User:

@@ -116,3 +116,43 @@ def test_account_audit_events_do_not_leak_other_accounts(client):
     a_ids = {e["id"] for e in response_a.json()}
     b_ids = {e["id"] for e in response_b.json()}
     assert a_ids.isdisjoint(b_ids)
+
+
+def test_account_id_is_resolved_and_persisted_at_write_time(client, db_session):
+    """account_id is now a real column populated once inside log_event -
+    not a query-time heuristic anymore. Both the signup event (actor=user.id)
+    and the account-created event (actor=account_id itself, from the signup
+    flow's earlier call) should resolve to the same account."""
+    from app.audit.models import AuditEvent
+
+    signup_response = client.post("/auth/signup", json=_signup_payload("audit6@example.com"))
+    account_id = signup_response.json()["account_id"]
+
+    events = db_session.query(AuditEvent).filter(AuditEvent.account_id == account_id).all()
+    assert len(events) >= 1
+    actions = {e.action for e in events}
+    assert "account.signup" in actions
+
+
+def test_staff_can_filter_audit_events_by_account_id(client, db_session):
+    from app.staff import service as staff_service
+    from app.staff.models import PlatformStaffRole
+
+    signup_response = client.post("/auth/signup", json=_signup_payload("audit7@example.com"))
+    account_id = signup_response.json()["account_id"]
+    _signup_and_login(client, "audit7-other@example.com")
+
+    staff_service.create_staff(
+        db_session, email="staffaudit2@zoikolocal.com", password="staffpass123", role=PlatformStaffRole.SUPER_ADMIN
+    )
+    staff_token = client.post(
+        "/staff/login", json={"email": "staffaudit2@zoikolocal.com", "password": "staffpass123"}
+    ).json()["access_token"]
+
+    response = client.get(
+        "/audit/events", params={"account_id": account_id}, headers={"Authorization": f"Bearer {staff_token}"}
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert len(body) >= 1
+    assert all(e["account_id"] == account_id for e in body)

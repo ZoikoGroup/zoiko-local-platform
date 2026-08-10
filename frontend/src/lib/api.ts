@@ -31,10 +31,14 @@ async function request<T>(
   path: string,
   options: RequestInit = {}
 ): Promise<T> {
+  // FormData bodies (file uploads) must NOT get a Content-Type set here -
+  // the browser generates its own multipart boundary, and overriding it
+  // with application/json breaks the upload silently server-side.
+  const isFormData = options.body instanceof FormData;
   const response = await fetch(`${API_BASE_URL}${path}`, {
     ...options,
     headers: {
-      "Content-Type": "application/json",
+      ...(isFormData ? {} : { "Content-Type": "application/json" }),
       ...options.headers,
     },
   });
@@ -77,6 +81,20 @@ export function login(input: { email: string; password: string }): Promise<Login
   });
 }
 
+export function forgotPassword(email: string): Promise<void> {
+  return request<void>("/auth/forgot-password", {
+    method: "POST",
+    body: JSON.stringify({ email }),
+  });
+}
+
+export function resetPassword(token: string, newPassword: string): Promise<LoginResult> {
+  return request<LoginResult>("/auth/reset-password", {
+    method: "POST",
+    body: JSON.stringify({ token, new_password: newPassword }),
+  });
+}
+
 export function getCurrentUser(token: string): Promise<User> {
   return request<User>("/auth/me", {
     headers: { Authorization: `Bearer ${token}` },
@@ -93,6 +111,24 @@ export function setPhoneNumber(token: string, phoneNumber: string | null): Promi
 
 export function listTeamMembers(token: string): Promise<TeamMember[]> {
   return request<TeamMember[]>("/team/members", {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export function addTeamMember(
+  token: string,
+  input: { email: string; password: string; role: "admin" | "member" | "viewer" }
+): Promise<TeamMember> {
+  return request<TeamMember>("/team/members", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify(input),
+  });
+}
+
+export function removeTeamMember(token: string, userId: string): Promise<void> {
+  return request<void>(`/team/members/${encodeURIComponent(userId)}`, {
+    method: "DELETE",
     headers: { Authorization: `Bearer ${token}` },
   });
 }
@@ -168,14 +204,58 @@ export function openComplianceCase(
   });
 }
 
+export type ComplianceDocument = {
+  document_type: string;
+  storage_key: string;
+  filename: string;
+  content_type: string;
+  uploaded_at: string;
+};
+
 export type MyComplianceCase = ComplianceCase & {
-  documents: { document_type: string; reference: string }[];
+  documents: ComplianceDocument[];
   created_at: string;
 };
 
 export function listMyComplianceCases(token: string): Promise<MyComplianceCase[]> {
   return request<MyComplianceCase[]>("/compliance/cases/me", {
     headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export function submitComplianceDocument(
+  token: string,
+  caseId: string,
+  documentType: string,
+  file: File
+): Promise<MyComplianceCase> {
+  const formData = new FormData();
+  formData.append("document_type", documentType);
+  formData.append("file", file);
+  return request<MyComplianceCase>(`/compliance/cases/${caseId}/documents`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+    body: formData,
+  });
+}
+
+export function getComplianceDocumentDownloadUrl(
+  token: string,
+  caseId: string,
+  documentIndex: number
+): Promise<{ url: string }> {
+  return request(`/compliance/cases/${caseId}/documents/${documentIndex}/download-url`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export function getStaffComplianceDocumentDownloadUrl(
+  staffToken: string,
+  caseId: string,
+  documentIndex: number
+): Promise<{ url: string }> {
+  return request(`/compliance/staff/cases/${caseId}/documents/${documentIndex}/download-url`, {
+    headers: { Authorization: `Bearer ${staffToken}` },
   });
 }
 
@@ -196,7 +276,7 @@ export type NotificationDelivery = {
   recipient_email: string | null;
   recipient_phone: string | null;
   subject: string;
-  status: "sent" | "failed";
+  status: "sent" | "failed" | "suppressed";
   error: string | null;
   created_at: string;
   read_at: string | null;
@@ -247,6 +327,31 @@ export function unsubscribeFromPush(token: string, endpoint: string): Promise<vo
   });
 }
 
+export type NotificationPreferences = {
+  transactional_enabled: boolean;
+  sms_enabled: boolean;
+  quiet_hours_start: string | null; // "HH:MM:SS"
+  quiet_hours_end: string | null;
+  quiet_hours_timezone: string;
+};
+
+export function getNotificationPreferences(token: string): Promise<NotificationPreferences> {
+  return request<NotificationPreferences>("/notifications/preferences", {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export function updateNotificationPreferences(
+  token: string,
+  updates: Partial<NotificationPreferences>
+): Promise<NotificationPreferences> {
+  return request<NotificationPreferences>("/notifications/preferences", {
+    method: "PUT",
+    headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify(updates),
+  });
+}
+
 // --- Staff / Admin console ---
 
 export function staffLogin(input: {
@@ -264,7 +369,7 @@ export type StaffComplianceCase = ComplianceCase & {
   account_name: string;
   account_owner_email: string;
   number_id: string | null;
-  documents: { document_type: string; reference: string }[];
+  documents: ComplianceDocument[];
   expires_at: string | null;
   created_at: string;
 };
@@ -402,6 +507,103 @@ export function listProviderStatuses(staffToken: string): Promise<{ providers: P
   });
 }
 
+// --- Distributed tracing (self-hosted, staff-only) ---
+
+export type ProviderCallTrace = {
+  id: string;
+  request_id: string | null;
+  provider: string;
+  operation: string;
+  duration_ms: number;
+  success: boolean;
+  error_detail: string | null;
+  created_at: string;
+};
+
+export type ProviderLatencySummary = {
+  provider: string;
+  operation: string;
+  count: number;
+  avg_duration_ms: number;
+  max_duration_ms: number;
+  failure_count: number;
+};
+
+export function listProviderTraces(
+  staffToken: string,
+  filters: { provider?: string; requestId?: string; limit?: number } = {}
+): Promise<ProviderCallTrace[]> {
+  const params = new URLSearchParams();
+  if (filters.provider) params.set("provider", filters.provider);
+  if (filters.requestId) params.set("request_id", filters.requestId);
+  if (filters.limit) params.set("limit", String(filters.limit));
+  const query = params.toString() ? `?${params.toString()}` : "";
+  return request<ProviderCallTrace[]>(`/ops/traces${query}`, {
+    headers: { Authorization: `Bearer ${staffToken}` },
+  });
+}
+
+export function getProviderTraceSummary(staffToken: string, hours: number = 24): Promise<ProviderLatencySummary[]> {
+  return request<ProviderLatencySummary[]>(`/ops/traces/summary?hours=${hours}`, {
+    headers: { Authorization: `Bearer ${staffToken}` },
+  });
+}
+
+// --- ZoikoNex mock billing adapter (staff-only) ---
+// No real ZoikoNex API exists yet - these routes simulate the webhook a
+// real ZoikoNex would eventually send, so the graceful-degradation
+// mechanism can be exercised. See backend app/integrations/billing/
+// zoikonex.py's docstring.
+
+export type ZoikoNexSyncEvent = {
+  id: string;
+  account_id: string;
+  event_type: "subscription_sync" | "usage_sync" | "payment_event_received";
+  zoikonex_ref: string | null;
+  payload: Record<string, unknown>;
+  created_at: string;
+};
+
+export type ZoikoNexReconciliationSummary = {
+  total_subscriptions: number;
+  synced_subscriptions: number;
+  unsynced_subscriptions: number;
+  total_usage_events: number;
+  synced_usage_events: number;
+  unsynced_usage_events: number;
+};
+
+export function simulateZoikoNexPaymentEvent(
+  staffToken: string,
+  accountId: string,
+  eventType: "payment_failed" | "payment_retry" | "payment_restored"
+): Promise<Subscription> {
+  return request<Subscription>("/billing/zoikonex/simulate-payment-event", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${staffToken}` },
+    body: JSON.stringify({ account_id: accountId, event_type: eventType }),
+  });
+}
+
+export function listZoikoNexSyncLog(
+  staffToken: string,
+  filters: { accountId?: string; limit?: number } = {}
+): Promise<ZoikoNexSyncEvent[]> {
+  const params = new URLSearchParams();
+  if (filters.accountId) params.set("account_id", filters.accountId);
+  if (filters.limit) params.set("limit", String(filters.limit));
+  const query = params.toString() ? `?${params.toString()}` : "";
+  return request<ZoikoNexSyncEvent[]>(`/billing/zoikonex/sync-log${query}`, {
+    headers: { Authorization: `Bearer ${staffToken}` },
+  });
+}
+
+export function getZoikoNexReconciliation(staffToken: string): Promise<ZoikoNexReconciliationSummary> {
+  return request<ZoikoNexReconciliationSummary>("/billing/zoikonex/reconciliation", {
+    headers: { Authorization: `Bearer ${staffToken}` },
+  });
+}
+
 // --- Public status page (no auth) ---
 
 export type PublicStatus = {
@@ -513,6 +715,63 @@ export function configureRouting(
   });
 }
 
+export type RingGroupDestination = {
+  id: string;
+  destination_number: string;
+  ring_order: number;
+};
+
+export function getRingGroup(token: string, e164: string): Promise<RingGroupDestination[]> {
+  return request<RingGroupDestination[]>(`/numbers/${encodeURIComponent(e164)}/ring-group`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export function setRingGroup(token: string, e164: string, destinations: string[]): Promise<RingGroupDestination[]> {
+  return request<RingGroupDestination[]>(`/numbers/${encodeURIComponent(e164)}/ring-group`, {
+    method: "PUT",
+    headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ destinations }),
+  });
+}
+
+export type IVROption = {
+  id: string;
+  digit: string;
+  destination_number: string;
+};
+
+export type IVRMenu = {
+  greeting: string | null;
+  options: IVROption[];
+};
+
+export function getIvrMenu(token: string, e164: string): Promise<IVRMenu> {
+  return request<IVRMenu>(`/numbers/${encodeURIComponent(e164)}/ivr`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export function setIvrMenu(
+  token: string,
+  e164: string,
+  greeting: string,
+  options: Record<string, string>
+): Promise<IVRMenu> {
+  return request<IVRMenu>(`/numbers/${encodeURIComponent(e164)}/ivr`, {
+    method: "PUT",
+    headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ greeting, options }),
+  });
+}
+
+export function clearIvrMenu(token: string, e164: string): Promise<void> {
+  return request<void>(`/numbers/${encodeURIComponent(e164)}/ivr`, {
+    method: "DELETE",
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
 export type CallLogEntry = {
   id: string;
   sid: string | null;
@@ -522,11 +781,13 @@ export type CallLogEntry = {
   direction: "inbound" | "outbound";
   duration: number | null;
   recording_url: string | null;
+  is_suspected_spam: boolean;
   created_at: string;
 };
 
-export function listCalls(token: string): Promise<CallLogEntry[]> {
-  return request<CallLogEntry[]>("/media/voice/calls", {
+export function listCalls(token: string, limit?: number): Promise<CallLogEntry[]> {
+  const query = limit ? `?limit=${limit}` : "";
+  return request<CallLogEntry[]>(`/media/voice/calls${query}`, {
     headers: { Authorization: `Bearer ${token}` },
   });
 }
@@ -606,6 +867,19 @@ export function acknowledgeEmergencyCallingLimitation(token: string): Promise<{ 
   });
 }
 
+export type ConsentRecordStatus = {
+  consent_type: string;
+  jurisdiction: string;
+  granted_at: string | null;
+  revoked_at: string | null;
+};
+
+export function listConsentStatus(token: string): Promise<ConsentRecordStatus[]> {
+  return request<ConsentRecordStatus[]>("/compliance/consent", {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
 // --- Video ---
 
 export type VideoRoom = {
@@ -616,6 +890,9 @@ export type VideoRoom = {
   recording_in_progress: boolean;
   recording_url: string | null;
   participant_minutes: number;
+  confidential: boolean;
+  worst_connection_quality: "excellent" | "good" | "poor" | null;
+  reconnect_count: number;
 };
 
 export function listVideoRooms(token: string): Promise<VideoRoom[]> {
@@ -624,10 +901,14 @@ export function listVideoRooms(token: string): Promise<VideoRoom[]> {
   });
 }
 
-export function createVideoRoom(token: string): Promise<{ room_name: string; status: string }> {
+export function createVideoRoom(
+  token: string,
+  confidential: boolean = false
+): Promise<{ room_name: string; status: string; confidential: boolean }> {
   return request("/media/video/rooms", {
     method: "POST",
     headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ confidential }),
   });
 }
 
@@ -640,6 +921,53 @@ export function joinVideoRoom(
     method: "POST",
     headers: { Authorization: `Bearer ${token}` },
     body: JSON.stringify({ display_name: displayName }),
+  });
+}
+
+// Deliberately no token param - a guest requests to join via the shared
+// link + their name only, no Zoiko account (see backend's POST
+// .../guest-token, which has no auth dependency at all). Doesn't return a
+// token directly - the guest lands in the waiting room until the host
+// admits them (see checkGuestWaitingStatus).
+export function guestJoinVideoRoom(roomName: string, displayName: string): Promise<{ waiting_id: string }> {
+  return request(`/media/video/rooms/${encodeURIComponent(roomName)}/guest-token`, {
+    method: "POST",
+    body: JSON.stringify({ display_name: displayName }),
+  });
+}
+
+export type WaitingStatus = {
+  status: "pending" | "admitted" | "denied";
+  token: string | null;
+  url: string | null;
+  recording: boolean;
+};
+
+export function checkGuestWaitingStatus(roomName: string, waitingId: string): Promise<WaitingStatus> {
+  return request(
+    `/media/video/rooms/${encodeURIComponent(roomName)}/waiting/${encodeURIComponent(waitingId)}`
+  );
+}
+
+export type WaitingGuest = { id: string; display_name: string; created_at: string };
+
+export function listWaitingGuests(token: string, roomName: string): Promise<WaitingGuest[]> {
+  return request(`/media/video/rooms/${encodeURIComponent(roomName)}/waiting`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export function admitWaitingGuest(token: string, roomName: string, waitingId: string): Promise<{ admitted: boolean }> {
+  return request(`/media/video/rooms/${encodeURIComponent(roomName)}/waiting/${encodeURIComponent(waitingId)}/admit`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export function denyWaitingGuest(token: string, roomName: string, waitingId: string): Promise<{ denied: boolean }> {
+  return request(`/media/video/rooms/${encodeURIComponent(roomName)}/waiting/${encodeURIComponent(waitingId)}/deny`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
   });
 }
 
@@ -660,15 +988,16 @@ export function startVideoRecording(
   });
 }
 
-// No auth token - this is the shareable-link path anyone can use to join a
-// call without a Zoiko account, gated only on knowing the room name.
-export function joinVideoRoomAsGuest(
+export function reportCallQuality(
+  token: string,
   roomName: string,
-  displayName: string
-): Promise<{ token: string; url: string; recording: boolean }> {
-  return request(`/media/video/rooms/${encodeURIComponent(roomName)}/guest-token`, {
+  quality: "excellent" | "good" | "poor",
+  reconnected: boolean = false
+): Promise<{ recorded: boolean }> {
+  return request(`/media/video/rooms/${encodeURIComponent(roomName)}/quality`, {
     method: "POST",
-    body: JSON.stringify({ display_name: displayName }),
+    headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ quality, reconnected }),
   });
 }
 
@@ -758,6 +1087,8 @@ export type ReceptionistCallEntry = {
   urgency: "low" | "medium" | "high" | null;
   escalated: boolean;
   guardrail_flags: string[];
+  is_likely_spam: boolean;
+  spam_reason: string | null;
   assigned_user_id: string | null;
   assigned_user_email: string | null;
   original_summary: string | null;
@@ -809,6 +1140,74 @@ export type UsageEvent = {
 
 export function listUsage(token: string): Promise<UsageEvent[]> {
   return request<UsageEvent[]>("/usage", {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+// --- Billing / Plans / Entitlements ---
+// No payment processing - this only gates feature/resource limits locally,
+// pending a real ZoikoNex connection (see backend app/billing/models.py).
+
+export type Plan = {
+  plan_code: string;
+  name: string;
+  max_numbers: number;
+  max_team_seats: number;
+  monthly_voice_minutes: number;
+  monthly_video_minutes: number;
+  monthly_ai_summaries: number;
+  trial_days: number;
+};
+
+export type Subscription = {
+  id: string;
+  plan_code: string;
+  status: "trialing" | "active" | "past_due" | "canceled";
+  trial_ends_at: string | null;
+  current_period_start: string;
+  current_period_end: string;
+  zoikonex_ref: string | null;
+  grace_period_ends_at: string | null;
+};
+
+export type UsageResourceSummary = {
+  resource: string;
+  used: number;
+  limit: number;
+};
+
+export type UsageSummary = {
+  plan_code: string;
+  plan_name: string;
+  status: string;
+  trial_ends_at: string | null;
+  current_period_start: string;
+  current_period_end: string;
+  resources: UsageResourceSummary[];
+};
+
+export function listPlans(token: string): Promise<Plan[]> {
+  return request<Plan[]>("/billing/plans", {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export function getSubscription(token: string): Promise<Subscription> {
+  return request<Subscription>("/billing/subscription", {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export function changeSubscriptionPlan(token: string, planCode: string): Promise<Subscription> {
+  return request<Subscription>("/billing/subscription/plan", {
+    method: "PUT",
+    headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ plan_code: planCode }),
+  });
+}
+
+export function getUsageSummary(token: string): Promise<UsageSummary> {
+  return request<UsageSummary>("/billing/usage-summary", {
     headers: { Authorization: `Bearer ${token}` },
   });
 }
@@ -945,11 +1344,20 @@ export function removeBlockedDestination(staffToken: string, ruleId: string): Pr
 
 export type Contact = {
   id: string;
+  account_id: string;
   name: string;
   phone_number: string;
   email: string | null;
   notes: string | null;
+  created_by_user_id: string | null;
   created_at: string;
+};
+
+export type ContactInput = {
+  name: string;
+  phone_number: string;
+  email?: string | null;
+  notes?: string | null;
 };
 
 export type ContactHistoryEntry = {
@@ -969,10 +1377,7 @@ export function listContacts(token: string): Promise<Contact[]> {
   });
 }
 
-export function createContact(
-  token: string,
-  input: { name: string; phone_number: string; email?: string; notes?: string }
-): Promise<Contact> {
+export function createContact(token: string, input: ContactInput): Promise<Contact> {
   return request<Contact>("/contacts", {
     method: "POST",
     headers: { Authorization: `Bearer ${token}` },
@@ -980,11 +1385,7 @@ export function createContact(
   });
 }
 
-export function updateContact(
-  token: string,
-  contactId: string,
-  input: { name: string; phone_number: string; email?: string; notes?: string }
-): Promise<Contact> {
+export function updateContact(token: string, contactId: string, input: ContactInput): Promise<Contact> {
   return request<Contact>(`/contacts/${encodeURIComponent(contactId)}`, {
     method: "PUT",
     headers: { Authorization: `Bearer ${token}` },
@@ -1073,6 +1474,34 @@ export type PublishResult = {
 
 export function listCallFlows(token: string): Promise<CallFlowSummary[]> {
   return request<CallFlowSummary[]>("/call-flows", {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+// --- Developer Webhooks ---
+
+export type WebhookEndpoint = {
+  id: string;
+  url: string;
+  description: string | null;
+  is_active: boolean;
+  created_at: string;
+};
+
+export type WebhookEndpointCreated = WebhookEndpoint & { secret: string };
+
+export type WebhookDelivery = {
+  id: string;
+  endpoint_id: string;
+  event_type: string;
+  status: "delivered" | "failed";
+  response_status_code: number | null;
+  error: string | null;
+  created_at: string;
+};
+
+export function listWebhookEndpoints(token: string): Promise<WebhookEndpoint[]> {
+  return request<WebhookEndpoint[]>("/webhooks/endpoints", {
     headers: { Authorization: `Bearer ${token}` },
   });
 }
@@ -1199,6 +1628,17 @@ export function createQueue(
   });
 }
 
+export function createWebhookEndpoint(
+  token: string,
+  input: { url: string; description?: string }
+): Promise<WebhookEndpointCreated> {
+  return request<WebhookEndpointCreated>("/webhooks/endpoints", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify(input),
+  });
+}
+
 export function updateQueue(
   token: string,
   queueId: string,
@@ -1226,8 +1666,22 @@ export function removeQueueMember(token: string, queueId: string, userId: string
   });
 }
 
+export function deleteWebhookEndpoint(token: string, endpointId: string): Promise<void> {
+  return request<void>(`/webhooks/endpoints/${encodeURIComponent(endpointId)}`, {
+    method: "DELETE",
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
 export function getQueueStatus(token: string, queueId: string): Promise<QueueStatus> {
   return request<QueueStatus>(`/queues/${encodeURIComponent(queueId)}/status`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export function listWebhookDeliveries(token: string, endpointId?: string): Promise<WebhookDelivery[]> {
+  const qs = endpointId ? `?endpoint_id=${encodeURIComponent(endpointId)}` : "";
+  return request<WebhookDelivery[]>(`/webhooks/deliveries${qs}`, {
     headers: { Authorization: `Bearer ${token}` },
   });
 }
@@ -1277,6 +1731,66 @@ export type MessagingMessage = {
 
 export function listConversations(token: string): Promise<MessagingConversation[]> {
   return request<MessagingConversation[]>("/messaging/conversations", {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+// --- Public API keys ---
+
+export type ApiKey = {
+  id: string;
+  label: string;
+  key_prefix: string;
+  last_used_at: string | null;
+  revoked_at: string | null;
+  created_at: string;
+};
+
+export type ApiKeyCreated = ApiKey & { raw_key: string };
+
+export function listApiKeys(token: string): Promise<ApiKey[]> {
+  return request<ApiKey[]>("/developer/api-keys", {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export function createApiKey(token: string, label: string): Promise<ApiKeyCreated> {
+  return request<ApiKeyCreated>("/developer/api-keys", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ label }),
+  });
+}
+
+export function revokeApiKey(token: string, keyId: string): Promise<void> {
+  return request<void>(`/developer/api-keys/${encodeURIComponent(keyId)}`, {
+    method: "DELETE",
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+// --- CRM connection (HubSpot: real OAuth - see backend/app/integrations/crm/hubspot.py;
+// Salesforce/Pipedrive: still mock - see backend/app/integrations/crm/mock.py) ---
+
+export type CrmProvider = "hubspot" | "salesforce" | "pipedrive";
+
+export type CrmConnection = {
+  id: string;
+  provider: CrmProvider;
+  external_account_label: string;
+  connected_at: string;
+};
+
+export type CrmSyncEvent = {
+  id: string;
+  event_type: "contact_sync" | "activity_sync";
+  external_ref: string;
+  payload: Record<string, unknown>;
+  created_at: string;
+};
+
+export function getCrmConnection(token: string): Promise<CrmConnection | null> {
+  return request<CrmConnection | null>("/crm/connection", {
     headers: { Authorization: `Bearer ${token}` },
   });
 }
@@ -1342,4 +1856,51 @@ export async function exportAnalyticsCsv(token: string, days: number): Promise<B
     throw new ApiError("Couldn't export the report.", response.status);
   }
   return response.blob();
+}
+
+export function connectCrm(token: string, provider: CrmProvider): Promise<CrmConnection> {
+  return request<CrmConnection>("/crm/connect", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ provider }),
+  });
+}
+
+// HubSpot has a real OAuth flow - /crm/connect rejects provider="hubspot".
+// This returns HubSpot's own consent-screen URL; the caller redirects the
+// browser there (window.location.href = authorize_url), HubSpot redirects
+// back to /crm/hubspot/callback on the API itself (not this frontend),
+// which then redirects the browser to this page with ?crm=connected|error.
+export function getHubspotAuthorizeUrl(token: string): Promise<{ authorize_url: string }> {
+  return request<{ authorize_url: string }>("/crm/hubspot/authorize", {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+// Same real-OAuth shape as HubSpot above, for Salesforce.
+export function getSalesforceAuthorizeUrl(token: string): Promise<{ authorize_url: string }> {
+  return request<{ authorize_url: string }>("/crm/salesforce/authorize", {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+// Same real-OAuth shape as HubSpot above, for Pipedrive - all three
+// CrmProvider values are real now; /crm/connect rejects all of them.
+export function getPipedriveAuthorizeUrl(token: string): Promise<{ authorize_url: string }> {
+  return request<{ authorize_url: string }>("/crm/pipedrive/authorize", {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export function disconnectCrm(token: string): Promise<void> {
+  return request<void>("/crm/disconnect", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export function listCrmSyncEvents(token: string): Promise<CrmSyncEvent[]> {
+  return request<CrmSyncEvent[]>("/crm/sync-log", {
+    headers: { Authorization: `Bearer ${token}` },
+  });
 }

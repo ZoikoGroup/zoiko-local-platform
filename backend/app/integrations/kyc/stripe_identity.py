@@ -9,6 +9,7 @@ import stripe
 
 from app.core.config import settings
 from app.integrations._shared.circuit_breaker import CircuitBreaker, with_failover
+from app.observability.service import trace_provider_call
 
 _breaker = CircuitBreaker("kyc")
 
@@ -49,11 +50,12 @@ def create_verification_session(reference_id: str) -> dict:
 
     def _primary() -> dict:
         try:
-            session = stripe.identity.VerificationSession.create(
-                api_key=settings.stripe_secret_key,
-                type="document",
-                metadata={"case_id": reference_id},
-            )
+            with trace_provider_call("stripe_identity", "create_verification_session"):
+                session = stripe.identity.VerificationSession.create(
+                    api_key=settings.stripe_secret_key,
+                    type="document",
+                    metadata={"case_id": reference_id},
+                )
         except stripe.error.StripeError as e:
             raise KYCError(f"Stripe create verification session failed: {e}") from e
 

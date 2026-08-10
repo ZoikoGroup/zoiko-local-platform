@@ -1,7 +1,7 @@
 "use client";
 
-import { useEffect, useRef, useState, useCallback } from "react";
-import { Room, RoomEvent, Track } from "livekit-client";
+import { useEffect, useRef, useState, useCallback, type FormEvent } from "react";
+import { Room, RoomEvent, Track, ConnectionQuality } from "livekit-client";
 import {
   getCurrentUser,
   listVideoRooms,
@@ -9,16 +9,33 @@ import {
   joinVideoRoom,
   endVideoRoom,
   startVideoRecording,
+  reportCallQuality,
   summarizeVideoSession,
   grantAiProcessingConsent,
+  listWaitingGuests,
+  admitWaitingGuest,
+  denyWaitingGuest,
   ApiError,
   type VideoRoom,
   type ConversationSummary,
+  type WaitingGuest,
 } from "@/lib/api";
 import { getToken } from "@/lib/auth";
 
-type CallState = "idle" | "connecting" | "in-call";
+type CallState = "idle" | "lobby" | "connecting" | "in-call";
 type RecordingState = "idle" | "busy" | "consent_required" | "active";
+type DeviceStatus = "idle" | "requesting" | "ready" | "blocked";
+
+type ChatMessage = {
+  id: string;
+  senderName: string;
+  isLocal: boolean;
+  text: string;
+  ts: number;
+};
+
+const CHAT_ENCODER = new TextEncoder();
+const CHAT_DECODER = new TextDecoder();
 
 export default function VideoPage() {
   const [token] = useState<string | null>(() => getToken());
@@ -36,6 +53,9 @@ export default function VideoPage() {
   const [screenSharing, setScreenSharing] = useState(false);
   const [participantCount, setParticipantCount] = useState(0);
   const [participants, setParticipants] = useState<{ identity: string; name: string }[]>([]);
+  const [inviteLinkCopied, setInviteLinkCopied] = useState(false);
+  const [waitingGuests, setWaitingGuests] = useState<WaitingGuest[]>([]);
+  const [admittingGuestId, setAdmittingGuestId] = useState<string | null>(null);
   const [recordingState, setRecordingState] = useState<RecordingState>("idle");
   const [recordingError, setRecordingError] = useState<string | null>(null);
 
@@ -44,9 +64,33 @@ export default function VideoPage() {
   const [summaryErrors, setSummaryErrors] = useState<Record<string, string>>({});
   const [copiedRoom, setCopiedRoom] = useState<string | null>(null);
 
+  // Pre-join lobby - a device/camera check before actually connecting to the
+  // LiveKit room, not just an instant auto-join. lobbyRoomName is null when
+  // starting a brand new call (a room is created only once "Join meeting"
+  // is clicked) vs joining an existing active one.
+  const [lobbyRoomName, setLobbyRoomName] = useState<string | null>(null);
+  const [lobbyDisplayName, setLobbyDisplayName] = useState("");
+  const [lobbyCameraOn, setLobbyCameraOn] = useState(false);
+  const [lobbyMicOn, setLobbyMicOn] = useState(false);
+  const [lobbyCameraStatus, setLobbyCameraStatus] = useState<DeviceStatus>("idle");
+  const [lobbyMicStatus, setLobbyMicStatus] = useState<DeviceStatus>("idle");
+  const [lobbyVideoStream, setLobbyVideoStream] = useState<MediaStream | null>(null);
+  const [videoDevices, setVideoDevices] = useState<MediaDeviceInfo[]>([]);
+  const [audioDevices, setAudioDevices] = useState<MediaDeviceInfo[]>([]);
+  const [selectedVideoDeviceId, setSelectedVideoDeviceId] = useState("");
+  const [selectedAudioDeviceId, setSelectedAudioDeviceId] = useState("");
+  const [lobbyConfidential, setLobbyConfidential] = useState(false);
+  const [roomConfidential, setRoomConfidential] = useState(false);
+  const [chatOpen, setChatOpen] = useState(false);
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
+  const [chatInput, setChatInput] = useState("");
+  const [unreadChatCount, setUnreadChatCount] = useState(0);
+  const [connectionQuality, setConnectionQuality] = useState<"excellent" | "good" | "poor" | null>(null);
+
   const roomRef = useRef<Room | null>(null);
   const localVideoRef = useRef<HTMLVideoElement>(null);
   const localScreenVideoRef = useRef<HTMLVideoElement>(null);
+  const lobbyVideoRef = useRef<HTMLVideoElement>(null);
   const remoteContainerRef = useRef<HTMLDivElement>(null);
   const attachedElements = useRef<Map<string, HTMLMediaElement>>(new Map());
   const participantTiles = useRef<Map<string, HTMLDivElement>>(new Map());
@@ -75,6 +119,9 @@ export default function VideoPage() {
     setParticipants([]);
   }
 
+  const chatEndRef = useRef<HTMLDivElement>(null);
+  const chatOpenRef = useRef(false);
+
   const loadRooms = useCallback(() => {
     if (!token) return;
     return listVideoRooms(token)
@@ -93,8 +140,19 @@ export default function VideoPage() {
   useEffect(() => {
     return () => {
       roomRef.current?.disconnect();
+      lobbyVideoStream?.getTracks().forEach((t) => t.stop());
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // Attaches the lobby's own getUserMedia preview stream (separate from any
+  // LiveKit room - we haven't connected to one yet at this point) to its
+  // <video> element whenever the stream changes.
+  useEffect(() => {
+    const videoEl = lobbyVideoRef.current;
+    if (!videoEl) return;
+    videoEl.srcObject = lobbyVideoStream;
+  }, [lobbyVideoStream, callState]);
 
   // Runs once callState flips to "in-call", which is when the <video> element
   // below actually mounts - attaching earlier (e.g. right after
@@ -109,6 +167,38 @@ export default function VideoPage() {
     cameraPublication?.videoTrack?.attach(videoEl);
   }, [callState]);
 
+  // Polls for guests waiting to be let in, while actually in a call - not
+  // before (no room exists yet to wait for) and not after (nothing to poll).
+  useEffect(() => {
+    if (callState !== "in-call" || !token || !roomName) return;
+    let cancelled = false;
+    const poll = () => {
+      listWaitingGuests(token, roomName)
+        .then((guests) => {
+          if (!cancelled) setWaitingGuests(guests);
+        })
+        .catch(() => {
+          // Transient failure - the next poll a few seconds later will just
+          // pick up where this one left off, not worth surfacing an error.
+        });
+    };
+    poll();
+    const interval = setInterval(poll, 3000);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, [callState, token, roomName]);
+
+  useEffect(() => {
+    chatOpenRef.current = chatOpen;
+  }, [chatOpen]);
+
+  useEffect(() => {
+    if (!chatOpen) return;
+    chatEndRef.current?.scrollIntoView({ block: "end" });
+  }, [chatMessages, chatOpen]);
+
   // Same timing issue as the camera effect above - the screen-share preview
   // element only renders once screenSharing is true, so attach after.
   useEffect(() => {
@@ -120,16 +210,132 @@ export default function VideoPage() {
     screenPublication?.videoTrack?.attach(videoEl);
   }, [screenSharing]);
 
+  async function refreshDeviceList() {
+    try {
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      setVideoDevices(devices.filter((d) => d.kind === "videoinput"));
+      setAudioDevices(devices.filter((d) => d.kind === "audioinput"));
+    } catch {
+      // Device labels are blank until permission has been granted at least
+      // once - the dropdowns just show generically-named options until then.
+    }
+  }
+
+  function stopLobbyVideoPreview() {
+    lobbyVideoStream?.getTracks().forEach((t) => t.stop());
+    setLobbyVideoStream(null);
+  }
+
+  async function openLobby(existingRoomName: string | null) {
+    setCallError(null);
+    setLobbyRoomName(existingRoomName);
+    setLobbyCameraOn(false);
+    setLobbyMicOn(false);
+    setLobbyCameraStatus("idle");
+    setLobbyMicStatus("idle");
+    setLobbyConfidential(existingRoomName ? rooms.find((r) => r.room_name === existingRoomName)?.confidential ?? false : false);
+    setCallState("lobby");
+
+    if (token) {
+      try {
+        const me = await getCurrentUser(token);
+        setLobbyDisplayName((prev) => prev || me.email);
+      } catch {
+        // Name field just stays editable/blank - not fatal to opening the lobby.
+      }
+    }
+    await refreshDeviceList();
+  }
+
+  function handleCancelLobby() {
+    stopLobbyVideoPreview();
+    setCallState("idle");
+    setLobbyRoomName(null);
+  }
+
+  async function handleLobbyToggleCamera() {
+    if (lobbyCameraOn) {
+      stopLobbyVideoPreview();
+      setLobbyCameraOn(false);
+      return;
+    }
+    setLobbyCameraStatus("requesting");
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: selectedVideoDeviceId ? { deviceId: { exact: selectedVideoDeviceId } } : true,
+      });
+      setLobbyVideoStream(stream);
+      setLobbyCameraOn(true);
+      setLobbyCameraStatus("ready");
+      await refreshDeviceList(); // device labels become available once permission is granted
+    } catch {
+      setLobbyCameraStatus("blocked");
+      setLobbyCameraOn(false);
+    }
+  }
+
+  async function handleLobbyToggleMic() {
+    if (lobbyMicOn) {
+      setLobbyMicOn(false);
+      return;
+    }
+    setLobbyMicStatus("requesting");
+    try {
+      // Just a permission/availability check - the mic isn't actually kept
+      // open in the lobby (nothing here needs a live audio level meter), so
+      // the stream is released immediately. LiveKit acquires its own fresh
+      // mic stream once the call actually connects.
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: selectedAudioDeviceId ? { deviceId: { exact: selectedAudioDeviceId } } : true,
+      });
+      stream.getTracks().forEach((t) => t.stop());
+      setLobbyMicOn(true);
+      setLobbyMicStatus("ready");
+      await refreshDeviceList();
+    } catch {
+      setLobbyMicStatus("blocked");
+      setLobbyMicOn(false);
+    }
+  }
+
+  async function handleLobbyVideoDeviceChange(deviceId: string) {
+    setSelectedVideoDeviceId(deviceId);
+    if (!lobbyCameraOn) return;
+    stopLobbyVideoPreview();
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ video: { deviceId: { exact: deviceId } } });
+      setLobbyVideoStream(stream);
+    } catch {
+      setLobbyCameraStatus("blocked");
+      setLobbyCameraOn(false);
+    }
+  }
+
   async function connectToRoom(existingRoomName: string | null) {
     if (!token) return;
     setCallError(null);
     setCallState("connecting");
     setRecordingState("idle");
     setRecordingError(null);
+    const useCamera = lobbyCameraOn;
+    const useMic = lobbyMicOn;
+    const displayName = lobbyDisplayName.trim();
+    const videoDeviceId = selectedVideoDeviceId;
+    const audioDeviceId = selectedAudioDeviceId;
+    stopLobbyVideoPreview();
+
     try {
       const me = await getCurrentUser(token);
-      const targetRoomName = existingRoomName ?? (await createVideoRoom(token)).room_name;
-      const { token: liveKitToken, url } = await joinVideoRoom(token, targetRoomName, me.email);
+      let targetRoomName = existingRoomName;
+      let isConfidential = lobbyConfidential;
+      if (!targetRoomName) {
+        const created = await createVideoRoom(token, lobbyConfidential);
+        targetRoomName = created.room_name;
+        isConfidential = created.confidential;
+      } else {
+        isConfidential = rooms.find((r) => r.room_name === targetRoomName)?.confidential ?? false;
+      }
+      const { token: liveKitToken, url } = await joinVideoRoom(token, targetRoomName, displayName || me.email);
 
       const room = new Room();
       roomRef.current = room;
@@ -162,6 +368,35 @@ export default function VideoPage() {
           tile.classList.toggle("ring-emerald-400", speakingIds.has(identity));
         });
       });
+      room.on(RoomEvent.DataReceived, (payload, participant) => {
+        let text: string;
+        try {
+          const parsed = JSON.parse(CHAT_DECODER.decode(payload));
+          if (parsed?.type !== "chat" || typeof parsed.text !== "string") return;
+          text = parsed.text;
+        } catch {
+          return;
+        }
+        setChatMessages((prev) => [
+          ...prev,
+          { id: `${Date.now()}-${Math.random()}`, senderName: participant?.name || "Guest", isLocal: false, text, ts: Date.now() },
+        ]);
+        if (!chatOpenRef.current) setUnreadChatCount((c) => c + 1);
+      });
+      room.on(RoomEvent.ConnectionQualityChanged, (quality, participant) => {
+        if (!participant.isLocal) return;
+        if (quality !== ConnectionQuality.Excellent && quality !== ConnectionQuality.Good && quality !== ConnectionQuality.Poor) {
+          return; // "lost"/"unknown" aren't a quality tier worth persisting - a real disconnect is covered separately
+        }
+        setConnectionQuality(quality);
+        reportCallQuality(token, targetRoomName as string, quality).catch(() => {
+          // Best-effort telemetry - a failed sample just means one gap in
+          // the call's quality history, not worth interrupting the call.
+        });
+      });
+      room.on(RoomEvent.Reconnected, () => {
+        reportCallQuality(token, targetRoomName as string, connectionQuality ?? "good", true).catch(() => {});
+      });
       room.on(RoomEvent.Disconnected, () => {
         setCallState("idle");
         setRoomName(null);
@@ -170,9 +405,20 @@ export default function VideoPage() {
       });
 
       await room.connect(url, liveKitToken);
-      await room.localParticipant.enableCameraAndMicrophone();
+      // Respects the lobby's camera/mic toggles and chosen devices, rather
+      // than always turning both on - a caller who left the camera off in
+      // the lobby expects it to still be off once they're actually in the call.
+      if (useCamera) {
+        await room.localParticipant.setCameraEnabled(true, videoDeviceId ? { deviceId: videoDeviceId } : undefined);
+      }
+      if (useMic) {
+        await room.localParticipant.setMicrophoneEnabled(true, audioDeviceId ? { deviceId: audioDeviceId } : undefined);
+      }
+      setCameraOn(useCamera);
+      setMicOn(useMic);
 
       setRoomName(targetRoomName);
+      setRoomConfidential(isConfidential);
       setParticipantCount(room.remoteParticipants.size);
       setCallState("in-call");
     } catch (err) {
@@ -181,6 +427,58 @@ export default function VideoPage() {
       setCallState("idle");
       const message = err instanceof ApiError || err instanceof Error ? err.message : "Unknown error.";
       setCallError(`Couldn't ${existingRoomName ? "join" : "start"} the call: ${message}`);
+    }
+  }
+
+  function handleSendChatMessage(e: FormEvent) {
+    e.preventDefault();
+    const text = chatInput.trim();
+    const room = roomRef.current;
+    if (!text || !room) return;
+    room.localParticipant.publishData(CHAT_ENCODER.encode(JSON.stringify({ type: "chat", text })), { reliable: true });
+    setChatMessages((prev) => [
+      ...prev,
+      { id: `${Date.now()}-${Math.random()}`, senderName: "You", isLocal: true, text, ts: Date.now() },
+    ]);
+    setChatInput("");
+  }
+
+  async function handleCopyInviteLink() {
+    if (!roomName) return;
+    const inviteUrl = `${window.location.origin}/join/${roomName}`;
+    try {
+      await navigator.clipboard.writeText(inviteUrl);
+      setInviteLinkCopied(true);
+      setTimeout(() => setInviteLinkCopied(false), 2000);
+    } catch {
+      // Clipboard access can be denied by the browser - not worth a hard error,
+      // the room name/link is already visible on screen to copy by hand.
+    }
+  }
+
+  async function handleAdmitGuest(waitingId: string) {
+    if (!token || !roomName) return;
+    setAdmittingGuestId(waitingId);
+    try {
+      await admitWaitingGuest(token, roomName, waitingId);
+      setWaitingGuests((prev) => prev.filter((g) => g.id !== waitingId));
+    } catch {
+      // Next poll will re-sync the list either way - not worth a hard error banner.
+    } finally {
+      setAdmittingGuestId(null);
+    }
+  }
+
+  async function handleDenyGuest(waitingId: string) {
+    if (!token || !roomName) return;
+    setAdmittingGuestId(waitingId);
+    try {
+      await denyWaitingGuest(token, roomName, waitingId);
+      setWaitingGuests((prev) => prev.filter((g) => g.id !== waitingId));
+    } catch {
+      // Next poll will re-sync the list either way - not worth a hard error banner.
+    } finally {
+      setAdmittingGuestId(null);
     }
   }
 
@@ -194,6 +492,12 @@ export default function VideoPage() {
     setScreenSharing(false);
     setRecordingState("idle");
     clearRemoteTiles();
+    setWaitingGuests([]);
+    setRoomConfidential(false);
+    setChatMessages([]);
+    setChatOpen(false);
+    setUnreadChatCount(0);
+    setConnectionQuality(null);
     try {
       await endVideoRoom(token, endingRoomName);
     } catch {
@@ -202,7 +506,7 @@ export default function VideoPage() {
     await loadRooms();
   }
 
-  async function handleCopyInviteLink(targetRoomName: string) {
+  async function handleCopyRoomInviteLink(targetRoomName: string) {
     const link = `${window.location.origin}/join/${targetRoomName}`;
     try {
       await navigator.clipboard.writeText(link);
@@ -314,7 +618,7 @@ export default function VideoPage() {
       {callState === "idle" && (
         <div className="bg-white rounded-xl border border-slate-200 p-6 space-y-4">
           <button
-            onClick={() => connectToRoom(null)}
+            onClick={() => openLobby(null)}
             className="bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-medium rounded-lg px-4 py-2"
           >
             Start a Video Call
@@ -322,14 +626,14 @@ export default function VideoPage() {
 
           <div className="flex items-center gap-3 pt-1">
             <div className="h-px bg-slate-200 flex-1" />
-            <span className="text-xs text-slate-400">or join a teammate&apos;s call</span>
+            <span className="text-xs text-slate-600">or join a teammate&apos;s call</span>
             <div className="h-px bg-slate-200 flex-1" />
           </div>
 
           <form
             onSubmit={(e) => {
               e.preventDefault();
-              if (joinRoomInput.trim()) connectToRoom(joinRoomInput.trim());
+              if (joinRoomInput.trim()) openLobby(joinRoomInput.trim());
             }}
             className="flex gap-2"
           >
@@ -354,6 +658,136 @@ export default function VideoPage() {
         </div>
       )}
 
+      {callState === "lobby" && (
+        <div className="bg-slate-900 rounded-xl border border-slate-800 p-4 grid gap-4 sm:grid-cols-[1.3fr_1fr]">
+          {/* Camera preview */}
+          <div className="space-y-3">
+            <div className="relative aspect-video bg-black rounded-lg overflow-hidden flex items-center justify-center">
+              {lobbyCameraOn ? (
+                <video ref={lobbyVideoRef} autoPlay muted playsInline className="w-full h-full object-cover" />
+              ) : (
+                <div className="flex flex-col items-center gap-2 text-slate-400">
+                  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" className="w-10 h-10">
+                    <path d="M3 3l18 18M15 10l4.55-2.9A1 1 0 0121 8v8a1 1 0 01-1.45.9L15 14M5 6h7a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2V8a2 2 0 012-2z" />
+                  </svg>
+                  <span className="text-sm">Camera off</span>
+                  {lobbyCameraStatus === "blocked" && (
+                    <span className="text-xs text-red-400">Camera access was blocked by the browser.</span>
+                  )}
+                </div>
+              )}
+            </div>
+
+            <div className="flex items-center justify-center gap-3">
+              <button
+                onClick={handleLobbyToggleMic}
+                disabled={lobbyMicStatus === "requesting"}
+                className={`text-xs font-medium rounded-lg px-3 py-2 disabled:opacity-60 ${
+                  lobbyMicOn ? "bg-slate-800 text-white" : "bg-red-700 text-white"
+                }`}
+              >
+                Mic {lobbyMicOn ? "On" : "Off"}
+              </button>
+              <button
+                onClick={handleLobbyToggleCamera}
+                disabled={lobbyCameraStatus === "requesting"}
+                className={`text-xs font-medium rounded-lg px-3 py-2 disabled:opacity-60 ${
+                  lobbyCameraOn ? "bg-slate-800 text-white" : "bg-red-700 text-white"
+                }`}
+              >
+                {lobbyCameraStatus === "requesting" ? "Turning on…" : `Camera ${lobbyCameraOn ? "On" : "Off"}`}
+              </button>
+            </div>
+
+            {(videoDevices.length > 0 || audioDevices.length > 0) && (
+              <div className="grid grid-cols-2 gap-2">
+                <select
+                  value={selectedVideoDeviceId}
+                  onChange={(e) => handleLobbyVideoDeviceChange(e.target.value)}
+                  className="w-full text-xs rounded-lg bg-slate-800 text-slate-200 border border-slate-700 px-2 py-1.5"
+                >
+                  <option value="">Default camera</option>
+                  {videoDevices.map((d) => (
+                    <option key={d.deviceId} value={d.deviceId}>
+                      {d.label || "Camera"}
+                    </option>
+                  ))}
+                </select>
+                <select
+                  value={selectedAudioDeviceId}
+                  onChange={(e) => setSelectedAudioDeviceId(e.target.value)}
+                  className="w-full text-xs rounded-lg bg-slate-800 text-slate-200 border border-slate-700 px-2 py-1.5"
+                >
+                  <option value="">Default microphone</option>
+                  {audioDevices.map((d) => (
+                    <option key={d.deviceId} value={d.deviceId}>
+                      {d.label || "Microphone"}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            )}
+          </div>
+
+          {/* Meeting details + join */}
+          <div className="space-y-4">
+            <div>
+              <h3 className="text-white font-semibold">{lobbyRoomName ? "Join call" : "Start a call"}</h3>
+              <p className="text-xs text-slate-400 font-mono mt-0.5">{lobbyRoomName ?? "A new room will be created"}</p>
+            </div>
+
+            <div>
+              <label className="block text-xs font-medium text-slate-400 mb-1 tracking-wide uppercase">Your name</label>
+              <input
+                value={lobbyDisplayName}
+                onChange={(e) => setLobbyDisplayName(e.target.value)}
+                placeholder="Enter your name"
+                className="w-full rounded-lg bg-slate-800 border border-slate-700 text-white text-sm px-3 py-2 placeholder:text-slate-500 focus:outline-none focus:ring-2 focus:ring-indigo-500/40"
+              />
+            </div>
+
+            {lobbyRoomName ? (
+              lobbyConfidential && (
+                <p className="text-xs text-indigo-300 bg-indigo-950/40 border border-indigo-900 rounded-lg px-3 py-2">
+                  Confidential Mode is active for this call. Recording and AI notes are off.
+                </p>
+              )
+            ) : (
+              <label className="flex items-start gap-2 text-xs text-slate-300 bg-slate-800/60 rounded-lg px-3 py-2 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={lobbyConfidential}
+                  onChange={(e) => setLobbyConfidential(e.target.checked)}
+                  className="mt-0.5"
+                />
+                <span>
+                  <span className="font-medium text-slate-200">Confidential Mode</span>
+                  <br />
+                  Disables recording and AI notes for this call. Can&apos;t be changed once the call starts.
+                </span>
+              </label>
+            )}
+
+            {callError && <p className="text-xs text-red-400 bg-red-950/50 rounded-lg px-3 py-2">{callError}</p>}
+
+            <div className="flex gap-2 pt-1">
+              <button
+                onClick={() => connectToRoom(lobbyRoomName)}
+                className="flex-1 bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-medium rounded-lg px-4 py-2"
+              >
+                Join meeting
+              </button>
+              <button
+                onClick={handleCancelLobby}
+                className="text-sm font-medium rounded-lg px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-200"
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {callState === "connecting" && (
         <div className="bg-white rounded-xl border border-slate-200 p-6">
           <p className="text-sm text-slate-500">Connecting...</p>
@@ -363,16 +797,22 @@ export default function VideoPage() {
       {callState === "in-call" && (
         <div className="bg-slate-900 rounded-xl border border-slate-800 p-4 space-y-3">
           <div className="flex items-center justify-between text-xs text-slate-400 px-1">
-            <span className="font-mono">{roomName}</span>
-            <div className="flex items-center gap-3">
-              {roomName && (
-                <button
-                  onClick={() => handleCopyInviteLink(roomName)}
-                  className="font-medium text-indigo-400 hover:text-indigo-300"
-                >
-                  {copiedRoom === roomName ? "Copied!" : "Copy invite link"}
-                </button>
+            <div className="flex items-center gap-2">
+              <span className="font-mono">{roomName}</span>
+              <button
+                onClick={handleCopyInviteLink}
+                className="text-indigo-400 hover:text-indigo-300 font-medium"
+                title="Copy a link anyone can use to join this call without a Zoiko account"
+              >
+                {inviteLinkCopied ? "Link copied!" : "Copy invite link"}
+              </button>
+              {roomConfidential && (
+                <span className="flex items-center gap-1 text-indigo-300 bg-indigo-950/60 border border-indigo-900 rounded-full px-2 py-0.5 text-[11px] font-medium">
+                  Confidential Mode: Active
+                </span>
               )}
+            </div>
+            <div className="flex items-center gap-3">
               {recordingState === "active" && (
                 <span className="flex items-center gap-1.5 text-red-400">
                   <span className="w-1.5 h-1.5 rounded-full bg-red-500 animate-pulse" />
@@ -395,30 +835,118 @@ export default function VideoPage() {
             <p className="text-xs text-red-400 bg-red-950/50 rounded-lg px-3 py-2">{recordingError}</p>
           )}
 
-          {screenSharing && (
-            <div className="relative aspect-video bg-black rounded-lg overflow-hidden">
-              <video ref={localScreenVideoRef} autoPlay muted playsInline className="w-full h-full object-contain" />
-              <span className="absolute bottom-2 left-2 text-xs text-white/80 bg-black/40 rounded px-2 py-0.5">
-                Your screen
-              </span>
+          {waitingGuests.length > 0 && (
+            <div className="bg-indigo-950/50 border border-indigo-900 rounded-lg px-3 py-2 space-y-2">
+              <p className="text-xs font-medium text-indigo-300">
+                {waitingGuests.length} {waitingGuests.length === 1 ? "person" : "people"} waiting to join
+              </p>
+              <ul className="space-y-1.5">
+                {waitingGuests.map((guest) => (
+                  <li key={guest.id} className="flex items-center justify-between gap-3 text-sm">
+                    <span className="text-slate-200 truncate">{guest.display_name}</span>
+                    <div className="flex items-center gap-2 shrink-0">
+                      <button
+                        onClick={() => handleAdmitGuest(guest.id)}
+                        disabled={admittingGuestId === guest.id}
+                        className="text-xs font-medium rounded-lg px-2.5 py-1 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-60 text-white"
+                      >
+                        Admit
+                      </button>
+                      <button
+                        onClick={() => handleDenyGuest(guest.id)}
+                        disabled={admittingGuestId === guest.id}
+                        className="text-xs font-medium rounded-lg px-2.5 py-1 bg-slate-800 hover:bg-slate-700 disabled:opacity-60 text-slate-300"
+                      >
+                        Deny
+                      </button>
+                    </div>
+                  </li>
+                ))}
+              </ul>
             </div>
           )}
 
-          <div
-            className="grid gap-2 max-h-[60vh] overflow-y-auto pr-1"
-            style={{ gridTemplateColumns: "repeat(auto-fill, minmax(160px, 1fr))" }}
-          >
-            <div className="relative aspect-video bg-black rounded-lg overflow-hidden">
-              <video ref={localVideoRef} autoPlay muted playsInline className="w-full h-full object-cover" />
-              <span className="absolute bottom-2 left-2 text-xs text-white/80 bg-black/40 rounded px-2 py-0.5">
-                You
-              </span>
+          <div className="flex gap-3 items-stretch">
+            <div className="flex-1 min-w-0 space-y-3">
+              {screenSharing && (
+                <div className="relative aspect-video bg-black rounded-lg overflow-hidden">
+                  <video ref={localScreenVideoRef} autoPlay muted playsInline className="w-full h-full object-contain" />
+                  <span className="absolute bottom-2 left-2 text-xs text-white/80 bg-black/40 rounded px-2 py-0.5">
+                    Your screen
+                  </span>
+                </div>
+              )}
+
+              {/* auto-fit grid, not a fixed 2-column split - a fixed split works
+                  for 1:1 but squeezes every remote tile into a single narrow
+                  column once a 3rd+ participant joins (up to MAX_PARTICIPANTS=50
+                  per app.integrations.video.livekit). display:contents on the
+                  remote container lets each participant tile appended into it
+                  imperatively (see getOrCreateTile) land directly in this grid
+                  as its own sibling cell, sharing one unified auto-fit layout
+                  instead of a fixed side column. max-h + overflow caps how tall
+                  the grid gets once a call has many participants. */}
+              <div
+                className="grid gap-3 max-h-[60vh] overflow-y-auto pr-1"
+                style={{ gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))" }}
+              >
+                <div className="relative aspect-video bg-black rounded-lg overflow-hidden">
+                  <video ref={localVideoRef} autoPlay muted playsInline className="w-full h-full object-cover" />
+                  <span className="absolute bottom-2 left-2 flex items-center gap-1.5 text-xs text-white/80 bg-black/40 rounded px-2 py-0.5">
+                    <span
+                      title={connectionQuality ? `Connection: ${connectionQuality}` : undefined}
+                      className={`w-1.5 h-1.5 rounded-full ${
+                        connectionQuality === "excellent"
+                          ? "bg-emerald-400"
+                          : connectionQuality === "good"
+                            ? "bg-amber-400"
+                            : connectionQuality === "poor"
+                              ? "bg-red-500"
+                              : "bg-slate-500"
+                      }`}
+                    />
+                    You
+                  </span>
+                </div>
+                <div ref={remoteContainerRef} className="contents" />
+              </div>
             </div>
-            {/* display:contents makes this wrapper invisible to the grid layout, so
-                the participant tiles appended into it imperatively (see
-                getOrCreateTile) become direct items of the parent grid above,
-                sharing one unified auto-fit layout instead of a fixed side column. */}
-            <div ref={remoteContainerRef} className="contents" />
+
+            {chatOpen && (
+              <div className="w-64 shrink-0 flex flex-col bg-slate-950 border border-slate-800 rounded-lg">
+                <div className="px-3 py-2 border-b border-slate-800 text-xs font-medium text-slate-300">In-call chat</div>
+                <div className="flex-1 min-h-[200px] max-h-[320px] overflow-y-auto px-3 py-2 space-y-2">
+                  {chatMessages.length === 0 ? (
+                    <p className="text-xs text-slate-500">No messages yet.</p>
+                  ) : (
+                    chatMessages.map((m) => (
+                      <div key={m.id} className="text-sm">
+                        <span className={`text-xs font-medium ${m.isLocal ? "text-indigo-400" : "text-slate-400"}`}>
+                          {m.senderName}
+                        </span>
+                        <p className="text-slate-200 break-words">{m.text}</p>
+                      </div>
+                    ))
+                  )}
+                  <div ref={chatEndRef} />
+                </div>
+                <form onSubmit={handleSendChatMessage} className="flex items-center gap-1.5 p-2 border-t border-slate-800">
+                  <input
+                    value={chatInput}
+                    onChange={(e) => setChatInput(e.target.value)}
+                    placeholder="Message everyone"
+                    className="flex-1 min-w-0 text-sm rounded-lg bg-slate-800 border border-slate-700 text-white px-2.5 py-1.5 placeholder:text-slate-500 focus:outline-none focus:ring-2 focus:ring-indigo-500/40"
+                  />
+                  <button
+                    type="submit"
+                    disabled={!chatInput.trim()}
+                    className="text-xs font-medium rounded-lg px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-40 text-white"
+                  >
+                    Send
+                  </button>
+                </form>
+              </div>
+            )}
           </div>
 
           {participants.length > 0 && (
@@ -459,7 +987,23 @@ export default function VideoPage() {
             >
               {screenSharing ? "Stop Sharing" : "Share Screen"}
             </button>
-            {recordingState !== "active" && (
+            <button
+              onClick={() => {
+                setChatOpen((v) => !v);
+                setUnreadChatCount(0);
+              }}
+              className={`relative text-xs font-medium rounded-lg px-3 py-2 ${
+                chatOpen ? "bg-emerald-700 text-white" : "bg-slate-800 text-white"
+              }`}
+            >
+              Chat
+              {unreadChatCount > 0 && (
+                <span className="absolute -top-1.5 -right-1.5 flex items-center justify-center w-4 h-4 rounded-full bg-red-500 text-white text-[10px] font-bold">
+                  {unreadChatCount > 9 ? "9+" : unreadChatCount}
+                </span>
+              )}
+            </button>
+            {recordingState !== "active" && !roomConfidential && (
               <button
                 onClick={handleStartRecording}
                 disabled={recordingState === "busy"}
@@ -494,7 +1038,22 @@ export default function VideoPage() {
             return (
               <div key={r.room_name} className="rounded-lg border border-slate-200 px-4 py-3 space-y-2">
                 <div className="flex items-center justify-between">
-                  <span className="font-mono text-sm text-slate-800">{r.room_name}</span>
+                  <span className="flex items-center gap-2">
+                    <span className="font-mono text-sm text-slate-800">{r.room_name}</span>
+                    {r.confidential && (
+                      <span className="text-[11px] font-medium text-indigo-700 bg-indigo-50 border border-indigo-200 rounded-full px-2 py-0.5">
+                        Confidential
+                      </span>
+                    )}
+                    {r.worst_connection_quality === "poor" && (
+                      <span
+                        className="text-[11px] font-medium text-red-700 bg-red-50 border border-red-200 rounded-full px-2 py-0.5"
+                        title={r.reconnect_count > 0 ? `${r.reconnect_count} reconnect(s) during this call` : undefined}
+                      >
+                        Poor connection
+                      </span>
+                    )}
+                  </span>
                   <div className="flex items-center gap-3">
                     {r.participant_minutes > 0 && (
                       <span className="text-xs text-slate-400">{r.participant_minutes} participant-min</span>
@@ -534,7 +1093,7 @@ export default function VideoPage() {
                     </span>
                     {r.status === "active" && (
                       <button
-                        onClick={() => handleCopyInviteLink(r.room_name)}
+                        onClick={() => handleCopyRoomInviteLink(r.room_name)}
                         className="text-xs font-medium text-indigo-600 hover:text-indigo-800"
                       >
                         {copiedRoom === r.room_name ? "Copied!" : "Copy invite link"}
@@ -542,7 +1101,7 @@ export default function VideoPage() {
                     )}
                     {r.status === "active" && callState === "idle" && (
                       <button
-                        onClick={() => connectToRoom(r.room_name)}
+                        onClick={() => openLobby(r.room_name)}
                         className="text-xs font-medium text-indigo-600 hover:text-indigo-800"
                       >
                         Join

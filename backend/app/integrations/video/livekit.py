@@ -8,6 +8,7 @@ from livekit import api as livekit_api
 
 from app.core.config import settings
 from app.integrations._shared.circuit_breaker import CircuitBreaker, with_failover_async
+from app.observability.service import trace_provider_call
 
 _breaker = CircuitBreaker("video")
 
@@ -67,9 +68,10 @@ async def create_room(room_name: str) -> dict:
             raise VideoError(str(e)) from e
 
         try:
-            room = await client.room.create_room(
-                livekit_api.CreateRoomRequest(name=room_name, max_participants=MAX_PARTICIPANTS)
-            )
+            with trace_provider_call("livekit", "create_room"):
+                room = await client.room.create_room(
+                    livekit_api.CreateRoomRequest(name=room_name, max_participants=MAX_PARTICIPANTS)
+                )
         except livekit_api.TwirpError as e:
             raise VideoError(str(e)) from e
         finally:
@@ -88,7 +90,8 @@ async def end_room(room_name: str) -> None:
             raise VideoError(str(e)) from e
 
         try:
-            await client.room.delete_room(livekit_api.DeleteRoomRequest(room=room_name))
+            with trace_provider_call("livekit", "end_room"):
+                await client.room.delete_room(livekit_api.DeleteRoomRequest(room=room_name))
         except livekit_api.TwirpError as e:
             raise VideoError(str(e)) from e
         finally:
@@ -126,21 +129,22 @@ async def start_room_recording(room_name: str) -> str:
     )
 
     try:
-        egress = await client.egress.start_room_composite_egress(
-            livekit_api.RoomCompositeEgressRequest(
-                room_name=room_name,
-                file_outputs=[
-                    livekit_api.EncodedFileOutput(
-                        file_type=livekit_api.EncodedFileType.MP4,
-                        # room_name is already globally unique (zl-<uuid hex>)
-                        # and a room is only ever recorded once in this design,
-                        # so no need for LiveKit's {time}-style filepath templates.
-                        filepath=f"recordings/{room_name}.mp4",
-                        s3=s3_upload,
-                    )
-                ],
+        with trace_provider_call("livekit", "start_room_recording"):
+            egress = await client.egress.start_room_composite_egress(
+                livekit_api.RoomCompositeEgressRequest(
+                    room_name=room_name,
+                    file_outputs=[
+                        livekit_api.EncodedFileOutput(
+                            file_type=livekit_api.EncodedFileType.MP4,
+                            # room_name is already globally unique (zl-<uuid hex>)
+                            # and a room is only ever recorded once in this design,
+                            # so no need for LiveKit's {time}-style filepath templates.
+                            filepath=f"recordings/{room_name}.mp4",
+                            s3=s3_upload,
+                        )
+                    ],
+                )
             )
-        )
     except livekit_api.TwirpError as e:
         raise VideoError(str(e)) from e
     finally:
@@ -155,7 +159,8 @@ async def stop_room_recording(egress_id: str) -> None:
         raise VideoError(str(e)) from e
 
     try:
-        await client.egress.stop_egress(livekit_api.StopEgressRequest(egress_id=egress_id))
+        with trace_provider_call("livekit", "stop_room_recording"):
+            await client.egress.stop_egress(livekit_api.StopEgressRequest(egress_id=egress_id))
     except livekit_api.TwirpError as e:
         raise VideoError(str(e)) from e
     finally:

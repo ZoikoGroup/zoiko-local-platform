@@ -11,6 +11,7 @@ import httpx
 
 from app.core.config import settings
 from app.integrations._shared.circuit_breaker import CircuitBreaker, with_failover
+from app.observability.service import trace_provider_call
 
 logger = logging.getLogger("zoiko.notifications")
 
@@ -52,18 +53,19 @@ def send_email(to: str, subject: str, body: str) -> None:
 
     def _primary() -> None:
         try:
-            response = httpx.post(
-                _RESEND_API_URL,
-                headers={"Authorization": f"Bearer {settings.resend_api_key}"},
-                json={
-                    "from": settings.email_from_address,
-                    "to": [to],
-                    "subject": subject,
-                    "text": body,
-                },
-                timeout=15.0,
-            )
-            response.raise_for_status()
+            with trace_provider_call("resend", "send_email"):
+                response = httpx.post(
+                    _RESEND_API_URL,
+                    headers={"Authorization": f"Bearer {settings.resend_api_key}"},
+                    json={
+                        "from": settings.email_from_address,
+                        "to": [to],
+                        "subject": subject,
+                        "text": body,
+                    },
+                    timeout=15.0,
+                )
+                response.raise_for_status()
         except httpx.HTTPError as e:
             raise EmailError(f"Resend send failed: {e}") from e
 

@@ -210,13 +210,31 @@ def test_submit_document_adds_it_to_the_case(client):
 
     response = client.post(
         f"/compliance/cases/{case_id}/documents",
-        json={"document_type": "government_id", "reference": "placeholder-ref-1"},
+        data={"document_type": "government_id"},
+        files={"file": ("id.pdf", b"%PDF-1.4 fake id document", "application/pdf")},
         headers=headers,
     )
-    assert response.status_code == 200
-    assert response.json()["documents"] == [
-        {"document_type": "government_id", "reference": "placeholder-ref-1"}
-    ]
+    assert response.status_code == 200, response.text
+    documents = response.json()["documents"]
+    assert len(documents) == 1
+    assert documents[0]["document_type"] == "government_id"
+    assert documents[0]["filename"] == "id.pdf"
+    assert documents[0]["content_type"] == "application/pdf"
+    assert documents[0]["storage_key"].startswith(f"compliance-documents/{case_id}/")
+
+
+def test_submit_document_rejects_an_unsupported_content_type(client):
+    token = _signup_and_login(client, "docsubmitbadtype@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    case_id = _open_case(client, headers)
+
+    response = client.post(
+        f"/compliance/cases/{case_id}/documents",
+        data={"document_type": "government_id"},
+        files={"file": ("script.exe", b"not a real document", "application/x-msdownload")},
+        headers=headers,
+    )
+    assert response.status_code == 422
 
 
 def test_submit_document_on_someone_elses_case_is_forbidden(client):
@@ -226,7 +244,8 @@ def test_submit_document_on_someone_elses_case_is_forbidden(client):
     token_b = _signup_and_login(client, "docintruder@example.com")
     response = client.post(
         f"/compliance/cases/{case_id}/documents",
-        json={"document_type": "government_id", "reference": "x"},
+        data={"document_type": "government_id"},
+        files={"file": ("id.pdf", b"fake", "application/pdf")},
         headers={"Authorization": f"Bearer {token_b}"},
     )
     assert response.status_code == 403
@@ -236,9 +255,53 @@ def test_submit_document_on_missing_case_is_404(client):
     token = _signup_and_login(client, "docsubmit2@example.com")
     response = client.post(
         "/compliance/cases/does-not-exist/documents",
-        json={"document_type": "government_id", "reference": "x"},
+        data={"document_type": "government_id"},
+        files={"file": ("id.pdf", b"fake", "application/pdf")},
         headers={"Authorization": f"Bearer {token}"},
     )
+    assert response.status_code == 404
+
+
+def test_document_download_url_returns_a_real_presigned_link(client):
+    token = _signup_and_login(client, "docdownload1@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    case_id = _open_case(client, headers)
+    client.post(
+        f"/compliance/cases/{case_id}/documents",
+        data={"document_type": "government_id"},
+        files={"file": ("id.pdf", b"%PDF-1.4 fake id document", "application/pdf")},
+        headers=headers,
+    )
+
+    response = client.get(f"/compliance/cases/{case_id}/documents/0/download-url", headers=headers)
+    assert response.status_code == 200, response.text
+    assert "X-Amz-Signature" in response.json()["url"]
+
+
+def test_document_download_url_rejects_a_different_account(client):
+    token_a = _signup_and_login(client, "docdownloadowner@example.com")
+    case_id = _open_case(client, {"Authorization": f"Bearer {token_a}"})
+    client.post(
+        f"/compliance/cases/{case_id}/documents",
+        data={"document_type": "government_id"},
+        files={"file": ("id.pdf", b"fake", "application/pdf")},
+        headers={"Authorization": f"Bearer {token_a}"},
+    )
+
+    token_b = _signup_and_login(client, "docdownloadintruder@example.com")
+    response = client.get(
+        f"/compliance/cases/{case_id}/documents/0/download-url",
+        headers={"Authorization": f"Bearer {token_b}"},
+    )
+    assert response.status_code == 403
+
+
+def test_document_download_url_404s_for_an_out_of_range_index(client):
+    token = _signup_and_login(client, "docdownloadoor@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    case_id = _open_case(client, headers)
+
+    response = client.get(f"/compliance/cases/{case_id}/documents/0/download-url", headers=headers)
     assert response.status_code == 404
 
 
@@ -406,6 +469,27 @@ def test_start_kyc_on_someone_elses_case_is_forbidden(client):
 def test_start_kyc_fails_cleanly_when_stripe_is_not_configured(client, monkeypatch):
     monkeypatch.setattr("app.core.config.settings.stripe_secret_key", "")
     token = _signup_and_login(client, "kycnoconfig@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    case_id = _open_case(client, headers)
+
+    response = client.post(f"/compliance/cases/{case_id}/kyc/start", headers=headers)
+    assert response.status_code == 502
+
+
+def test_start_kyc_returns_a_clean_502_on_a_genuine_stripe_failure(client, monkeypatch):
+    """Chaos test: Stripe IS configured, but the API call itself fails (a
+    real outage/timeout), not a missing secret key - the "not configured"
+    test above only covers the latter."""
+    from app.integrations.kyc.stripe_identity import KYCError
+
+    monkeypatch.setattr("app.core.config.settings.stripe_secret_key", "sk_test_fake")
+
+    def _raise(reference_id):
+        raise KYCError("Stripe Identity request failed: connection timed out")
+
+    monkeypatch.setattr("app.compliance.service.stripe_identity.create_verification_session", _raise)
+
+    token = _signup_and_login(client, "kycstripedown@example.com")
     headers = {"Authorization": f"Bearer {token}"}
     case_id = _open_case(client, headers)
 

@@ -86,7 +86,7 @@ function EmptyState({ label }: { label: string }) {
       <div className="w-10 h-10 rounded-full bg-slate-50 flex items-center justify-center text-slate-300">
         <SparkleIcon className="w-5 h-5" />
       </div>
-      <p className="text-sm text-slate-400">{label}</p>
+      <p className="text-sm text-slate-600">{label}</p>
     </div>
   );
 }
@@ -296,7 +296,7 @@ export default function AIInsightsPage() {
         <div className="px-6 py-5 border-b border-slate-100 space-y-3">
           <div>
             <h3 className="font-semibold text-slate-900">Call &amp; Voicemail Summaries</h3>
-            <p className="text-xs text-slate-400 mt-0.5">
+            <p className="text-xs text-slate-600 mt-0.5">
               AI-generated — may be inaccurate, not an authoritative record.
             </p>
           </div>
@@ -446,7 +446,7 @@ export default function AIInsightsPage() {
       <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
         <div className="px-6 py-5 border-b border-slate-100">
           <h3 className="font-semibold text-slate-900">AI Receptionist</h3>
-          <p className="text-xs text-slate-400 mt-0.5">
+          <p className="text-xs text-slate-600 mt-0.5">
             Caller qualification captured when a number has the AI Receptionist enabled.
           </p>
           {routedNotice && (
@@ -484,6 +484,14 @@ export default function AIInsightsPage() {
                         )}
                       </div>
                       <div className="flex items-center gap-2 shrink-0">
+                        {c.is_likely_spam && (
+                          <span
+                            title={c.spam_reason ?? undefined}
+                            className="text-xs font-medium text-amber-700 bg-amber-100 rounded-full px-2.5 py-1"
+                          >
+                            Suspected spam
+                          </span>
+                        )}
                         {c.escalated && (
                           <span className="text-xs font-medium text-white bg-indigo-600 rounded-full px-2.5 py-1">
                             Escalated
@@ -549,7 +557,7 @@ export default function AIInsightsPage() {
 
                     {c.guardrail_flags.length > 0 && (
                       <p className="text-xs font-medium text-red-700 bg-red-50 rounded-lg px-2.5 py-1.5">
-                        Review before acting — the AI's summary above may contain a{" "}
+                        Review before acting — the AI&apos;s summary above may contain a{" "}
                         {c.guardrail_flags.map((f) => f.replaceAll("_", " ")).join(" and ")} that was never
                         actually authorized.
                       </p>

@@ -97,6 +97,118 @@ def test_create_room_requires_auth(client):
     assert response.status_code == 401
 
 
+def test_create_room_returns_a_clean_502_on_a_genuine_livekit_failure(client, db_session, monkeypatch):
+    """Chaos test: LiveKit configured correctly but the API call itself
+    fails (real outage/timeout - a VideoError from a genuine TwirpError,
+    not a missing-config ValueError). No VideoSession row should be left
+    behind half-created."""
+    from app.integrations.video.livekit import VideoError
+    from app.media.models import VideoSession
+
+    async def _raise(*args, **kwargs):
+        raise VideoError("livekit request failed: 503 Service Unavailable")
+
+    monkeypatch.setattr("app.media.service.video.create_room", _raise)
+    token = _signup_and_login(client, "videocreatelivekitdown@example.com")
+    account_id = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"}).json()["account_id"]
+
+    response = client.post("/media/video/rooms", headers={"Authorization": f"Bearer {token}"})
+    assert response.status_code == 502
+
+    assert db_session.query(VideoSession).filter(VideoSession.account_id == account_id).count() == 0
+
+
+def test_end_room_returns_a_clean_502_on_a_genuine_livekit_failure(client, db_session, monkeypatch):
+    """Same chaos scenario for ending a room - the session must stay ACTIVE
+    (not silently marked ENDED) if the provider call actually failed, since
+    that would desync our record from the still-live LiveKit room."""
+    from app.integrations.video.livekit import VideoError
+    from app.media.models import VideoSession, VideoSessionStatus
+
+    token = _signup_and_login(client, "videoendlivekitdown@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    me = client.get("/auth/me", headers=headers).json()
+
+    session = VideoSession(
+        account_id=me["account_id"], host_user_id=me["id"], room_name="zl-test-end-livekit-down",
+        status=VideoSessionStatus.ACTIVE,
+    )
+    db_session.add(session)
+    db_session.commit()
+
+    async def _raise(*args, **kwargs):
+        raise VideoError("livekit request failed: 503 Service Unavailable")
+
+    monkeypatch.setattr("app.media.service.video.end_room", _raise)
+
+    response = client.post(f"/media/video/rooms/{session.room_name}/end", headers=headers)
+    assert response.status_code == 502
+
+    db_session.refresh(session)
+    assert session.status == VideoSessionStatus.ACTIVE
+    assert session.ended_at is None
+
+
+def test_start_recording_returns_a_clean_502_on_a_genuine_livekit_failure(client, db_session, monkeypatch):
+    """Chaos test for the Egress API call itself failing - the session must
+    not be left thinking a recording is in progress (recording_egress_id
+    must stay unset) if LiveKit never actually started one."""
+    from app.integrations.video.livekit import VideoError
+    from app.media.models import VideoSession, VideoSessionStatus
+
+    token = _signup_and_login(client, "videorecordlivekitdown@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    client.post("/compliance/consent", json={"consent_type": "ai_processing"}, headers=headers)
+    me = client.get("/auth/me", headers=headers).json()
+
+    session = VideoSession(
+        account_id=me["account_id"], host_user_id=me["id"], room_name="zl-test-record-livekit-down",
+        status=VideoSessionStatus.ACTIVE,
+    )
+    db_session.add(session)
+    db_session.commit()
+
+    async def _raise(*args, **kwargs):
+        raise VideoError("livekit egress request failed: 503 Service Unavailable")
+
+    monkeypatch.setattr("app.media.service.video.start_room_recording", _raise)
+
+    response = client.post(f"/media/video/rooms/{session.room_name}/recording/start", headers=headers)
+    assert response.status_code == 502
+
+    db_session.refresh(session)
+    assert session.recording_egress_id is None
+
+
+def test_list_rooms_degrades_recording_url_to_none_on_a_genuine_s3_failure(client, db_session, monkeypatch):
+    """Chaos test for the S3/boto3 call site in get_recording_download_url -
+    a genuine presigned-URL generation failure (bucket unreachable) must not
+    break the whole call-history list, just that one row's download link."""
+    from app.integrations.storage.s3 import StorageError
+    from app.media.models import VideoSession, VideoSessionStatus
+
+    token = _signup_and_login(client, "videolists3down@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    me = client.get("/auth/me", headers=headers).json()
+
+    session = VideoSession(
+        account_id=me["account_id"], host_user_id=me["id"], room_name="zl-test-list-s3-down",
+        status=VideoSessionStatus.ENDED, recording_url="https://s3.example.com/recordings/zl-test-list-s3-down.mp4",
+    )
+    db_session.add(session)
+    db_session.commit()
+
+    def _raise(*args, **kwargs):
+        raise StorageError("Unable to generate presigned URL: connection reset")
+
+    monkeypatch.setattr("app.media.service.generate_presigned_url", _raise)
+
+    response = client.get("/media/video/rooms", headers=headers)
+    assert response.status_code == 200
+    matching = next(r for r in response.json() if r["room_name"] == "zl-test-list-s3-down")
+    assert matching["recording_url"] is None
+
+
 def test_create_room_fails_cleanly_when_livekit_url_is_not_configured(client, monkeypatch):
     """A missing LIVEKIT_URL makes the SDK's own client constructor raise a
     plain ValueError (not a TwirpError) - must still surface as a clean 502,
@@ -545,3 +657,491 @@ def test_usage_endpoint_sums_across_all_of_an_accounts_sessions(client, db_sessi
     response = client.get("/media/video/usage", headers=headers)
     assert response.status_code == 200
     assert response.json()["participant_minutes"] == 12.0
+
+
+@pytest.mark.live
+def test_group_video_call_issues_join_tokens_to_more_than_two_team_members(client):
+    """Roadmap §8 'Video Calling - Phase 1 Standard' targets up to
+    MAX_PARTICIPANTS=8 (app.integrations.video.livekit) - this only verified
+    1:1 rooms live before. Confirms a real LiveKit room actually accepts join
+    tokens for a 3rd and 4th distinct identity on the same room, not just a
+    host and one other."""
+    owner_token = _signup_and_login(client, "groupvideoowner@example.com")
+    owner_headers = {"Authorization": f"Bearer {owner_token}"}
+
+    for email in ("groupvideomember1@example.com", "groupvideomember2@example.com"):
+        add_response = client.post(
+            "/team/members",
+            json={"email": email, "password": "membersecret123", "role": "member"},
+            headers=owner_headers,
+        )
+        assert add_response.status_code == 201, add_response.text
+
+    member1_token = client.post(
+        "/auth/login", json={"email": "groupvideomember1@example.com", "password": "membersecret123"}
+    ).json()["access_token"]
+    member2_token = client.post(
+        "/auth/login", json={"email": "groupvideomember2@example.com", "password": "membersecret123"}
+    ).json()["access_token"]
+
+    room_name = client.post("/media/video/rooms", headers=owner_headers).json()["room_name"]
+
+    tokens = []
+    for headers, display_name in (
+        (owner_headers, "Owner"),
+        ({"Authorization": f"Bearer {member1_token}"}, "Member One"),
+        ({"Authorization": f"Bearer {member2_token}"}, "Member Two"),
+    ):
+        response = client.post(
+            f"/media/video/rooms/{room_name}/token", json={"display_name": display_name}, headers=headers
+        )
+        assert response.status_code == 200, response.text
+        tokens.append(response.json()["token"])
+
+    # Each participant gets their own distinct signed token (identity =
+    # their own user id) - not the same token reused across participants.
+    assert len(set(tokens)) == 3
+
+    client.post(f"/media/video/rooms/{room_name}/end", headers=owner_headers)
+
+
+@pytest.mark.live
+def test_group_video_call_tracks_three_concurrent_participants(client, db_session):
+    """Extends test_room_finished_closes_any_dangling_open_participant_sessions
+    (which only ever exercised a single dangling participant) to 3 - proves
+    usage tracking and the abrupt-disconnect cleanup both scale past a pair."""
+    from app.media.models import VideoParticipantSession
+
+    token = _signup_and_login(client, "groupvideotrack@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    room_name = client.post("/media/video/rooms", headers=headers).json()["room_name"]
+
+    identities = ["participant-a", "participant-b", "participant-c"]
+    for identity in identities:
+        body, auth_token = _participant_webhook_body_and_token("participant_joined", room_name, identity)
+        response = client.post("/media/video/webhook", content=body, headers={"Authorization": auth_token})
+        assert response.status_code == 204
+
+    open_rows = (
+        db_session.query(VideoParticipantSession)
+        .filter(
+            VideoParticipantSession.participant_identity.in_(identities),
+            VideoParticipantSession.left_at.is_(None),
+        )
+        .all()
+    )
+    assert len(open_rows) == 3
+
+    # One participant leaves normally; the other two are still mid-call when
+    # the room ends (e.g. both disconnected without a clean leave event).
+    left_body, left_token = _participant_webhook_body_and_token("participant_left", room_name, "participant-a")
+    client.post("/media/video/webhook", content=left_body, headers={"Authorization": left_token})
+
+    finished_body, finished_token = _livekit_webhook_body_and_token("room_finished", room_name)
+    client.post("/media/video/webhook", content=finished_body, headers={"Authorization": finished_token})
+
+    rows = (
+        db_session.query(VideoParticipantSession)
+        .filter(VideoParticipantSession.participant_identity.in_(identities))
+        .all()
+    )
+    assert len(rows) == 3
+    assert all(row.left_at is not None for row in rows)
+
+
+def _seed_active_session(db_session, room_name: str, *, account_id: str | None = None, host_user_id: str | None = None):
+    """Seeds a VideoSession row directly, bypassing the real LiveKit room-
+    creation call - build_participant_token (what guest-token issuance
+    actually calls) is pure JWT signing with no network call, so guest-join
+    tests don't need @pytest.mark.live at all."""
+    from app.media.models import VideoSession, VideoSessionStatus
+    from app.numbering.identity.models import Account, AccountType, User, UserRole
+
+    if account_id is None:
+        account = Account(name="Guest Join Test Co", account_type=AccountType.BUSINESS)
+        db_session.add(account)
+        db_session.flush()
+        account_id = account.id
+    if host_user_id is None:
+        user = User(account_id=account_id, email=f"guesthost-{room_name}@example.com", role=UserRole.OWNER)
+        db_session.add(user)
+        db_session.flush()
+        host_user_id = user.id
+
+    session = VideoSession(
+        account_id=account_id, host_user_id=host_user_id, room_name=room_name,
+        status=VideoSessionStatus.ACTIVE,
+    )
+    db_session.add(session)
+    db_session.commit()
+    return session
+
+
+def test_guest_join_requires_no_auth_and_lands_in_the_waiting_room(client, db_session):
+    session = _seed_active_session(db_session, "zl-guest-test-1")
+
+    response = client.post(
+        f"/media/video/rooms/{session.room_name}/guest-token", json={"display_name": "Alex Guest"}
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["waiting_id"]
+
+
+def test_guest_join_rejects_a_nonexistent_room(client):
+    response = client.post(
+        "/media/video/rooms/zl-does-not-exist/guest-token", json={"display_name": "Alex Guest"}
+    )
+    assert response.status_code == 404
+
+
+def test_guest_join_rejects_an_ended_room(client, db_session):
+    from app.media.models import VideoSessionStatus
+
+    session = _seed_active_session(db_session, "zl-guest-test-ended")
+    session.status = VideoSessionStatus.ENDED
+    db_session.commit()
+
+    response = client.post(
+        f"/media/video/rooms/{session.room_name}/guest-token", json={"display_name": "Alex Guest"}
+    )
+    assert response.status_code == 404
+
+
+def test_guest_join_rejects_a_blank_display_name(client, db_session):
+    session = _seed_active_session(db_session, "zl-guest-test-blank-name")
+
+    response = client.post(f"/media/video/rooms/{session.room_name}/guest-token", json={"display_name": ""})
+    assert response.status_code == 422
+
+
+def test_guest_join_creates_an_audit_event(client, db_session):
+    from app.audit.models import AuditEvent
+
+    session = _seed_active_session(db_session, "zl-guest-test-audit")
+
+    response = client.post(
+        f"/media/video/rooms/{session.room_name}/guest-token", json={"display_name": "Audited Guest"}
+    )
+    assert response.status_code == 200
+
+    events = (
+        db_session.query(AuditEvent)
+        .filter(AuditEvent.action == "video.guest_join_requested", AuditEvent.target == f"video_session:{session.id}")
+        .all()
+    )
+    assert len(events) == 1
+
+
+def test_guest_join_is_rate_limited_after_repeated_attempts(client, db_session):
+    session = _seed_active_session(db_session, "zl-guest-test-ratelimit")
+
+    for _ in range(10):
+        response = client.post(
+            f"/media/video/rooms/{session.room_name}/guest-token", json={"display_name": "Repeat Guest"}
+        )
+        assert response.status_code == 200
+
+    over_limit_response = client.post(
+        f"/media/video/rooms/{session.room_name}/guest-token", json={"display_name": "Repeat Guest"}
+    )
+    assert over_limit_response.status_code == 429
+
+
+def test_waiting_status_is_pending_before_the_host_responds(client, db_session):
+    session = _seed_active_session(db_session, "zl-waiting-test-pending")
+    waiting_id = client.post(
+        f"/media/video/rooms/{session.room_name}/guest-token", json={"display_name": "Waiting Guest"}
+    ).json()["waiting_id"]
+
+    response = client.get(f"/media/video/rooms/{session.room_name}/waiting/{waiting_id}")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "pending"
+    assert body["token"] is None
+
+
+def test_waiting_status_rejects_an_unknown_waiting_id(client, db_session):
+    session = _seed_active_session(db_session, "zl-waiting-test-unknown")
+
+    response = client.get(f"/media/video/rooms/{session.room_name}/waiting/00000000-0000-0000-0000-000000000000")
+    assert response.status_code == 404
+
+
+def _seed_active_session_with_real_owner(client, db_session, email: str, room_name: str):
+    """Like _seed_active_session, but the host is a real signed-up account
+    (with a real password) so tests can authenticate as them via the real
+    /auth/login endpoint - needed for the host-side waiting-room actions,
+    which require a genuine bearer token, not just a DB row."""
+    from app.media.models import VideoSession, VideoSessionStatus
+
+    token = _signup_and_login(client, email)
+    me = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"}).json()
+    session = VideoSession(
+        account_id=me["account_id"], host_user_id=me["id"], room_name=room_name,
+        status=VideoSessionStatus.ACTIVE,
+    )
+    db_session.add(session)
+    db_session.commit()
+    return session, {"Authorization": f"Bearer {token}"}
+
+
+def test_host_can_list_and_admit_a_waiting_guest(client, db_session):
+    from jose import jwt as jose_jwt
+
+    session, owner_headers = _seed_active_session_with_real_owner(
+        client, db_session, "waitingroomhost1@example.com", "zl-waiting-test-admit"
+    )
+
+    waiting_id = client.post(
+        f"/media/video/rooms/{session.room_name}/guest-token", json={"display_name": "Admit Me"}
+    ).json()["waiting_id"]
+
+    list_response = client.get(f"/media/video/rooms/{session.room_name}/waiting", headers=owner_headers)
+    assert list_response.status_code == 200
+    assert any(g["id"] == waiting_id and g["display_name"] == "Admit Me" for g in list_response.json())
+
+    admit_response = client.post(
+        f"/media/video/rooms/{session.room_name}/waiting/{waiting_id}/admit", headers=owner_headers
+    )
+    assert admit_response.status_code == 200
+
+    # The guest's own poll (no auth) must now see a real token.
+    status_response = client.get(f"/media/video/rooms/{session.room_name}/waiting/{waiting_id}")
+    body = status_response.json()
+    assert body["status"] == "admitted"
+    assert body["token"]
+    claims = jose_jwt.get_unverified_claims(body["token"])
+    assert claims["sub"].startswith("guest-")
+
+    # Admitted guests drop off the host's pending list.
+    list_after = client.get(f"/media/video/rooms/{session.room_name}/waiting", headers=owner_headers)
+    assert not any(g["id"] == waiting_id for g in list_after.json())
+
+
+def test_host_can_deny_a_waiting_guest(client, db_session):
+    session, owner_headers = _seed_active_session_with_real_owner(
+        client, db_session, "waitingroomhost2@example.com", "zl-waiting-test-deny"
+    )
+
+    waiting_id = client.post(
+        f"/media/video/rooms/{session.room_name}/guest-token", json={"display_name": "Deny Me"}
+    ).json()["waiting_id"]
+
+    deny_response = client.post(
+        f"/media/video/rooms/{session.room_name}/waiting/{waiting_id}/deny", headers=owner_headers
+    )
+    assert deny_response.status_code == 200
+
+    status_response = client.get(f"/media/video/rooms/{session.room_name}/waiting/{waiting_id}")
+    body = status_response.json()
+    assert body["status"] == "denied"
+    assert body["token"] is None
+
+
+def test_create_room_defaults_to_not_confidential(client, monkeypatch):
+    monkeypatch.setattr("app.media.service.video.create_room", _fake_create_room)
+    token = _signup_and_login(client, "videoconfidentialdefault@example.com")
+
+    response = client.post("/media/video/rooms", headers={"Authorization": f"Bearer {token}"})
+    assert response.status_code == 201
+    assert response.json()["confidential"] is False
+
+
+def test_create_room_persists_confidential_flag(client, db_session, monkeypatch):
+    from app.media.models import VideoSession
+
+    monkeypatch.setattr("app.media.service.video.create_room", _fake_create_room)
+    token = _signup_and_login(client, "videoconfidentialcreate@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    response = client.post("/media/video/rooms", json={"confidential": True}, headers=headers)
+    assert response.status_code == 201
+    assert response.json()["confidential"] is True
+
+    session = db_session.query(VideoSession).filter(VideoSession.room_name == response.json()["room_name"]).first()
+    assert session.confidential is True
+
+    list_response = client.get("/media/video/rooms", headers=headers)
+    matching = next(r for r in list_response.json() if r["room_name"] == response.json()["room_name"])
+    assert matching["confidential"] is True
+
+
+def test_start_recording_is_blocked_unconditionally_for_a_confidential_session(client, db_session):
+    from app.media.models import VideoSession, VideoSessionStatus
+
+    token = _signup_and_login(client, "videoconfidentialrecord@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    client.post("/compliance/consent", json={"consent_type": "ai_processing"}, headers=headers)
+    me = client.get("/auth/me", headers=headers).json()
+
+    session = VideoSession(
+        account_id=me["account_id"], host_user_id=me["id"], room_name="zl-test-confidential-record",
+        status=VideoSessionStatus.ACTIVE, confidential=True,
+    )
+    db_session.add(session)
+    db_session.commit()
+
+    # Consent is granted, so this proves confidential mode blocks recording
+    # on its own - not merely as a side effect of missing consent.
+    response = client.post(f"/media/video/rooms/{session.room_name}/recording/start", headers=headers)
+    assert response.status_code == 403
+    assert "confidential" in response.json()["detail"].lower()
+
+    db_session.refresh(session)
+    assert session.recording_egress_id is None
+
+
+async def _fake_create_room(room_name):
+    return None
+
+
+def test_a_different_accounts_host_cannot_see_or_admit_a_waiting_guest(client, db_session):
+    session = _seed_active_session(db_session, "zl-waiting-test-other-account")
+    waiting_id = client.post(
+        f"/media/video/rooms/{session.room_name}/guest-token", json={"display_name": "Someone"}
+    ).json()["waiting_id"]
+
+    intruder_token = _signup_and_login(client, "waitingroomintruder@example.com")
+    intruder_headers = {"Authorization": f"Bearer {intruder_token}"}
+
+    list_response = client.get(f"/media/video/rooms/{session.room_name}/waiting", headers=intruder_headers)
+    assert list_response.status_code == 403
+
+    admit_response = client.post(
+        f"/media/video/rooms/{session.room_name}/waiting/{waiting_id}/admit", headers=intruder_headers
+    )
+    assert admit_response.status_code == 403
+
+
+# --- Call-quality telemetry ---
+
+
+def test_report_call_quality_requires_auth(client):
+    response = client.post("/media/video/rooms/some-room/quality", json={"quality": "good"})
+    assert response.status_code == 401
+
+
+def test_report_call_quality_404s_with_no_open_participant_session(client):
+    token = _signup_and_login(client, "qualitynosession@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    room_name = client.post("/media/video/rooms", headers=headers).json()["room_name"]
+
+    response = client.post(
+        f"/media/video/rooms/{room_name}/quality", json={"quality": "poor"}, headers=headers
+    )
+    assert response.status_code == 404
+
+    client.post(f"/media/video/rooms/{room_name}/end", headers=headers)
+
+
+def _open_participant_session(db_session, video_session_id: str, participant_identity: str):
+    from datetime import datetime, timezone
+
+    from app.media.models import VideoParticipantSession
+
+    row = VideoParticipantSession(
+        video_session_id=video_session_id, participant_identity=participant_identity,
+        joined_at=datetime.now(timezone.utc),
+    )
+    db_session.add(row)
+    db_session.commit()
+    return row
+
+
+def test_report_call_quality_records_the_sample(client, db_session):
+    token = _signup_and_login(client, "qualitysample1@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    me = client.get("/auth/me", headers=headers).json()
+    room_name = client.post("/media/video/rooms", headers=headers).json()["room_name"]
+    _open_participant_session(db_session, _room_session_id(db_session, room_name), me["id"])
+
+    response = client.post(
+        f"/media/video/rooms/{room_name}/quality", json={"quality": "good"}, headers=headers
+    )
+    assert response.status_code == 200, response.text
+
+    list_response = client.get("/media/video/rooms", headers=headers)
+    matching = next(r for r in list_response.json() if r["room_name"] == room_name)
+    assert matching["worst_connection_quality"] == "good"
+    assert matching["reconnect_count"] == 0
+
+    client.post(f"/media/video/rooms/{room_name}/end", headers=headers)
+
+
+def test_report_call_quality_keeps_the_worst_value_seen(client, db_session):
+    token = _signup_and_login(client, "qualitysample2@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    me = client.get("/auth/me", headers=headers).json()
+    room_name = client.post("/media/video/rooms", headers=headers).json()["room_name"]
+    _open_participant_session(db_session, _room_session_id(db_session, room_name), me["id"])
+
+    client.post(f"/media/video/rooms/{room_name}/quality", json={"quality": "excellent"}, headers=headers)
+    client.post(f"/media/video/rooms/{room_name}/quality", json={"quality": "poor"}, headers=headers)
+    # A later "excellent" sample must NOT erase the "poor" dip already seen.
+    client.post(f"/media/video/rooms/{room_name}/quality", json={"quality": "excellent"}, headers=headers)
+
+    list_response = client.get("/media/video/rooms", headers=headers)
+    matching = next(r for r in list_response.json() if r["room_name"] == room_name)
+    assert matching["worst_connection_quality"] == "poor"
+
+    client.post(f"/media/video/rooms/{room_name}/end", headers=headers)
+
+
+def test_report_call_quality_counts_reconnects(client, db_session):
+    token = _signup_and_login(client, "qualityreconnect@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    me = client.get("/auth/me", headers=headers).json()
+    room_name = client.post("/media/video/rooms", headers=headers).json()["room_name"]
+    _open_participant_session(db_session, _room_session_id(db_session, room_name), me["id"])
+
+    client.post(
+        f"/media/video/rooms/{room_name}/quality",
+        json={"quality": "good", "reconnected": True}, headers=headers,
+    )
+    client.post(
+        f"/media/video/rooms/{room_name}/quality",
+        json={"quality": "good", "reconnected": True}, headers=headers,
+    )
+
+    list_response = client.get("/media/video/rooms", headers=headers)
+    matching = next(r for r in list_response.json() if r["room_name"] == room_name)
+    assert matching["reconnect_count"] == 2
+
+    client.post(f"/media/video/rooms/{room_name}/end", headers=headers)
+
+
+def _room_session_id(db_session, room_name: str) -> str:
+    from app.media.models import VideoSession
+
+    return db_session.query(VideoSession).filter(VideoSession.room_name == room_name).first().id
+
+
+def test_get_call_quality_summary_aggregates_across_participants(db_session):
+    from app.media.models import ConnectionQuality, VideoSession, VideoSessionStatus
+    from app.media.service import get_call_quality_summary
+    from app.numbering.identity.models import Account, AccountType, User, UserRole
+
+    account = Account(name="Quality Summary Co", account_type=AccountType.INDIVIDUAL)
+    db_session.add(account)
+    db_session.flush()
+    user = User(account_id=account.id, email="qualitysummary@example.com", role=UserRole.OWNER)
+    db_session.add(user)
+    db_session.flush()
+
+    session = VideoSession(
+        account_id=account.id, host_user_id=user.id, room_name="zl-quality-summary-test",
+        status=VideoSessionStatus.ENDED,
+    )
+    db_session.add(session)
+    db_session.flush()
+
+    row_a = _open_participant_session(db_session, session.id, "user-a")
+    row_a.worst_connection_quality = ConnectionQuality.GOOD
+    row_a.reconnect_count = 1
+    row_b = _open_participant_session(db_session, session.id, "user-b")
+    row_b.worst_connection_quality = ConnectionQuality.POOR
+    row_b.reconnect_count = 2
+    db_session.commit()
+
+    summary = get_call_quality_summary(db_session, session.id)
+    assert summary == {"worst_connection_quality": "poor", "reconnect_count": 3}

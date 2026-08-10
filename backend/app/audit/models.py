@@ -28,6 +28,13 @@ class AuditEvent(Base):
     actor: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
     action: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
     target: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    # Resolved once at write time in log_event() (see _resolve_account_id) -
+    # nullable because some actors (staff, "system", cross-account platform
+    # actions) genuinely have no owning customer account. Not a foreign key:
+    # events must survive an account's deletion for compliance/evidentiary
+    # reasons, same posture as before_hash/after_hash being one-way hashes
+    # rather than live references.
+    account_id: Mapped[str | None] = mapped_column(UUID(as_uuid=False), nullable=True, index=True)
     before_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     after_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     reason: Mapped[str | None] = mapped_column(Text, nullable=True)

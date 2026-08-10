@@ -4,6 +4,7 @@ import sqlalchemy as sa
 from sqlalchemy.orm import Session
 
 from app.audit.service import log_event
+from app.billing import service as billing_service
 from app.consent.models import GLOBAL_JURISDICTION, ConsentType
 from app.consent.service import has_active_consent
 from app.events.service import publish_ai_summary_completed, publish_transcript_completed
@@ -15,11 +16,13 @@ from app.integrations.telecom.twilio import download_recording
 from app.integrations.transcription.groq import MODEL_VERSION as TRANSCRIPTION_MODEL_VERSION
 from app.integrations.transcription.groq import transcribe_audio
 from app.intelligence.models import ConversationSummary, SummarySourceType
-from app.media.models import CallRecord, ReceptionistUrgency, Voicemail, VideoSession
+from app.media.models import CallDirection, CallRecord, ReceptionistUrgency, Voicemail, VideoSession
+from app.notifications.service import notify_call_summary_available, notify_voicemail_transcription_ready
 from app.numbering.identity.models import User, UserRole
 from app.numbering.numbers.service import NumberConflictError, assert_number_access, assigned_number_ids
 from app.numbering.numbers.models import PhoneNumber
 from app.retention.service import PURGED_MARKER
+from app.usage import service as usage_service
 
 AI_DISCLAIMER = "AI-generated summary — may be inaccurate; not an authoritative record."
 
@@ -74,6 +77,11 @@ def _download_and_transcribe_video(room_name: str) -> str:
 def _analyze_and_store(
     db: Session, *, account_id: str, source_type: SummarySourceType, source_id: str, transcript: str
 ) -> ConversationSummary:
+    # Graceful degradation (Architecture doc §9) - AI features pause once a
+    # payment grace period expires. Checked before spending a real Groq
+    # call, not just before storing the result.
+    billing_service.assert_billing_not_suspended(db, account_id)
+
     analysis = extract_conversation_summary(transcript)
 
     urgency_raw = analysis.get("urgency")
@@ -128,6 +136,15 @@ def _analyze_and_store(
         account_id, summary_id=record.id, source_type=source_type.value, source_id=source_id,
         urgency=urgency.value if urgency else None,
     )
+
+    # Usage Metering (Architecture doc §7/§5 "AI processing units") - one
+    # unit per generated summary, keyed by the summary's own id so a retry
+    # of the same summarize call (which always creates a new record, never
+    # updates one in place) is correctly counted as new usage, not a duplicate.
+    usage_service.record_usage_event(
+        db, account_id=account_id, event_type="ai_summary", quantity=1, unit="summaries",
+        country_band=None, idempotency_key=f"ai_summary:{record.id}",
+    )
     return record
 
 
@@ -154,13 +171,15 @@ def summarize_voicemail(db: Session, user: User, voicemail_id: str) -> Conversat
     jurisdiction = _phone_number_country(db, voicemail.phone_number_id)
     _require_consent(db, user.account_id, "voicemails", jurisdiction)
 
-    return _analyze_and_store(
+    summary = _analyze_and_store(
         db,
         account_id=user.account_id,
         source_type=SummarySourceType.VOICEMAIL,
         source_id=voicemail.id,
         transcript=_download_and_transcribe(voicemail.recording_url),
     )
+    notify_voicemail_transcription_ready(db, account_id=user.account_id, account_email=user.email)
+    return summary
 
 
 def summarize_call(db: Session, user: User, call_id: str) -> ConversationSummary:
@@ -174,13 +193,16 @@ def summarize_call(db: Session, user: User, call_id: str) -> ConversationSummary
     jurisdiction = _phone_number_country(db, call.phone_number_id)
     _require_consent(db, user.account_id, "calls", jurisdiction)
 
-    return _analyze_and_store(
+    summary = _analyze_and_store(
         db,
         account_id=user.account_id,
         source_type=SummarySourceType.CALL,
         source_id=call.id,
         transcript=_download_and_transcribe(call.recording_url),
     )
+    counterparty = call.to_number if call.direction == CallDirection.OUTBOUND else call.from_number
+    notify_call_summary_available(db, account_id=user.account_id, account_email=user.email, counterparty=counterparty)
+    return summary
 
 
 def summarize_video_session(db: Session, user: User, room_name: str) -> ConversationSummary:

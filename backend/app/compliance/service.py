@@ -1,4 +1,5 @@
 import uuid
+from datetime import datetime, timezone
 
 from sqlalchemy.orm import Session
 
@@ -10,7 +11,17 @@ from app.events.service import (
     publish_compliance_case_required,
 )
 from app.integrations.kyc import stripe_identity
-from app.notifications.service import notify_compliance_case_approved, notify_compliance_case_rejected
+from app.integrations.storage import s3 as storage
+from app.notifications.service import (
+    notify_compliance_case_approved,
+    notify_compliance_case_rejected,
+    notify_organization_verification_submitted,
+)
+
+# Kept small and conservative - these are ID/business documents reviewed by
+# a human compliance officer, not a general file-upload feature.
+_ALLOWED_DOCUMENT_CONTENT_TYPES = {"application/pdf", "image/jpeg", "image/png"}
+_MAX_DOCUMENT_SIZE_BYTES = 10 * 1024 * 1024
 
 # Stripe Identity VerificationSession status -> our case status. "requires_input"
 # is overloaded - confirmed live against a real submission: it's BOTH the
@@ -150,16 +161,51 @@ def get_case(db: Session, case_id: str) -> ComplianceCase | None:
     return db.query(ComplianceCase).filter(ComplianceCase.id == case_id).first()
 
 
+class UnsupportedDocumentTypeError(Exception):
+    """Raised when an uploaded compliance document isn't a PDF or image."""
+
+
+class DocumentTooLargeError(Exception):
+    """Raised when an uploaded compliance document exceeds the size cap."""
+
+
+class DocumentNotFoundError(Exception):
+    """Raised when a document index doesn't exist on this case, or refers
+    to a legacy metadata-only entry with no file actually in storage."""
+
+
 def submit_document(
-    db: Session, case: ComplianceCase, *, document_type: str, reference: str, actor: str
+    db: Session,
+    case: ComplianceCase,
+    *,
+    document_type: str,
+    filename: str,
+    content_type: str,
+    data: bytes,
+    actor: str,
 ) -> ComplianceCase:
-    """Tracks that a document was submitted for this case. This does NOT
-    store the actual file - no cloud storage is wired up yet (needs its
-    own provider credentials, same situation as Twilio). This records
-    the metadata: what type of document, and a reference to where the
-    real file would live once storage exists.
-    """
-    new_doc = {"document_type": document_type, "reference": reference}
+    """Stores the actual uploaded file in the configured object storage
+    (same Provider Gateway used for recordings) and records its metadata on
+    the case - the storage key is server-generated from the case id, never
+    taken from client input, so a case's documents can't be pointed at an
+    arbitrary bucket path."""
+    if content_type not in _ALLOWED_DOCUMENT_CONTENT_TYPES:
+        raise UnsupportedDocumentTypeError(
+            f"{content_type} is not an accepted document type - upload a PDF, JPEG, or PNG"
+        )
+    if len(data) > _MAX_DOCUMENT_SIZE_BYTES:
+        raise DocumentTooLargeError("Document exceeds the 10MB upload limit")
+
+    storage_key = f"compliance-documents/{case.id}/{uuid.uuid4()}-{filename}"
+    storage.upload_object(storage_key, data, content_type)
+
+    new_doc = {
+        "document_type": document_type,
+        "storage_key": storage_key,
+        "filename": filename,
+        "content_type": content_type,
+        "uploaded_at": datetime.now(timezone.utc).isoformat(),
+    }
     case.documents = [*case.documents, new_doc]  # reassign, not .append() - JSON columns need a new object to detect the change
     db.commit()
     db.refresh(case)
@@ -169,9 +215,30 @@ def submit_document(
         actor=actor,
         action="compliance.document_submitted",
         target=f"compliance_case:{case.id}",
-        after={"document_type": document_type},
+        after={"document_type": document_type, "filename": filename},
     )
+
+    owner_email = _account_owner_email(db, case.account_id)
+    if owner_email:
+        from app.numbering.identity.models import Account
+
+        account = db.query(Account).filter(Account.id == case.account_id).first()
+        notify_organization_verification_submitted(
+            db, account_id=case.account_id, account_email=owner_email,
+            organization_name=account.name if account else "your organization",
+            case_reference=case.id,
+        )
+
     return case
+
+
+def get_document_download_url(case: ComplianceCase, document_index: int) -> str:
+    if document_index < 0 or document_index >= len(case.documents):
+        raise DocumentNotFoundError(f"Document {document_index} does not exist on case {case.id}")
+    storage_key = case.documents[document_index].get("storage_key")
+    if not storage_key:
+        raise DocumentNotFoundError(f"Document {document_index} on case {case.id} has no stored file")
+    return storage.generate_presigned_url(storage_key)
 
 
 def approve_case(db: Session, case: ComplianceCase, *, actor: str) -> ComplianceCase:

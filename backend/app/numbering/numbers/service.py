@@ -5,23 +5,49 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.audit.service import log_event
+from app.billing import service as billing_service
 from app.compliance.service import has_approved_case, is_requirement_active
 from app.consent.models import ConsentType
 from app.consent.service import has_active_consent
 from app.core.config import settings
 from app.events.service import publish_number_activated, publish_number_reserved, publish_number_suspended
 from app.integrations.telecom import twilio as telecom
-from app.notifications.service import notify_number_activated, notify_number_suspended
+from app.notifications.service import (
+    notify_number_activated,
+    notify_number_assigned,
+    notify_number_order_not_approved,
+    notify_number_released,
+    notify_number_suspended,
+    notify_number_unassigned,
+    notify_number_verification_required,
+)
 from app.numbering.identity.models import Account, AccountType, User, UserRole
-from app.numbering.numbers.models import PhoneNumber, PhoneNumberStatus
+from app.numbering.numbers.countries import SUPPORTED_COUNTRIES, SUPPORTED_COUNTRY_CODES
+from app.numbering.numbers.models import IVROption, PhoneNumber, PhoneNumberStatus, RingGroupDestination
 
 RESERVATION_TTL_MINUTES = 12
 QUARANTINE_DAYS = 90
+RENEWAL_PERIOD_DAYS = 30
 
 
 class NumberConflictError(Exception):
     """Raised when a number can't be reserved/purchased because another
     account already holds it, or the caller's own reservation lapsed."""
+
+
+class UnsupportedCountryError(Exception):
+    """Raised for a country outside Zoiko Local's curated launch list -
+    see app.numbering.numbers.countries for why this is narrower than
+    Twilio's own coverage."""
+
+
+def list_supported_countries() -> list[dict]:
+    return SUPPORTED_COUNTRIES
+
+
+def _assert_supported_country(country: str) -> None:
+    if country not in SUPPORTED_COUNTRY_CODES:
+        raise UnsupportedCountryError(f"{country!r} is not on Zoiko Local's supported country list yet")
 
 
 class ComplianceRequiredError(Exception):
@@ -56,6 +82,7 @@ SMS_REQUIREMENT_TYPE = "sms_business_messaging"
 
 
 def search_numbers(country: str, number_type: str = "local", area_code: str | None = None) -> list[dict]:
+    _assert_supported_country(country)
     return telecom.search_available_numbers(country, number_type=number_type, area_code=area_code)
 
 
@@ -65,6 +92,7 @@ def reserve_number(db: Session, account_id: str, e164: str, country: str) -> Pho
     existing row; the unique constraint on `e164` catches the race where two
     requests both try to INSERT a brand-new row for the same number.
     """
+    _assert_supported_country(country)
     now = datetime.now(timezone.utc)
     number = db.query(PhoneNumber).filter(PhoneNumber.e164 == e164).with_for_update().first()
 
@@ -133,6 +161,16 @@ def purchase_number(db: Session, account_id: str, e164: str) -> PhoneNumber:
     ):
         raise NumberConflictError(f"Reservation for {e164} expired — reserve it again before purchasing")
 
+    # Architecture doc §5 "Subscription and Entitlement" - number allowance
+    # gate. Checked before the (unwindable) emergency-disclosure/KYC checks
+    # below since it's the cheapest possible reason to reject, and unlike
+    # those, has nothing to persist on rejection.
+    billing_service.assert_number_quota_available(db, account_id, exclude_number_id=number.id)
+    # Graceful degradation (Architecture doc §9) - new number purchases
+    # pause once a payment grace period expires; already-owned numbers are
+    # never affected.
+    billing_service.assert_billing_not_suspended(db, account_id)
+
     if not has_active_consent(db, account_id, ConsentType.EMERGENCY_CALLING_ACKNOWLEDGED):
         raise EmergencyDisclosureRequiredError(
             "You must acknowledge that emergency (911/999) calling may not work reliably through "
@@ -154,6 +192,12 @@ def purchase_number(db: Session, account_id: str, e164: str) -> PhoneNumber:
             target_type="phone_number", target_id=number.id,
             metadata={"e164": e164, "requirement_type": requirement_type},
         )
+        owner = db.query(User).filter(User.account_id == account_id, User.role == UserRole.OWNER).first()
+        if owner is not None:
+            notify_number_verification_required(
+                db, account_id=account_id, account_email=owner.email, e164=e164,
+                action_summary=f"An approved {requirement_type} compliance case for {number.country}",
+            )
         raise ComplianceRequiredError(
             f"An approved {requirement_type} compliance case for {number.country} "
             "is required before purchasing a number there"
@@ -191,12 +235,19 @@ def purchase_number(db: Session, account_id: str, e164: str) -> PhoneNumber:
             db, actor_id=account_id, action="number.purchase_failed",
             target_type="phone_number", target_id=number.id, metadata={"e164": e164},
         )
+        owner = db.query(User).filter(User.account_id == account_id, User.role == UserRole.OWNER).first()
+        if owner is not None:
+            notify_number_order_not_approved(
+                db, account_id=account_id, account_email=owner.email,
+                order_reference=number.id, reason_category="provider unable to complete purchase",
+            )
         raise
 
     number.status = PhoneNumberStatus.ACTIVE
     number.provider_sid = bought["sid"]
     number.reserved_until = None
     number.provisioning_started_at = None
+    number.next_renewal_at = now + timedelta(days=RENEWAL_PERIOD_DAYS)
     db.commit()
     db.refresh(number)
     log_event(
@@ -207,7 +258,11 @@ def purchase_number(db: Session, account_id: str, e164: str) -> PhoneNumber:
 
     owner = db.query(User).filter(User.account_id == account_id, User.role == UserRole.OWNER).first()
     if owner is not None:
-        notify_number_activated(db, account_id=account_id, account_email=owner.email, e164=e164)
+        account = db.query(Account).filter(Account.id == account_id).first()
+        notify_number_activated(
+            db, account_id=account_id, account_email=owner.email, e164=e164,
+            organization_name=account.name if account else "your organization",
+        )
 
     return number
 
@@ -282,6 +337,7 @@ def retry_provisioning(db: Session, staff_id: str, number_id: str) -> PhoneNumbe
     number.provider_sid = bought["sid"]
     number.reserved_until = None
     number.provisioning_started_at = None
+    number.next_renewal_at = datetime.now(timezone.utc) + timedelta(days=RENEWAL_PERIOD_DAYS)
     db.commit()
     db.refresh(number)
     log_event(
@@ -292,7 +348,11 @@ def retry_provisioning(db: Session, staff_id: str, number_id: str) -> PhoneNumbe
 
     owner = db.query(User).filter(User.account_id == number.account_id, User.role == UserRole.OWNER).first()
     if owner is not None:
-        notify_number_activated(db, account_id=number.account_id, account_email=owner.email, e164=number.e164)
+        account = db.query(Account).filter(Account.id == number.account_id).first()
+        notify_number_activated(
+            db, account_id=number.account_id, account_email=owner.email, e164=number.e164,
+            organization_name=account.name if account else "your organization",
+        )
 
     return number
 
@@ -313,6 +373,54 @@ def release_stuck_provisioning(db: Session, staff_id: str, number_id: str) -> Ph
     log_event(
         db, actor_id=staff_id, action="number.provisioning_released",
         target_type="phone_number", target_id=number.id, metadata={"e164": number.e164},
+    )
+    return number
+
+
+class NotDueForRenewalError(Exception):
+    """Raised when trying to mark a number renewed that isn't ACTIVE or
+    doesn't have a next_renewal_at in the past."""
+
+
+def list_due_renewals(db: Session) -> list[PhoneNumber]:
+    """Numbers whose lifecycle renewal date has passed. There's no real
+    payment gateway to charge yet (same gap purchase_number's docstring
+    flags), so this is a staff-visible worklist, not an automated billing
+    run - see mark_number_renewed."""
+    now = datetime.now(timezone.utc)
+    return (
+        db.query(PhoneNumber)
+        .filter(
+            PhoneNumber.status == PhoneNumberStatus.ACTIVE,
+            PhoneNumber.next_renewal_at.isnot(None),
+            PhoneNumber.next_renewal_at <= now,
+        )
+        .order_by(PhoneNumber.next_renewal_at.asc())
+        .all()
+    )
+
+
+def mark_number_renewed(db: Session, staff_id: str, number_id: str) -> PhoneNumber:
+    """Staff bookkeeping action - advances a number's renewal date by one
+    period. Deliberately does not touch billing/suspension: existing number
+    ownership is explicitly exempt from billing-suspension effects
+    (app.billing.service.assert_billing_not_suspended's docstring), and
+    there's no real per-number payment step to fail against yet, so this
+    must not invent a punitive failure mode that isn't backed by one."""
+    number = db.query(PhoneNumber).filter(PhoneNumber.id == number_id).with_for_update().first()
+    now = datetime.now(timezone.utc)
+    if number is None or number.status != PhoneNumberStatus.ACTIVE or (
+        number.next_renewal_at is None or number.next_renewal_at > now
+    ):
+        raise NotDueForRenewalError(f"{number_id} is not currently due for renewal")
+
+    number.next_renewal_at = now + timedelta(days=RENEWAL_PERIOD_DAYS)
+    db.commit()
+    db.refresh(number)
+    log_event(
+        db, actor_id=staff_id, action="number.renewed",
+        target_type="phone_number", target_id=number.id,
+        metadata={"e164": number.e164, "next_renewal_at": number.next_renewal_at.isoformat()},
     )
     return number
 
@@ -398,6 +506,7 @@ def reactivate_numbers_for_account_by_staff(
     db.commit()
 
     owner = db.query(User).filter(User.account_id == account_id, User.role == UserRole.OWNER).first()
+    account = db.query(Account).filter(Account.id == account_id).first()
     for number in numbers:
         db.refresh(number)
         log_event(
@@ -406,7 +515,10 @@ def reactivate_numbers_for_account_by_staff(
         )
         publish_number_activated(account_id, number_id=number.id, e164=number.e164)
         if owner is not None:
-            notify_number_activated(db, account_id=account_id, account_email=owner.email, e164=number.e164)
+            notify_number_activated(
+                db, account_id=account_id, account_email=owner.email, e164=number.e164,
+                organization_name=account.name if account else "your organization",
+            )
 
     return numbers
 
@@ -433,6 +545,11 @@ def cancel_number(db: Session, user: User, e164: str) -> PhoneNumber:
         db, actor_id=user.id, action="number.cancelled",
         target_type="phone_number", target_id=number.id, metadata={"e164": e164},
     )
+
+    owner = db.query(User).filter(User.account_id == user.account_id, User.role == UserRole.OWNER).first()
+    if owner is not None:
+        notify_number_released(db, account_id=user.account_id, account_email=owner.email, e164=e164)
+
     return number
 
 
@@ -494,6 +611,126 @@ def configure_routing(
         },
     )
     return number
+
+
+MAX_RING_GROUP_SIZE = 5
+
+
+class RingGroupTooLargeError(Exception):
+    """Raised when trying to set more than MAX_RING_GROUP_SIZE destinations."""
+
+
+def set_ring_group(db: Session, user: User, e164: str, destinations: list[str]) -> list[RingGroupDestination]:
+    """Replaces the number's entire ring group in one call - simpler and
+    less error-prone for a customer-facing "these are my destinations,
+    in this order" form than incremental add/remove endpoints. An empty
+    list clears the ring group entirely, reverting the number to plain
+    single-forwarding_number behavior (see voice.py's incoming_call)."""
+    number = db.query(PhoneNumber).filter(PhoneNumber.e164 == e164).first()
+    if number is None or number.account_id != user.account_id:
+        raise NumberConflictError(f"{e164} is not a number owned by your account")
+    assert_number_access(number, user)
+
+    if len(destinations) > MAX_RING_GROUP_SIZE:
+        raise RingGroupTooLargeError(f"A ring group may have up to {MAX_RING_GROUP_SIZE} destinations")
+
+    db.query(RingGroupDestination).filter(RingGroupDestination.phone_number_id == number.id).delete()
+    rows = [
+        RingGroupDestination(phone_number_id=number.id, destination_number=dest, ring_order=i)
+        for i, dest in enumerate(destinations)
+    ]
+    db.add_all(rows)
+    db.commit()
+
+    log_event(
+        db, actor_id=user.account_id, action="number.ring_group_updated",
+        target_type="phone_number", target_id=number.id, metadata={"e164": e164, "destinations": destinations},
+    )
+    return list_ring_group(db, e164)
+
+
+def list_ring_group(db: Session, e164: str) -> list[RingGroupDestination]:
+    return (
+        db.query(RingGroupDestination)
+        .join(PhoneNumber, PhoneNumber.id == RingGroupDestination.phone_number_id)
+        .filter(PhoneNumber.e164 == e164)
+        .order_by(RingGroupDestination.ring_order.asc())
+        .all()
+    )
+
+
+MAX_IVR_OPTIONS = 10
+_VALID_IVR_DIGITS = set("0123456789")
+
+
+class InvalidIVROptionError(Exception):
+    """Raised for a digit outside 0-9, a duplicate digit, or too many options."""
+
+
+def set_ivr_menu(
+    db: Session, user: User, e164: str, greeting: str, options: dict[str, str]
+) -> tuple[PhoneNumber, list[IVROption]]:
+    """Replaces the number's entire IVR menu in one call, same pattern as
+    set_ring_group - simpler for a customer-facing "here's my whole menu"
+    form than incremental per-digit endpoints. An empty greeting clears the
+    menu entirely (see clear_ivr_menu), reverting to the number's existing
+    ring-group/receptionist/voicemail behavior."""
+    number = db.query(PhoneNumber).filter(PhoneNumber.e164 == e164).first()
+    if number is None or number.account_id != user.account_id:
+        raise NumberConflictError(f"{e164} is not a number owned by your account")
+    assert_number_access(number, user)
+
+    if not greeting.strip():
+        raise InvalidIVROptionError("A greeting message is required")
+    if len(options) > MAX_IVR_OPTIONS:
+        raise InvalidIVROptionError(f"An IVR menu may have up to {MAX_IVR_OPTIONS} options")
+    for digit in options:
+        if digit not in _VALID_IVR_DIGITS:
+            raise InvalidIVROptionError(f"{digit!r} is not a valid digit - use 0-9")
+
+    number.ivr_greeting = greeting
+    db.query(IVROption).filter(IVROption.phone_number_id == number.id).delete()
+    rows = [
+        IVROption(phone_number_id=number.id, digit=digit, destination_number=destination)
+        for digit, destination in options.items()
+    ]
+    db.add_all(rows)
+    db.commit()
+
+    log_event(
+        db, actor_id=user.account_id, action="number.ivr_menu_updated",
+        target_type="phone_number", target_id=number.id, metadata={"e164": e164, "options": options},
+    )
+    return get_ivr_menu(db, e164)
+
+
+def get_ivr_menu(db: Session, e164: str) -> tuple[PhoneNumber | None, list[IVROption]]:
+    number = db.query(PhoneNumber).filter(PhoneNumber.e164 == e164).first()
+    if number is None:
+        return None, []
+    options = (
+        db.query(IVROption)
+        .filter(IVROption.phone_number_id == number.id)
+        .order_by(IVROption.digit.asc())
+        .all()
+    )
+    return number, options
+
+
+def clear_ivr_menu(db: Session, user: User, e164: str) -> None:
+    number = db.query(PhoneNumber).filter(PhoneNumber.e164 == e164).first()
+    if number is None or number.account_id != user.account_id:
+        raise NumberConflictError(f"{e164} is not a number owned by your account")
+    assert_number_access(number, user)
+
+    number.ivr_greeting = None
+    db.query(IVROption).filter(IVROption.phone_number_id == number.id).delete()
+    db.commit()
+
+    log_event(
+        db, actor_id=user.account_id, action="number.ivr_menu_cleared",
+        target_type="phone_number", target_id=number.id, metadata={"e164": e164},
+    )
 
 
 def sync_webhook(db: Session, user: User, e164: str) -> PhoneNumber:
@@ -564,6 +801,36 @@ def assign_number(db: Session, *, account_id: str, e164: str, user_id: str | Non
         before={"assigned_user_id": before_assignee},
         after={"assigned_user_id": user_id},
     )
+
+    account = db.query(Account).filter(Account.id == account_id).first()
+    organization_name = account.name if account else "your organization"
+    if user_id is not None:
+        notify_number_assigned(
+            db, account_id=account_id, account_email=assignee.email, e164=e164, organization_name=organization_name,
+        )
+    if before_assignee is not None and before_assignee != user_id:
+        previous_user = db.query(User).filter(User.id == before_assignee).first()
+        if previous_user is not None:
+            notify_number_unassigned(
+                db, account_id=account_id, account_email=previous_user.email, e164=e164,
+                previous_target=previous_user.email,
+                lifecycle_status=number.status.value,
+                route_summary=(
+                    f"forward to {number.forwarding_number}" if number.forwarding_number else "no configured forwarding route"
+                ),
+            )
+    return number
+
+
+def assert_owns_number(db: Session, user: User, e164: str) -> PhoneNumber:
+    """Looks up a number by e164 and confirms the caller's account owns
+    it - the read-path counterpart to the account_id checks every
+    write path already does inline. Used by GET routes (e.g. ring group)
+    that would otherwise leak which destinations another account's
+    number forwards to."""
+    number = db.query(PhoneNumber).filter(PhoneNumber.e164 == e164).first()
+    if number is None or number.account_id != user.account_id:
+        raise NumberConflictError(f"{e164} is not a number owned by your account")
     return number
 
 

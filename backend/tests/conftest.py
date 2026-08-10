@@ -35,6 +35,45 @@ def reset_rate_limiter():
     yield
 
 
+@pytest.fixture(autouse=True)
+def cleanup_error_events():
+    """error_events rows are written via a deliberately independent DB
+    session (see app.observability.service.record_error_event's docstring -
+    it must survive even a broken/rolled-back request transaction), so
+    they're NOT cleaned up by db_session's per-test rollback like everything
+    else. Without this, every chaos/failure test that triggers a real 5xx
+    would leave a permanent row in the shared dev database on every test
+    run, forever."""
+    yield
+    from app.core.database import SessionLocal
+    from app.observability.models import ErrorEvent
+
+    db = SessionLocal()
+    try:
+        db.query(ErrorEvent).delete()
+        db.commit()
+    finally:
+        db.close()
+
+
+@pytest.fixture(autouse=True)
+def cleanup_provider_call_traces():
+    """Same rationale as cleanup_error_events - record_provider_call_trace
+    also uses an independent SessionLocal (see its docstring), so rows
+    written by any test that exercises a traced Provider Gateway call
+    escape the normal per-test transaction rollback."""
+    yield
+    from app.core.database import SessionLocal
+    from app.observability.models import ProviderCallTrace
+
+    db = SessionLocal()
+    try:
+        db.query(ProviderCallTrace).delete()
+        db.commit()
+    finally:
+        db.close()
+
+
 @pytest.fixture()
 def db_session():
     """Each test runs inside its own transaction, rolled back at the end —

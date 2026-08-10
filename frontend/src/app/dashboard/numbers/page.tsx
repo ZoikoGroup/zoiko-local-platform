@@ -17,12 +17,18 @@ import {
   createPortingRequest,
   listMyPortingRequests,
   cancelPortingRequest,
+  getRingGroup,
+  setRingGroup,
+  getIvrMenu,
+  setIvrMenu,
+  clearIvrMenu,
   ApiError,
   type ComplianceRule,
   type MyPhoneNumber,
   type NumberSearchResult,
   type TeamMember,
   type PortingRequest,
+  type IVROption,
 } from "@/lib/api";
 import { getToken } from "@/lib/auth";
 
@@ -83,6 +89,16 @@ export default function NumbersPage() {
   const [smsCaseBlockedE164, setSmsCaseBlockedE164] = useState<string | null>(null);
   const [smsCaseBusy, setSmsCaseBusy] = useState(false);
   const [smsCaseOpened, setSmsCaseOpened] = useState(false);
+
+  const [ringGroupInput, setRingGroupInput] = useState("");
+  const [ringGroupBusy, setRingGroupBusy] = useState(false);
+  const [ringGroupError, setRingGroupError] = useState<string | null>(null);
+
+  const [ivrGreetingInput, setIvrGreetingInput] = useState("");
+  const [ivrOptionsInput, setIvrOptionsInput] = useState("");
+  const [ivrBusy, setIvrBusy] = useState(false);
+  const [ivrError, setIvrError] = useState<string | null>(null);
+  const [ivrExisting, setIvrExisting] = useState<IVROption[]>([]);
 
   const [step, setStep] = useState<Step>("search");
   const [countryCode, setCountryCode] = useState("US");
@@ -318,6 +334,85 @@ export default function NumbersPage() {
     setRoutingSms(number.sms_enabled);
     setSmsCaseBlockedE164(null);
     setSmsCaseOpened(false);
+
+    setRingGroupError(null);
+    setRingGroupInput("");
+    if (token) {
+      getRingGroup(token, number.e164)
+        .then((destinations) => setRingGroupInput(destinations.map((d) => d.destination_number).join(", ")))
+        .catch(() => setRingGroupError("Couldn't load the ring group."));
+    }
+
+    setIvrError(null);
+    setIvrGreetingInput("");
+    setIvrOptionsInput("");
+    setIvrExisting([]);
+    if (token) {
+      getIvrMenu(token, number.e164)
+        .then((menu) => {
+          setIvrGreetingInput(menu.greeting ?? "");
+          setIvrExisting(menu.options);
+          setIvrOptionsInput(menu.options.map((o) => `${o.digit}=${o.destination_number}`).join(", "));
+        })
+        .catch(() => setIvrError("Couldn't load the IVR menu."));
+    }
+  }
+
+  async function handleSaveRingGroup(e164: string) {
+    if (!token) return;
+    setRingGroupBusy(true);
+    setRingGroupError(null);
+    try {
+      const destinations = ringGroupInput
+        .split(",")
+        .map((n) => n.trim())
+        .filter(Boolean);
+      await setRingGroup(token, e164, destinations);
+    } catch (err) {
+      setRingGroupError(err instanceof ApiError ? err.message : "Couldn't save the ring group.");
+    } finally {
+      setRingGroupBusy(false);
+    }
+  }
+
+  function parseIvrOptionsInput(input: string): Record<string, string> {
+    const options: Record<string, string> = {};
+    for (const pair of input.split(",")) {
+      const [digit, destination] = pair.split("=").map((s) => s.trim());
+      if (digit && destination) options[digit] = destination;
+    }
+    return options;
+  }
+
+  async function handleSaveIvrMenu(e164: string) {
+    if (!token || !ivrGreetingInput.trim()) return;
+    setIvrBusy(true);
+    setIvrError(null);
+    try {
+      const options = parseIvrOptionsInput(ivrOptionsInput);
+      const menu = await setIvrMenu(token, e164, ivrGreetingInput, options);
+      setIvrExisting(menu.options);
+    } catch (err) {
+      setIvrError(err instanceof ApiError ? err.message : "Couldn't save the IVR menu.");
+    } finally {
+      setIvrBusy(false);
+    }
+  }
+
+  async function handleClearIvrMenu(e164: string) {
+    if (!token) return;
+    setIvrBusy(true);
+    setIvrError(null);
+    try {
+      await clearIvrMenu(token, e164);
+      setIvrGreetingInput("");
+      setIvrOptionsInput("");
+      setIvrExisting([]);
+    } catch (err) {
+      setIvrError(err instanceof ApiError ? err.message : "Couldn't clear the IVR menu.");
+    } finally {
+      setIvrBusy(false);
+    }
   }
 
   async function handleSaveRouting(e164: string) {
@@ -598,6 +693,71 @@ export default function NumbersPage() {
                   >
                     {routingBusy ? "Saving..." : "Save routing"}
                   </button>
+
+                  <div className="border-t border-slate-200 pt-3 space-y-2">
+                    <label className="block text-xs font-medium text-slate-500">
+                      Ring group (rings all of these at once instead of the single forwarding number above)
+                    </label>
+                    {ringGroupError && <p className="text-xs text-red-600">{ringGroupError}</p>}
+                    <input
+                      value={ringGroupInput}
+                      onChange={(e) => setRingGroupInput(e.target.value)}
+                      placeholder="+15551112222, +15553334444"
+                      className="w-full rounded-lg border border-slate-300 px-3 py-1.5 text-sm font-mono placeholder:text-slate-400"
+                    />
+                    <p className="text-xs text-slate-400">
+                      Comma-separated, up to 5 numbers. Leave empty to use the forwarding number instead.
+                    </p>
+                    <button
+                      onClick={() => handleSaveRingGroup(n.e164)}
+                      disabled={ringGroupBusy}
+                      className="bg-slate-700 hover:bg-slate-800 disabled:opacity-60 text-white text-sm font-medium rounded-lg px-4 py-2"
+                    >
+                      {ringGroupBusy ? "Saving..." : "Save ring group"}
+                    </button>
+                  </div>
+
+                  <div className="border-t border-slate-200 pt-3 space-y-2">
+                    <label className="block text-xs font-medium text-slate-500">
+                      IVR menu (plays a greeting and routes by keypad digit before forwarding/ring group)
+                    </label>
+                    {ivrError && <p className="text-xs text-red-600">{ivrError}</p>}
+                    <input
+                      value={ivrGreetingInput}
+                      onChange={(e) => setIvrGreetingInput(e.target.value)}
+                      placeholder="Press 1 for sales, 2 for support."
+                      className="w-full rounded-lg border border-slate-300 px-3 py-1.5 text-sm placeholder:text-slate-400"
+                    />
+                    <input
+                      value={ivrOptionsInput}
+                      onChange={(e) => setIvrOptionsInput(e.target.value)}
+                      placeholder="1=+15551112222, 2=+15553334444"
+                      className="w-full rounded-lg border border-slate-300 px-3 py-1.5 text-sm font-mono placeholder:text-slate-400"
+                    />
+                    <p className="text-xs text-slate-400">
+                      Digit=destination pairs, comma-separated, up to 10. An unrecognized digit or no input falls
+                      through to the routing above.
+                      {ivrExisting.length > 0 && ` Currently ${ivrExisting.length} option(s) configured.`}
+                    </p>
+                    <div className="flex items-center gap-2">
+                      <button
+                        onClick={() => handleSaveIvrMenu(n.e164)}
+                        disabled={ivrBusy || !ivrGreetingInput.trim()}
+                        className="bg-slate-700 hover:bg-slate-800 disabled:opacity-60 text-white text-sm font-medium rounded-lg px-4 py-2"
+                      >
+                        {ivrBusy ? "Saving..." : "Save IVR menu"}
+                      </button>
+                      {ivrExisting.length > 0 && (
+                        <button
+                          onClick={() => handleClearIvrMenu(n.e164)}
+                          disabled={ivrBusy}
+                          className="text-sm text-red-600 hover:text-red-700 font-medium disabled:opacity-50"
+                        >
+                          Clear
+                        </button>
+                      )}
+                    </div>
+                  </div>
                 </div>
               )}
             </div>
@@ -611,7 +771,7 @@ export default function NumbersPage() {
         <p className="text-sm text-slate-500">Search, reserve, and verify a number for your account.</p>
       </div>
 
-      <div className="flex items-center gap-2 text-xs font-medium text-slate-400">
+      <div className="flex items-center gap-2 text-xs font-medium text-slate-600">
         {["Search", "Reserve", "Verify", "Checkout"].map((label, i) => {
           const stepIndex = ["search", "reserved", "compliance", "checkout"].indexOf(step);
           const active = i <= stepIndex || step === "purchased";
@@ -628,7 +788,11 @@ export default function NumbersPage() {
       {step === "search" && (
         <div className="bg-white rounded-xl border border-slate-200 p-6 space-y-4">
           <div className="flex flex-wrap gap-3">
+            <label htmlFor="search-country" className="sr-only">
+              Country to search
+            </label>
             <select
+              id="search-country"
               value={countryCode}
               onChange={(e) => setCountryCode(e.target.value)}
               className="rounded-lg border border-slate-300 px-3 py-2 text-sm"
@@ -835,8 +999,8 @@ export default function NumbersPage() {
 
       <div className="bg-white rounded-xl border border-slate-200 p-6 space-y-4">
         <p className="text-xs text-slate-500 bg-slate-50 rounded-lg px-3 py-2">
-          Porting moves a real number between carriers, so it's reviewed by our team and coordinated with
-          your current carrier by hand — it isn't instant like a new number purchase. We'll email you at
+          Porting moves a real number between carriers, so it&apos;s reviewed by our team and coordinated with
+          your current carrier by hand — it isn&apos;t instant like a new number purchase. We&apos;ll email you at
           each step.
         </p>
 

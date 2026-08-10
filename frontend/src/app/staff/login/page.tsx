@@ -28,7 +28,7 @@ export default function StaffLoginPage() {
   }
 
   return (
-    <div className="min-h-screen flex items-center justify-center bg-slate-950">
+    <main className="min-h-screen flex items-center justify-center bg-slate-950">
       <div className="w-full max-w-sm bg-slate-900 border border-slate-800 rounded-2xl p-8">
         <div className="flex items-center gap-2 mb-6">
           <div className="w-9 h-9 rounded-lg bg-slate-700 text-white flex items-center justify-center font-bold">
@@ -36,12 +36,12 @@ export default function StaffLoginPage() {
           </div>
           <div>
             <div className="font-semibold text-white leading-tight">Zoiko Local</div>
-            <div className="text-xs text-slate-500 leading-tight">Internal Ops Console</div>
+            <div className="text-xs text-slate-400 leading-tight">Internal Ops Console</div>
           </div>
         </div>
 
         <h1 className="text-lg font-semibold text-white mb-1">Staff sign-in</h1>
-        <p className="text-sm text-slate-500 mb-6">
+        <p className="text-sm text-slate-400 mb-6">
           For Zoiko staff only. Not a customer login.
         </p>
 
@@ -84,6 +84,6 @@ export default function StaffLoginPage() {
           </button>
         </form>
       </div>
-    </div>
+    </main>
   );
 }

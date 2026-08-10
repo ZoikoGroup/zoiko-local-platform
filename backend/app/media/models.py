@@ -18,6 +18,17 @@ class CallDirection(str, enum.Enum):
     OUTBOUND = "outbound"
 
 
+class ConnectionQuality(str, enum.Enum):
+    """Mirrors the LiveKit client SDK's own ConnectionQuality enum
+    (livekit-client's ConnectionQuality.Excellent/Good/Poor) - the client
+    is what actually observes this (packet loss, RTT), so these values are
+    reported in, not independently measured server-side."""
+
+    EXCELLENT = "excellent"
+    GOOD = "good"
+    POOR = "poor"
+
+
 class CallRecord(Base):
     __tablename__ = "call_records"
 
@@ -43,6 +54,12 @@ class CallRecord(Base):
     # separate recording rows already, so recording the whole outer call
     # there would just duplicate audio that's already captured.
     recording_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    # Roadmap "AI-driven fraud/spam signals" - platform-wide velocity signal,
+    # not AI: set at record_call() time for INBOUND calls when from_number
+    # has called several distinct accounts in a short window (see
+    # app.risk.service.is_suspected_spam_caller). A real customer calls one
+    # business; a robocall/spam campaign fans out across many.
+    is_suspected_spam: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -70,6 +87,18 @@ class VideoSession(Base):
     )
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    # Set once at creation (from the video-conferencing reference screenshot's
+    # "Confidential Mode" toggle) - not changeable mid-call, since flipping it
+    # on partway through would falsely imply everything said before the
+    # switch was also protected. When true, recording is blocked outright
+    # (see start_video_recording's ConfidentialModeRecordingBlockedError),
+    # which transitively blocks AI summaries too - summarize_video_session
+    # already requires a finished recording_url to exist, so a confidential
+    # session that never has one can never be summarized either. No new
+    # storage/consent bypass needed - just refusing to create the artifact
+    # in the first place.
+    confidential: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
     # Roadmap "Recording: off by default... must be consented" - recording is
     # opt-in per session (never automatic like the voice-forwarding path),
@@ -100,6 +129,58 @@ class VideoParticipantSession(Base):
     participant_identity: Mapped[str] = mapped_column(String(200), nullable=False)
     joined_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     left_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    # Call-quality telemetry (architecture doc §11) - client-reported, not a
+    # continuous stream: the client only POSTs when its own ConnectionQuality
+    # actually changes, and this column keeps the WORST value seen rather
+    # than the latest, so a call that dips briefly still shows the dip.
+    worst_connection_quality: Mapped[ConnectionQuality | None] = mapped_column(
+        Enum(ConnectionQuality, name="connection_quality_enum"), nullable=True
+    )
+    reconnect_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+
+class VideoWaitingGuestStatus(str, enum.Enum):
+    PENDING = "pending"
+    ADMITTED = "admitted"
+    DENIED = "denied"
+
+
+class VideoWaitingGuest(Base):
+    """Host waiting-room / admission for guest video join (Roadmap-adjacent
+    feature, built on top of the guest-join feature - see
+    app.media.service.request_guest_join / admit_waiting_guest). A guest's
+    join request lands here as PENDING instead of getting a LiveKit token
+    immediately; the host admits or denies it, and only then does the
+    guest's next poll receive a real token - never persisted here, since a
+    LiveKit access token is itself a bearer credential and there's no
+    reason to store one at rest when it's cheap to (re)generate on demand
+    from guest_identity/display_name once admitted.
+
+    No automatic expiry/cleanup of stale PENDING rows yet - a real product
+    would want one (this session's scope stopped at proving the admission
+    flow itself works), so this table will accumulate abandoned requests
+    over time. Worth a retention-style purge job later, same pattern as
+    app/retention/service.py, if this becomes a real problem.
+    """
+
+    __tablename__ = "video_waiting_guests"
+
+    id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=new_uuid)
+    video_session_id: Mapped[str] = mapped_column(
+        UUID(as_uuid=False), ForeignKey("video_sessions.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    display_name: Mapped[str] = mapped_column(String(100), nullable=False)
+    # Reserved at request time (not at admission) so the SAME identity is
+    # used throughout - the host is shown/approves this exact guest, not a
+    # freshly-minted one that could theoretically differ.
+    guest_identity: Mapped[str] = mapped_column(String(50), nullable=False, unique=True)
+    status: Mapped[VideoWaitingGuestStatus] = mapped_column(
+        Enum(VideoWaitingGuestStatus, name="video_waiting_guest_status_enum"),
+        nullable=False,
+        default=VideoWaitingGuestStatus.PENDING,
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -181,4 +262,13 @@ class ReceptionistCall(Base):
         UUID(as_uuid=False), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
     )
     model_version: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    # AI content signal, distinct from CallRecord.is_suspected_spam's
+    # velocity signal above - the LLM classifying the caller's OWN
+    # transcript for scam/spam pitch patterns (fake prize, warranty scam,
+    # generic sales pitch with no real reason for calling this business,
+    # etc.), same qualify_caller() extraction pass as name/company/urgency.
+    # Never set without AI-processing consent, same as every other field
+    # qualify_caller() produces.
+    is_likely_spam: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    spam_reason: Mapped[str | None] = mapped_column(String(255), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

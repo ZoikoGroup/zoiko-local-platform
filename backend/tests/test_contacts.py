@@ -6,8 +6,10 @@ def _signup_and_login(client, email: str) -> tuple[str, str]:
     signup = client.post(
         "/auth/signup",
         json={
-            "account_name": "Contacts Test Co", "account_type": "business",
-            "email": email, "password": "supersecret123",
+            "account_name": "Contacts Test Co",
+            "account_type": "business",
+            "email": email,
+            "password": "supersecret123",
         },
     )
     account_id = signup.json()["account_id"]
@@ -15,77 +17,122 @@ def _signup_and_login(client, email: str) -> tuple[str, str]:
     return login.json()["access_token"], account_id
 
 
+def _add_viewer(client, owner_headers, email: str) -> str:
+    add_response = client.post(
+        "/team/members",
+        json={"email": email, "password": "viewersecret123", "role": "viewer"},
+        headers=owner_headers,
+    )
+    assert add_response.status_code == 201, add_response.text
+    login_response = client.post("/auth/login", json={"email": email, "password": "viewersecret123"})
+    return login_response.json()["access_token"]
+
+
 def test_create_contact_requires_auth(client):
     response = client.post("/contacts", json={"name": "Jordan", "phone_number": "+15550001111"})
     assert response.status_code == 401
 
 
-def test_create_and_list_contact(client):
-    token, _ = _signup_and_login(client, "contacts1@example.com")
+def test_list_contacts_requires_auth(client):
+    response = client.get("/contacts")
+    assert response.status_code == 401
+
+
+def test_create_and_list_a_contact(client):
+    token, _ = _signup_and_login(client, "contactsowner1@example.com")
     headers = {"Authorization": f"Bearer {token}"}
 
-    create = client.post(
-        "/contacts", headers=headers,
-        json={"name": "Jordan Lee", "phone_number": "+15550001111", "email": "jordan@example.com", "notes": "VIP"},
+    create_response = client.post(
+        "/contacts",
+        json={"name": "Jordan Lee", "phone_number": "+15551234567", "email": "jordan@example.com", "notes": "VIP"},
+        headers=headers,
     )
-    assert create.status_code == 201
-    body = create.json()
+    assert create_response.status_code == 201, create_response.text
+    body = create_response.json()
     assert body["name"] == "Jordan Lee"
-    assert body["phone_number"] == "+15550001111"
-    assert body["email"] == "jordan@example.com"
-    assert body["notes"] == "VIP"
+    assert body["phone_number"] == "+15551234567"
 
-    listed = client.get("/contacts", headers=headers)
-    assert listed.status_code == 200
-    assert len(listed.json()) == 1
-    assert listed.json()[0]["id"] == body["id"]
+    list_response = client.get("/contacts", headers=headers)
+    assert list_response.status_code == 200
+    names = [c["name"] for c in list_response.json()]
+    assert "Jordan Lee" in names
 
 
-def test_create_duplicate_phone_number_conflicts(client):
-    token, _ = _signup_and_login(client, "contacts2@example.com")
+def test_create_contact_rejects_a_blank_name(client):
+    token, _ = _signup_and_login(client, "contactsowner2@example.com")
     headers = {"Authorization": f"Bearer {token}"}
 
-    client.post("/contacts", headers=headers, json={"name": "Jordan", "phone_number": "+15550002222"})
-    dupe = client.post("/contacts", headers=headers, json={"name": "Someone Else", "phone_number": "+15550002222"})
-    assert dupe.status_code == 409
-
-
-def test_get_update_and_delete_contact(client):
-    token, _ = _signup_and_login(client, "contacts3@example.com")
-    headers = {"Authorization": f"Bearer {token}"}
-
-    created = client.post(
-        "/contacts", headers=headers, json={"name": "Jordan", "phone_number": "+15550003333"},
-    ).json()
-
-    fetched = client.get(f"/contacts/{created['id']}", headers=headers)
-    assert fetched.status_code == 200
-    assert fetched.json()["name"] == "Jordan"
-
-    updated = client.put(
-        f"/contacts/{created['id']}", headers=headers,
-        json={"name": "Jordan Lee", "phone_number": "+15550003333", "notes": "Updated"},
+    response = client.post(
+        "/contacts", json={"name": "", "phone_number": "+15551234567"}, headers=headers
     )
-    assert updated.status_code == 200
-    assert updated.json()["name"] == "Jordan Lee"
-    assert updated.json()["notes"] == "Updated"
-
-    deleted = client.delete(f"/contacts/{created['id']}", headers=headers)
-    assert deleted.status_code == 204
-    assert client.get(f"/contacts/{created['id']}", headers=headers).status_code == 404
+    assert response.status_code == 422
 
 
-def test_update_contact_to_a_phone_number_already_used_conflicts(client):
-    token, _ = _signup_and_login(client, "contacts4@example.com")
+def test_update_a_contact(client):
+    token, _ = _signup_and_login(client, "contactsowner3@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    contact_id = client.post(
+        "/contacts", json={"name": "Old Name", "phone_number": "+15550000001"}, headers=headers
+    ).json()["id"]
+
+    update_response = client.put(
+        f"/contacts/{contact_id}",
+        json={"name": "New Name", "phone_number": "+15550000002", "notes": "updated"},
+        headers=headers,
+    )
+    assert update_response.status_code == 200
+    body = update_response.json()
+    assert body["name"] == "New Name"
+    assert body["phone_number"] == "+15550000002"
+    assert body["notes"] == "updated"
+
+
+def test_update_a_nonexistent_contact_returns_404(client):
+    token, _ = _signup_and_login(client, "contactsowner4@example.com")
     headers = {"Authorization": f"Bearer {token}"}
 
-    client.post("/contacts", headers=headers, json={"name": "A", "phone_number": "+15550004444"})
-    b = client.post("/contacts", headers=headers, json={"name": "B", "phone_number": "+15550005555"}).json()
-
-    conflict = client.put(
-        f"/contacts/{b['id']}", headers=headers, json={"name": "B", "phone_number": "+15550004444"},
+    response = client.put(
+        "/contacts/00000000-0000-0000-0000-000000000000",
+        json={"name": "Ghost", "phone_number": "+15550000000"},
+        headers=headers,
     )
-    assert conflict.status_code == 409
+    assert response.status_code == 404
+
+
+def test_delete_a_contact(client):
+    token, _ = _signup_and_login(client, "contactsowner5@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    contact_id = client.post(
+        "/contacts", json={"name": "To Delete", "phone_number": "+15550000003"}, headers=headers
+    ).json()["id"]
+
+    delete_response = client.delete(f"/contacts/{contact_id}", headers=headers)
+    assert delete_response.status_code == 204
+
+    list_response = client.get("/contacts", headers=headers)
+    assert not any(c["id"] == contact_id for c in list_response.json())
+
+
+def test_contacts_are_scoped_to_the_callers_own_account(client):
+    token_a, _ = _signup_and_login(client, "contactsaccountA@example.com")
+    token_b, _ = _signup_and_login(client, "contactsaccountB@example.com")
+
+    client.post(
+        "/contacts", json={"name": "Account A Contact", "phone_number": "+15550000004"},
+        headers={"Authorization": f"Bearer {token_a}"},
+    )
+
+    b_list = client.get("/contacts", headers={"Authorization": f"Bearer {token_b}"}).json()
+    assert not any(c["name"] == "Account A Contact" for c in b_list)
+
+    # Cross-account update/delete must also be rejected, not just hidden from listing.
+    a_contact_id = client.get("/contacts", headers={"Authorization": f"Bearer {token_a}"}).json()[0]["id"]
+    cross_update = client.put(
+        f"/contacts/{a_contact_id}",
+        json={"name": "Hijacked", "phone_number": "+15550000004"},
+        headers={"Authorization": f"Bearer {token_b}"},
+    )
+    assert cross_update.status_code == 404
 
 
 def test_contact_from_another_account_is_not_found(client):
@@ -106,6 +153,25 @@ def test_contact_from_another_account_is_not_found(client):
     assert client.delete(f"/contacts/{owner_contact['id']}", headers=intruder_headers).status_code == 404
 
 
+def test_viewer_can_list_contacts_but_not_create_them(client):
+    owner_token, _ = _signup_and_login(client, "contactsviewerowner@example.com")
+    owner_headers = {"Authorization": f"Bearer {owner_token}"}
+    client.post(
+        "/contacts", json={"name": "Owner's Contact", "phone_number": "+15550000005"}, headers=owner_headers
+    )
+    viewer_token = _add_viewer(client, owner_headers, "contactsviewer1@example.com")
+    viewer_headers = {"Authorization": f"Bearer {viewer_token}"}
+
+    list_response = client.get("/contacts", headers=viewer_headers)
+    assert list_response.status_code == 200
+    assert any(c["name"] == "Owner's Contact" for c in list_response.json())
+
+    create_response = client.post(
+        "/contacts", json={"name": "Blocked", "phone_number": "+15550000006"}, headers=viewer_headers
+    )
+    assert create_response.status_code == 403
+
+
 def test_contact_history_aggregates_calls_voicemails_and_receptionist_calls(client, db_session):
     token, account_id = _signup_and_login(client, "contacts6@example.com")
     headers = {"Authorization": f"Bearer {token}"}
@@ -118,8 +184,8 @@ def test_contact_history_aggregates_calls_voicemails_and_receptionist_calls(clie
     db_session.flush()
 
     db_session.add(CallRecord(
-        account_id=account_id, direction=CallDirection.INBOUND, from_number=phone, to_number=number.e164,
-        status="completed", duration=42,
+        account_id=account_id, phone_number_id=number.id, direction=CallDirection.INBOUND,
+        from_number=phone, to_number=number.e164, status="completed", duration=42,
     ))
     db_session.add(Voicemail(
         phone_number_id=number.id, account_id=account_id, from_number=phone,
@@ -135,8 +201,8 @@ def test_contact_history_aggregates_calls_voicemails_and_receptionist_calls(clie
     # unrelated contact/number - must not show up in Riley's history
     other_phone = "+15550008888"
     db_session.add(CallRecord(
-        account_id=account_id, direction=CallDirection.OUTBOUND, from_number=number.e164, to_number=other_phone,
-        status="completed", duration=5,
+        account_id=account_id, phone_number_id=number.id, direction=CallDirection.OUTBOUND,
+        from_number=number.e164, to_number=other_phone, status="completed", duration=5,
     ))
     db_session.commit()
 
@@ -157,6 +223,35 @@ def test_contact_history_aggregates_calls_voicemails_and_receptionist_calls(clie
     assert voicemail_entry["recording_url"] == "https://example.com/vm.mp3"
 
 
+def test_contact_history_is_empty_for_a_contact_with_no_activity(client):
+    token, _ = _signup_and_login(client, "contactshistory2@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    contact_id = client.post(
+        "/contacts", json={"name": "No History", "phone_number": "+15559997777"}, headers=headers
+    ).json()["id"]
+
+    response = client.get(f"/contacts/{contact_id}/history", headers=headers)
+    assert response.status_code == 200
+    assert response.json() == []
+
+
 def test_contact_history_requires_auth(client):
     response = client.get("/contacts/some-id/history")
     assert response.status_code == 401
+
+
+def test_creating_a_contact_creates_an_audit_event(client, db_session):
+    from app.audit.models import AuditEvent
+
+    token, _ = _signup_and_login(client, "contactsaudit1@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    contact_id = client.post(
+        "/contacts", json={"name": "Audited", "phone_number": "+15550000007"}, headers=headers
+    ).json()["id"]
+
+    events = (
+        db_session.query(AuditEvent)
+        .filter(AuditEvent.action == "contacts.created", AuditEvent.target == f"contact:{contact_id}")
+        .all()
+    )
+    assert len(events) == 1

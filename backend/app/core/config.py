@@ -11,6 +11,16 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file="../.env")
 
     database_url: str = "postgresql+psycopg2://zoiko:zoiko@localhost:5433/zoiko_local"
+    # loadtest.py's actual finding: Postgres itself was NOT the bottleneck
+    # under 50 concurrent users (pg_stat_activity showed 1-2 active queries,
+    # <2% container CPU, mostly idle connections) - so this is deliberately
+    # a modest bump over SQLAlchemy's bare default (pool_size=5,
+    # max_overflow=10), not an aggressive one. The real ceiling found was
+    # request concurrency in a single uvicorn process (see Dockerfile's
+    # WEB_CONCURRENCY). Multiplied by however many worker processes run per
+    # machine, so keep this conservative - it's per-process, not per-machine.
+    db_pool_size: int = 10
+    db_max_overflow: int = 10
     jwt_secret_key: str = PLACEHOLDER_JWT_SECRET_KEY
     environment: str = "development"
     # Comma-separated allowed CORS origins - the deployed frontend's real
@@ -31,6 +41,10 @@ class Settings(BaseSettings):
     # or the real deployed origin) — used to register Twilio webhook URLs
     # (call status callbacks) that can't be constructed from a request object
     public_base_url: str = ""
+    # The customer-facing web app's origin - used to build links inside
+    # emails (password reset, etc.) that must point at the frontend, not
+    # this API. Defaults to the local Next.js dev server.
+    frontend_base_url: str = "http://localhost:3000"
 
     livekit_url: str = ""
     livekit_api_key: str = ""
@@ -56,6 +70,11 @@ class Settings(BaseSettings):
 
     stripe_secret_key: str = ""
     stripe_identity_webhook_secret: str = ""
+
+    # ZoikoNex (integrations/billing) - shared-secret HMAC for the inbound
+    # payment-event webhook. Empty until a real ZoikoNex connection issues
+    # one; see app.integrations.billing.zoikonex's docstring.
+    zoikonex_webhook_secret: str = ""
 
     # Resend (integrations/notifications) - real transactional email sending.
     # email_from_address must be on a domain verified in Resend once one is
@@ -156,5 +175,44 @@ class Settings(BaseSettings):
     # Periodic health_check() sweep across every integration
     # (ops/synthetic.py), logged + emitted as an OTel gauge. 0 disables it.
     synthetic_check_interval_seconds: int = 0
+
+    # HubSpot (integrations/crm) - real OAuth app credentials, from a
+    # HubSpot developer account's app settings. Empty until one is created;
+    # see app.integrations.crm.hubspot's docstring. hubspot_redirect_uri
+    # must exactly match the "Redirect URL" configured in that HubSpot app
+    # (typically {public_base_url}/crm/hubspot/callback).
+    hubspot_client_id: str = ""
+    hubspot_client_secret: str = ""
+    hubspot_redirect_uri: str = ""
+
+    # Symmetric key (Fernet, base64-encoded - generate with
+    # cryptography.fernet.Fernet.generate_key()) for encrypting OAuth
+    # tokens at rest, e.g. CrmConnection's HubSpot/Salesforce tokens - see
+    # app.core.crypto. Empty in dev is fine for the mock-only providers;
+    # required before any real OAuth connection can be stored.
+    token_encryption_key: str = ""
+
+    # Salesforce (integrations/crm) - real OAuth "Connected App" credentials
+    # from a Salesforce org (a free Developer Edition org works). Empty
+    # until one is created; see app.integrations.crm.salesforce's
+    # docstring. salesforce_redirect_uri must exactly match the Connected
+    # App's configured Callback URL (typically
+    # {public_base_url}/crm/salesforce/callback). salesforce_login_base_url
+    # is the login domain to authenticate against - login.salesforce.com
+    # for production/Developer Edition orgs, test.salesforce.com for
+    # sandboxes.
+    salesforce_client_id: str = ""
+    salesforce_client_secret: str = ""
+    salesforce_redirect_uri: str = ""
+    salesforce_login_base_url: str = "https://login.salesforce.com"
+
+    # Pipedrive (integrations/crm) - real OAuth app credentials, from a
+    # Pipedrive Developer Hub app. Empty until one is created; see
+    # app.integrations.crm.pipedrive's docstring. pipedrive_redirect_uri
+    # must exactly match that app's configured Callback URL (typically
+    # {public_base_url}/crm/pipedrive/callback).
+    pipedrive_client_id: str = ""
+    pipedrive_client_secret: str = ""
+    pipedrive_redirect_uri: str = ""
 
 settings = Settings()

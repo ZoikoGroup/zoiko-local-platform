@@ -1,3 +1,4 @@
+import hashlib
 from datetime import datetime, timedelta, timezone
 
 import pyotp
@@ -38,6 +39,18 @@ def decode_access_token(token: str) -> dict | None:
         return jwt.decode(token, settings.jwt_secret_key, algorithms=[ALGORITHM])
     except JWTError:
         return None
+
+
+def password_fingerprint(hashed_password: str) -> str:
+    """A short, non-reversible fingerprint of a user's CURRENT hashed
+    password, embedded in a password-reset token's payload. There's no
+    reset-token table to mark tokens used - instead, the fingerprint stops
+    matching the instant the password actually changes (successfully using
+    a reset token changes hashed_password), so any other outstanding token
+    for the same request (e.g. a reset email opened twice, or a stale
+    link after the password was already changed some other way) is
+    automatically invalidated without needing separate revocation state."""
+    return hashlib.sha256(hashed_password.encode("utf-8")).hexdigest()[:16]
 
 
 def verify_google_id_token(credential: str) -> dict | None:

@@ -9,23 +9,32 @@ from alembic import context
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from app.apikeys import models as apikeys_models  # noqa: F401
 from app.audit import models as audit_models  # noqa: F401
+from app.billing import models as billing_models  # noqa: F401
 from app.compliance import models as compliance_models  # noqa: F401
 from app.consent import models as consent_models  # noqa: F401
 from app.contacts import models as contacts_models  # noqa: F401
+from app.crm import models as crm_models  # noqa: F401
 from app.core.config import settings
 from app.core.database import Base
 from app.events import models as events_models  # noqa: F401
 from app.intelligence import models as intelligence_models  # noqa: F401
 from app.media import models as media_models  # noqa: F401
+from app.messaging import models as messaging_models  # noqa: F401
 from app.numbering.identity import models as identity_models  # noqa: F401
 from app.numbering.numbers import models as numbers_models  # noqa: F401
 from app.notifications import models as notifications_models  # noqa: F401
+from app.observability import models as observability_models  # noqa: F401
+from app.ops import models as ops_models  # noqa: F401
 from app.porting import models as porting_models  # noqa: F401
+from app.queues import models as queues_models  # noqa: F401
 from app.retention import models as retention_models  # noqa: F401
 from app.risk import models as risk_models  # noqa: F401
+from app.routing import models as routing_models  # noqa: F401
 from app.staff import models as staff_models  # noqa: F401
 from app.usage import models as usage_models  # noqa: F401
+from app.webhooks import models as webhooks_models  # noqa: F401
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.

@@ -12,6 +12,7 @@ from botocore.exceptions import BotoCoreError, ClientError
 
 from app.core.config import settings
 from app.integrations._shared.circuit_breaker import CircuitBreaker, with_failover
+from app.observability.service import trace_provider_call
 
 _breaker = CircuitBreaker("storage")
 
@@ -55,13 +56,26 @@ def health_check() -> dict:
         return {"configured": True, "ok": False, "detail": str(e)}
 
 
+def upload_object(key: str, data: bytes, content_type: str) -> None:
+    """Uploads raw bytes to the configured (private) bucket — used for
+    documents a customer submits directly (e.g. compliance verification
+    docs), as opposed to recordings, which providers write via their own
+    egress/callback flow rather than us pushing bytes ourselves."""
+    try:
+        with trace_provider_call("s3", "upload_object"):
+            _client().put_object(Bucket=settings.s3_bucket, Key=key, Body=data, ContentType=content_type)
+    except (BotoCoreError, ClientError) as e:
+        raise StorageError(str(e)) from e
+
+
 def delete_object(key: str) -> None:
     """Deletes one object from the configured bucket — used to actually
     remove a recording's file once it's past its retention window, not just
     unlink it in our own database."""
     def _primary() -> None:
         try:
-            _client().delete_object(Bucket=settings.s3_bucket, Key=key)
+            with trace_provider_call("s3", "delete_object"):
+                _client().delete_object(Bucket=settings.s3_bucket, Key=key)
         except (BotoCoreError, ClientError) as e:
             raise StorageError(str(e)) from e
 
@@ -76,8 +90,9 @@ def download_object(key: str) -> bytes:
     presigned URL isn't the right shape here."""
     def _primary() -> bytes:
         try:
-            response = _client().get_object(Bucket=settings.s3_bucket, Key=key)
-            return response["Body"].read()
+            with trace_provider_call("s3", "download_object"):
+                response = _client().get_object(Bucket=settings.s3_bucket, Key=key)
+                return response["Body"].read()
         except (BotoCoreError, ClientError) as e:
             raise StorageError(str(e)) from e
 

@@ -100,7 +100,7 @@ export default function LoginPage() {
               setCode("");
               setError(null);
             }}
-            className="w-full text-xs text-slate-400 hover:text-slate-700"
+            className="w-full text-xs text-slate-600 hover:text-slate-700"
           >
             Back to login
           </button>
@@ -115,7 +115,7 @@ export default function LoginPage() {
 
       <div className="flex items-center gap-3 my-5">
         <div className="h-px bg-slate-200 flex-1" />
-        <span className="text-xs text-slate-400">or continue with email</span>
+        <span className="text-xs text-slate-600">or continue with email</span>
         <div className="h-px bg-slate-200 flex-1" />
       </div>
 
@@ -134,6 +134,9 @@ export default function LoginPage() {
         <div>
           <div className="flex items-center justify-between mb-1.5">
             <label className="block text-sm font-medium text-slate-700">Password</label>
+            <Link href="/forgot-password" className="text-xs text-indigo-600 hover:text-indigo-700">
+              Forgot password?
+            </Link>
           </div>
           <input
             type="password"

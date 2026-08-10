@@ -28,6 +28,15 @@ RISK_SIGNAL_WEIGHTS = {
 MAX_RISK_SCORE = 100
 AUTO_SUSPEND_THRESHOLD = 100
 
+# Inbound fraud/spam signal (Roadmap "AI-driven fraud/spam signals"): a real
+# customer calls one business; a robocall/spam campaign dials the same
+# number out to many businesses in a short window. Platform-wide (not
+# per-account) by design - the whole point is spotting a pattern no single
+# account's own call history would ever show. Same "not a tuned production
+# value" caveat as the outbound velocity threshold above.
+INBOUND_SPAM_WINDOW_MINUTES = 60
+INBOUND_SPAM_ACCOUNT_THRESHOLD = 3
+
 
 class DestinationBlockedError(Exception):
     """Raised when an outbound call targets a blocked destination prefix."""
@@ -151,6 +160,36 @@ def maybe_auto_suspend_for_risk(db: Session, account_id: str) -> bool:
             after={"score": score, "numbers_suspended": [n.e164 for n in suspended]},
         )
     return bool(suspended)
+
+
+def is_suspected_spam_caller(db: Session, from_number: str, candidate_account_id: str | None = None) -> bool:
+    """True when from_number has called INBOUND_SPAM_ACCOUNT_THRESHOLD+
+    distinct accounts (platform-wide) within the last INBOUND_SPAM_WINDOW_MINUTES.
+    Checked at record_call() time for every inbound call, regardless of which
+    number it's calling - a single account's own history could never surface
+    this, since each call it sees is just one data point.
+
+    candidate_account_id: the CURRENT call's account, checked BEFORE that
+    call's own CallRecord row exists yet - without folding it in, the call
+    that actually crosses the threshold would itself go unflagged (only the
+    next one would), since it isn't in the DB yet at decision time.
+    """
+    window_start = datetime.now(timezone.utc) - timedelta(minutes=INBOUND_SPAM_WINDOW_MINUTES)
+    accounts = {
+        row[0]
+        for row in db.query(CallRecord.account_id)
+        .filter(
+            CallRecord.direction == CallDirection.INBOUND,
+            CallRecord.from_number == from_number,
+            CallRecord.created_at >= window_start,
+            CallRecord.account_id.isnot(None),
+        )
+        .distinct()
+        .all()
+    }
+    if candidate_account_id is not None:
+        accounts.add(candidate_account_id)
+    return len(accounts) >= INBOUND_SPAM_ACCOUNT_THRESHOLD
 
 
 def add_blocked_destination(db: Session, *, prefix: str, reason: str, actor: str) -> BlockedDestination:

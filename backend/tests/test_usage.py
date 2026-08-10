@@ -60,6 +60,8 @@ def test_completed_call_records_a_usage_event(client, db_session, monkeypatch):
     assert events[0]["quantity"] == 125
     assert events[0]["unit"] == "seconds"
     assert events[0]["country_band"] == "GB"
+    # GB is seeded at 2 cents/minute; 125 seconds rounds up to 3 minutes.
+    assert events[0]["estimated_cost_cents"] == 6
 
 
 def test_duplicate_status_callback_does_not_double_count_usage(client, db_session, monkeypatch):
@@ -79,6 +81,93 @@ def test_duplicate_status_callback_does_not_double_count_usage(client, db_sessio
 
     usage_response = client.get("/usage", headers={"Authorization": f"Bearer {token}"})
     assert len(usage_response.json()) == 1
+
+
+def test_completed_call_falls_back_to_the_default_rate_for_an_unseeded_country(client, db_session, monkeypatch):
+    """The calling number's own country only has a rate row for the 8
+    curated countries - anything else (a number bought before this country
+    ended up curated, or a staff-added rate that hasn't been set) must
+    still price using the DEFAULT_RATE_COUNTRY fallback rather than leaving
+    estimated_cost_cents null."""
+    token = _signup_and_login(client, "usagefallback@example.com")
+    account_id = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"}).json()["account_id"]
+
+    monkeypatch.setattr(
+        "app.media.service.telecom.place_call",
+        lambda **kwargs: {"sid": "CAusagefallback1", "status": "queued", "to": kwargs["to"], "from": kwargs["from_"]},
+    )
+    number = PhoneNumber(e164="+81312345678", country="JP", status=PhoneNumberStatus.ACTIVE, account_id=account_id)
+    db_session.add(number)
+    db_session.commit()
+    response = client.post(
+        "/media/voice/outbound", json={"to": "+15559990002", "from": "+81312345678"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert response.status_code == 200, response.text
+
+    callback_url = "http://testserver/media/voice/status-callback"
+    callback_params = {"CallSid": "CAusagefallback1", "CallStatus": "completed", "CallDuration": "60"}
+    signature = _twilio_signature(callback_url, callback_params)
+    client.post("/media/voice/status-callback", data=callback_params, headers={"X-Twilio-Signature": signature})
+
+    events = client.get("/usage", headers={"Authorization": f"Bearer {token}"}).json()
+    assert events[0]["country_band"] == "JP"
+    # XX (default fallback) is seeded at 5 cents/minute.
+    assert events[0]["estimated_cost_cents"] == 5
+
+
+def test_customer_can_view_the_calling_rate_card(client):
+    token = _signup_and_login(client, "ratecard1@example.com")
+    response = client.get("/usage/calling-rates", headers={"Authorization": f"Bearer {token}"})
+    assert response.status_code == 200
+    rates = {r["country"]: r["price_per_minute_cents"] for r in response.json()}
+    assert rates["US"] == 1
+    assert rates["XX"] == 5
+
+
+def test_staff_can_update_a_calling_rate(client, db_session):
+    from app.staff import service as staff_service
+    from app.staff.models import PlatformStaffRole
+
+    staff_service.create_staff(
+        db_session, email="staffrate1@zoikolocal.com", password="staffpass123", role=PlatformStaffRole.SUPER_ADMIN
+    )
+    staff_token = client.post(
+        "/staff/login", json={"email": "staffrate1@zoikolocal.com", "password": "staffpass123"}
+    ).json()["access_token"]
+    staff_headers = {"Authorization": f"Bearer {staff_token}"}
+
+    response = client.put(
+        "/staff/calling-rates", json={"country": "US", "price_per_minute_cents": 9, "currency": "USD"},
+        headers=staff_headers,
+    )
+    assert response.status_code == 200
+    assert response.json()["price_per_minute_cents"] == 9
+
+    token = _signup_and_login(client, "ratecard2@example.com")
+    rates = {
+        r["country"]: r["price_per_minute_cents"]
+        for r in client.get("/usage/calling-rates", headers={"Authorization": f"Bearer {token}"}).json()
+    }
+    assert rates["US"] == 9
+
+
+def test_non_super_admin_staff_cannot_update_calling_rates(client, db_session):
+    from app.staff import service as staff_service
+    from app.staff.models import PlatformStaffRole
+
+    staff_service.create_staff(
+        db_session, email="staffrate2@zoikolocal.com", password="staffpass123", role=PlatformStaffRole.SUPPORT
+    )
+    staff_token = client.post(
+        "/staff/login", json={"email": "staffrate2@zoikolocal.com", "password": "staffpass123"}
+    ).json()["access_token"]
+
+    response = client.put(
+        "/staff/calling-rates", json={"country": "US", "price_per_minute_cents": 9},
+        headers={"Authorization": f"Bearer {staff_token}"},
+    )
+    assert response.status_code == 403
 
 
 def test_usage_requires_admin(client):
