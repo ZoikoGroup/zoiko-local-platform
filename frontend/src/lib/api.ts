@@ -361,6 +361,10 @@ export type NotificationPreferences = {
   quiet_hours_start: string | null; // "HH:MM:SS"
   quiet_hours_end: string | null;
   quiet_hours_timezone: string;
+  // Email Communications System doc's Preference Center - domain-scoped
+  // opt-out (e.g. "BILL", "VOICE") on top of the single transactional
+  // on/off switch above, matching NotificationTemplate.domain.
+  disabled_domains: string[];
 };
 
 export function getNotificationPreferences(token: string): Promise<NotificationPreferences> {
@@ -1486,39 +1490,8 @@ export function removeBlockedDestination(staffToken: string, ruleId: string): Pr
   });
 }
 
-// Roadmap doc §13 Risk Register "anomalous usage" review queue - opened
-// automatically when an account's risk score crosses REVIEW_THRESHOLD
-// (below the auto-suspend threshold), for a human to confirm or clear.
-
-export type FraudCase = {
-  id: string;
-  account_id: string;
-  score_at_open: number;
-  status: "open" | "confirmed" | "cleared";
-  resolved_by: string | null;
-  resolution_notes: string | null;
-  created_at: string;
-  resolved_at: string | null;
-};
-
-export function listFraudCases(staffToken: string, caseStatus?: string): Promise<FraudCase[]> {
-  const query = caseStatus ? `?case_status=${encodeURIComponent(caseStatus)}` : "";
-  return request<FraudCase[]>(`/risk/fraud-cases${query}`, {
-    headers: { Authorization: `Bearer ${staffToken}` },
-  });
-}
-
-export function resolveFraudCase(
-  staffToken: string,
-  caseId: string,
-  input: { status: "confirmed" | "cleared"; notes: string }
-): Promise<FraudCase> {
-  return request<FraudCase>(`/risk/fraud-cases/${encodeURIComponent(caseId)}/resolve`, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${staffToken}` },
-    body: JSON.stringify(input),
-  });
-}
+// Fraud case review queue and scoring rules are defined further down,
+// alongside listFraudRules/upsertFraudRule (see "Fraud model" section).
 
 // --- Contacts ---
 
@@ -2082,5 +2055,76 @@ export function disconnectCrm(token: string): Promise<void> {
 export function listCrmSyncEvents(token: string): Promise<CrmSyncEvent[]> {
   return request<CrmSyncEvent[]>("/crm/sync-log", {
     headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+// Fraud model (Architecture doc Phase 4 "proprietary fraud models") - staff
+// review queue for accounts whose decayed risk score crossed REVIEW_THRESHOLD,
+// and staff-tunable per-signal-type scoring weights (same "rules as data"
+// doctrine as ComplianceRule/BlockedDestination).
+export type RiskSignalType =
+  | "velocity_exceeded"
+  | "blocked_destination_attempt"
+  | "geographic_dispersion";
+
+export type FraudCaseStatus = "open" | "confirmed" | "cleared";
+
+export type FraudRule = {
+  id: string;
+  signal_type: RiskSignalType;
+  weight: number;
+  is_active: boolean;
+  created_at: string;
+};
+
+export type FraudCase = {
+  id: string;
+  account_id: string;
+  score_at_open: number;
+  status: FraudCaseStatus;
+  resolved_by: string | null;
+  resolution_notes: string | null;
+  created_at: string;
+  resolved_at: string | null;
+};
+
+export function listFraudRules(token: string): Promise<FraudRule[]> {
+  return request<FraudRule[]>("/risk/fraud-rules", {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export function upsertFraudRule(
+  token: string,
+  signalType: RiskSignalType,
+  input: { weight: number; is_active: boolean }
+): Promise<FraudRule> {
+  return request<FraudRule>(`/risk/fraud-rules/${signalType}`, {
+    method: "PUT",
+    headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify(input),
+  });
+}
+
+export function listFraudCases(
+  token: string,
+  status?: FraudCaseStatus
+): Promise<FraudCase[]> {
+  const query = status ? `?case_status=${status}` : "";
+  return request<FraudCase[]>(`/risk/fraud-cases${query}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export function resolveFraudCase(
+  token: string,
+  caseId: string,
+  status: Exclude<FraudCaseStatus, "open">,
+  notes?: string
+): Promise<FraudCase> {
+  return request<FraudCase>(`/risk/fraud-cases/${caseId}/resolve`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ status, notes }),
   });
 }

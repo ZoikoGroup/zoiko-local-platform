@@ -72,6 +72,13 @@ class RiskSignal(Base):
     account_id: Mapped[str] = mapped_column(
         UUID(as_uuid=False), ForeignKey("accounts.id", ondelete="CASCADE"), nullable=False, index=True
     )
+    # No values_callable override here (unlike an earlier draft of this
+    # column that briefly assumed lowercase storage) - the actual live
+    # risksignaltype Postgres type was fixed to this codebase's usual
+    # uppercase-.name convention (see the a80b7b11ce8e migration's fix
+    # this session for why: it matches call_direction_enum and every other
+    # enum column here), so SQLAlchemy's default Enum(SomeStrEnum) behavior
+    # (send the member's .name) is exactly correct.
     signal_type: Mapped[RiskSignalType] = mapped_column(Enum(RiskSignalType), nullable=False)
     detail: Mapped[str] = mapped_column(String(255), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
@@ -89,7 +96,11 @@ class FraudRule(Base):
     __tablename__ = "fraud_rules"
 
     id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=new_uuid)
-    signal_type: Mapped[RiskSignalType] = mapped_column(Enum(RiskSignalType), unique=True, nullable=False)
+    # No values_callable override - see RiskSignal.signal_type's docstring
+    # above for why the plain default (.name, uppercase) is correct here.
+    signal_type: Mapped[RiskSignalType] = mapped_column(
+        Enum(RiskSignalType), unique=True, nullable=False,
+    )
     weight: Mapped[int] = mapped_column(nullable=False)
     is_active: Mapped[bool] = mapped_column(nullable=False, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

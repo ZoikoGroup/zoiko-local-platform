@@ -32,12 +32,28 @@ class AccountRiskSummaryResponse(BaseModel):
     account_id: str
     score: int
     auto_suspend_threshold: int
+    review_threshold: int
     window_hours: int
     signals: list[RiskSignalResponse]
 
 
 class AccountReinstateRequest(BaseModel):
     reason: str | None = None
+
+
+class FraudRuleResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    signal_type: RiskSignalType
+    weight: int
+    is_active: bool
+    created_at: datetime
+
+
+class FraudRuleUpsertRequest(BaseModel):
+    weight: int
+    is_active: bool = True
 
 
 class FraudCaseResponse(BaseModel):
@@ -53,6 +69,6 @@ class FraudCaseResponse(BaseModel):
     resolved_at: datetime | None
 
 
-class ResolveFraudCaseRequest(BaseModel):
+class FraudCaseResolveRequest(BaseModel):
     status: FraudCaseStatus
-    notes: str
+    notes: str | None = None

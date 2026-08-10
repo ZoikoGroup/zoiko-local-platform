@@ -1,0 +1,318 @@
+from datetime import datetime, timedelta, timezone
+
+from app.numbering.numbers.models import PhoneNumber, PhoneNumberStatus
+
+
+def _signup_and_login(client, email: str) -> str:
+    client.post(
+        "/auth/signup",
+        json={
+            "account_name": "Fraud Model Test Co",
+            "account_type": "business",
+            "email": email,
+            "password": "supersecret123",
+        },
+    )
+    response = client.post("/auth/login", json={"email": email, "password": "supersecret123"})
+    return response.json()["access_token"]
+
+
+def _create_staff_and_login(client, db_session, email: str, role):
+    from app.staff import service as staff_service
+
+    staff_service.create_staff(db_session, email=email, password="staffpass123", role=role)
+    response = client.post("/staff/login", json={"email": email, "password": "staffpass123"})
+    return response.json()["access_token"]
+
+
+def _active_number(db_session, account_id: str, e164: str) -> PhoneNumber:
+    number = PhoneNumber(e164=e164, country="US", status=PhoneNumberStatus.ACTIVE, account_id=account_id)
+    db_session.add(number)
+    db_session.commit()
+    return number
+
+
+def _place_call(client, headers, to: str, from_number: str):
+    return client.post("/media/voice/outbound", json={"to": to, "from": from_number}, headers=headers)
+
+
+# --- Geographic dispersion (IRSF pattern) ---
+
+# One real-shaped E.164 number per distinct country, matching phonenumbers'
+# own region metadata - these don't need to be live/assigned, just
+# structurally valid enough for region_code_for_number to resolve.
+_COUNTRY_NUMBERS = [
+    "+14155552671",  # US
+    "+442071838750",  # GB
+    "+33142685300",  # FR
+    "+4930123456",  # DE
+    "+81312345678",  # JP
+]
+
+
+def test_geographic_dispersion_allowed_below_threshold(client, db_session, monkeypatch):
+    monkeypatch.setattr(
+        "app.media.service.telecom.place_call",
+        lambda **kwargs: {"sid": "CAgeo1", "status": "queued", "to": kwargs["to"], "from": kwargs["from_"]},
+    )
+    from app.risk.service import GEOGRAPHIC_DISPERSION_COUNTRY_THRESHOLD
+
+    token = _signup_and_login(client, "fraudgeo1@example.com")
+    account_id = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"}).json()["account_id"]
+    _active_number(db_session, account_id, "+15550070001")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    for destination in _COUNTRY_NUMBERS[: GEOGRAPHIC_DISPERSION_COUNTRY_THRESHOLD - 1]:
+        response = _place_call(client, headers, destination, "+15550070001")
+        assert response.status_code == 200, response.text
+
+
+def test_geographic_dispersion_blocks_at_threshold(client, db_session, monkeypatch):
+    monkeypatch.setattr(
+        "app.media.service.telecom.place_call",
+        lambda **kwargs: {"sid": "CAgeo2", "status": "queued", "to": kwargs["to"], "from": kwargs["from_"]},
+    )
+    from app.risk.service import GEOGRAPHIC_DISPERSION_COUNTRY_THRESHOLD
+
+    token = _signup_and_login(client, "fraudgeo2@example.com")
+    account_id = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"}).json()["account_id"]
+    _active_number(db_session, account_id, "+15550070002")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    for destination in _COUNTRY_NUMBERS[: GEOGRAPHIC_DISPERSION_COUNTRY_THRESHOLD - 1]:
+        assert _place_call(client, headers, destination, "+15550070002").status_code == 200
+
+    over_threshold = _place_call(
+        client, headers, _COUNTRY_NUMBERS[GEOGRAPHIC_DISPERSION_COUNTRY_THRESHOLD - 1], "+15550070002"
+    )
+    assert over_threshold.status_code == 429
+    assert "distinct countries" in over_threshold.json()["detail"].lower()
+
+
+def test_geographic_dispersion_signal_is_recorded(client, db_session, monkeypatch):
+    monkeypatch.setattr(
+        "app.media.service.telecom.place_call",
+        lambda **kwargs: {"sid": "CAgeo3", "status": "queued", "to": kwargs["to"], "from": kwargs["from_"]},
+    )
+    from app.risk.models import RiskSignal, RiskSignalType
+    from app.risk.service import GEOGRAPHIC_DISPERSION_COUNTRY_THRESHOLD
+
+    token = _signup_and_login(client, "fraudgeo3@example.com")
+    account_id = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"}).json()["account_id"]
+    _active_number(db_session, account_id, "+15550070003")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    for destination in _COUNTRY_NUMBERS[: GEOGRAPHIC_DISPERSION_COUNTRY_THRESHOLD - 1]:
+        _place_call(client, headers, destination, "+15550070003")
+    _place_call(client, headers, _COUNTRY_NUMBERS[GEOGRAPHIC_DISPERSION_COUNTRY_THRESHOLD - 1], "+15550070003")
+
+    signal = (
+        db_session.query(RiskSignal)
+        .filter(RiskSignal.account_id == account_id, RiskSignal.signal_type == RiskSignalType.GEOGRAPHIC_DISPERSION)
+        .first()
+    )
+    assert signal is not None
+
+
+# --- Time-decayed scoring ---
+
+def test_score_decays_with_signal_age(db_session):
+    from app.numbering.identity.models import Account, AccountType
+    from app.risk.models import RiskSignal, RiskSignalType
+    from app.risk.service import compute_account_risk_score, get_signal_weight
+
+    account = Account(name="Decay Test Co", account_type=AccountType.BUSINESS)
+    db_session.add(account)
+    db_session.flush()
+
+    weight = get_signal_weight(db_session, RiskSignalType.BLOCKED_DESTINATION_ATTEMPT)
+    now = datetime.now(timezone.utc)
+    db_session.add(
+        RiskSignal(
+            account_id=account.id, signal_type=RiskSignalType.BLOCKED_DESTINATION_ATTEMPT,
+            detail="fresh", created_at=now - timedelta(seconds=1),
+        )
+    )
+    db_session.add(
+        RiskSignal(
+            account_id=account.id, signal_type=RiskSignalType.BLOCKED_DESTINATION_ATTEMPT,
+            detail="old", created_at=now - timedelta(hours=16),
+        )
+    )
+    db_session.commit()
+
+    score = compute_account_risk_score(db_session, account.id)
+    # Flat-sum would be 2*weight; decay (16h = two 8h half-lives on the old
+    # signal, ~1x on the fresh one) should land meaningfully below that -
+    # proving age actually discounts a signal's contribution.
+    assert score < 2 * weight
+    assert score > weight * 0.5  # the fresh signal alone still counts for most of its weight
+
+
+# --- FraudRule staff tuning ---
+
+def test_non_admin_staff_cannot_update_fraud_rule(client, db_session):
+    from app.staff.models import PlatformStaffRole
+
+    support_token = _create_staff_and_login(client, db_session, "fraudrulesupport@zoikolocal.com", PlatformStaffRole.SUPPORT)
+    response = client.put(
+        "/risk/fraud-rules/blocked_destination_attempt",
+        json={"weight": 5, "is_active": True},
+        headers={"Authorization": f"Bearer {support_token}"},
+    )
+    assert response.status_code == 403
+
+
+def test_deactivating_a_signal_stops_it_contributing_to_score(client, db_session, monkeypatch):
+    monkeypatch.setattr(
+        "app.media.service.telecom.place_call",
+        lambda **kwargs: {"sid": "CArule1", "status": "queued", "to": kwargs["to"], "from": kwargs["from_"]},
+    )
+    from app.risk.models import BlockedDestination
+    from app.risk.service import compute_account_risk_score
+    from app.staff.models import PlatformStaffRole
+
+    admin_token = _create_staff_and_login(client, db_session, "fraudruleadmin1@zoikolocal.com", PlatformStaffRole.SUPER_ADMIN)
+    rule_response = client.put(
+        "/risk/fraud-rules/blocked_destination_attempt",
+        json={"weight": 40, "is_active": False},
+        headers={"Authorization": f"Bearer {admin_token}"},
+    )
+    assert rule_response.status_code == 200
+    assert rule_response.json()["is_active"] is False
+
+    db_session.add(BlockedDestination(prefix="+1901", reason="test prefix"))
+    db_session.commit()
+
+    token = _signup_and_login(client, "fraudruleaccount1@example.com")
+    account_id = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"}).json()["account_id"]
+    _active_number(db_session, account_id, "+15550070010")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    _place_call(client, headers, "+19015551234", "+15550070010")
+
+    assert compute_account_risk_score(db_session, account_id) == 0
+
+
+# --- FraudCase review queue ---
+
+def test_review_threshold_opens_a_case_without_suspending(client, db_session):
+    from app.risk.models import BlockedDestination
+    from app.risk.service import record_risk_signal
+    from app.risk.models import RiskSignalType
+
+    db_session.add(BlockedDestination(prefix="+1902", reason="test prefix"))
+    db_session.commit()
+
+    token = _signup_and_login(client, "fraudcaseaccount1@example.com")
+    account_id = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"}).json()["account_id"]
+    number = _active_number(db_session, account_id, "+15550070020")
+
+    # Two BLOCKED_DESTINATION_ATTEMPT signals (default weight 40 each,
+    # negligible decay since they just happened) -> ~80, above
+    # REVIEW_THRESHOLD (60) but below AUTO_SUSPEND_THRESHOLD (100).
+    record_risk_signal(db_session, account_id=account_id, signal_type=RiskSignalType.BLOCKED_DESTINATION_ATTEMPT, detail="t1")
+    record_risk_signal(db_session, account_id=account_id, signal_type=RiskSignalType.BLOCKED_DESTINATION_ATTEMPT, detail="t2")
+
+    db_session.refresh(number)
+    assert number.status == PhoneNumberStatus.ACTIVE
+
+    from app.staff.models import PlatformStaffRole
+    staff_token = _create_staff_and_login(client, db_session, "fraudcasestaff1@zoikolocal.com", PlatformStaffRole.SUPPORT)
+    cases_response = client.get("/risk/fraud-cases", headers={"Authorization": f"Bearer {staff_token}"})
+    assert cases_response.status_code == 200
+    matching = [c for c in cases_response.json() if c["account_id"] == account_id]
+    assert len(matching) == 1
+    assert matching[0]["status"] == "open"
+
+
+def test_auto_suspend_threshold_does_not_also_open_a_case(client, db_session):
+    from app.risk.models import BlockedDestination, RiskSignalType
+    from app.risk.service import record_risk_signal
+
+    db_session.add(BlockedDestination(prefix="+1903", reason="test prefix"))
+    db_session.commit()
+
+    token = _signup_and_login(client, "fraudcaseaccount2@example.com")
+    account_id = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"}).json()["account_id"]
+    number = _active_number(db_session, account_id, "+15550070021")
+
+    for i in range(3):  # 3 * 40 = 120, capped at 100 -> crosses AUTO_SUSPEND_THRESHOLD
+        record_risk_signal(db_session, account_id=account_id, signal_type=RiskSignalType.BLOCKED_DESTINATION_ATTEMPT, detail=f"t{i}")
+
+    db_session.refresh(number)
+    assert number.status == PhoneNumberStatus.SUSPENDED
+
+    from app.staff.models import PlatformStaffRole
+    staff_token = _create_staff_and_login(client, db_session, "fraudcasestaff2@zoikolocal.com", PlatformStaffRole.SUPPORT)
+    cases_response = client.get("/risk/fraud-cases", headers={"Authorization": f"Bearer {staff_token}"})
+    # The 2nd signal (score 80) legitimately opened a review case before the
+    # 3rd pushed the account over AUTO_SUSPEND_THRESHOLD - that case should
+    # be auto-resolved (not left dangling "open"), not erased from history.
+    matching = [c for c in cases_response.json() if c["account_id"] == account_id]
+    assert all(c["status"] != "open" for c in matching)
+
+
+def test_resolve_fraud_case(client, db_session):
+    from app.risk.models import BlockedDestination, RiskSignalType
+    from app.risk.service import record_risk_signal
+    from app.staff.models import PlatformStaffRole
+
+    db_session.add(BlockedDestination(prefix="+1904", reason="test prefix"))
+    db_session.commit()
+
+    token = _signup_and_login(client, "fraudcaseaccount3@example.com")
+    account_id = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"}).json()["account_id"]
+    _active_number(db_session, account_id, "+15550070022")
+
+    record_risk_signal(db_session, account_id=account_id, signal_type=RiskSignalType.BLOCKED_DESTINATION_ATTEMPT, detail="t1")
+    record_risk_signal(db_session, account_id=account_id, signal_type=RiskSignalType.BLOCKED_DESTINATION_ATTEMPT, detail="t2")
+
+    staff_token = _create_staff_and_login(
+        client, db_session, "fraudcasestaff3@zoikolocal.com", PlatformStaffRole.COMPLIANCE_OFFICER
+    )
+    cases = client.get("/risk/fraud-cases", headers={"Authorization": f"Bearer {staff_token}"}).json()
+    case_id = next(c["id"] for c in cases if c["account_id"] == account_id)
+
+    resolve_response = client.post(
+        f"/risk/fraud-cases/{case_id}/resolve",
+        json={"status": "cleared", "notes": "confirmed legitimate business traffic"},
+        headers={"Authorization": f"Bearer {staff_token}"},
+    )
+    assert resolve_response.status_code == 200
+    assert resolve_response.json()["status"] == "cleared"
+    assert resolve_response.json()["resolved_by"] is not None
+
+    second_attempt = client.post(
+        f"/risk/fraud-cases/{case_id}/resolve",
+        json={"status": "confirmed"},
+        headers={"Authorization": f"Bearer {staff_token}"},
+    )
+    assert second_attempt.status_code == 409
+
+
+def test_resolving_as_open_is_rejected(client, db_session):
+    from app.risk.models import BlockedDestination, RiskSignalType
+    from app.risk.service import record_risk_signal
+    from app.staff.models import PlatformStaffRole
+
+    db_session.add(BlockedDestination(prefix="+1905", reason="test prefix"))
+    db_session.commit()
+
+    token = _signup_and_login(client, "fraudcaseaccount4@example.com")
+    account_id = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"}).json()["account_id"]
+    _active_number(db_session, account_id, "+15550070023")
+
+    record_risk_signal(db_session, account_id=account_id, signal_type=RiskSignalType.BLOCKED_DESTINATION_ATTEMPT, detail="t1")
+    record_risk_signal(db_session, account_id=account_id, signal_type=RiskSignalType.BLOCKED_DESTINATION_ATTEMPT, detail="t2")
+
+    staff_token = _create_staff_and_login(client, db_session, "fraudcasestaff4@zoikolocal.com", PlatformStaffRole.SUPER_ADMIN)
+    cases = client.get("/risk/fraud-cases", headers={"Authorization": f"Bearer {staff_token}"}).json()
+    case_id = next(c["id"] for c in cases if c["account_id"] == account_id)
+
+    response = client.post(
+        f"/risk/fraud-cases/{case_id}/resolve",
+        json={"status": "open"},
+        headers={"Authorization": f"Bearer {staff_token}"},
+    )
+    assert response.status_code == 409

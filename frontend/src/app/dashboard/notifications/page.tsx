@@ -11,6 +11,22 @@ import {
 } from "@/lib/api";
 import { getToken } from "@/lib/auth";
 
+// The domains actually seeded in notification_templates today (Email
+// Communications System doc's full taxonomy has more - ROUTE/MSG/DEVICE/
+// TRUST/SUP/OPS/PART/MKTG aren't imported yet, so there's nothing to opt
+// out of there). Kept in sync manually with the canonical estate seed
+// migrations, not fetched from the API, since the set changes rarely.
+const NOTIFICATION_DOMAINS: { key: string; label: string }[] = [
+  { key: "AUTH", label: "Account & security" },
+  { key: "ORG", label: "Organization & team" },
+  { key: "NUM", label: "Numbers" },
+  { key: "PORT", label: "Number porting" },
+  { key: "COMP", label: "Compliance & emergency calling" },
+  { key: "VOICE", label: "Calling & voicemail" },
+  { key: "BILL", label: "Billing & plans" },
+  { key: "INTG", label: "APIs & integrations" },
+];
+
 export default function NotificationsPage() {
   const [notifications, setNotifications] = useState<NotificationDelivery[]>([]);
   const [notificationsLoading, setNotificationsLoading] = useState(true);
@@ -77,6 +93,13 @@ export default function NotificationsPage() {
       quiet_hours_end: `${quietHoursDraft.end}:00`,
       quiet_hours_timezone: quietHoursDraft.timezone,
     });
+  }
+
+  function handleToggleDomain(domain: string, enabled: boolean) {
+    if (!prefs) return;
+    const current = prefs.disabled_domains ?? [];
+    const next = enabled ? current.filter((d) => d !== domain) : [...current, domain];
+    handleUpdatePrefs({ disabled_domains: next });
   }
 
   return (
@@ -159,6 +182,27 @@ export default function NotificationsPage() {
                   </button>
                 </div>
               )}
+            </div>
+
+            <div className="pt-3 border-t border-slate-100">
+              <p className="text-sm text-slate-700 mb-1">Email categories</p>
+              <p className="text-xs text-slate-500 mb-3">
+                Turn off specific categories without affecting the rest — security and account-access notices
+                always send regardless of these.
+              </p>
+              <div className="grid grid-cols-2 gap-x-4 gap-y-2">
+                {NOTIFICATION_DOMAINS.map((domain) => (
+                  <label key={domain.key} className="flex items-center justify-between gap-2">
+                    <span className="text-sm text-slate-700">{domain.label}</span>
+                    <input
+                      type="checkbox"
+                      checked={!(prefs.disabled_domains ?? []).includes(domain.key)}
+                      disabled={prefsSaving}
+                      onChange={(e) => handleToggleDomain(domain.key, e.target.checked)}
+                    />
+                  </label>
+                ))}
+              </div>
             </div>
           </div>
         )}

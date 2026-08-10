@@ -2,7 +2,7 @@ import enum
 from datetime import datetime, time
 
 from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, String, Text, Time, func
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import ARRAY, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import Base
@@ -28,9 +28,20 @@ class NotificationDeliveryStatus(str, enum.Enum):
     FAILED = "failed"
     # Not sent on purpose - either the customer opted out of this category
     # (see NotificationPreference.transactional_enabled) or it landed inside
-    # their configured quiet hours. Kept as its own ledger row (not silently
-    # dropped) so "why didn't I get this" has a real answer.
+    # their configured quiet hours, or the recipient is on the central
+    # suppression list (see NotificationSuppression). Kept as its own
+    # ledger row (not silently dropped) so "why didn't I get this" has a
+    # real answer.
     SUPPRESSED = "suppressed"
+    # Populated asynchronously from Resend's delivery webhooks (see
+    # notifications.service.handle_resend_webhook) - a scaled-down version
+    # of the Email Communications System doc's full delivery-ledger state
+    # machine (3.2), covering only the states this platform can actually
+    # observe today via its one ESP's webhook events.
+    DELIVERED = "delivered"
+    BOUNCED = "bounced"
+    COMPLAINED = "complained"
+    CLICKED = "clicked"
 
 
 class NotificationChannel(str, enum.Enum):
@@ -105,6 +116,12 @@ class NotificationDelivery(Base):
         Enum(NotificationDeliveryStatus, name="notification_delivery_status_enum"), nullable=False
     )
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Resend's own email id, returned from the send API - lets an inbound
+    # webhook event (bounced/complained/delivered/clicked) find its way
+    # back to the delivery row it's about. Nullable because it's only
+    # available for real sends (not the no-API-key-configured log stub) and
+    # for non-email channels (SMS/push) that don't go through Resend at all.
+    provider_message_id: Mapped[str | None] = mapped_column(String(100), nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     # In-app notification center - the dashboard bell icon reads this ledger
@@ -154,4 +171,39 @@ class NotificationPreference(Base):
     quiet_hours_start: Mapped[time | None] = mapped_column(Time, nullable=True)
     quiet_hours_end: Mapped[time | None] = mapped_column(Time, nullable=True)
     quiet_hours_timezone: Mapped[str] = mapped_column(String(64), nullable=False, default="UTC")
+    # Email Communications System doc §11.1 "changing one category never
+    # silently changes another" - domain-scoped opt-out (matches
+    # NotificationTemplate.domain, e.g. "BILL", "VOICE") rather than one
+    # global switch, so unsubscribing from billing emails doesn't also mute
+    # number/porting emails. Same SECURITY/CRITICAL override as above still
+    # applies regardless of what's in this list.
+    disabled_domains: Mapped[list[str]] = mapped_column(ARRAY(String(20)), nullable=False, default=list)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class SuppressionReason(str, enum.Enum):
+    HARD_BOUNCE = "hard_bounce"
+    COMPLAINT = "complaint"
+    MANUAL_UNSUBSCRIBE = "manual_unsubscribe"
+
+
+class NotificationSuppression(Base):
+    """Email Communications System doc §4.2 "central suppression order" /
+    §11.1: "closing an account does not erase complaint, hard-bounce...
+    suppression records required to prevent harmful or unlawful delivery."
+    Deliberately keyed by recipient_email, not account_id - a bounced or
+    complained-about address must stay suppressed even if the account is
+    later deleted or the address moves to a different account. `domain`
+    NULL means "every domain" (hard bounce/complaint - the address itself is
+    bad); a specific domain value means only that category was unsubscribed
+    (one-click unsubscribe's "only the represented list/category action"
+    invariant) - checked as `domain IS NULL OR domain = :template_domain`.
+    """
+
+    __tablename__ = "notification_suppressions"
+
+    id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=new_uuid)
+    recipient_email: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    domain: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    reason: Mapped[SuppressionReason] = mapped_column(Enum(SuppressionReason, name="suppression_reason_enum"), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)

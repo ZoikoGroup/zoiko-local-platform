@@ -14,7 +14,7 @@ from app.integrations.notifications.email import EmailError
 _SEND_URL = "https://api.sendgrid.com/v3/mail/send"
 
 
-def send_email(to: str, subject: str, body: str) -> None:
+def send_email(to: str, subject: str, body: str) -> str | None:
     if not settings.sendgrid_api_key:
         raise EmailError("Secondary email provider (SendGrid) is not configured - set SENDGRID_API_KEY")
 
@@ -31,5 +31,10 @@ def send_email(to: str, subject: str, body: str) -> None:
             timeout=15.0,
         )
         response.raise_for_status()
+        # SendGrid doesn't return an id in the body - it's in the
+        # X-Message-Id response header. No webhook correlation for the
+        # secondary provider yet (see this module's docstring: untested
+        # against a live account).
+        return response.headers.get("X-Message-Id")
     except httpx.HTTPError as e:
         raise EmailError(f"SendGrid send failed: {e}") from e

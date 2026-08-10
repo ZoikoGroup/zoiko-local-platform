@@ -5,14 +5,16 @@ from app.core.database import get_db
 from app.core.deps import get_current_staff, require_capability
 from app.numbering.numbers.service import reactivate_numbers_for_account_by_staff
 from app.risk import service
-from app.risk.models import FraudCaseStatus
+from app.risk.models import FraudCaseStatus, RiskSignalType
 from app.risk.schemas import (
     AccountReinstateRequest,
     AccountRiskSummaryResponse,
     BlockedDestinationCreate,
     BlockedDestinationResponse,
+    FraudCaseResolveRequest,
     FraudCaseResponse,
-    ResolveFraudCaseRequest,
+    FraudRuleResponse,
+    FraudRuleUpsertRequest,
 )
 from app.staff.models import PlatformStaff
 
@@ -73,28 +75,56 @@ def reinstate_account_numbers(
     return {"reactivated": [n.e164 for n in numbers]}
 
 
+@router.get("/fraud-rules", response_model=list[FraudRuleResponse])
+def list_fraud_rules(
+    db: Session = Depends(get_db),
+    _staff: PlatformStaff = Depends(get_current_staff),
+):
+    """Staff-tunable weights for the fraud scoring model (Architecture doc
+    Phase 4 "proprietary fraud models") - a signal type with no row here is
+    still active, at its built-in default weight (see risk/service.py's
+    _DEFAULT_WEIGHTS)."""
+    return service.list_fraud_rules(db)
+
+
+@router.put("/fraud-rules/{signal_type}", response_model=FraudRuleResponse)
+def upsert_fraud_rule(
+    signal_type: RiskSignalType,
+    payload: FraudRuleUpsertRequest,
+    db: Session = Depends(get_db),
+    staff: PlatformStaff = Depends(require_capability("risk.manage_fraud_rules")),
+):
+    return service.upsert_fraud_rule(
+        db, signal_type=signal_type, weight=payload.weight, is_active=payload.is_active, actor=staff.id,
+    )
+
+
 @router.get("/fraud-cases", response_model=list[FraudCaseResponse])
 def list_fraud_cases(
     case_status: FraudCaseStatus | None = None,
     db: Session = Depends(get_db),
     _staff: PlatformStaff = Depends(get_current_staff),
 ):
-    """Roadmap doc §13 Risk Register "anomalous usage" review queue - any
-    staff role can view it (diagnostic, same posture as the risk score
-    view above); resolving one is the sensitive action, gated below."""
+    """Review queue for accounts whose decayed risk score crossed
+    REVIEW_THRESHOLD but not (yet) AUTO_SUSPEND_THRESHOLD - the early-
+    warning tier auto-suspension alone doesn't surface. Any staff role can
+    view it (diagnostic, same posture as the risk score view above);
+    resolving one is the sensitive action, gated below."""
     return service.list_fraud_cases(db, status=case_status)
 
 
 @router.post("/fraud-cases/{case_id}/resolve", response_model=FraudCaseResponse)
 def resolve_fraud_case(
     case_id: str,
-    payload: ResolveFraudCaseRequest,
+    payload: FraudCaseResolveRequest,
     db: Session = Depends(get_db),
     staff: PlatformStaff = Depends(require_capability("risk.resolve_fraud_case")),
 ):
     try:
         return service.resolve_fraud_case(
-            db, case_id, status=payload.status, actor=staff.id, notes=payload.notes
+            db, case_id, status=payload.status, actor=staff.id, notes=payload.notes,
         )
     except service.FraudCaseNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
+    except (service.FraudCaseAlreadyResolvedError, service.InvalidFraudCaseResolutionError) as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e

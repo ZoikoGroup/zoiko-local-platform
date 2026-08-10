@@ -1,3 +1,4 @@
+import phonenumbers
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy.exc import IntegrityError
@@ -23,29 +24,42 @@ VELOCITY_WINDOW_MINUTES = 5
 MAX_OUTBOUND_CALLS_PER_WINDOW = 20
 
 # Account risk scoring (Roadmap doc §13 Risk Register: "account risk
-# scoring", "rapid suspension workflow"). _DEFAULT_WEIGHTS is the fallback
-# used when a signal type has no active FraudRule row (see
-# get_signal_weight) - conservative first-pass values, same caveat as the
-# velocity threshold above. A blocked-destination attempt outweighs a
-# velocity hit because it's evidence of deliberate abuse (dialing a
-# known-bad prefix) rather than just a burst of otherwise-legitimate
-# traffic; geographic dispersion and spend-limit signals sit between the
-# two - real IRSF/toll-abuse indicators, but each individually noisier
-# than a known-bad-prefix hit.
+# scoring", "rapid suspension workflow"; Architecture doc Phase 4 "proprietary
+# fraud models"). Defaults are a conservative first pass, same caveat as the
+# velocity threshold above - a blocked-destination attempt is weighted higher
+# than a velocity hit because it's evidence of deliberate abuse (dialing a
+# known-bad prefix) rather than just a burst of otherwise-legitimate traffic.
+# These are only the FALLBACK - see get_signal_weight, which prefers a
+# staff-tunable FraudRule row over this dict, same "rules as data" doctrine
+# ComplianceRule already follows.
 RISK_SIGNAL_WINDOW_HOURS = 24
 _DEFAULT_WEIGHTS = {
     RiskSignalType.VELOCITY_EXCEEDED: 30,
     RiskSignalType.BLOCKED_DESTINATION_ATTEMPT: 40,
-    RiskSignalType.GEOGRAPHIC_DISPERSION: 35,
+    RiskSignalType.GEOGRAPHIC_DISPERSION: 25,
     RiskSignalType.SPEND_LIMIT_EXCEEDED: 35,
 }
 MAX_RISK_SCORE = 100
 AUTO_SUSPEND_THRESHOLD = 100
-# Roadmap doc §13 Risk Register "anomalous usage" - a lower tier than
-# AUTO_SUSPEND_THRESHOLD that opens a FraudCase for human review instead of
-# immediately suspending. Gives ops a rising-risk account to look at before
-# it's severe enough to auto-suspend, not only after.
-REVIEW_THRESHOLD = 70
+# A rising-risk account that hasn't yet earned instant suspension still
+# deserves a human look - the gap the old binary "100+ -> suspend,
+# otherwise nothing visible" design left. See open_fraud_case_if_needed.
+REVIEW_THRESHOLD = 60
+# Exponential decay: a signal from `RISK_SIGNAL_WINDOW_HOURS` ago still
+# counts (it's inside the window) but contributes far less than one from
+# the last hour - a repeatedly-abusive account concentrated in a short
+# burst now scores meaningfully higher than one with the same signal count
+# spread thinly across the whole day, which a flat sum can't distinguish.
+RISK_DECAY_HALF_LIFE_HOURS = 8.0
+
+# International Revenue Share Fraud (IRSF) pattern: outbound calls to many
+# distinct countries in a short window, a classic sign of a compromised
+# account or stolen credentials being used to dial premium international
+# ranges - a real cross-border business's own calling pattern is normally
+# far steadier. Same "not a tuned production value" caveat as the other
+# thresholds in this module.
+GEOGRAPHIC_DISPERSION_WINDOW_MINUTES = 10
+GEOGRAPHIC_DISPERSION_COUNTRY_THRESHOLD = 5
 
 # Commercial Billing Operating Standard doc's "real-time fraud/toll-abuse
 # spend controls" - independent of call COUNT (velocity) or destination
@@ -56,19 +70,6 @@ REVIEW_THRESHOLD = 70
 # calibrate against actual customer spend patterns.
 SPEND_WINDOW_HOURS = 24
 MAX_SPEND_CENTS_PER_WINDOW = 5000  # $50.00
-
-# IRSF-style dispersion check (Commercial Billing Operating Standard doc's
-# fraud/toll-abuse ask + the pre-existing GEOGRAPHIC_DISPERSION signal type
-# this module never actually implemented until now). Deliberately NOT a
-# real E.164-to-country parse - this codebase has explicitly declined to
-# build one elsewhere (see app.usage.models.CallingRate's docstring on the
-# same gap for billing) - so this groups by to_number's leading digits as a
-# coarse destination-cluster proxy instead of a resolved country. Good
-# enough to catch "suddenly dialing many different regions," not precise
-# enough to bill by.
-GEOGRAPHIC_DISPERSION_WINDOW_MINUTES = 60
-GEOGRAPHIC_DISPERSION_PREFIX_LEN = 3
-MAX_DESTINATION_PREFIXES_PER_WINDOW = 5
 
 # Architecture doc §5 "Fraud and Risk: device fingerprinting" - detection
 # only, see RiskSignalType.DEVICE_FINGERPRINT_ABUSE's docstring for why
@@ -96,9 +97,9 @@ class VelocityLimitExceededError(Exception):
     velocity threshold allows."""
 
 
-class GeographicDispersionExceededError(Exception):
-    """Raised when an account dials too many distinct destination-prefix
-    clusters in a short window - an IRSF-style abuse pattern."""
+class GeographicDispersionError(Exception):
+    """Raised when an account's outbound calls fan out across too many
+    distinct countries too quickly (IRSF pattern)."""
 
 
 class SpendLimitExceededError(Exception):
@@ -118,6 +119,17 @@ def is_destination_blocked(db: Session, to_number: str) -> BlockedDestination | 
     return None
 
 
+def get_signal_weight(db: Session, signal_type: RiskSignalType) -> int:
+    """Staff-tunable weight for one signal type - a FraudRule row overrides
+    the built-in default (0 if staff have explicitly deactivated the
+    signal); no row at all falls back to _DEFAULT_WEIGHTS. Lets the fraud
+    model be retuned, or a noisy signal silenced, without a code deploy."""
+    rule = db.query(FraudRule).filter(FraudRule.signal_type == signal_type).first()
+    if rule is not None:
+        return rule.weight if rule.is_active else 0
+    return _DEFAULT_WEIGHTS.get(signal_type, 0)
+
+
 def record_risk_signal(db: Session, *, account_id: str, signal_type: RiskSignalType, detail: str) -> RiskSignal:
     """Evidences a fraud/abuse rule actually firing against an account -
     called right before assert_destination_allowed/assert_outbound_velocity_ok
@@ -132,9 +144,31 @@ def record_risk_signal(db: Session, *, account_id: str, signal_type: RiskSignalT
         db, actor="system:risk_engine", action=f"risk.{signal_type.value}",
         target=f"account:{account_id}", after={"detail": detail},
     )
-    if not maybe_auto_suspend_for_risk(db, account_id):
-        maybe_open_fraud_case_for_risk(db, account_id)
+    if maybe_auto_suspend_for_risk(db, account_id):
+        _auto_resolve_open_case_for_suspended_account(db, account_id)
+    else:
+        open_fraud_case_if_needed(db, account_id)
     return signal
+
+
+def _auto_resolve_open_case_for_suspended_account(db: Session, account_id: str) -> None:
+    """A case can open at REVIEW_THRESHOLD on one signal and the account can
+    cross AUTO_SUSPEND_THRESHOLD on a later one - without this, that earlier
+    case is left dangling in OPEN status even though the account has since
+    been suspended, which reads to a reviewer as "still needs a look" for an
+    account the system already acted on. Auto-suspension is stronger
+    evidence than the review-tier trigger, so it supersedes the case rather
+    than leaving it stale."""
+    case = (
+        db.query(FraudCase)
+        .filter(FraudCase.account_id == account_id, FraudCase.status == FraudCaseStatus.OPEN)
+        .first()
+    )
+    if case is not None:
+        resolve_fraud_case(
+            db, case.id, status=FraudCaseStatus.CONFIRMED, actor="system:risk_engine",
+            notes="Auto-resolved: account was auto-suspended before human review completed.",
+        )
 
 
 def assert_destination_allowed(db: Session, to_number: str, account_id: str) -> None:
@@ -169,88 +203,54 @@ def assert_outbound_velocity_ok(db: Session, account_id: str) -> None:
         )
 
 
-def get_signal_weight(db: Session, signal_type: RiskSignalType) -> int:
-    """FraudRule as data (Architecture doc's "rules as data" doctrine,
-    already established for ComplianceRule) instead of a hardcoded Python
-    dict - staff can retune or disable a noisy signal without a deploy
-    (see app.risk.models.FraudRule's docstring). A signal type with no
-    active row falls back to the conservative built-in default."""
-    rule = (
-        db.query(FraudRule)
-        .filter(FraudRule.signal_type == signal_type, FraudRule.is_active.is_(True))
-        .first()
-    )
-    if rule is not None:
-        return rule.weight
-    return _DEFAULT_WEIGHTS.get(signal_type, 0)
+def _country_for_e164(e164: str) -> str | None:
+    """Best-effort E.164 -> ISO country code, matching the 2-letter format
+    already used by PhoneNumber.country. Returns None for a number
+    phonenumbers can't parse (e.g. malformed input) rather than raising -
+    a parse failure isn't itself fraud evidence."""
+    try:
+        parsed = phonenumbers.parse(e164 if e164.startswith("+") else f"+{e164}")
+    except phonenumbers.NumberParseException:
+        return None
+    return phonenumbers.region_code_for_number(parsed)
 
 
-def _weighted_score(db: Session, signals: list[RiskSignal]) -> int:
-    return min(sum(get_signal_weight(db, s.signal_type) for s in signals), MAX_RISK_SCORE)
+def assert_geographic_dispersion_ok(db: Session, account_id: str, to_number: str) -> None:
+    """IRSF-pattern guard: blocks the call (and records a signal) once an
+    account's outbound calls in the trailing window have touched
+    GEOGRAPHIC_DISPERSION_COUNTRY_THRESHOLD+ distinct countries, counting
+    the destination about to be dialed. Same "count existing, decide before
+    this one lands" shape as assert_outbound_velocity_ok. Uses a real
+    E.164-to-country parse (phonenumbers), not a coarse proxy."""
+    destination_country = _country_for_e164(to_number)
+    if destination_country is None:
+        return  # can't classify this destination's country - nothing to disperse-check
 
-
-def compute_account_risk_score(db: Session, account_id: str) -> int:
-    """Weighted count of RiskSignal rows in the trailing window, capped at
-    MAX_RISK_SCORE - a repeatedly-abusive account scores higher than one that
-    tripped a rule once, which a raw block/no-block signal can't distinguish."""
-    window_start = datetime.now(timezone.utc) - timedelta(hours=RISK_SIGNAL_WINDOW_HOURS)
-    signals = (
-        db.query(RiskSignal)
-        .filter(RiskSignal.account_id == account_id, RiskSignal.created_at >= window_start)
-        .all()
-    )
-    return _weighted_score(db, signals)
-
-
-def get_account_risk_summary(db: Session, account_id: str) -> dict:
-    window_start = datetime.now(timezone.utc) - timedelta(hours=RISK_SIGNAL_WINDOW_HOURS)
-    signals = (
-        db.query(RiskSignal)
-        .filter(RiskSignal.account_id == account_id, RiskSignal.created_at >= window_start)
-        .order_by(RiskSignal.created_at.desc())
-        .all()
-    )
-    score = _weighted_score(db, signals)
-    return {
-        "account_id": account_id,
-        "score": score,
-        "auto_suspend_threshold": AUTO_SUSPEND_THRESHOLD,
-        "window_hours": RISK_SIGNAL_WINDOW_HOURS,
-        "signals": signals,
-    }
-
-
-def assert_geographic_dispersion_ok(db: Session, to_number: str, account_id: str) -> None:
-    """IRSF-style abuse pattern: a compromised account suddenly dials many
-    different regions in a short window, unlike a legitimate cross-border
-    business's steadier spread. Uses to_number's leading digits as a
-    coarse destination-cluster proxy, not a resolved country - see this
-    module's docstring constants for why a real E.164 parser is
-    deliberately out of scope."""
     window_start = datetime.now(timezone.utc) - timedelta(minutes=GEOGRAPHIC_DISPERSION_WINDOW_MINUTES)
-    recent_destinations = {
-        row[0][:GEOGRAPHIC_DISPERSION_PREFIX_LEN]
-        for row in db.query(CallRecord.to_number)
+    recent_destinations = (
+        db.query(CallRecord.to_number)
         .filter(
             CallRecord.account_id == account_id,
             CallRecord.direction == CallDirection.OUTBOUND,
             CallRecord.created_at >= window_start,
         )
         .all()
-    }
-    recent_destinations.add(to_number[:GEOGRAPHIC_DISPERSION_PREFIX_LEN])
-    if len(recent_destinations) > MAX_DESTINATION_PREFIXES_PER_WINDOW:
+    )
+    countries = {_country_for_e164(row[0]) for row in recent_destinations}
+    countries.discard(None)
+    countries.add(destination_country)
+
+    if len(countries) >= GEOGRAPHIC_DISPERSION_COUNTRY_THRESHOLD:
         record_risk_signal(
             db, account_id=account_id, signal_type=RiskSignalType.GEOGRAPHIC_DISPERSION,
             detail=(
-                f"{len(recent_destinations)} distinct destination prefixes in "
-                f"{GEOGRAPHIC_DISPERSION_WINDOW_MINUTES} minutes"
+                f"outbound calls to {len(countries)} distinct countries "
+                f"({', '.join(sorted(countries))}) in {GEOGRAPHIC_DISPERSION_WINDOW_MINUTES} minutes"
             ),
         )
-        raise GeographicDispersionExceededError(
-            f"Too many distinct call destinations in a short window: {len(recent_destinations)} "
-            f"in the last {GEOGRAPHIC_DISPERSION_WINDOW_MINUTES} minutes "
-            f"(limit {MAX_DESTINATION_PREFIXES_PER_WINDOW})"
+        raise GeographicDispersionError(
+            f"Outbound calling pattern blocked: {len(countries)} distinct countries dialed in "
+            f"{GEOGRAPHIC_DISPERSION_WINDOW_MINUTES} minutes (limit {GEOGRAPHIC_DISPERSION_COUNTRY_THRESHOLD})"
         )
 
 
@@ -258,7 +258,9 @@ def assert_spend_limit_ok(db: Session, account_id: str) -> None:
     """Commercial Billing Operating Standard doc's "real-time fraud/toll-
     abuse spend controls" - sums UsageEvent.estimated_cost_cents (the same
     rated figures app.usage.service.record_usage_event already writes)
-    over the trailing window, independent of call count or destination."""
+    over the trailing window, independent of call count or destination.
+    Anil's anilupdated branch didn't build this leg of the fraud model -
+    kept from the merge's other side."""
     from sqlalchemy import func as sa_func
 
     from app.usage.models import UsageEvent
@@ -284,12 +286,61 @@ def assert_spend_limit_ok(db: Session, account_id: str) -> None:
         )
 
 
+def _decayed_score(db: Session, signals: list[RiskSignal]) -> int:
+    """Each signal's weight decays exponentially by age within the window -
+    a burst of abuse in the last hour scores far higher than the same
+    signal count spread thinly across the full RISK_SIGNAL_WINDOW_HOURS,
+    which a flat sum can't distinguish. Half-life, not a hard cutoff, so
+    the score glides down smoothly rather than falling off a cliff exactly
+    at the window boundary."""
+    now = datetime.now(timezone.utc)
+    total = 0.0
+    for signal in signals:
+        age_hours = (now - signal.created_at).total_seconds() / 3600
+        weight = get_signal_weight(db, signal.signal_type)
+        total += weight * (0.5 ** (age_hours / RISK_DECAY_HALF_LIFE_HOURS))
+    return min(round(total), MAX_RISK_SCORE)
+
+
+def compute_account_risk_score(db: Session, account_id: str) -> int:
+    """Time-decayed weighted score of RiskSignal rows in the trailing
+    window, capped at MAX_RISK_SCORE - see _decayed_score."""
+    window_start = datetime.now(timezone.utc) - timedelta(hours=RISK_SIGNAL_WINDOW_HOURS)
+    signals = (
+        db.query(RiskSignal)
+        .filter(RiskSignal.account_id == account_id, RiskSignal.created_at >= window_start)
+        .all()
+    )
+    return _decayed_score(db, signals)
+
+
+def get_account_risk_summary(db: Session, account_id: str) -> dict:
+    window_start = datetime.now(timezone.utc) - timedelta(hours=RISK_SIGNAL_WINDOW_HOURS)
+    signals = (
+        db.query(RiskSignal)
+        .filter(RiskSignal.account_id == account_id, RiskSignal.created_at >= window_start)
+        .order_by(RiskSignal.created_at.desc())
+        .all()
+    )
+    return {
+        "account_id": account_id,
+        "score": _decayed_score(db, signals),
+        "auto_suspend_threshold": AUTO_SUSPEND_THRESHOLD,
+        "review_threshold": REVIEW_THRESHOLD,
+        "window_hours": RISK_SIGNAL_WINDOW_HOURS,
+        "signals": signals,
+    }
+
+
 def maybe_auto_suspend_for_risk(db: Session, account_id: str) -> bool:
     """Roadmap doc §13 Risk Register: "rapid suspension workflow" - crossing
     the threshold suspends every active number on the account immediately,
     without waiting for a human reviewer. Reversible: staff can reactivate
     via the normal number-activation path once reviewed, same as any other
-    suspension reason."""
+    suspension reason. Returns True whenever the threshold was crossed
+    (regardless of whether the account had any active number left to
+    suspend) - callers use this to decide whether the lower-tier review
+    queue (open_fraud_case_if_needed) still applies."""
     score = compute_account_risk_score(db, account_id)
     if score < AUTO_SUSPEND_THRESHOLD:
         return False
@@ -303,16 +354,16 @@ def maybe_auto_suspend_for_risk(db: Session, account_id: str) -> bool:
             target=f"account:{account_id}",
             after={"score": score, "numbers_suspended": [n.e164 for n in suspended]},
         )
-    return bool(suspended)
+    return True
 
 
-def maybe_open_fraud_case_for_risk(db: Session, account_id: str) -> FraudCase | None:
-    """Roadmap doc §13 Risk Register "anomalous usage" - a rising-risk
-    account gets a human-reviewable FraudCase once it crosses
-    REVIEW_THRESHOLD, before (or instead of, if it never reaches
-    AUTO_SUSPEND_THRESHOLD) an automatic suspension. Never opens a second
-    OPEN case for the same account - one growing case, not a new row per
-    signal."""
+def open_fraud_case_if_needed(db: Session, account_id: str) -> FraudCase | None:
+    """Human-in-the-loop review queue (Architecture doc Phase 4 "proprietary
+    fraud models") - opens a case once the decayed score crosses
+    REVIEW_THRESHOLD but the account hasn't (yet) hit AUTO_SUSPEND_THRESHOLD.
+    At most one OPEN case per account at a time - repeated signals while a
+    case is already open just accumulate more evidence for the reviewer,
+    not a pile of duplicate cases."""
     score = compute_account_risk_score(db, account_id)
     if score < REVIEW_THRESHOLD:
         return None
@@ -323,20 +374,20 @@ def maybe_open_fraud_case_for_risk(db: Session, account_id: str) -> FraudCase | 
         .first()
     )
     if existing_open is not None:
-        return None
+        return existing_open
 
-    case = FraudCase(account_id=account_id, score_at_open=score, status=FraudCaseStatus.OPEN)
+    case = FraudCase(account_id=account_id, score_at_open=score)
     db.add(case)
     db.commit()
     db.refresh(case)
     log_event(
         db, actor="system:risk_engine", action="risk.fraud_case_opened",
-        target=f"account:{account_id}", after={"score_at_open": score},
+        target=f"account:{account_id}", after={"case_id": case.id, "score": score},
     )
     return case
 
 
-def list_fraud_cases(db: Session, *, status: FraudCaseStatus | None = None) -> list[FraudCase]:
+def list_fraud_cases(db: Session, status: FraudCaseStatus | None = None) -> list[FraudCase]:
     query = db.query(FraudCase)
     if status is not None:
         query = query.filter(FraudCase.status == status)
@@ -344,18 +395,31 @@ def list_fraud_cases(db: Session, *, status: FraudCaseStatus | None = None) -> l
 
 
 class FraudCaseNotFoundError(Exception):
-    """Raised when resolving a fraud case id that doesn't exist."""
+    """Raised when a fraud_case id doesn't exist."""
+
+
+class FraudCaseAlreadyResolvedError(Exception):
+    """Raised when trying to resolve a case that's already CONFIRMED or CLEARED."""
+
+
+class InvalidFraudCaseResolutionError(Exception):
+    """Raised when a resolution status other than CONFIRMED/CLEARED is given -
+    OPEN isn't a resolution, only the case's own starting state."""
 
 
 def resolve_fraud_case(
-    db: Session, case_id: str, *, status: FraudCaseStatus, actor: str, notes: str
+    db: Session, case_id: str, *, status: FraudCaseStatus, actor: str, notes: str | None = None
 ) -> FraudCase:
     """CONFIRMED or CLEARED, staff's call after reviewing the account's
     signal history - same "manual override reason" posture as every other
     sensitive staff action in this codebase."""
+    if status == FraudCaseStatus.OPEN:
+        raise InvalidFraudCaseResolutionError("A case can only be resolved as 'confirmed' or 'cleared'")
     case = db.query(FraudCase).filter(FraudCase.id == case_id).first()
     if case is None:
-        raise FraudCaseNotFoundError(f"No fraud case {case_id!r}")
+        raise FraudCaseNotFoundError(f"No such fraud case {case_id!r}")
+    if case.status != FraudCaseStatus.OPEN:
+        raise FraudCaseAlreadyResolvedError(f"Case {case_id} is already {case.status.value}")
 
     case.status = status
     case.resolved_by = actor
@@ -363,12 +427,34 @@ def resolve_fraud_case(
     case.resolved_at = datetime.now(timezone.utc)
     db.commit()
     db.refresh(case)
-
     log_event(
-        db, actor=actor, action="risk.fraud_case_resolved", target=f"fraud_case:{case.id}",
-        after={"status": status.value, "notes": notes},
+        db, actor=actor, action="risk.fraud_case_resolved",
+        target=f"fraud_case:{case.id}", after={"status": status.value, "notes": notes},
     )
     return case
+
+
+def list_fraud_rules(db: Session) -> list[FraudRule]:
+    return db.query(FraudRule).order_by(FraudRule.signal_type).all()
+
+
+def upsert_fraud_rule(
+    db: Session, *, signal_type: RiskSignalType, weight: int, is_active: bool, actor: str
+) -> FraudRule:
+    rule = db.query(FraudRule).filter(FraudRule.signal_type == signal_type).first()
+    if rule is None:
+        rule = FraudRule(signal_type=signal_type, weight=weight, is_active=is_active)
+        db.add(rule)
+    else:
+        rule.weight = weight
+        rule.is_active = is_active
+    db.commit()
+    db.refresh(rule)
+    log_event(
+        db, actor=actor, action="risk.fraud_rule_updated",
+        target=f"fraud_rule:{rule.id}", after={"signal_type": signal_type.value, "weight": weight, "is_active": is_active},
+    )
+    return rule
 
 
 def is_suspected_spam_caller(db: Session, from_number: str, candidate_account_id: str | None = None) -> bool:
@@ -441,7 +527,7 @@ def check_fingerprint_on_signup(db: Session, *, fingerprint_hash: str | None, ac
     create_account_with_owner) - records the sighting and raises a
     RiskSignal if the fingerprint has now touched too many accounts.
     Never raises/blocks: detection only, for the review queue
-    (maybe_open_fraud_case_for_risk), not a hard signup gate - a coarse
+    (open_fraud_case_if_needed), not a hard signup gate - a coarse
     client-side fingerprint has real false-positive risk (shared office
     network, family device)."""
     if not fingerprint_hash:

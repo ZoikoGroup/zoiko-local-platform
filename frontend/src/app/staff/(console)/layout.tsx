@@ -8,11 +8,11 @@ const NAV_ITEMS = [
   { href: "/staff/cases", label: "Compliance Cases" },
   { href: "/staff/porting", label: "Number Porting" },
   { href: "/staff/provisioning", label: "Provisioning Recovery" },
+  { href: "/staff/fraud", label: "Risk & Fraud" },
   { href: "/staff/accounts", label: "Accounts" },
   { href: "/staff/audit", label: "Audit Log" },
   { href: "/staff/providers", label: "Provider Status" },
   { href: "/staff/billing", label: "Billing (ZoikoNex)" },
-  { href: "/staff/risk", label: "Risk & Fraud" },
   { href: "/staff/access-matrix", label: "Access Matrix" },
 ];
 
