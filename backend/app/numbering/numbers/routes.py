@@ -132,8 +132,11 @@ async def stripe_payment_webhook(request: Request, db: Session = Depends(get_db)
         metadata = session["metadata"] if "metadata" in session else {}
         e164 = metadata["e164"] if "e164" in metadata else None
         account_id = metadata["account_id"] if "account_id" in metadata else None
+        payment_intent_id = session["payment_intent"] if "payment_intent" in session else None
         if e164 and account_id:
-            service.complete_number_purchase_from_checkout(db, e164=e164, account_id=account_id)
+            service.complete_number_purchase_from_checkout(
+                db, e164=e164, account_id=account_id, payment_intent_id=payment_intent_id
+            )
 
     return None
 

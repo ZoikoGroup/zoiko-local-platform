@@ -331,7 +331,9 @@ def create_number_purchase_checkout_session(db: Session, account_id: str, e164: 
     return session
 
 
-def complete_number_purchase_from_checkout(db: Session, *, e164: str, account_id: str) -> PhoneNumber | None:
+def complete_number_purchase_from_checkout(
+    db: Session, *, e164: str, account_id: str, payment_intent_id: str | None = None
+) -> PhoneNumber | None:
     """Called from the Stripe payment webhook once checkout.session.completed
     fires - runs the existing purchase_number flow with all its gates
     intact, rather than duplicating any of that logic. Returns None (not an
@@ -340,33 +342,42 @@ def complete_number_purchase_from_checkout(db: Session, *, e164: str, account_id
 
     - NumberConflictError: the number is no longer purchasable (already
       bought, or the webhook was retried after already succeeding once) -
-      idempotency against Stripe's at-least-once webhook delivery.
+      idempotency against Stripe's at-least-once webhook delivery. Not
+      refunded - this path means the number was already (or is being)
+      fulfilled, or a duplicate delivery of an already-handled event.
     - ComplianceRequiredError: purchase_number already persisted the
       number into COMPLIANCE_PENDING and sent its own customer
       notification - correct behavior, nothing further for this handler
-      to do.
+      to do. Not refunded - the customer still gets the number once
+      compliance clears, this isn't a failure.
     - NumberQuotaExceededError / BillingSuspendedError /
       EmergencyDisclosureRequiredError / TelecomError: genuine post-
-      payment fulfillment failures. Disclosed gap: none of these trigger
-      an automatic refund - there is no real payment/refund reconciliation
-      workflow in this codebase yet (see docs/pci-scope-assessment.md).
-      In test mode this is inconsequential (no real money); a real launch
-      needs a real refund path wired to these specific failure branches
-      before this stops being acceptable.
+      payment fulfillment failures - the customer paid and won't be
+      getting a number for it. Automatically refunded via Stripe (if
+      payment_intent_id is available) so no real launch would leave a
+      collected-but-unfulfilled payment sitting uncorrected.
     """
     try:
         return purchase_number(db, account_id, e164)
+    except (NumberConflictError, ComplianceRequiredError):
+        return None
     except (
-        NumberConflictError,
-        ComplianceRequiredError,
         EmergencyDisclosureRequiredError,
         billing_service.NumberQuotaExceededError,
         billing_service.BillingSuspendedError,
         telecom.TelecomError,
     ):
+        if payment_intent_id:
+            try:
+                stripe_checkout.refund_payment(payment_intent_id)
+            except stripe_checkout.PaymentError:
+                # Refund itself failed (e.g. provider outage) - logged by
+                # trace_provider_call already; swallowed here so a refund
+                # hiccup never turns into a 500 back to Stripe's webhook
+                # (which would just cause pointless redelivery retries of
+                # an event we've already fully handled on our side).
+                pass
         return None
-
-    return number
 
 
 # purchase_number is entirely synchronous - it never returns to the caller

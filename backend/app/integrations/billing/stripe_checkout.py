@@ -89,6 +89,29 @@ def create_checkout_session(
     return with_failover(_breaker, _primary, None, PaymentError)
 
 
+def refund_payment(payment_intent_id: str) -> dict:
+    """Issues a full refund against a completed Checkout Session's
+    PaymentIntent - called when a payment succeeds but number fulfillment
+    then fails for a genuine reason (quota/billing/disclosure/telecom),
+    see app.numbering.numbers.service.complete_number_purchase_from_checkout.
+    Confirmed the restricted "One-time payments" key scope includes refund
+    creation (verified against the real test account, not assumed)."""
+    if not settings.stripe_payments_secret_key:
+        raise PaymentError("Stripe payments secret key is not configured")
+
+    def _primary() -> dict:
+        try:
+            with trace_provider_call("stripe_payments", "refund_payment"):
+                refund = stripe.Refund.create(
+                    api_key=settings.stripe_payments_secret_key, payment_intent=payment_intent_id,
+                )
+        except stripe.error.StripeError as e:
+            raise PaymentError(f"Stripe refund failed: {e}") from e
+        return {"id": refund.id, "status": refund.status}
+
+    return with_failover(_breaker, _primary, None, PaymentError)
+
+
 def construct_webhook_event(payload: bytes, signature_header: str) -> stripe.Event:
     """Verifies the Stripe-Signature header and returns the parsed event -
     the official SDK handles the HMAC check, same pattern as

@@ -724,6 +724,108 @@ def test_stripe_payment_webhook_is_idempotent_against_retried_delivery(client, d
     assert second.status_code == 204
 
 
+def test_stripe_payment_webhook_refunds_a_genuine_fulfillment_failure(client, db_session, monkeypatch):
+    """The exact scenario hit live during manual testing: payment succeeds,
+    Twilio then can't provision the number (e.g. trial account number
+    limit) - the customer paid for nothing, so the payment must be
+    refunded automatically."""
+    from app.integrations.telecom.twilio import TelecomError
+
+    def _raise_buy(e164):
+        raise TelecomError("Trial account has reached the maximum number of phone numbers allowed.")
+
+    monkeypatch.setattr("app.numbering.numbers.service.telecom.buy_number", _raise_buy)
+    monkeypatch.setattr("app.core.config.settings.stripe_payments_webhook_secret", "whsec_test")
+
+    refund_calls = []
+    monkeypatch.setattr(
+        "app.numbering.numbers.service.stripe_checkout.refund_payment",
+        lambda payment_intent_id: refund_calls.append(payment_intent_id) or {"id": "re_test", "status": "succeeded"},
+    )
+
+    token = _signup_and_login(client, "checkoutrefund1@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    account_id = client.get("/auth/me", headers=headers).json()["account_id"]
+    _reserve(client, headers, "+15550013007")
+
+    body, signature = _stripe_webhook_body_and_signature(
+        "whsec_test", "checkout.session.completed",
+        {
+            "id": "cs_test_refund", "payment_intent": "pi_test_refund_me",
+            "metadata": {"e164": "+15550013007", "account_id": account_id},
+        },
+    )
+    response = client.post("/numbers/payments/webhook", content=body, headers={"Stripe-Signature": signature})
+    assert response.status_code == 204
+    assert refund_calls == ["pi_test_refund_me"]
+
+    numbers = client.get("/numbers", headers=headers).json()
+    number = next(n for n in numbers if n["e164"] == "+15550013007")
+    assert number["status"] == "reserved"  # released back, not stranded
+
+
+def test_stripe_payment_webhook_does_not_refund_a_compliance_pending_outcome(client, db_session, monkeypatch):
+    """Compliance-pending is not a failure - the customer still gets the
+    number once their case is approved, so the payment must be kept."""
+    from app.compliance.models import ComplianceRule
+
+    db_session.add(ComplianceRule(country="US", requirement_type="kyc_individual", is_active=True))
+    db_session.commit()
+
+    monkeypatch.setattr("app.core.config.settings.stripe_payments_webhook_secret", "whsec_test")
+    refund_calls = []
+    monkeypatch.setattr(
+        "app.numbering.numbers.service.stripe_checkout.refund_payment",
+        lambda payment_intent_id: refund_calls.append(payment_intent_id),
+    )
+
+    token = _signup_and_login(client, "checkoutrefund2@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    account_id = client.get("/auth/me", headers=headers).json()["account_id"]
+    _reserve(client, headers, "+15550013008")
+
+    body, signature = _stripe_webhook_body_and_signature(
+        "whsec_test", "checkout.session.completed",
+        {
+            "id": "cs_test_compliance", "payment_intent": "pi_test_compliance",
+            "metadata": {"e164": "+15550013008", "account_id": account_id},
+        },
+    )
+    response = client.post("/numbers/payments/webhook", content=body, headers={"Stripe-Signature": signature})
+    assert response.status_code == 204
+    assert refund_calls == []
+
+    numbers = client.get("/numbers", headers=headers).json()
+    number = next(n for n in numbers if n["e164"] == "+15550013008")
+    assert number["status"] == "compliance_pending"
+
+
+def test_stripe_payment_webhook_does_not_refund_an_idempotent_replay(client, db_session, monkeypatch):
+    _stub_buy_number(monkeypatch)
+    monkeypatch.setattr("app.core.config.settings.stripe_payments_webhook_secret", "whsec_test")
+    refund_calls = []
+    monkeypatch.setattr(
+        "app.numbering.numbers.service.stripe_checkout.refund_payment",
+        lambda payment_intent_id: refund_calls.append(payment_intent_id),
+    )
+
+    token = _signup_and_login(client, "checkoutrefund3@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    account_id = client.get("/auth/me", headers=headers).json()["account_id"]
+    _reserve(client, headers, "+15550013009")
+
+    body, signature = _stripe_webhook_body_and_signature(
+        "whsec_test", "checkout.session.completed",
+        {
+            "id": "cs_test_noreplay", "payment_intent": "pi_test_noreplay",
+            "metadata": {"e164": "+15550013009", "account_id": account_id},
+        },
+    )
+    client.post("/numbers/payments/webhook", content=body, headers={"Stripe-Signature": signature})
+    client.post("/numbers/payments/webhook", content=body, headers={"Stripe-Signature": signature})
+    assert refund_calls == []
+
+
 def test_stripe_payment_webhook_ignores_unrelated_event_types(client, monkeypatch):
     monkeypatch.setattr("app.core.config.settings.stripe_payments_webhook_secret", "whsec_test")
     body, signature = _stripe_webhook_body_and_signature(
