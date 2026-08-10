@@ -23,7 +23,16 @@ from app.notifications.service import (
     notify_number_verification_required,
 )
 from app.numbering.identity.models import Account, AccountType, User, UserRole
-from app.numbering.numbers.models import IVROption, PhoneNumber, PhoneNumberStatus, RingGroupDestination, SupportedCountry
+from app.numbering.numbers.models import (
+    IVROption,
+    NumberEligibilityCase,
+    NumberEligibilityCaseStatus,
+    NumberEligibilityRule,
+    PhoneNumber,
+    PhoneNumberStatus,
+    RingGroupDestination,
+    SupportedCountry,
+)
 
 RESERVATION_TTL_MINUTES = 12
 QUARANTINE_DAYS = 90
@@ -98,6 +107,179 @@ class EmergencyDisclosureRequiredError(Exception):
     real E911 routing."""
 
 
+class NumberEligibilityRequiredError(Exception):
+    """Raised when the requested number's (country, number_type) has an
+    active NumberEligibilityRule and no approved NumberEligibilityCase
+    covers this specific number yet - the doc's eligibility_case gate,
+    distinct from the account-level KYC ComplianceRequiredError above."""
+
+
+class NumberEligibilityCaseNotFoundError(Exception):
+    """Raised when a case id doesn't exist."""
+
+
+def get_active_eligibility_rule(db: Session, country: str, number_type: str) -> NumberEligibilityRule | None:
+    return (
+        db.query(NumberEligibilityRule)
+        .filter(
+            NumberEligibilityRule.country == country.upper(),
+            NumberEligibilityRule.number_type == number_type,
+            NumberEligibilityRule.is_active.is_(True),
+        )
+        .first()
+    )
+
+
+def list_number_eligibility_rules(db: Session) -> list[NumberEligibilityRule]:
+    return db.query(NumberEligibilityRule).order_by(NumberEligibilityRule.country, NumberEligibilityRule.number_type).all()
+
+
+def upsert_number_eligibility_rule(
+    db: Session, *, country: str, number_type: str, required_evidence: list[str], is_active: bool
+) -> NumberEligibilityRule:
+    """Staff-only, SUPER_ADMIN-gated at the route - same bar as the country
+    list and calling-rate changes (this decides which numbers can even be
+    purchased at all, not a routine support action)."""
+    country = country.upper()
+    rule = (
+        db.query(NumberEligibilityRule)
+        .filter(NumberEligibilityRule.country == country, NumberEligibilityRule.number_type == number_type)
+        .first()
+    )
+    if rule is None:
+        rule = NumberEligibilityRule(country=country, number_type=number_type)
+        db.add(rule)
+    rule.required_evidence = required_evidence
+    rule.is_active = is_active
+    db.commit()
+    db.refresh(rule)
+    return rule
+
+
+def remove_number_eligibility_rule(db: Session, rule_id: str) -> None:
+    db.query(NumberEligibilityRule).filter(NumberEligibilityRule.id == rule_id).delete()
+    db.commit()
+
+
+def _get_or_open_eligibility_case(db: Session, *, number: PhoneNumber, actor: str) -> NumberEligibilityCase:
+    """One case per phone_number_id (the doc's "links requested number/
+    market to evidence" - a case is scoped to THIS number request, not the
+    account). Reopening after REJECTED/EXPIRED isn't automatic - a rejected
+    case stays visible as the record of that decision; the customer submits
+    fresh evidence via submit_number_eligibility_evidence instead of a new
+    case silently appearing."""
+    case = db.query(NumberEligibilityCase).filter(NumberEligibilityCase.phone_number_id == number.id).first()
+    if case is not None:
+        return case
+
+    case = NumberEligibilityCase(
+        phone_number_id=number.id, account_id=number.account_id,
+        country=number.country, number_type=number.number_type,
+    )
+    db.add(case)
+    db.commit()
+    db.refresh(case)
+    log_event(
+        db, actor=actor, action="number.eligibility_case_opened",
+        target=f"number_eligibility_case:{case.id}",
+        after={"phone_number_id": number.id, "country": number.country, "number_type": number.number_type},
+    )
+    return case
+
+
+def has_approved_eligibility_case(db: Session, phone_number_id: str) -> bool:
+    return (
+        db.query(NumberEligibilityCase)
+        .filter(
+            NumberEligibilityCase.phone_number_id == phone_number_id,
+            NumberEligibilityCase.status == NumberEligibilityCaseStatus.APPROVED,
+        )
+        .first()
+        is not None
+    )
+
+
+def list_eligibility_cases_for_account(db: Session, account_id: str) -> list[NumberEligibilityCase]:
+    return (
+        db.query(NumberEligibilityCase)
+        .filter(NumberEligibilityCase.account_id == account_id)
+        .order_by(NumberEligibilityCase.created_at.desc())
+        .all()
+    )
+
+
+def list_all_eligibility_cases(db: Session, status: NumberEligibilityCaseStatus | None = None) -> list[NumberEligibilityCase]:
+    query = db.query(NumberEligibilityCase)
+    if status is not None:
+        query = query.filter(NumberEligibilityCase.status == status)
+    return query.order_by(NumberEligibilityCase.created_at.desc()).all()
+
+
+def _get_eligibility_case(db: Session, case_id: str) -> NumberEligibilityCase:
+    case = db.query(NumberEligibilityCase).filter(NumberEligibilityCase.id == case_id).first()
+    if case is None:
+        raise NumberEligibilityCaseNotFoundError(f"No eligibility case with id {case_id}")
+    return case
+
+
+def submit_number_eligibility_evidence(
+    db: Session, case_id: str, evidence: list[dict], *, account_id: str, actor: str
+) -> NumberEligibilityCase:
+    """Customer-facing - appends evidence and, if the case was previously
+    REJECTED, moves it back to PENDING for a fresh review (same retry
+    pattern as compliance.service.start_kyc_verification's REJECTED case).
+    APPROVED cases are left untouched - resubmitting evidence after
+    approval would be pointless and risks a stale review overwriting a
+    correct decision. account_id is checked here, before any mutation, so
+    a case owned by another account is rejected atomically rather than
+    the caller having to check ownership only after the write already
+    committed."""
+    case = _get_eligibility_case(db, case_id)
+    if case.account_id != account_id:
+        raise NumberEligibilityCaseNotFoundError(f"No eligibility case with id {case_id}")
+    case.evidence = [*case.evidence, *evidence]
+    if case.status == NumberEligibilityCaseStatus.REJECTED:
+        case.status = NumberEligibilityCaseStatus.PENDING
+        case.review_notes = None
+    db.commit()
+    db.refresh(case)
+    log_event(
+        db, actor=actor, action="number.eligibility_evidence_submitted",
+        target=f"number_eligibility_case:{case.id}", after={"evidence_count": len(case.evidence)},
+    )
+    return case
+
+
+def approve_number_eligibility_case(db: Session, case_id: str, *, actor: str, notes: str | None = None) -> NumberEligibilityCase:
+    case = _get_eligibility_case(db, case_id)
+    before_status = case.status
+    case.status = NumberEligibilityCaseStatus.APPROVED
+    case.review_notes = notes
+    case.resolved_at = datetime.now(timezone.utc)
+    db.commit()
+    db.refresh(case)
+    log_event(
+        db, actor=actor, action="number.eligibility_case_approved",
+        target=f"number_eligibility_case:{case.id}", before={"status": before_status}, after={"status": case.status},
+    )
+    return case
+
+
+def reject_number_eligibility_case(db: Session, case_id: str, *, actor: str, notes: str | None = None) -> NumberEligibilityCase:
+    case = _get_eligibility_case(db, case_id)
+    before_status = case.status
+    case.status = NumberEligibilityCaseStatus.REJECTED
+    case.review_notes = notes
+    case.resolved_at = datetime.now(timezone.utc)
+    db.commit()
+    db.refresh(case)
+    log_event(
+        db, actor=actor, action="number.eligibility_case_rejected",
+        target=f"number_eligibility_case:{case.id}", before={"status": before_status}, after={"status": case.status},
+    )
+    return case
+
+
 def _kyc_requirement_type(db: Session, account_id: str) -> str:
     account = db.query(Account).filter(Account.id == account_id).first()
     return "kyc_individual" if account.account_type == AccountType.INDIVIDUAL else "kyc_business"
@@ -119,7 +301,7 @@ def search_numbers(db: Session, country: str, number_type: str = "local", area_c
     return telecom.search_available_numbers(country, number_type=number_type, area_code=area_code)
 
 
-def reserve_number(db: Session, account_id: str, e164: str, country: str) -> PhoneNumber:
+def reserve_number(db: Session, account_id: str, e164: str, country: str, number_type: str = "local") -> PhoneNumber:
     """Atomicity law: two accounts must never hold a live reservation on the
     same number. `SELECT ... FOR UPDATE` serializes concurrent reservers of an
     existing row; the unique constraint on `e164` catches the race where two
@@ -133,6 +315,7 @@ def reserve_number(db: Session, account_id: str, e164: str, country: str) -> Pho
         number = PhoneNumber(
             e164=e164,
             country=country,
+            number_type=number_type,
             status=PhoneNumberStatus.RESERVED,
             account_id=account_id,
             reserved_until=now + timedelta(minutes=RESERVATION_TTL_MINUTES),
@@ -160,6 +343,7 @@ def reserve_number(db: Session, account_id: str, e164: str, country: str) -> Pho
         # own expired-or-active reservation, or a released/cancelled row past quarantine: re-reserve it
         number.status = PhoneNumberStatus.RESERVED
         number.account_id = account_id
+        number.number_type = number_type
         number.reserved_until = now + timedelta(minutes=RESERVATION_TTL_MINUTES)
 
     try:
@@ -235,6 +419,29 @@ def purchase_number(db: Session, account_id: str, e164: str) -> PhoneNumber:
             f"An approved {requirement_type} compliance case for {number.country} "
             "is required before purchasing a number there"
         )
+
+    if get_active_eligibility_rule(db, number.country, number.number_type) is not None and not has_approved_eligibility_case(
+        db, number.id
+    ):
+        # Same persisted "Compliance Pending" lifecycle state as the KYC
+        # gate above - purchase_number can be retried from here once the
+        # eligibility case is approved. Reuses COMPLIANCE_PENDING rather
+        # than adding a parallel status: both gates mean the same thing to
+        # the customer ("purchase blocked pending a case being approved"),
+        # just a different case type underneath.
+        case = _get_or_open_eligibility_case(db, number=number, actor=account_id)
+        if case.status != NumberEligibilityCaseStatus.APPROVED:
+            number.status = PhoneNumberStatus.COMPLIANCE_PENDING
+            db.commit()
+            log_event(
+                db, actor_id=account_id, action="number.eligibility_pending",
+                target_type="phone_number", target_id=number.id,
+                metadata={"e164": e164, "country": number.country, "number_type": number.number_type},
+            )
+            raise NumberEligibilityRequiredError(
+                f"An approved market-eligibility case for {number.number_type} numbers in {number.country} "
+                "is required before purchasing this number"
+            )
 
     number.status = PhoneNumberStatus.PURCHASE_PENDING
     number.provisioning_started_at = now
@@ -345,11 +552,12 @@ def complete_number_purchase_from_checkout(
       idempotency against Stripe's at-least-once webhook delivery. Not
       refunded - this path means the number was already (or is being)
       fulfilled, or a duplicate delivery of an already-handled event.
-    - ComplianceRequiredError: purchase_number already persisted the
-      number into COMPLIANCE_PENDING and sent its own customer
-      notification - correct behavior, nothing further for this handler
-      to do. Not refunded - the customer still gets the number once
-      compliance clears, this isn't a failure.
+    - ComplianceRequiredError / NumberEligibilityRequiredError:
+      purchase_number already persisted the number into COMPLIANCE_PENDING
+      and (for the KYC case) sent its own customer notification - correct
+      behavior, nothing further for this handler to do. Not refunded - the
+      customer still gets the number once the relevant case clears, this
+      isn't a failure.
     - NumberQuotaExceededError / BillingSuspendedError /
       EmergencyDisclosureRequiredError / TelecomError: genuine post-
       payment fulfillment failures - the customer paid and won't be
@@ -359,7 +567,7 @@ def complete_number_purchase_from_checkout(
     """
     try:
         return purchase_number(db, account_id, e164)
-    except (NumberConflictError, ComplianceRequiredError):
+    except (NumberConflictError, ComplianceRequiredError, NumberEligibilityRequiredError):
         return None
     except (
         EmergencyDisclosureRequiredError,

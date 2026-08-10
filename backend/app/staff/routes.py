@@ -6,15 +6,30 @@ from app.core.deps import get_current_staff, require_capability
 from app.core.rate_limit import limiter
 from app.core.security import create_access_token
 from app.integrations.telecom.twilio import TelecomError
-from app.numbering.numbers.schemas import SupportedCountryResponse, UpsertSupportedCountryRequest
+from app.numbering.numbers.schemas import (
+    NumberEligibilityCaseResponse,
+    NumberEligibilityRuleResponse,
+    ResolveNumberEligibilityCaseRequest,
+    SupportedCountryResponse,
+    UpsertNumberEligibilityRuleRequest,
+    UpsertSupportedCountryRequest,
+)
+from app.numbering.numbers.models import NumberEligibilityCaseStatus
 from app.numbering.numbers.service import (
     NoStuckProvisioningError,
     NotDueForRenewalError,
+    NumberEligibilityCaseNotFoundError,
+    approve_number_eligibility_case,
+    list_all_eligibility_cases,
+    list_number_eligibility_rules,
     list_supported_countries,
     mark_number_renewed,
+    reject_number_eligibility_case,
     release_stuck_provisioning,
+    remove_number_eligibility_rule,
     remove_supported_country,
     retry_provisioning,
+    upsert_number_eligibility_rule,
     upsert_supported_country,
 )
 from app.staff import service
@@ -171,6 +186,77 @@ def remove_supported_country_route(
 ):
     remove_supported_country(db, code)
     return None
+
+
+@router.get("/number-eligibility-rules", response_model=list[NumberEligibilityRuleResponse])
+def list_number_eligibility_rules_route(
+    db: Session = Depends(get_db),
+    _staff: PlatformStaff = Depends(get_current_staff),
+):
+    return list_number_eligibility_rules(db)
+
+
+@router.put("/number-eligibility-rules", response_model=NumberEligibilityRuleResponse)
+def upsert_number_eligibility_rule_route(
+    payload: UpsertNumberEligibilityRuleRequest,
+    db: Session = Depends(get_db),
+    _staff: PlatformStaff = Depends(require_capability("numbers.manage_eligibility_rules")),
+):
+    # SUPER_ADMIN only - deciding a market/number-type needs an eligibility
+    # case at all is a compliance/commercial decision, same bar as the
+    # country list and calling-rate changes above.
+    return upsert_number_eligibility_rule(
+        db, country=payload.country, number_type=payload.number_type,
+        required_evidence=payload.required_evidence, is_active=payload.is_active,
+    )
+
+
+@router.delete("/number-eligibility-rules/{rule_id}", status_code=status.HTTP_204_NO_CONTENT)
+def remove_number_eligibility_rule_route(
+    rule_id: str,
+    db: Session = Depends(get_db),
+    _staff: PlatformStaff = Depends(require_capability("numbers.manage_eligibility_rules")),
+):
+    remove_number_eligibility_rule(db, rule_id)
+    return None
+
+
+@router.get("/number-eligibility-cases", response_model=list[NumberEligibilityCaseResponse])
+def list_number_eligibility_cases_route(
+    case_status: NumberEligibilityCaseStatus | None = None,
+    db: Session = Depends(get_db),
+    _staff: PlatformStaff = Depends(get_current_staff),
+):
+    """Review queue, diagnostic for any staff role to view (same posture as
+    the risk-case queue) - approving/rejecting is the sensitive action,
+    gated below."""
+    return list_all_eligibility_cases(db, case_status)
+
+
+@router.post("/number-eligibility-cases/{case_id}/approve", response_model=NumberEligibilityCaseResponse)
+def approve_number_eligibility_case_route(
+    case_id: str,
+    payload: ResolveNumberEligibilityCaseRequest = ResolveNumberEligibilityCaseRequest(),
+    db: Session = Depends(get_db),
+    staff: PlatformStaff = Depends(require_capability("compliance.review_case")),
+):
+    try:
+        return approve_number_eligibility_case(db, case_id, actor=staff.id, notes=payload.notes)
+    except NumberEligibilityCaseNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
+
+
+@router.post("/number-eligibility-cases/{case_id}/reject", response_model=NumberEligibilityCaseResponse)
+def reject_number_eligibility_case_route(
+    case_id: str,
+    payload: ResolveNumberEligibilityCaseRequest = ResolveNumberEligibilityCaseRequest(),
+    db: Session = Depends(get_db),
+    staff: PlatformStaff = Depends(require_capability("compliance.review_case")),
+):
+    try:
+        return reject_number_eligibility_case(db, case_id, actor=staff.id, notes=payload.notes)
+    except NumberEligibilityCaseNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
 
 
 @router.get("/access-matrix", response_model=list[AccessMatrixEntryResponse])

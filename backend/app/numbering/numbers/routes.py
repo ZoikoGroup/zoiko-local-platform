@@ -12,6 +12,7 @@ from app.numbering.numbers.schemas import (
     AssignNumberRequest,
     CheckoutSessionResponse,
     IVRMenuResponse,
+    NumberEligibilityCaseResponse,
     NumberSearchResult,
     PhoneNumberResponse,
     PurchaseNumberRequest,
@@ -20,6 +21,7 @@ from app.numbering.numbers.schemas import (
     RoutingConfigRequest,
     SetIVRMenuRequest,
     SetRingGroupRequest,
+    SubmitNumberEligibilityEvidenceRequest,
     SupportedCountryResponse,
     SuspendNumberRequest,
 )
@@ -27,6 +29,8 @@ from app.numbering.numbers.service import (
     ComplianceRequiredError,
     EmergencyDisclosureRequiredError,
     NumberConflictError,
+    NumberEligibilityCaseNotFoundError,
+    NumberEligibilityRequiredError,
     UnsupportedCountryError,
 )
 
@@ -64,7 +68,9 @@ def reserve_number(
     current_user: User = Depends(require_admin),
 ):
     try:
-        return service.reserve_number(db, current_user.account_id, payload.e164, payload.country)
+        return service.reserve_number(
+            db, current_user.account_id, payload.e164, payload.country, payload.number_type,
+        )
     except UnsupportedCountryError as e:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e)) from e
     except NumberConflictError as e:
@@ -83,10 +89,36 @@ def purchase_number(
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e
     except (NumberQuotaExceededError, BillingSuspendedError) as e:
         raise HTTPException(status_code=status.HTTP_402_PAYMENT_REQUIRED, detail=str(e)) from e
-    except (ComplianceRequiredError, EmergencyDisclosureRequiredError) as e:
+    except (ComplianceRequiredError, EmergencyDisclosureRequiredError, NumberEligibilityRequiredError) as e:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e)) from e
     except TelecomError as e:
         raise HTTPException(status_code=502, detail=str(e)) from e
+
+
+@router.get("/eligibility-cases", response_model=list[NumberEligibilityCaseResponse])
+def list_own_eligibility_cases(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Customer-facing view of eligibility cases opened for this account's
+    numbers - surfaces which specific number purchase is blocked on a
+    market-eligibility case, and its current status/review notes."""
+    return service.list_eligibility_cases_for_account(db, current_user.account_id)
+
+
+@router.post("/eligibility-cases/{case_id}/evidence", response_model=NumberEligibilityCaseResponse)
+def submit_eligibility_evidence(
+    case_id: str,
+    payload: SubmitNumberEligibilityEvidenceRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin),
+):
+    try:
+        return service.submit_number_eligibility_evidence(
+            db, case_id, payload.evidence, account_id=current_user.account_id, actor=current_user.id,
+        )
+    except NumberEligibilityCaseNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
 
 
 @router.post("/{e164}/checkout-session", response_model=CheckoutSessionResponse)

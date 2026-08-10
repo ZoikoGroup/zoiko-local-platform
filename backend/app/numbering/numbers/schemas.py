@@ -58,6 +58,7 @@ class NumberSearchResult(BaseModel):
 class ReserveNumberRequest(BaseModel):
     e164: str
     country: str
+    number_type: str = "local"
 
 
 class PurchaseNumberRequest(BaseModel):
@@ -79,6 +80,7 @@ class PhoneNumberResponse(BaseModel):
     id: str
     e164: str
     country: str
+    number_type: str
     status: str
     account_id: str
     assigned_user_id: str | None
@@ -106,3 +108,44 @@ class UpsertSupportedCountryRequest(BaseModel):
     code: str
     name: str
     sort_order: int = 0
+
+
+class NumberEligibilityRuleResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    country: str
+    number_type: str
+    required_evidence: list
+    is_active: bool
+
+
+class UpsertNumberEligibilityRuleRequest(BaseModel):
+    country: str
+    number_type: str
+    required_evidence: list[str] = []
+    is_active: bool = True
+
+
+class NumberEligibilityCaseResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    phone_number_id: str
+    account_id: str
+    country: str
+    number_type: str
+    status: str
+    evidence: list
+    review_notes: str | None
+    expires_at: datetime | None
+    created_at: datetime
+    resolved_at: datetime | None
+
+
+class SubmitNumberEligibilityEvidenceRequest(BaseModel):
+    evidence: list[dict]
+
+
+class ResolveNumberEligibilityCaseRequest(BaseModel):
+    notes: str | None = None
