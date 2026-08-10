@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
@@ -27,10 +27,15 @@ MFA_TOKEN_EXPIRE_MINUTES = 5
 
 
 @router.post("/signup", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
-def signup(payload: SignupRequest, db: Session = Depends(get_db)):
+def signup(
+    payload: SignupRequest,
+    db: Session = Depends(get_db),
+    x_device_fingerprint: str | None = Header(default=None),
+):
     try:
         user = service.create_account_with_owner(
-            db, payload.account_name, payload.account_type, payload.email, payload.password
+            db, payload.account_name, payload.account_type, payload.email, payload.password,
+            device_fingerprint_hash=x_device_fingerprint,
         )
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))

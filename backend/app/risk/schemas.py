@@ -2,7 +2,7 @@ from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict
 
-from app.risk.models import RiskSignalType
+from app.risk.models import FraudCaseStatus, RiskSignalType
 
 
 class BlockedDestinationCreate(BaseModel):
@@ -38,3 +38,21 @@ class AccountRiskSummaryResponse(BaseModel):
 
 class AccountReinstateRequest(BaseModel):
     reason: str | None = None
+
+
+class FraudCaseResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    account_id: str
+    score_at_open: int
+    status: FraudCaseStatus
+    resolved_by: str | None
+    resolution_notes: str | None
+    created_at: datetime
+    resolved_at: datetime | None
+
+
+class ResolveFraudCaseRequest(BaseModel):
+    status: FraudCaseStatus
+    notes: str

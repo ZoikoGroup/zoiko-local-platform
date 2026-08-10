@@ -184,6 +184,8 @@ def _dispatch_outbound_call(
         )
         raise
     risk_service.assert_outbound_velocity_ok(db, account_id)
+    risk_service.assert_geographic_dispersion_ok(db, to, account_id)
+    risk_service.assert_spend_limit_ok(db, account_id)
 
     twiml = telecom.build_say_response(message)
     result = telecom.place_call(to=to, from_=from_number, twiml=twiml, status_callback_url=status_callback_url)

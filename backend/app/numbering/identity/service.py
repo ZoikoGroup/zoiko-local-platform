@@ -23,12 +23,14 @@ from app.notifications.service import (
     notify_team_member_added,
 )
 from app.numbering.identity.models import Account, AccountType, User, UserRole
+from app.risk.service import check_fingerprint_on_signup
 
 PASSWORD_RESET_TOKEN_EXPIRE_MINUTES = 30
 
 
 def create_account_with_owner(
-    db: Session, account_name: str, account_type: str, email: str, password: str
+    db: Session, account_name: str, account_type: str, email: str, password: str,
+    device_fingerprint_hash: str | None = None,
 ) -> User:
     existing = db.query(User).filter(User.email == email).first()
     if existing:
@@ -56,6 +58,11 @@ def create_account_with_owner(
         after={"account_id": account.id, "user_id": user.id, "email": user.email, "role": user.role},
     )
     notify_account_activated(db, account_id=account.id, user_email=user.email)
+    # Architecture doc §5 "Fraud and Risk: device fingerprinting" - detection
+    # only, never blocks signup itself (see check_fingerprint_on_signup's
+    # docstring). Optional: a client that sends no fingerprint header is a
+    # no-op here, not an error.
+    check_fingerprint_on_signup(db, fingerprint_hash=device_fingerprint_hash, account_id=account.id)
     return user
 
 
