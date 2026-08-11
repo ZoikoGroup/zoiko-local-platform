@@ -37,22 +37,48 @@ def _signup_and_login(client, email: str) -> str:
     return client.post("/auth/login", json={"email": email, "password": "supersecret123"}).json()["access_token"]
 
 
+def _stub_sync_subscription(monkeypatch, *, account_id_suffix: str = "1"):
+    """Real ZoikoNex calls (app.integrations.billing.zoikonex.sync_subscription)
+    make genuine HTTP requests against a running ZoikoNex stack - same
+    "mock the provider, don't hit the network" discipline as Twilio/Stripe
+    elsewhere in this test suite. Returns the fake ids used, so a test can
+    assert against them directly instead of a hardcoded prefix."""
+    ids = {"party_id": f"zn-party-{account_id_suffix}", "customer_id": f"zn-cust-{account_id_suffix}", "account_id": f"zn-acct-{account_id_suffix}"}
+
+    def _fake_sync_subscription(db, sub, *, account_type):
+        sub.zoikonex_party_id = ids["party_id"]
+        sub.zoikonex_customer_id = ids["customer_id"]
+        sub.zoikonex_account_id = ids["account_id"]
+        return dict(ids)
+
+    monkeypatch.setattr("app.billing.service.zoikonex_adapter.sync_subscription", _fake_sync_subscription)
+    return ids
+
+
+def _stub_sync_usage_event(monkeypatch, *, ref: str = "zn-usage-ref-1"):
+    monkeypatch.setattr(
+        "app.billing.service.zoikonex_adapter.sync_usage_event",
+        lambda db, sub, usage_event_id, **kwargs: {"zoikonex_ref": ref, "status": "NORMALISED"},
+    )
+
+
 # --- Sync mechanics ---
 
 
-def test_new_subscription_is_synced_to_zoikonex_on_creation(db_session):
+def test_new_subscription_is_synced_to_zoikonex_on_creation(db_session, monkeypatch):
+    ids = _stub_sync_subscription(monkeypatch)
     account = _make_account(db_session, "Sync New Sub Co")
     sub = service.get_or_create_subscription(db_session, account.id)
 
-    assert sub.zoikonex_ref is not None
-    assert sub.zoikonex_ref.startswith("zn_sub_")
+    assert sub.zoikonex_ref == ids["account_id"]
 
     events = db_session.query(ZoikoNexSyncEvent).filter(ZoikoNexSyncEvent.account_id == account.id).all()
     assert len(events) == 1
     assert events[0].event_type == ZoikoNexSyncEventType.SUBSCRIPTION_SYNC
 
 
-def test_change_plan_re_syncs_to_zoikonex(db_session):
+def test_change_plan_re_syncs_to_zoikonex(db_session, monkeypatch):
+    _stub_sync_subscription(monkeypatch)
     account = _make_account(db_session, "Sync Change Plan Co")
     service.get_or_create_subscription(db_session, account.id)
 
@@ -67,9 +93,11 @@ def test_change_plan_re_syncs_to_zoikonex(db_session):
     assert events[-1].payload["plan_code"] == "starter"
 
 
-def test_recording_usage_syncs_it_to_zoikonex(client, db_session):
+def test_recording_usage_syncs_it_to_zoikonex(client, db_session, monkeypatch):
     from app.usage.service import record_usage_event
 
+    _stub_sync_subscription(monkeypatch)
+    _stub_sync_usage_event(monkeypatch, ref="zn-usage-ref-42")
     token = _signup_and_login(client, "zoikonexusage1@example.com")
     me = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"}).json()
 
@@ -85,12 +113,14 @@ def test_recording_usage_syncs_it_to_zoikonex(client, db_session):
     )
     assert len(events) == 1
     assert events[0].payload["quantity"] == 42
-    assert events[0].zoikonex_ref.startswith("zn_usage_")
+    assert events[0].zoikonex_ref == "zn-usage-ref-42"
 
 
-def test_duplicate_usage_event_is_not_synced_twice(db_session):
+def test_duplicate_usage_event_is_not_synced_twice(db_session, monkeypatch):
     from app.usage.service import record_usage_event
 
+    _stub_sync_subscription(monkeypatch)
+    _stub_sync_usage_event(monkeypatch)
     account = _make_account(db_session, "Sync Dup Usage Co")
     record_usage_event(
         db_session, account_id=account.id, event_type="call_seconds", quantity=10, unit="seconds",

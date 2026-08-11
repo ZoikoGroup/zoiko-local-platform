@@ -76,20 +76,29 @@ def _new_period(now: datetime) -> tuple[datetime, datetime]:
 
 
 def sync_subscription_to_zoikonex(db: Session, sub: Subscription) -> Subscription:
-    """Architecture doc §9 "Subscription sync". Best-effort in spirit (the
-    real adapter will eventually need retry/dead-letter handling), but
-    since this is a mock with no way to fail, it always succeeds - the
-    seam is what matters, not fault-tolerance for a call that never
-    actually goes over the network yet."""
-    result = zoikonex_adapter.sync_subscription(
-        subscription_id=sub.id, account_id=sub.account_id, plan_code=sub.plan_code, status=sub.status.value,
-    )
-    sub.zoikonex_ref = result["zoikonex_ref"]
+    """Architecture doc §9 "Subscription sync". Best-effort: a ZoikoNex
+    outage must never block signup/plan-change, so a failure here is
+    logged and swallowed rather than raised - sub.zoikonex_ref stays NULL,
+    which is exactly what the reconciliation job's
+    SUBSCRIPTION_MISSING_ZOIKONEX_REF check is for (retries naturally on
+    the next sync_subscription_to_zoikonex call, e.g. a later plan
+    change, without any dedicated retry/dead-letter machinery yet)."""
+    from app.numbering.identity.models import Account
+
+    account = db.query(Account).filter(Account.id == sub.account_id).first()
+    account_type = account.account_type.value if account else "individual"
+
+    try:
+        result = zoikonex_adapter.sync_subscription(db, sub, account_type=account_type)
+    except zoikonex_adapter.ZoikoNexError:
+        return sub
+
+    sub.zoikonex_ref = result["account_id"]
     db.add(
         ZoikoNexSyncEvent(
             account_id=sub.account_id,
             event_type=ZoikoNexSyncEventType.SUBSCRIPTION_SYNC,
-            zoikonex_ref=result["zoikonex_ref"],
+            zoikonex_ref=result["account_id"],
             payload={"subscription_id": sub.id, "plan_code": sub.plan_code, "status": sub.status.value},
         )
     )
@@ -103,27 +112,31 @@ def sync_usage_event_to_zoikonex(db: Session, usage_event) -> None:
     UsageEvent (see app.usage.service.record_usage_event) and mirrors it
     into the sync ledger - a separate write, not part of the same
     transaction, since usage capture must never fail or roll back because
-    a downstream billing sync (mock or real) had a problem.
+    a downstream billing sync (real or unreachable) had a problem.
 
-    Also asks ZoikoNex to rate the event and applies the result to
-    usage_event.estimated_cost_cents - the actual $ decision must come
-    from here, not be pre-computed by the caller (see
-    zoikonex_adapter.rate_usage_event's docstring)."""
+    Cost estimation still comes from Zoiko Local's own calling-rate card,
+    not a real ZoikoNex rating decision - see
+    zoikonex_adapter.rate_usage_event's docstring for why."""
     rating = zoikonex_adapter.rate_usage_event(
         db, event_type=usage_event.event_type, quantity=float(usage_event.quantity),
         unit=usage_event.unit, country_band=usage_event.country_band,
     )
     usage_event.estimated_cost_cents = rating["estimated_cost_cents"]
 
-    result = zoikonex_adapter.sync_usage_event(
-        usage_event_id=usage_event.id, account_id=usage_event.account_id,
-        event_type=usage_event.event_type, quantity=float(usage_event.quantity), unit=usage_event.unit,
-    )
+    sub = db.query(Subscription).filter(Subscription.account_id == usage_event.account_id).first()
+    try:
+        result = zoikonex_adapter.sync_usage_event(
+            db, sub, usage_event.id,
+            event_type=usage_event.event_type, quantity=float(usage_event.quantity), unit=usage_event.unit,
+        )
+    except zoikonex_adapter.ZoikoNexError:
+        result = {}
+
     db.add(
         ZoikoNexSyncEvent(
             account_id=usage_event.account_id,
             event_type=ZoikoNexSyncEventType.USAGE_SYNC,
-            zoikonex_ref=result["zoikonex_ref"],
+            zoikonex_ref=result.get("zoikonex_ref"),
             payload={
                 "usage_event_id": usage_event.id, "event_type": usage_event.event_type,
                 "quantity": float(usage_event.quantity), "unit": usage_event.unit,

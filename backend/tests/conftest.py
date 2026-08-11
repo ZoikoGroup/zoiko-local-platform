@@ -65,6 +65,39 @@ def reset_circuit_breakers():
 
 
 @pytest.fixture(autouse=True)
+def mock_zoikonex_sync(monkeypatch):
+    """app.integrations.billing.zoikonex is a real HTTP client against a
+    self-hosted ZoikoNex backend (not a mock, unlike every other Provider
+    Gateway's test posture) - get_or_create_subscription (called from
+    dozens of unrelated tests via billing quota checks) would otherwise
+    make a real network call to a ZoikoNex instance most environments
+    running this suite don't have running. Same "mock the provider, don't
+    hit the network" discipline as Twilio/Stripe elsewhere in this suite.
+    Deliberately not real ZoikoNexError-raising behavior - tests that need
+    to exercise ZoikoNex failure/success specifics (test_zoikonex_mock.py)
+    override this per-test with their own monkeypatch.setattr call, which
+    wins since it runs after this fixture in the same test."""
+    from app.billing import service as billing_service
+
+    def _fake_sync_subscription(db, sub, *, account_type):
+        sub.zoikonex_party_id = sub.zoikonex_party_id or "zn-party-test"
+        sub.zoikonex_customer_id = sub.zoikonex_customer_id or "zn-cust-test"
+        sub.zoikonex_account_id = sub.zoikonex_account_id or "zn-acct-test"
+        return {
+            "party_id": sub.zoikonex_party_id,
+            "customer_id": sub.zoikonex_customer_id,
+            "account_id": sub.zoikonex_account_id,
+        }
+
+    def _fake_sync_usage_event(db, sub, usage_event_id, **kwargs):
+        return {"zoikonex_ref": "zn-usage-test", "status": "NORMALISED"}
+
+    monkeypatch.setattr(billing_service.zoikonex_adapter, "sync_subscription", _fake_sync_subscription)
+    monkeypatch.setattr(billing_service.zoikonex_adapter, "sync_usage_event", _fake_sync_usage_event)
+    yield
+
+
+@pytest.fixture(autouse=True)
 def cleanup_error_events():
     """error_events rows are written via a deliberately independent DB
     session (see app.observability.service.record_error_event's docstring -

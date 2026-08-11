@@ -40,6 +40,13 @@ class Plan(Base):
     monthly_ai_summaries: Mapped[int] = mapped_column(Integer, nullable=False)
     trial_days: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     sort_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # Populated once by app.integrations.billing.zoikonex.register_plan_in_catalog
+    # - ZoikoNex's product-catalogue-commercial service is the actual price
+    # authority (Product + Offer + PriceRule); NULL until that one-time
+    # registration has run for this plan_code.
+    zoikonex_product_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    zoikonex_offer_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    zoikonex_price_rule_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -73,6 +80,19 @@ class Subscription(Base):
     current_period_start: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     current_period_end: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     zoikonex_ref: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    # ZoikoNex's own Party -> Customer -> Account chain (customer-account
+    # service) - a real, separate identity model from ours, created once per
+    # account the first time its subscription syncs. zoikonex_pii_token is
+    # the opaque reference customer-account requires in place of a plaintext
+    # name (ZN-ADR-013, "PII is vaulted") - identity-tenancy's PII vault has
+    # no reachable API yet (confirmed against its source: the domain logic
+    # exists but no HTTP/gRPC route calls it), so this is a freshly-generated
+    # placeholder UUID, not a real vaulted token. Swap for a real vault call
+    # the moment ZoikoNex exposes one - no schema change needed here.
+    zoikonex_party_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    zoikonex_customer_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    zoikonex_account_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    zoikonex_pii_token: Mapped[str | None] = mapped_column(String(100), nullable=True)
     # Architecture doc §9 "Graceful degradation": set when a (mock) payment
     # failure is received, cleared on restoration. Incoming calls and number
     # ownership stay active regardless; outbound calling/video/purchases/AI

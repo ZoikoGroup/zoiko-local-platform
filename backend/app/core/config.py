@@ -85,18 +85,26 @@ class Settings(BaseSettings):
     # this API's own address for provider webhooks to call back into.
     frontend_base_url: str = "http://localhost:3000"
 
-    # ZoikoNex (integrations/billing) - all three empty until a real
-    # ZoikoNex connection exists; see app.integrations.billing.zoikonex's
-    # docstring for why there's no HTTP client to point these at yet.
-    # zoikonex_webhook_secret verifies the inbound signature on payment-
-    # event webhooks ZoikoNex sends us; zoikonex_base_url/zoikonex_api_key
-    # are for the outbound direction (us calling ZoikoNex to sync a
-    # subscription or rate a usage event) - added as placeholders only,
-    # not yet read by any code, since the real API's base path and auth
-    # scheme (bearer token? signed request? something else?) aren't known.
+    # ZoikoNex (integrations/billing) - real client, wired against the
+    # ZoikoNex backend's own documented API (services/*/API.INTEGRATION.md
+    # in that repo). Auth is OAuth2 client_credentials against ZoikoNex's
+    # own identity-tenancy service (RS256 JWT, ~15min expiry) - NOT a bare
+    # API key. Defaults point at ZoikoNex's own docker-compose port
+    # allocations for local dev; override every zoikonex_*_url in
+    # production to wherever that stack is actually deployed.
+    zoikonex_identity_url: str = "http://localhost:8080"
+    zoikonex_customer_account_url: str = "http://localhost:8081"
+    zoikonex_catalog_url: str = "http://localhost:8082"
+    zoikonex_usage_url: str = "http://localhost:8094"
+    zoikonex_rating_url: str = "http://localhost:8085"
+    zoikonex_billing_url: str = "http://localhost:8092"
+    zoikonex_payments_url: str = "http://localhost:8096"
+    zoikonex_client_id: str = ""
+    zoikonex_client_secret: str = ""
+    # Verifies X-ZoikoNex-Signature (sha256=<hmac>) on inbound payment
+    # webhooks - same header/scheme this app already used for the mock,
+    # confirmed correct against ZoikoNex payments' own docs.
     zoikonex_webhook_secret: str = ""
-    zoikonex_base_url: str = ""
-    zoikonex_api_key: str = ""
 
     # Resend (integrations/notifications) - real transactional email sending.
     # email_from_address must be on a domain verified in Resend once one is
