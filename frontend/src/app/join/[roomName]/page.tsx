@@ -5,7 +5,7 @@ import { useParams } from "next/navigation";
 import { Room, RoomEvent, Track } from "livekit-client";
 import { guestJoinVideoRoom, checkGuestWaitingStatus, ApiError } from "@/lib/api";
 
-type CallState = "lobby" | "requesting" | "waiting" | "in-call" | "ended" | "denied" | "not-found";
+type CallState = "lobby" | "requesting" | "waiting" | "in-call" | "ended" | "denied" | "expired" | "not-found";
 type DeviceStatus = "idle" | "requesting" | "ready" | "blocked";
 
 type ChatMessage = {
@@ -193,6 +193,9 @@ export default function GuestJoinPage() {
         } else if (result.status === "denied") {
           clearInterval(interval);
           setCallState("denied");
+        } else if (result.status === "expired") {
+          clearInterval(interval);
+          setCallState("expired");
         }
       } catch (err) {
         if (cancelled) return;
@@ -291,6 +294,21 @@ export default function GuestJoinPage() {
           <div className="bg-slate-900 border border-slate-800 rounded-2xl p-8 text-center space-y-2">
             <h2 className="text-lg font-semibold text-white">You weren&apos;t let in</h2>
             <p className="text-sm text-slate-400">The host didn&apos;t admit you to this call.</p>
+          </div>
+        )}
+
+        {callState === "expired" && (
+          <div className="bg-slate-900 border border-slate-800 rounded-2xl p-8 text-center space-y-3">
+            <h2 className="text-lg font-semibold text-white">Nobody responded in time</h2>
+            <p className="text-sm text-slate-400">
+              The host didn&apos;t respond to your request to join. They may not be on the call right now.
+            </p>
+            <button
+              onClick={() => setCallState("lobby")}
+              className="text-sm font-medium text-indigo-400 hover:text-indigo-300"
+            >
+              Try again
+            </button>
           </div>
         )}
 

@@ -1087,7 +1087,7 @@ export function guestJoinVideoRoom(roomName: string, displayName: string): Promi
 }
 
 export type WaitingStatus = {
-  status: "pending" | "admitted" | "denied";
+  status: "pending" | "admitted" | "denied" | "expired";
   token: string | null;
   url: string | null;
   recording: boolean;
@@ -1133,6 +1133,16 @@ export function startVideoRecording(
   roomName: string
 ): Promise<{ room_name: string; recording: boolean }> {
   return request(`/media/video/rooms/${encodeURIComponent(roomName)}/recording/start`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export function stopVideoRecording(
+  token: string,
+  roomName: string
+): Promise<{ room_name: string; recording: boolean }> {
+  return request(`/media/video/rooms/${encodeURIComponent(roomName)}/recording/stop`, {
     method: "POST",
     headers: { Authorization: `Bearer ${token}` },
   });

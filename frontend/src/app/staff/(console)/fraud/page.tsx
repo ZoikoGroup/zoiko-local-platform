@@ -96,9 +96,12 @@ function FraudCasesSection({
   const [busyId, setBusyId] = useState<string | null>(null);
 
   const loadCases = useCallback(() => {
-    setLoading(true);
-    const status = tab === "all" ? undefined : tab;
-    return listFraudCases(token, status)
+    return Promise.resolve()
+      .then(() => {
+        setLoading(true);
+        const status = tab === "all" ? undefined : tab;
+        return listFraudCases(token, status);
+      })
       .then((data) => {
         setCases(data);
         onError(null);
@@ -258,8 +261,11 @@ function FraudRulesSection({
   const [savingType, setSavingType] = useState<RiskSignalType | null>(null);
 
   const loadRules = useCallback(() => {
-    setLoading(true);
-    return listFraudRules(token)
+    return Promise.resolve()
+      .then(() => {
+        setLoading(true);
+        return listFraudRules(token);
+      })
       .then((data) => {
         setRules(data);
         onError(null);

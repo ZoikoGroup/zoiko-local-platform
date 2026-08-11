@@ -927,6 +927,24 @@ def notify_call_summary_available(
     )
 
 
+def notify_video_guest_waiting(
+    db: Session, *, account_id: str, host_email: str, room_name: str, guest_display_name: str
+) -> None:
+    """A guest requesting to join a video call (app.media.service.
+    request_guest_join) only shows up in the host's waiting-room list if
+    they're actively watching the call screen - this is the out-of-band
+    alert so a host who's stepped away still finds out, instead of a guest
+    waiting the full WAITING_ROOM_TIMEOUT_MINUTES for nothing."""
+    send_notification(
+        db, event_name="video.guest_waiting", account_id=account_id, recipient_email=host_email,
+        context={
+            "user_display_name": host_email,
+            "video_guest_display_name": guest_display_name,
+            "video_room_name": room_name,
+        },
+    )
+
+
 def notify_voicemail_received(
     db: Session, *, account_id: str, account_email: str, e164: str, from_number: str, duration: int | None
 ) -> None:

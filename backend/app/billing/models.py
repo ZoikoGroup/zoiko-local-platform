@@ -37,6 +37,14 @@ class Plan(Base):
     max_team_seats: Mapped[int] = mapped_column(Integer, nullable=False)
     monthly_voice_minutes: Mapped[int] = mapped_column(Integer, nullable=False)
     monthly_video_minutes: Mapped[int] = mapped_column(Integer, nullable=False)
+    # Per-room capacity, not a monthly quota (see monthly_video_minutes for
+    # that) - Roadmap doc §8: "Phase 1 capacity: 1:1 and small-group video,
+    # target up to 8 participants" vs the later "larger meetings" tier
+    # (Architecture doc Phase 3). Passed straight to the Provider Gateway's
+    # create_room() (see media.service.create_video_session) - previously
+    # every plan silently got the same flat 50-participant LiveKit-side cap
+    # regardless of tier.
+    max_video_participants: Mapped[int] = mapped_column(Integer, nullable=False, server_default="8")
     monthly_ai_summaries: Mapped[int] = mapped_column(Integer, nullable=False)
     trial_days: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     sort_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0)

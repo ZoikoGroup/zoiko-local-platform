@@ -242,27 +242,27 @@ def test_outbound_call_geographic_dispersion_limit_is_enforced(client, db_sessio
     _active_number(db_session, account_id, "+15550007777")
     headers = {"Authorization": f"Bearer {token}"}
 
-    from app.risk.service import MAX_DESTINATION_PREFIXES_PER_WINDOW
+    from app.risk.service import GEOGRAPHIC_DISPERSION_COUNTRY_THRESHOLD
 
-    # Each prefix must differ in its first 3 characters (GEOGRAPHIC_
-    # DISPERSION_PREFIX_LEN) - e.g. "+20..." vs "+21..." would share the
-    # same "+20"/"+21" 3-char prefix, so use widely-spaced leading digits.
-    distinct_prefixes = ["20", "30", "40", "50", "60", "70", "80"]
-    for i in range(MAX_DESTINATION_PREFIXES_PER_WINDOW):
+    # Real, structurally-valid E.164 numbers spanning distinct countries -
+    # assert_geographic_dispersion_ok resolves the actual country via
+    # phonenumbers, not a prefix-clustering heuristic.
+    country_numbers = ["+14155552671", "+442071838750", "+33142685300", "+4930123456", "+81312345678"]
+    for destination in country_numbers[: GEOGRAPHIC_DISPERSION_COUNTRY_THRESHOLD - 1]:
         response = client.post(
             "/media/voice/outbound",
-            json={"to": f"+{distinct_prefixes[i]}5551230000", "from": "+15550007777"},
+            json={"to": destination, "from": "+15550007777"},
             headers=headers,
         )
         assert response.status_code == 200, response.text
 
     over_limit_response = client.post(
         "/media/voice/outbound",
-        json={"to": "+9995551230000", "from": "+15550007777"},
+        json={"to": country_numbers[GEOGRAPHIC_DISPERSION_COUNTRY_THRESHOLD - 1], "from": "+15550007777"},
         headers=headers,
     )
     assert over_limit_response.status_code == 429
-    assert "destination" in over_limit_response.json()["detail"].lower()
+    assert "countries" in over_limit_response.json()["detail"].lower()
 
 
 def test_assert_spend_limit_ok_passes_under_threshold(db_session):
@@ -338,13 +338,17 @@ def test_get_signal_weight_uses_active_fraud_rule_override(db_session):
 
 
 def test_get_signal_weight_ignores_inactive_fraud_rule(db_session):
+    # An inactive FraudRule contributes 0, not the hardcoded default - that's
+    # the whole point of is_active (see FraudRule's docstring: "turn a noisy
+    # signal off entirely"). Falling back to the default weight instead
+    # would mean staff can never actually fully silence a signal.
     from app.risk.models import FraudRule, RiskSignalType
-    from app.risk.service import _DEFAULT_WEIGHTS, get_signal_weight
+    from app.risk.service import get_signal_weight
 
     db_session.add(FraudRule(signal_type=RiskSignalType.SPEND_LIMIT_EXCEEDED, weight=99, is_active=False))
     db_session.commit()
 
-    assert get_signal_weight(db_session, RiskSignalType.SPEND_LIMIT_EXCEEDED) == _DEFAULT_WEIGHTS[RiskSignalType.SPEND_LIMIT_EXCEEDED]
+    assert get_signal_weight(db_session, RiskSignalType.SPEND_LIMIT_EXCEEDED) == 0
 
 
 # --- Fraud case review queue ---

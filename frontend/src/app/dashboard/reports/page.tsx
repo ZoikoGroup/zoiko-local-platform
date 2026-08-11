@@ -120,9 +120,12 @@ export default function ReportsPage() {
 
   const load = useCallback(() => {
     if (!token) return;
-    setLoading(true);
-    setError(null);
-    getAnalyticsOverview(token, days)
+    return Promise.resolve()
+      .then(() => {
+        setLoading(true);
+        setError(null);
+        return getAnalyticsOverview(token, days);
+      })
       .then(setOverview)
       .catch((err) => {
         const message =

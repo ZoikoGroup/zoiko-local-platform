@@ -21,6 +21,16 @@ class Settings(BaseSettings):
     # machine, so keep this conservative - it's per-process, not per-machine.
     db_pool_size: int = 10
     db_max_overflow: int = 10
+    # Same env var the Dockerfile's CMD passes to `uvicorn --workers` - not
+    # read by uvicorn itself here, just so this process can compute its own
+    # total DB connection footprint (see startup_checks.warn_if_db_connection_budget_is_risky)
+    # for the one thing it can't infer on its own: how many sibling worker
+    # processes it's sharing this database with.
+    web_concurrency: int = 4
+    # Rough guardrail, not a real platform limit - Neon's pooled connection
+    # ceiling varies by plan and isn't knowable from here. Override via env
+    # if a specific Neon plan's real limit is known.
+    db_connection_budget_warning_threshold: int = 100
     jwt_secret_key: str = PLACEHOLDER_JWT_SECRET_KEY
     environment: str = "development"
     # Comma-separated allowed CORS origins - the deployed frontend's real
@@ -127,6 +137,16 @@ class Settings(BaseSettings):
     # original "no Kafka" Phase 1 scope - see CLAUDE.md. Blank disables
     # publishing (falls back to logging), same pattern as the other providers.
     kafka_bootstrap_servers: str = ""
+
+    # Rate limiting (core/rate_limit.py) - shared counter store for slowapi.
+    # Blank falls back to slowapi's default in-memory storage, which is
+    # per-process: correct with WEB_CONCURRENCY=1, but with multiple uvicorn
+    # workers (or multiple instances) each process counts hits independently,
+    # so the *effective* limit becomes worker_count times the configured
+    # number before anything actually blocks. Set to redis://redis:6379/0
+    # (docker-compose's `redis` service) to fix that - every worker/instance
+    # then shares one counter.
+    redis_url: str = ""
 
     # Multi-provider failover (integrations/_shared/circuit_breaker.py) - per
     # category, a circuit breaker wraps the primary vendor call and falls

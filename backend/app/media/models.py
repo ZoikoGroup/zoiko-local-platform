@@ -145,6 +145,11 @@ class VideoWaitingGuestStatus(str, enum.Enum):
     PENDING = "pending"
     ADMITTED = "admitted"
     DENIED = "denied"
+    # A PENDING request the host never responded to within
+    # media.service.WAITING_ROOM_TIMEOUT_MINUTES - distinct from DENIED
+    # (an explicit host decision) so the guest sees "nobody responded" not
+    # "you were turned away".
+    EXPIRED = "expired"
 
 
 class VideoWaitingGuest(Base):
@@ -158,11 +163,11 @@ class VideoWaitingGuest(Base):
     reason to store one at rest when it's cheap to (re)generate on demand
     from guest_identity/display_name once admitted.
 
-    No automatic expiry/cleanup of stale PENDING rows yet - a real product
-    would want one (this session's scope stopped at proving the admission
-    flow itself works), so this table will accumulate abandoned requests
-    over time. Worth a retention-style purge job later, same pattern as
-    app/retention/service.py, if this becomes a real problem.
+    A PENDING row past WAITING_ROOM_TIMEOUT_MINUTES is lazily flipped to
+    EXPIRED the next time anything reads it (check_waiting_status or the
+    host's list_waiting_guests) - no separate cron/purge job needed, since
+    every PENDING row is already being polled by someone (the guest, at
+    minimum) for as long as it matters.
     """
 
     __tablename__ = "video_waiting_guests"

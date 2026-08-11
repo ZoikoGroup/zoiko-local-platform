@@ -22,7 +22,11 @@ from app.integrations.telecom import twilio as telecom
 from app.integrations.video import livekit as video
 from app.intelligence.guardrails import check_for_disallowed_commitments
 from app.intelligence.service import qualify_caller
-from app.notifications.service import notify_high_risk_destination_blocked, notify_voicemail_received
+from app.notifications.service import (
+    notify_high_risk_destination_blocked,
+    notify_video_guest_waiting,
+    notify_voicemail_received,
+)
 from app.media.models import (
     CallDirection,
     CallRecord,
@@ -74,6 +78,12 @@ class ConfidentialModeRecordingBlockedError(Exception):
 
 class WaitingGuestNotFoundError(Exception):
     """Raised when a waiting-room request id doesn't exist for the given room."""
+
+
+class WaitingGuestNoLongerPendingError(Exception):
+    """Raised when a host tries to admit/deny a request that's already been
+    resolved (admitted/denied earlier - e.g. a double-click) or expired -
+    there's nothing meaningful left to decide."""
 
 
 async def verify_twilio_webhook(request: Request) -> dict:
@@ -389,8 +399,14 @@ async def create_video_session(
     # once a payment grace period expires.
     billing_service.assert_billing_not_suspended(db, account_id)
 
+    # Roadmap doc §8 "Phase 1... up to 8 participants" vs the "larger
+    # meetings" Phase 3 tier - room capacity now follows the account's
+    # actual plan instead of every account getting the same flat ceiling.
+    subscription = billing_service.get_or_create_subscription(db, account_id)
+    plan = billing_service.get_plan(db, subscription.plan_code)
+
     room_name = f"zl-{uuid.uuid4().hex[:16]}"
-    await video.create_room(room_name)
+    await video.create_room(room_name, max_participants=plan.max_video_participants)
 
     session = VideoSession(
         account_id=account_id,
@@ -420,7 +436,11 @@ async def end_video_session(db: Session, user: User, room_name: str) -> VideoSes
     # Stop any in-progress recording first - ending the room doesn't
     # automatically stop egress, and a dangling egress job would keep
     # recording nothing useful (or error out) once the room is gone.
-    if session.recording_egress_id:
+    # is_recording_in_progress, not a bare recording_egress_id check - a
+    # manual stop_video_recording earlier in this same call already
+    # stopped it, and re-stopping an already-finished egress would just
+    # error against LiveKit for no reason.
+    if is_recording_in_progress(session):
         await video.stop_room_recording(session.recording_egress_id)
 
     await video.end_room(room_name)
@@ -437,13 +457,24 @@ async def end_video_session(db: Session, user: User, room_name: str) -> VideoSes
     return session
 
 
+def is_recording_in_progress(session: VideoSession) -> bool:
+    """True only while an egress is actively running - recording_egress_id
+    stays set even after a finished recording's egress_ended webhook
+    attaches recording_url (see _handle_egress_ended), since that same id
+    is how that webhook finds this session in the first place. Using a
+    bare `if session.recording_egress_id` check here would (incorrectly)
+    treat "recorded earlier in this call" the same as "recording right
+    now", permanently blocking a second recording in the same session."""
+    return session.recording_egress_id is not None and session.recording_url is None
+
+
 async def start_video_recording(db: Session, user: User, room_name: str) -> VideoSession:
     session = _find_account_video_session(db, user.account_id, room_name)
     if user.role == UserRole.MEMBER and session.host_user_id != user.id:
         raise VideoSessionAuthorizationError(f"{room_name} was not started by you")
     if session.status != VideoSessionStatus.ACTIVE:
         raise VideoSessionAuthorizationError(f"{room_name} is not an active session")
-    if session.recording_egress_id:
+    if is_recording_in_progress(session):
         raise VideoSessionAuthorizationError(f"{room_name} is already being recorded")
     if session.confidential:
         raise ConfidentialModeRecordingBlockedError(
@@ -457,10 +488,33 @@ async def start_video_recording(db: Session, user: User, room_name: str) -> Vide
 
     egress_id = await video.start_room_recording(room_name)
     session.recording_egress_id = egress_id
+    session.recording_url = None
     db.commit()
     db.refresh(session)
     log_event(
         db, actor_id=user.account_id, action="video.recording_started",
+        target_type="video_session", target_id=session.id, metadata={"room_name": room_name},
+    )
+    return session
+
+
+async def stop_video_recording(db: Session, user: User, room_name: str) -> VideoSession:
+    """Manual stop, independent of ending the call - end_video_session
+    already stops any in-progress recording on its own, so this is only
+    for "keep talking, but stop recording" mid-call. recording_egress_id
+    is deliberately left set (not cleared here) - the async egress_ended
+    webhook still needs it to find this session and attach the finished
+    recording_url; is_recording_in_progress is what actually gates whether a
+    NEW recording can start, not this field's mere presence."""
+    session = _find_account_video_session(db, user.account_id, room_name)
+    if user.role == UserRole.MEMBER and session.host_user_id != user.id:
+        raise VideoSessionAuthorizationError(f"{room_name} was not started by you")
+    if not is_recording_in_progress(session):
+        raise VideoSessionAuthorizationError(f"{room_name} is not currently being recorded")
+
+    await video.stop_room_recording(session.recording_egress_id)
+    log_event(
+        db, actor_id=user.account_id, action="video.recording_stopped",
         target_type="video_session", target_id=session.id, metadata={"room_name": room_name},
     )
     return session
@@ -480,6 +534,35 @@ def _get_active_session_or_raise(db: Session, room_name: str) -> VideoSession:
     if session is None or session.status != VideoSessionStatus.ACTIVE:
         raise VideoSessionAuthorizationError(f"{room_name} is not an active video session")
     return session
+
+
+# A guest waiting this long with no host response is treated as abandoned
+# rather than left pending forever - see VideoWaitingGuest's docstring.
+# Not a tuned production value, same "conservative first pass" caveat as
+# every other threshold in this codebase.
+WAITING_ROOM_TIMEOUT_MINUTES = 10
+
+
+def _expire_if_stale(db: Session, waiting_guest: VideoWaitingGuest) -> VideoWaitingGuest:
+    """Lazily flips a PENDING row to EXPIRED once it's outlived
+    WAITING_ROOM_TIMEOUT_MINUTES - checked wherever a waiting_guest row is
+    actually read (the guest's own poll, or the host's waiting-room list),
+    so no separate cron/purge job is needed: every PENDING row already has
+    someone polling it for as long as it matters."""
+    if waiting_guest.status != VideoWaitingGuestStatus.PENDING:
+        return waiting_guest
+    age = datetime.now(timezone.utc) - waiting_guest.created_at
+    if age > timedelta(minutes=WAITING_ROOM_TIMEOUT_MINUTES):
+        waiting_guest.status = VideoWaitingGuestStatus.EXPIRED
+        db.commit()
+        db.refresh(waiting_guest)
+        session = db.query(VideoSession).filter(VideoSession.id == waiting_guest.video_session_id).first()
+        log_event(
+            db, actor_id=session.account_id if session else None, action="video.guest_join_expired",
+            target_type="video_session", target_id=waiting_guest.video_session_id,
+            metadata={"waiting_id": waiting_guest.id, "display_name": waiting_guest.display_name},
+        )
+    return waiting_guest
 
 
 def request_guest_join(db: Session, room_name: str, display_name: str) -> VideoWaitingGuest:
@@ -512,6 +595,16 @@ def request_guest_join(db: Session, room_name: str, display_name: str) -> VideoW
         target_type="video_session", target_id=session.id,
         metadata={"display_name": display_name, "guest_identity": guest_identity, "waiting_id": waiting_guest.id},
     )
+    # Best-effort - the host might not be watching the call screen right
+    # now, so this is the out-of-band alert that a guest is waiting (see
+    # notify_video_guest_waiting's docstring). Never blocks the guest's own
+    # request on an email-send failure.
+    host = db.query(User).filter(User.id == session.host_user_id).first()
+    if host is not None:
+        notify_video_guest_waiting(
+            db, account_id=session.account_id, host_email=host.email,
+            room_name=room_name, guest_display_name=display_name,
+        )
     return waiting_guest
 
 
@@ -528,6 +621,7 @@ def check_waiting_status(db: Session, room_name: str, waiting_id: str) -> dict:
     )
     if waiting_guest is None:
         raise WaitingGuestNotFoundError(f"{waiting_id} is not a waiting-room request for {room_name}")
+    waiting_guest = _expire_if_stale(db, waiting_guest)
 
     if waiting_guest.status == VideoWaitingGuestStatus.ADMITTED:
         token = video.build_participant_token(room_name, waiting_guest.guest_identity, waiting_guest.display_name)
@@ -547,7 +641,7 @@ def _assert_can_manage_video_session(db: Session, user: User, room_name: str) ->
 
 def list_waiting_guests(db: Session, user: User, room_name: str) -> list[VideoWaitingGuest]:
     session = _assert_can_manage_video_session(db, user, room_name)
-    return (
+    candidates = (
         db.query(VideoWaitingGuest)
         .filter(
             VideoWaitingGuest.video_session_id == session.id,
@@ -556,6 +650,11 @@ def list_waiting_guests(db: Session, user: User, room_name: str) -> list[VideoWa
         .order_by(VideoWaitingGuest.created_at.asc())
         .all()
     )
+    # Expire stale ones before returning - a host opening the waiting-room
+    # list shouldn't see (or be able to admit) a request the guest may have
+    # long since given up on.
+    still_pending = [_expire_if_stale(db, g) for g in candidates]
+    return [g for g in still_pending if g.status == VideoWaitingGuestStatus.PENDING]
 
 
 def _get_waiting_guest_for_host(db: Session, user: User, room_name: str, waiting_id: str) -> VideoWaitingGuest:
@@ -567,11 +666,15 @@ def _get_waiting_guest_for_host(db: Session, user: User, room_name: str, waiting
     )
     if waiting_guest is None:
         raise WaitingGuestNotFoundError(f"{waiting_id} is not a waiting-room request for {room_name}")
-    return waiting_guest
+    return _expire_if_stale(db, waiting_guest)
 
 
 def admit_waiting_guest(db: Session, user: User, room_name: str, waiting_id: str) -> None:
     waiting_guest = _get_waiting_guest_for_host(db, user, room_name, waiting_id)
+    if waiting_guest.status != VideoWaitingGuestStatus.PENDING:
+        raise WaitingGuestNoLongerPendingError(
+            f"{waiting_id} is already {waiting_guest.status.value} - nothing to admit"
+        )
     waiting_guest.status = VideoWaitingGuestStatus.ADMITTED
     db.commit()
     log_event(
@@ -583,6 +686,10 @@ def admit_waiting_guest(db: Session, user: User, room_name: str, waiting_id: str
 
 def deny_waiting_guest(db: Session, user: User, room_name: str, waiting_id: str) -> None:
     waiting_guest = _get_waiting_guest_for_host(db, user, room_name, waiting_id)
+    if waiting_guest.status != VideoWaitingGuestStatus.PENDING:
+        raise WaitingGuestNoLongerPendingError(
+            f"{waiting_id} is already {waiting_guest.status.value} - nothing to deny"
+        )
     waiting_guest.status = VideoWaitingGuestStatus.DENIED
     db.commit()
     log_event(

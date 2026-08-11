@@ -21,7 +21,11 @@ from app.core.error_logging import ErrorLoggingMiddleware
 from app.core.logging import configure_logging
 from app.crm.routes import router as crm_router
 from app.core.rate_limit import limiter
-from app.core.startup_checks import assert_jwt_secret_is_configured, parse_allowed_origins
+from app.core.startup_checks import (
+    assert_jwt_secret_is_configured,
+    parse_allowed_origins,
+    warn_if_db_connection_budget_is_risky,
+)
 from app.core.telemetry import setup_telemetry, shutdown_telemetry
 from app.intelligence.routes import router as intelligence_router
 from app.media.receptionist import router as receptionist_router
@@ -57,7 +61,18 @@ async def lifespan(app: FastAPI):
     shutdown_telemetry()
 
 
-app = FastAPI(title="Zoiko Local API", lifespan=lifespan)
+# /docs, /redoc, and the raw OpenAPI schema enumerate every internal route
+# (staff/admin endpoints included) - fine to browse in development, an
+# unnecessary reconnaissance gift to anyone on the internet once this is a
+# real deployment. None of the three exist outside development.
+_docs_enabled = settings.environment == "development"
+app = FastAPI(
+    title="Zoiko Local API",
+    lifespan=lifespan,
+    docs_url="/docs" if _docs_enabled else None,
+    redoc_url="/redoc" if _docs_enabled else None,
+    openapi_url="/openapi.json" if _docs_enabled else None,
+)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
@@ -78,6 +93,10 @@ async def database_unavailable_handler(request: Request, exc: DBAPIError) -> JSO
 
 # Fail fast rather than boot insecurely - see app/core/startup_checks.py.
 assert_jwt_secret_is_configured(settings.environment, settings.jwt_secret_key)
+warn_if_db_connection_budget_is_risky(
+    settings.db_pool_size, settings.db_max_overflow, settings.web_concurrency,
+    settings.db_connection_budget_warning_threshold,
+)
 
 # Added before CORSMiddleware so CORS ends up outermost (last added wraps
 # first) - even an error response this middleware logs still needs its CORS

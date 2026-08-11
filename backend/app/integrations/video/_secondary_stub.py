@@ -22,7 +22,7 @@ def _require_credentials() -> None:
         raise VideoError("Secondary video provider (Daily.co) is not configured - set DAILY_API_KEY")
 
 
-async def create_room(room_name: str) -> dict:
+async def create_room(room_name: str, max_participants: int | None = None) -> dict:
     _require_credentials()
     from app.integrations.video.livekit import MAX_PARTICIPANTS
 
@@ -31,7 +31,7 @@ async def create_room(room_name: str) -> dict:
             response = await client.post(
                 _ROOMS_URL,
                 headers={"Authorization": f"Bearer {settings.daily_api_key}"},
-                json={"name": room_name, "properties": {"max_participants": MAX_PARTICIPANTS}},
+                json={"name": room_name, "properties": {"max_participants": max_participants or MAX_PARTICIPANTS}},
                 timeout=15.0,
             )
             response.raise_for_status()

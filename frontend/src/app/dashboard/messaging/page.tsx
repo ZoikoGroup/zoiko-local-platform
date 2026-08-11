@@ -43,36 +43,36 @@ export default function MessagingPage() {
   const channelNumbers = numbers.filter((n) => (newChannel === "whatsapp" ? n.whatsapp_enabled : n.sms_enabled));
   const anyChannelEnabled = numbers.some((n) => n.whatsapp_enabled || n.sms_enabled);
 
-  const loadConversations = useCallback(async () => {
+  const loadConversations = useCallback(() => {
     if (!token) return;
-    try {
-      const [numberData, conversationData] = await Promise.all([listMyNumbers(token), listConversations(token)]);
-      setNumbers(numberData);
-      setConversations(conversationData);
-      setError(null);
-    } catch {
-      setError("Couldn't load conversations.");
-    } finally {
-      setLoading(false);
-    }
+    return Promise.all([listMyNumbers(token), listConversations(token)])
+      .then(([numberData, conversationData]) => {
+        setNumbers(numberData);
+        setConversations(conversationData);
+        setError(null);
+      })
+      .catch(() => setError("Couldn't load conversations."))
+      .finally(() => setLoading(false));
   }, [token]);
 
   useEffect(() => {
     loadConversations();
   }, [loadConversations]);
 
-  useEffect(() => {
+  // Resets the selected number whenever the channel tab changes, rather than
+  // in a separate effect - see https://react.dev/learn/you-might-not-need-an-effect#adjusting-some-state-when-a-prop-changes
+  const [prevChannel, setPrevChannel] = useState(newChannel);
+  if (newChannel !== prevChannel) {
+    setPrevChannel(newChannel);
     setNewNumberId("");
-  }, [newChannel]);
+  }
 
   const loadMessages = useCallback(
-    async (conversationId: string) => {
+    (conversationId: string) => {
       if (!token) return;
-      try {
-        setMessages(await listConversationMessages(token, conversationId));
-      } catch {
-        setError("Couldn't load this conversation's messages.");
-      }
+      return listConversationMessages(token, conversationId)
+        .then(setMessages)
+        .catch(() => setError("Couldn't load this conversation's messages."));
     },
     [token]
   );

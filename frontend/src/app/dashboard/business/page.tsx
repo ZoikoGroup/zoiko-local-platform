@@ -283,7 +283,9 @@ function BusinessPageContent() {
     if (crmResult === "connected") {
       loadCrm();
     } else if (crmResult === "error") {
-      setCrmError("Couldn't complete the HubSpot connection - the link may have expired. Try connecting again.");
+      Promise.resolve().then(() =>
+        setCrmError("Couldn't complete the HubSpot connection - the link may have expired. Try connecting again.")
+      );
     }
     router.replace("/dashboard/business");
   }, [searchParams, router, loadCrm]);

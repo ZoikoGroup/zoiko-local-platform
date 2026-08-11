@@ -21,6 +21,14 @@ RUN pip install --no-cache-dir --upgrade pip && \
 # migrations from this same image (e.g. `docker run <image> alembic upgrade head`).
 COPY . .
 
+# Runs as an unprivileged user, not root - defense in depth in case a
+# dependency-level RCE (or a future arbitrary-file-write bug) ever gets code
+# execution inside this container; nothing in this app needs root (uvicorn
+# binds port 8000, well above the <1024 range that requires it).
+RUN useradd --system --create-home --shell /usr/sbin/nologin appuser \
+    && chown -R appuser:appuser /app
+USER appuser
+
 EXPOSE 8000
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
