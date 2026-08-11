@@ -50,6 +50,17 @@ class Settings(BaseSettings):
     livekit_api_key: str = ""
     livekit_api_secret: str = ""
 
+    # Not read by the app itself - only referenced by docker-compose.yml's
+    # `livekit` service (${LIVEKIT_SELF_HOSTED_API_KEY}/_SECRET substitution,
+    # Architecture doc Phase 4 "owned media components"). Declared here
+    # anyway because Settings shares one .env with docker-compose (see this
+    # class's env_file="../.env") and pydantic-settings rejects unrecognized
+    # keys by default - swap the three livekit_* values above to these same
+    # two plus ws://localhost:7880 to actually switch to the self-hosted
+    # server.
+    livekit_self_hosted_api_key: str = ""
+    livekit_self_hosted_api_secret: str = ""
+
     # S3-compatible storage for video call recordings (LiveKit Egress has no
     # free built-in storage - every recording request must specify a real
     # bucket). Works with real AWS S3 (leave s3_endpoint empty) or any
