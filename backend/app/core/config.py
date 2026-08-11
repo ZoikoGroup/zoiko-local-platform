@@ -85,10 +85,18 @@ class Settings(BaseSettings):
     # this API's own address for provider webhooks to call back into.
     frontend_base_url: str = "http://localhost:3000"
 
-    # ZoikoNex (integrations/billing) - shared-secret HMAC for the inbound
-    # payment-event webhook. Empty until a real ZoikoNex connection issues
-    # one; see app.integrations.billing.zoikonex's docstring.
+    # ZoikoNex (integrations/billing) - all three empty until a real
+    # ZoikoNex connection exists; see app.integrations.billing.zoikonex's
+    # docstring for why there's no HTTP client to point these at yet.
+    # zoikonex_webhook_secret verifies the inbound signature on payment-
+    # event webhooks ZoikoNex sends us; zoikonex_base_url/zoikonex_api_key
+    # are for the outbound direction (us calling ZoikoNex to sync a
+    # subscription or rate a usage event) - added as placeholders only,
+    # not yet read by any code, since the real API's base path and auth
+    # scheme (bearer token? signed request? something else?) aren't known.
     zoikonex_webhook_secret: str = ""
+    zoikonex_base_url: str = ""
+    zoikonex_api_key: str = ""
 
     # Resend (integrations/notifications) - real transactional email sending.
     # email_from_address must be on a domain verified in Resend once one is
