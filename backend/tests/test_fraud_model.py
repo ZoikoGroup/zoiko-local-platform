@@ -253,6 +253,49 @@ def test_auto_suspend_threshold_does_not_also_open_a_case(client, db_session):
     assert all(c["status"] != "open" for c in matching)
 
 
+def test_review_threshold_notifies_the_owner_with_a_warning(client, db_session, monkeypatch):
+    monkeypatch.setattr("app.core.config.settings.resend_api_key", "")
+    from app.risk.models import BlockedDestination, RiskSignalType
+    from app.risk.service import record_risk_signal
+
+    db_session.add(BlockedDestination(prefix="+1906", reason="test prefix"))
+    db_session.commit()
+
+    token = _signup_and_login(client, "fraudwarning1@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    account_id = client.get("/auth/me", headers=headers).json()["account_id"]
+
+    record_risk_signal(db_session, account_id=account_id, signal_type=RiskSignalType.BLOCKED_DESTINATION_ATTEMPT, detail="t1")
+    record_risk_signal(db_session, account_id=account_id, signal_type=RiskSignalType.BLOCKED_DESTINATION_ATTEMPT, detail="t2")
+
+    notifications = client.get("/notifications/me", headers=headers).json()
+    matches = [n for n in notifications if n["event_name"] == "trust.account_warning"]
+    assert len(matches) == 1
+    assert matches[0]["status"] == "sent"
+
+
+def test_auto_suspend_notifies_the_owner(client, db_session, monkeypatch):
+    monkeypatch.setattr("app.core.config.settings.resend_api_key", "")
+    from app.risk.models import BlockedDestination, RiskSignalType
+    from app.risk.service import record_risk_signal
+
+    db_session.add(BlockedDestination(prefix="+1907", reason="test prefix"))
+    db_session.commit()
+
+    token = _signup_and_login(client, "fraudsuspend1@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    account_id = client.get("/auth/me", headers=headers).json()["account_id"]
+    _active_number(db_session, account_id, "+15550070022")
+
+    for i in range(3):  # 3 * 40 = 120, capped at 100 -> crosses AUTO_SUSPEND_THRESHOLD
+        record_risk_signal(db_session, account_id=account_id, signal_type=RiskSignalType.BLOCKED_DESTINATION_ATTEMPT, detail=f"t{i}")
+
+    notifications = client.get("/notifications/me", headers=headers).json()
+    matches = [n for n in notifications if n["event_name"] == "trust.account_suspended_or_disabled"]
+    assert len(matches) == 1
+    assert matches[0]["status"] == "sent"
+
+
 def test_resolve_fraud_case(client, db_session):
     from app.risk.models import BlockedDestination, RiskSignalType
     from app.risk.service import record_risk_signal

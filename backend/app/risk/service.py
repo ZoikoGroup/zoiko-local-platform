@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 
 from app.audit.service import log_event
 from app.media.models import CallDirection, CallRecord
+from app.notifications.service import notify_account_suspended_for_risk, notify_account_warning
 from app.numbering.numbers.service import suspend_numbers_for_account_by_system
 from app.risk.models import (
     BlockedDestination,
@@ -86,6 +87,12 @@ DEVICE_FINGERPRINT_ACCOUNT_THRESHOLD = 4
 # value" caveat as the outbound velocity threshold above.
 INBOUND_SPAM_WINDOW_MINUTES = 60
 INBOUND_SPAM_ACCOUNT_THRESHOLD = 3
+
+
+def _get_account_owner(db: Session, account_id: str):
+    from app.numbering.identity.models import User, UserRole
+
+    return db.query(User).filter(User.account_id == account_id, User.role == UserRole.OWNER).first()
 
 
 class DestinationBlockedError(Exception):
@@ -354,6 +361,12 @@ def maybe_auto_suspend_for_risk(db: Session, account_id: str) -> bool:
             target=f"account:{account_id}",
             after={"score": score, "numbers_suspended": [n.e164 for n in suspended]},
         )
+        owner = _get_account_owner(db, account_id)
+        if owner is not None:
+            notify_account_suspended_for_risk(
+                db, account_id=account_id, account_email=owner.email,
+                reason_category=f"risk score {score}/{MAX_RISK_SCORE}", case_reference=account_id,
+            )
     return True
 
 
@@ -384,6 +397,19 @@ def open_fraud_case_if_needed(db: Session, account_id: str) -> FraudCase | None:
         db, actor="system:risk_engine", action="risk.fraud_case_opened",
         target=f"account:{account_id}", after={"case_id": case.id, "score": score},
     )
+    owner = _get_account_owner(db, account_id)
+    if owner is not None:
+        signal_types = {
+            s.signal_type.value
+            for s in db.query(RiskSignal).filter(RiskSignal.account_id == account_id).order_by(
+                RiskSignal.created_at.desc()
+            ).limit(5)
+        }
+        notify_account_warning(
+            db, account_id=account_id, account_email=owner.email,
+            policy_area=", ".join(sorted(signal_types)) or "unusual account activity",
+            case_reference=case.id,
+        )
     return case
 
 

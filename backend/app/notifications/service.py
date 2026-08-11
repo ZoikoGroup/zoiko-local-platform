@@ -1187,3 +1187,32 @@ def notify_recipient_opted_out(
             "event_occurred_at": _now_str(),
         },
     )
+
+
+def notify_account_warning(
+    db: Session, *, account_id: str, account_email: str, policy_area: str, case_reference: str
+) -> None:
+    send_notification(
+        db, event_name="trust.account_warning", account_id=account_id, recipient_email=account_email,
+        context={
+            "user_display_name": account_email,
+            "scope_summary": "your account",
+            "decision_policy_area": policy_area,
+            "case_reference": case_reference,
+        },
+    )
+
+
+def notify_account_suspended_for_risk(
+    db: Session, *, account_id: str, account_email: str, reason_category: str, case_reference: str
+) -> None:
+    send_notification(
+        db, event_name="trust.account_suspended_or_disabled", account_id=account_id, recipient_email=account_email,
+        context={
+            "user_display_name": account_email,
+            "restriction_status": "suspended",
+            "restriction_start_at": _now_str(),
+            "decision_reason_category": reason_category,
+            "case_reference": case_reference,
+        },
+    )
