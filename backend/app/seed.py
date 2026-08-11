@@ -15,6 +15,12 @@ COMPLIANCE_RULES = [
     {"country": "US", "requirement_type": "kyc_individual", "required_documents": ["government_id", "proof_of_address"]},
     {"country": "GB", "requirement_type": "kyc_individual", "required_documents": ["government_id", "proof_of_address"]},
     {"country": "CA", "requirement_type": "kyc_individual", "required_documents": ["government_id", "proof_of_address"]},
+    # "government_id" covers whichever accepted photo ID the customer submits
+    # (passport, Aadhaar, driving license, etc.) - document TYPE is captured
+    # per-upload (ComplianceCase.documents[].document_type), not enumerated
+    # per country here, same generic-category pattern as every other rule
+    # in this list.
+    {"country": "IN", "requirement_type": "kyc_individual", "required_documents": ["government_id", "proof_of_address"]},
     # Tier B - high-value growth corridors
     {"country": "NG", "requirement_type": "kyc_individual", "required_documents": ["government_id", "proof_of_address", "bvn"]},
     {"country": "ZA", "requirement_type": "kyc_individual", "required_documents": ["government_id", "proof_of_address"]},
