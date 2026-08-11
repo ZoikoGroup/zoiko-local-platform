@@ -2,10 +2,10 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
-from app.core.deps import get_current_staff, require_staff_role
+from app.core.deps import get_current_staff, require_capability
 from app.numbering.numbers.service import reactivate_numbers_for_account_by_staff
 from app.risk import service
-from app.risk.models import RiskSignalType
+from app.risk.models import FraudCaseStatus, RiskSignalType
 from app.risk.schemas import (
     AccountReinstateRequest,
     AccountRiskSummaryResponse,
@@ -16,7 +16,7 @@ from app.risk.schemas import (
     FraudRuleResponse,
     FraudRuleUpsertRequest,
 )
-from app.staff.models import PlatformStaff, PlatformStaffRole
+from app.staff.models import PlatformStaff
 
 router = APIRouter(prefix="/risk", tags=["risk"])
 
@@ -33,7 +33,7 @@ def list_blocked_destinations(
 def add_blocked_destination(
     payload: BlockedDestinationCreate,
     db: Session = Depends(get_db),
-    staff: PlatformStaff = Depends(require_staff_role(PlatformStaffRole.SUPER_ADMIN)),
+    staff: PlatformStaff = Depends(require_capability("risk.manage_blocked_destinations")),
 ):
     try:
         return service.add_blocked_destination(db, prefix=payload.prefix, reason=payload.reason, actor=staff.id)
@@ -45,7 +45,7 @@ def add_blocked_destination(
 def remove_blocked_destination(
     rule_id: str,
     db: Session = Depends(get_db),
-    staff: PlatformStaff = Depends(require_staff_role(PlatformStaffRole.SUPER_ADMIN)),
+    staff: PlatformStaff = Depends(require_capability("risk.manage_blocked_destinations")),
 ):
     service.remove_blocked_destination(db, rule_id, actor=staff.id)
 
@@ -67,9 +67,7 @@ def reinstate_account_numbers(
     account_id: str,
     payload: AccountReinstateRequest,
     db: Session = Depends(get_db),
-    staff: PlatformStaff = Depends(
-        require_staff_role(PlatformStaffRole.SUPER_ADMIN, PlatformStaffRole.COMPLIANCE_OFFICER)
-    ),
+    staff: PlatformStaff = Depends(require_capability("risk.reinstate_account")),
 ):
     """Reverses a risk-engine auto-suspension (or any suspension) after
     human review - reactivates every SUSPENDED number on the account."""
@@ -94,7 +92,7 @@ def upsert_fraud_rule(
     signal_type: RiskSignalType,
     payload: FraudRuleUpsertRequest,
     db: Session = Depends(get_db),
-    staff: PlatformStaff = Depends(require_staff_role(PlatformStaffRole.SUPER_ADMIN)),
+    staff: PlatformStaff = Depends(require_capability("risk.manage_fraud_rules")),
 ):
     return service.upsert_fraud_rule(
         db, signal_type=signal_type, weight=payload.weight, is_active=payload.is_active, actor=staff.id,
@@ -103,14 +101,16 @@ def upsert_fraud_rule(
 
 @router.get("/fraud-cases", response_model=list[FraudCaseResponse])
 def list_fraud_cases(
-    case_status: str | None = None,
+    case_status: FraudCaseStatus | None = None,
     db: Session = Depends(get_db),
     _staff: PlatformStaff = Depends(get_current_staff),
 ):
     """Review queue for accounts whose decayed risk score crossed
-    REVIEW_THRESHOLD but not (yet) AUTO_SUSPEND_THRESHOLD - the earlywarning tier auto-suspension alone doesn't surface."""
-    status_filter = service.FraudCaseStatus(case_status) if case_status else None
-    return service.list_fraud_cases(db, status=status_filter)
+    REVIEW_THRESHOLD but not (yet) AUTO_SUSPEND_THRESHOLD - the earlywarning
+    tier auto-suspension alone doesn't surface. Any staff role can view it
+    (diagnostic, same posture as the risk score view above); resolving one
+    is the sensitive action, gated below."""
+    return service.list_fraud_cases(db, status=case_status)
 
 
 @router.post("/fraud-cases/{case_id}/resolve", response_model=FraudCaseResponse)
@@ -118,9 +118,7 @@ def resolve_fraud_case(
     case_id: str,
     payload: FraudCaseResolveRequest,
     db: Session = Depends(get_db),
-    staff: PlatformStaff = Depends(
-        require_staff_role(PlatformStaffRole.SUPER_ADMIN, PlatformStaffRole.COMPLIANCE_OFFICER)
-    ),
+    staff: PlatformStaff = Depends(require_capability("risk.resolve_fraud_case")),
 ):
     try:
         return service.resolve_fraud_case(

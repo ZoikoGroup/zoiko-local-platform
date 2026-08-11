@@ -37,4 +37,13 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
 # computing, so multiple worker processes help even on one shared core.
 # Override via `fly secrets set WEB_CONCURRENCY=N` if the machine is resized.
 ENV WEB_CONCURRENCY=4
-CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers ${WEB_CONCURRENCY}"]
+# Runs migrations on every container start rather than relying on a
+# platform's separate pre-deploy/release-phase step - that step is a paid
+# feature on some platforms (e.g. Render's free tier silently skips it
+# with no error), so this is the one approach guaranteed to actually run
+# regardless of plan/platform. Fine at numInstances=1 (current deploy) -
+# there's no distributed locking here, so if this ever scales to multiple
+# instances deploying concurrently, two containers could race the same
+# migration. Move to a real release-phase step before scaling past one
+# instance.
+CMD ["sh", "-c", "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers ${WEB_CONCURRENCY}"]

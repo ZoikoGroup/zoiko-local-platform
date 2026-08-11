@@ -22,7 +22,14 @@ def upgrade() -> None:
     op.create_table('risk_signals',
     sa.Column('id', sa.UUID(as_uuid=False), nullable=False),
     sa.Column('account_id', sa.UUID(as_uuid=False), nullable=False),
-    sa.Column('signal_type', sa.Enum('velocity_exceeded', 'blocked_destination_attempt', name='risksignaltype'), nullable=False),
+    # Values must be the Python RiskSignalType enum's MEMBER NAMES
+    # (uppercase), not its .value strings - SQLAlchemy's Enum(SomeStrEnum)
+    # serializes using .name by default in this codebase's other enum
+    # columns (see e.g. call_direction_enum's actual stored labels:
+    # 'INBOUND'/'OUTBOUND', not 'inbound'/'outbound'), and app/risk/models.py's
+    # FraudRule.signal_type shares this exact same Postgres enum type - a
+    # mismatch here breaks both tables, not just this one.
+    sa.Column('signal_type', sa.Enum('VELOCITY_EXCEEDED', 'BLOCKED_DESTINATION_ATTEMPT', 'GEOGRAPHIC_DISPERSION', name='risksignaltype'), nullable=False),
     sa.Column('detail', sa.String(length=255), nullable=False),
     sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
     sa.ForeignKeyConstraint(['account_id'], ['accounts.id'], ondelete='CASCADE'),

@@ -8,7 +8,7 @@ import {
   listMyNumbers,
   searchNumbers,
   reserveNumber,
-  purchaseNumber,
+  createNumberCheckoutSession,
   suspendNumber,
   cancelNumber,
   configureRouting,
@@ -32,7 +32,7 @@ import {
 } from "@/lib/api";
 import { getToken } from "@/lib/auth";
 
-type Step = "search" | "reserved" | "compliance" | "checkout" | "purchased";
+type Step = "search" | "reserved" | "compliance" | "checkout";
 
 const STATUS_STYLES: Record<string, string> = {
   reserved: "bg-amber-50 text-amber-700",
@@ -118,7 +118,6 @@ export default function NumbersPage() {
 
   const [purchaseBusy, setPurchaseBusy] = useState(false);
   const [purchaseError, setPurchaseError] = useState<string | null>(null);
-  const [purchasedNumber, setPurchasedNumber] = useState<MyPhoneNumber | null>(null);
   const [emergencyAcknowledged, setEmergencyAcknowledged] = useState(false);
 
   const [portingRequests, setPortingRequests] = useState<PortingRequest[]>([]);
@@ -143,6 +142,23 @@ export default function NumbersPage() {
   useEffect(() => {
     loadMyNumbers();
   }, [loadMyNumbers]);
+
+  // Stripe redirects the browser back here after Checkout (success or
+  // cancel) - the number itself only activates via the backend's webhook,
+  // not this redirect, so this just reflects that outcome to the customer
+  // and refreshes the list to pick up the (by-then-likely-already-active)
+  // number.
+  const [checkoutResult, setCheckoutResult] = useState<"success" | "cancelled" | null>(null);
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const checkout = params.get("checkout");
+    if (checkout === "success" || checkout === "cancelled") {
+      setCheckoutResult(checkout);
+      window.history.replaceState({}, "", window.location.pathname);
+      if (checkout === "success") loadMyNumbers();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const loadPortingRequests = useCallback(() => {
     if (!token) return;
@@ -261,10 +277,12 @@ export default function NumbersPage() {
     setPurchaseError(null);
     try {
       await acknowledgeEmergencyCallingLimitation(token);
-      const number = await purchaseNumber(token, reservedNumber.e164);
-      setPurchasedNumber(number);
-      setStep("purchased");
-      await loadMyNumbers();
+      // Real Stripe Checkout (test mode) - redirects to Stripe's own
+      // hosted payment page. The number only actually activates once
+      // Stripe confirms payment via the backend's webhook; this tab
+      // navigates away, so nothing more happens here on success.
+      const session = await createNumberCheckoutSession(token, reservedNumber.e164);
+      window.location.href = session.url;
     } catch (err) {
       if (err instanceof ApiError && err.status === 403) {
         setPurchaseError(
@@ -277,8 +295,8 @@ export default function NumbersPage() {
       } else {
         setPurchaseError(
           err instanceof ApiError
-            ? `Couldn't reach the telecom provider: ${err.message}`
-            : "Couldn't complete the purchase."
+            ? `Couldn't start checkout: ${err.message}`
+            : "Couldn't start checkout."
         );
       }
     } finally {
@@ -297,7 +315,6 @@ export default function NumbersPage() {
     setCaseOpened(false);
     setComplianceError(null);
     setPurchaseError(null);
-    setPurchasedNumber(null);
     setEmergencyAcknowledged(false);
   }
 
@@ -479,6 +496,19 @@ export default function NumbersPage() {
         <h2 className="text-xl font-semibold text-slate-900">Phone Numbers</h2>
         <p className="text-sm text-slate-500">Numbers your account owns, and getting a new one.</p>
       </div>
+
+      {checkoutResult === "success" && (
+        <p className="text-sm text-emerald-800 bg-emerald-50 border border-emerald-200 rounded-lg px-3 py-2">
+          Payment received — your number will show as active below shortly (test mode, no real charge was
+          made).
+        </p>
+      )}
+      {checkoutResult === "cancelled" && (
+        <p className="text-sm text-amber-800 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
+          Checkout was cancelled — no payment was made and your number wasn&apos;t purchased. Your
+          reservation may still be active below if you&apos;d like to try again.
+        </p>
+      )}
 
       <div className="bg-white rounded-xl border border-slate-200 p-6 space-y-4">
         <h3 className="font-semibold text-slate-900">My Numbers</h3>
@@ -774,7 +804,7 @@ export default function NumbersPage() {
       <div className="flex items-center gap-2 text-xs font-medium text-slate-600">
         {["Search", "Reserve", "Verify", "Checkout"].map((label, i) => {
           const stepIndex = ["search", "reserved", "compliance", "checkout"].indexOf(step);
-          const active = i <= stepIndex || step === "purchased";
+          const active = i <= stepIndex;
           return (
             <div key={label} className="flex items-center gap-2">
               <span className={active ? "text-indigo-600" : ""}>{label}</span>
@@ -938,9 +968,12 @@ export default function NumbersPage() {
             <span className="font-mono text-slate-800">{reservedNumber.e164}</span>
           </div>
           <div className="flex justify-between text-sm">
-            <span className="text-slate-500">Monthly fee (estimate)</span>
-            <span className="text-slate-800">$5.00 / month</span>
+            <span className="text-slate-500">Purchase price</span>
+            <span className="text-slate-800">$1.00 (test mode — no real charge)</span>
           </div>
+          <p className="text-xs text-slate-400">
+            You&apos;ll be redirected to Stripe&apos;s secure payment page to complete this purchase.
+          </p>
 
           <div className="bg-amber-50 border border-amber-200 rounded-lg p-3 space-y-2">
             <p className="text-xs text-amber-900 font-medium">Emergency calling notice</p>
@@ -970,21 +1003,7 @@ export default function NumbersPage() {
             disabled={purchaseBusy || !emergencyAcknowledged}
             className="bg-indigo-600 hover:bg-indigo-700 disabled:opacity-60 text-white text-sm font-medium rounded-lg px-4 py-2"
           >
-            {purchaseBusy ? "Purchasing..." : "Confirm Purchase"}
-          </button>
-        </div>
-      )}
-
-      {/* Final: real purchase result */}
-      {step === "purchased" && purchasedNumber && (
-        <div className="bg-white rounded-xl border border-slate-200 p-6 text-center space-y-2">
-          <h3 className="font-semibold text-slate-900">Number activated</h3>
-          <p className="text-sm text-slate-500">
-            <span className="font-mono text-slate-800">{purchasedNumber.e164}</span> is now active on your
-            account.
-          </p>
-          <button onClick={handleStartOver} className="text-sm font-medium text-indigo-600">
-            Get another number
+            {purchaseBusy ? "Redirecting to payment..." : "Proceed to Payment"}
           </button>
         </div>
       )}

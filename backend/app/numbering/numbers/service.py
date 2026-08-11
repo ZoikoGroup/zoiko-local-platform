@@ -11,6 +11,7 @@ from app.consent.models import ConsentType
 from app.consent.service import has_active_consent
 from app.core.config import settings
 from app.events.service import publish_number_activated, publish_number_reserved, publish_number_suspended
+from app.integrations.billing import stripe_checkout
 from app.integrations.telecom import twilio as telecom
 from app.notifications.service import (
     notify_number_activated,
@@ -22,12 +23,19 @@ from app.notifications.service import (
     notify_number_verification_required,
 )
 from app.numbering.identity.models import Account, AccountType, User, UserRole
-from app.numbering.numbers.countries import SUPPORTED_COUNTRIES, SUPPORTED_COUNTRY_CODES
-from app.numbering.numbers.models import IVROption, PhoneNumber, PhoneNumberStatus, RingGroupDestination
+from app.numbering.numbers.models import IVROption, PhoneNumber, PhoneNumberStatus, RingGroupDestination, SupportedCountry
 
 RESERVATION_TTL_MINUTES = 12
 QUARANTINE_DAYS = 90
 RENEWAL_PERIOD_DAYS = 30
+
+# Real Stripe Checkout price for a number purchase (test mode - no real
+# money moves yet). One flat price for every number regardless of country
+# or type, a deliberate first-pass simplification - same "placeholder, not
+# a real rate card" posture as app.usage.models.CallingRate's per-country
+# calling prices. Revisit once real per-market pricing is decided.
+NUMBER_PURCHASE_PRICE_CENTS = 100
+NUMBER_PURCHASE_CURRENCY = "usd"
 
 
 class NumberConflictError(Exception):
@@ -36,17 +44,42 @@ class NumberConflictError(Exception):
 
 
 class UnsupportedCountryError(Exception):
-    """Raised for a country outside Zoiko Local's curated launch list -
-    see app.numbering.numbers.countries for why this is narrower than
-    Twilio's own coverage."""
+    """Raised for a country outside Zoiko Local's curated launch list (the
+    SupportedCountry table) - narrower than Twilio's own coverage since a
+    customer picking from an unreviewed 100+ country list would routinely
+    hit countries with numbering, tax, or compliance requirements this
+    platform hasn't reviewed yet."""
 
 
-def list_supported_countries() -> list[dict]:
-    return SUPPORTED_COUNTRIES
+def list_supported_countries(db: Session) -> list[SupportedCountry]:
+    return db.query(SupportedCountry).order_by(SupportedCountry.sort_order, SupportedCountry.code).all()
 
 
-def _assert_supported_country(country: str) -> None:
-    if country not in SUPPORTED_COUNTRY_CODES:
+def upsert_supported_country(db: Session, *, code: str, name: str, sort_order: int = 0) -> SupportedCountry:
+    """Staff-only, SUPER_ADMIN-gated at the route (see app.staff.routes) -
+    expanding the launch country list is a compliance/commercial decision,
+    the same bar as a calling-rate change (app.usage.service.
+    upsert_calling_rate)."""
+    country = db.query(SupportedCountry).filter(SupportedCountry.code == code).first()
+    if country is None:
+        country = SupportedCountry(code=code, name=name, sort_order=sort_order)
+        db.add(country)
+    else:
+        country.name = name
+        country.sort_order = sort_order
+    db.commit()
+    db.refresh(country)
+    return country
+
+
+def remove_supported_country(db: Session, code: str) -> None:
+    db.query(SupportedCountry).filter(SupportedCountry.code == code).delete()
+    db.commit()
+
+
+def _assert_supported_country(db: Session, country: str) -> None:
+    exists = db.query(SupportedCountry).filter(SupportedCountry.code == country).first() is not None
+    if not exists:
         raise UnsupportedCountryError(f"{country!r} is not on Zoiko Local's supported country list yet")
 
 
@@ -81,8 +114,8 @@ def _kyc_requirement_type(db: Session, account_id: str) -> str:
 SMS_REQUIREMENT_TYPE = "sms_business_messaging"
 
 
-def search_numbers(country: str, number_type: str = "local", area_code: str | None = None) -> list[dict]:
-    _assert_supported_country(country)
+def search_numbers(db: Session, country: str, number_type: str = "local", area_code: str | None = None) -> list[dict]:
+    _assert_supported_country(db, country)
     return telecom.search_available_numbers(country, number_type=number_type, area_code=area_code)
 
 
@@ -92,7 +125,7 @@ def reserve_number(db: Session, account_id: str, e164: str, country: str) -> Pho
     existing row; the unique constraint on `e164` catches the race where two
     requests both try to INSERT a brand-new row for the same number.
     """
-    _assert_supported_country(country)
+    _assert_supported_country(db, country)
     now = datetime.now(timezone.utc)
     number = db.query(PhoneNumber).filter(PhoneNumber.e164 == e164).with_for_update().first()
 
@@ -265,6 +298,86 @@ def purchase_number(db: Session, account_id: str, e164: str) -> PhoneNumber:
         )
 
     return number
+
+
+def create_number_purchase_checkout_session(db: Session, account_id: str, e164: str) -> dict:
+    """Real Stripe Checkout (test mode) for a number purchase - the payment
+    step this module's own purchase_number docstring said "can be inserted
+    before this later without a model change." Only creates the Stripe
+    session and logs it; the actual purchase (purchase_number, with every
+    existing quota/compliance/emergency-disclosure gate intact) only runs
+    once Stripe confirms payment via the checkout.session.completed
+    webhook - see complete_number_purchase_from_checkout below. Returns
+    {id, url} - the customer is redirected to url."""
+    now = datetime.now(timezone.utc)
+    number = db.query(PhoneNumber).filter(PhoneNumber.e164 == e164).first()
+    if number is None or number.account_id != account_id or number.status != PhoneNumberStatus.RESERVED:
+        raise NumberConflictError(f"{e164} must be reserved by your account before checkout")
+    if number.reserved_until is not None and number.reserved_until < now:
+        raise NumberConflictError(f"Reservation for {e164} expired — reserve it again before checkout")
+
+    session = stripe_checkout.create_checkout_session(
+        e164=e164,
+        amount_cents=NUMBER_PURCHASE_PRICE_CENTS,
+        currency=NUMBER_PURCHASE_CURRENCY,
+        success_url=f"{settings.frontend_base_url}/dashboard/numbers?checkout=success",
+        cancel_url=f"{settings.frontend_base_url}/dashboard/numbers?checkout=cancelled",
+        metadata={"e164": e164, "account_id": account_id},
+    )
+    log_event(
+        db, actor_id=account_id, action="number.checkout_session_created",
+        target_type="phone_number", target_id=number.id, metadata={"e164": e164, "session_id": session["id"]},
+    )
+    return session
+
+
+def complete_number_purchase_from_checkout(
+    db: Session, *, e164: str, account_id: str, payment_intent_id: str | None = None
+) -> PhoneNumber | None:
+    """Called from the Stripe payment webhook once checkout.session.completed
+    fires - runs the existing purchase_number flow with all its gates
+    intact, rather than duplicating any of that logic. Returns None (not an
+    error) for every known way purchase_number can fail to actually reach
+    ACTIVE after a successful payment:
+
+    - NumberConflictError: the number is no longer purchasable (already
+      bought, or the webhook was retried after already succeeding once) -
+      idempotency against Stripe's at-least-once webhook delivery. Not
+      refunded - this path means the number was already (or is being)
+      fulfilled, or a duplicate delivery of an already-handled event.
+    - ComplianceRequiredError: purchase_number already persisted the
+      number into COMPLIANCE_PENDING and sent its own customer
+      notification - correct behavior, nothing further for this handler
+      to do. Not refunded - the customer still gets the number once
+      compliance clears, this isn't a failure.
+    - NumberQuotaExceededError / BillingSuspendedError /
+      EmergencyDisclosureRequiredError / TelecomError: genuine post-
+      payment fulfillment failures - the customer paid and won't be
+      getting a number for it. Automatically refunded via Stripe (if
+      payment_intent_id is available) so no real launch would leave a
+      collected-but-unfulfilled payment sitting uncorrected.
+    """
+    try:
+        return purchase_number(db, account_id, e164)
+    except (NumberConflictError, ComplianceRequiredError):
+        return None
+    except (
+        EmergencyDisclosureRequiredError,
+        billing_service.NumberQuotaExceededError,
+        billing_service.BillingSuspendedError,
+        telecom.TelecomError,
+    ):
+        if payment_intent_id:
+            try:
+                stripe_checkout.refund_payment(payment_intent_id)
+            except stripe_checkout.PaymentError:
+                # Refund itself failed (e.g. provider outage) - logged by
+                # trace_provider_call already; swallowed here so a refund
+                # hiccup never turns into a 500 back to Stripe's webhook
+                # (which would just cause pointless redelivery retries of
+                # an event we've already fully handled on our side).
+                pass
+        return None
 
 
 # purchase_number is entirely synchronous - it never returns to the caller

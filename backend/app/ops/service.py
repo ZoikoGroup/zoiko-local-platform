@@ -5,6 +5,7 @@ from sqlalchemy.orm import Session
 from twilio.request_validator import RequestValidator
 
 from app.core.config import settings
+from app.integrations.billing import stripe_checkout
 from app.integrations.embeddings import cohere as cohere_embeddings
 from app.integrations.kyc import stripe_identity
 from app.integrations.llm import groq as groq_llm
@@ -40,6 +41,7 @@ async def get_provider_statuses() -> list[dict]:
         ("livekit", livekit_status),
         ("groq", groq_llm.health_check()),
         ("stripe_identity", stripe_identity.health_check()),
+        ("stripe_payments", stripe_checkout.health_check()),
         ("resend", resend_email.health_check()),
         ("storage_s3", s3.health_check()),
         ("cohere", cohere_embeddings.health_check()),
@@ -60,6 +62,7 @@ _PUBLIC_COMPONENT_NAMES = {
     "livekit": "Video",
     "groq": "AI Receptionist & Call Summaries",
     "stripe_identity": "Identity Verification",
+    "stripe_payments": "Number Purchase Payments",
     "resend": "Email Notifications",
     "storage_s3": "Recording Storage",
     "cohere": "Semantic Search",

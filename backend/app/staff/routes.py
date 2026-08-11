@@ -2,20 +2,25 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
-from app.core.deps import get_current_staff, require_staff_role
+from app.core.deps import get_current_staff, require_capability
 from app.core.rate_limit import limiter
 from app.core.security import create_access_token
 from app.integrations.telecom.twilio import TelecomError
+from app.numbering.numbers.schemas import SupportedCountryResponse, UpsertSupportedCountryRequest
 from app.numbering.numbers.service import (
     NoStuckProvisioningError,
     NotDueForRenewalError,
+    list_supported_countries,
     mark_number_renewed,
     release_stuck_provisioning,
+    remove_supported_country,
     retry_provisioning,
+    upsert_supported_country,
 )
 from app.staff import service
 from app.staff.models import PlatformStaff, PlatformStaffRole
-from app.staff.schemas import AccountOverviewResponse, StaffLoginRequest, StaffTokenResponse
+from app.staff.schemas import AccessMatrixEntryResponse, AccountOverviewResponse, StaffLoginRequest, StaffTokenResponse
+from app.staff.service import LastGrantRemovalError, list_access_matrix
 from app.usage.schemas import CallingRateResponse, UpsertCallingRateRequest
 from app.usage.service import list_calling_rates, upsert_calling_rate
 
@@ -68,7 +73,7 @@ def list_stuck_provisioning(
 def retry_number_provisioning(
     number_id: str,
     db: Session = Depends(get_db),
-    staff: PlatformStaff = Depends(require_staff_role(PlatformStaffRole.SUPPORT, PlatformStaffRole.SUPER_ADMIN)),
+    staff: PlatformStaff = Depends(require_capability("numbers.manage_provisioning")),
 ):
     try:
         number = retry_provisioning(db, staff.id, number_id)
@@ -83,7 +88,7 @@ def retry_number_provisioning(
 def release_number_provisioning(
     number_id: str,
     db: Session = Depends(get_db),
-    staff: PlatformStaff = Depends(require_staff_role(PlatformStaffRole.SUPPORT, PlatformStaffRole.SUPER_ADMIN)),
+    staff: PlatformStaff = Depends(require_capability("numbers.manage_provisioning")),
 ):
     try:
         number = release_stuck_provisioning(db, staff.id, number_id)
@@ -107,7 +112,7 @@ def list_due_renewals(
 def mark_number_renewed_route(
     number_id: str,
     db: Session = Depends(get_db),
-    staff: PlatformStaff = Depends(require_staff_role(PlatformStaffRole.SUPPORT, PlatformStaffRole.SUPER_ADMIN)),
+    staff: PlatformStaff = Depends(require_capability("numbers.manage_renewal")),
 ):
     try:
         number = mark_number_renewed(db, staff.id, number_id)
@@ -128,11 +133,82 @@ def list_calling_rates_route(
 def upsert_calling_rate_route(
     payload: UpsertCallingRateRequest,
     db: Session = Depends(get_db),
-    _staff: PlatformStaff = Depends(require_staff_role(PlatformStaffRole.SUPER_ADMIN)),
+    _staff: PlatformStaff = Depends(require_capability("billing.manage_calling_rates")),
 ):
-    # SUPER_ADMIN only - pricing changes are a platform-wide decision, not
-    # a routine support action like the recovery endpoints above.
+    # SUPER_ADMIN only (via the matrix) - pricing changes are a platform-
+    # wide decision, not a routine support action like the recovery
+    # endpoints above.
     return upsert_calling_rate(
         db, country=payload.country, price_per_minute_cents=payload.price_per_minute_cents,
         currency=payload.currency,
     )
+
+
+@router.get("/countries", response_model=list[SupportedCountryResponse])
+def list_supported_countries_route(
+    db: Session = Depends(get_db),
+    _staff: PlatformStaff = Depends(get_current_staff),
+):
+    return list_supported_countries(db)
+
+
+@router.put("/countries", response_model=SupportedCountryResponse)
+def upsert_supported_country_route(
+    payload: UpsertSupportedCountryRequest,
+    db: Session = Depends(get_db),
+    _staff: PlatformStaff = Depends(require_capability("numbers.manage_country_list")),
+):
+    # SUPER_ADMIN only - expanding the launch country list is a compliance/
+    # commercial decision, same bar as a calling-rate change above.
+    return upsert_supported_country(db, code=payload.code, name=payload.name, sort_order=payload.sort_order)
+
+
+@router.delete("/countries/{code}", status_code=status.HTTP_204_NO_CONTENT)
+def remove_supported_country_route(
+    code: str,
+    db: Session = Depends(get_db),
+    _staff: PlatformStaff = Depends(require_capability("numbers.manage_country_list")),
+):
+    remove_supported_country(db, code)
+    return None
+
+
+@router.get("/access-matrix", response_model=list[AccessMatrixEntryResponse])
+def access_matrix_route(
+    db: Session = Depends(get_db),
+    _staff: PlatformStaff = Depends(get_current_staff),
+):
+    """Read-only visibility into the role x capability grid that actually
+    gates every sensitive staff action (see app.staff.models.
+    StaffCapabilityGrant's docstring) - the Commercial Billing Operating
+    Standard doc's "formal RBAC/segregation-of-duties matrix" ask, made
+    inspectable rather than only living as scattered require_capability(...)
+    calls across route files. Any staff role can view it (diagnostic, not
+    an approval action, same posture as /ops/provider-status) - granting
+    or revoking a role's access is the sensitive action, gated below."""
+    return list_access_matrix(db)
+
+
+@router.put("/access-matrix/{capability}/{role}", status_code=status.HTTP_204_NO_CONTENT)
+def grant_capability_route(
+    capability: str,
+    role: PlatformStaffRole,
+    db: Session = Depends(get_db),
+    staff: PlatformStaff = Depends(require_capability(service.MATRIX_MANAGEMENT_CAPABILITY)),
+):
+    service.grant_capability(db, capability=capability, role=role, actor=staff.id)
+    return None
+
+
+@router.delete("/access-matrix/{capability}/{role}", status_code=status.HTTP_204_NO_CONTENT)
+def revoke_capability_route(
+    capability: str,
+    role: PlatformStaffRole,
+    db: Session = Depends(get_db),
+    staff: PlatformStaff = Depends(require_capability(service.MATRIX_MANAGEMENT_CAPABILITY)),
+):
+    try:
+        service.revoke_capability(db, capability=capability, role=role, actor=staff.id)
+    except LastGrantRemovalError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e
+    return None

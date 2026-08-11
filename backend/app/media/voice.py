@@ -250,6 +250,8 @@ async def outbound_call(
         raise HTTPException(status_code=429, detail=str(e)) from e
     except risk_service.GeographicDispersionError as e:
         raise HTTPException(status_code=429, detail=str(e)) from e
+    except risk_service.SpendLimitExceededError as e:
+        raise HTTPException(status_code=429, detail=str(e)) from e
     except TelecomError as e:
         raise HTTPException(status_code=502, detail=str(e)) from e
 

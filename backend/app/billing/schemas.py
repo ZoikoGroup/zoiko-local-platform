@@ -72,3 +72,36 @@ class ZoikoNexReconciliationSummary(BaseModel):
     total_usage_events: int
     synced_usage_events: int
     unsynced_usage_events: int
+
+
+class ZoikoNexReconciliationRunResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    total_subscriptions: int
+    unsynced_subscriptions: int
+    total_usage_events: int
+    unsynced_usage_events: int
+    total_completed_calls: int
+    unmatched_completed_calls: int
+    exceptions_found: int
+    created_at: datetime
+
+
+class ZoikoNexReconciliationExceptionResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    run_id: str
+    account_id: str
+    exception_type: str
+    subject_id: str
+    detail: str
+    resolved_at: datetime | None
+    resolved_by: str | None
+    resolution_reason: str | None
+    created_at: datetime
+
+
+class ResolveReconciliationExceptionRequest(BaseModel):
+    reason: str

@@ -13,6 +13,8 @@ const NAV_ITEMS = [
   { href: "/staff/audit", label: "Audit Log" },
   { href: "/staff/providers", label: "Provider Status" },
   { href: "/staff/billing", label: "Billing (ZoikoNex)" },
+  { href: "/staff/risk", label: "Risk & Fraud" },
+  { href: "/staff/access-matrix", label: "Access Matrix" },
 ];
 
 export default function StaffConsoleLayout({ children }: { children: React.ReactNode }) {

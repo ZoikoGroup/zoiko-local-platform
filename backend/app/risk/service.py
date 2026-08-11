@@ -10,6 +10,7 @@ from app.media.models import CallDirection, CallRecord
 from app.numbering.numbers.service import suspend_numbers_for_account_by_system
 from app.risk.models import (
     BlockedDestination,
+    DeviceFingerprintSighting,
     FraudCase,
     FraudCaseStatus,
     FraudRule,
@@ -28,15 +29,18 @@ MAX_OUTBOUND_CALLS_PER_WINDOW = 20
 # fraud models"). Defaults are a conservative first pass, same caveat as the
 # velocity threshold above - a blocked-destination attempt is weighted higher
 # than a velocity hit because it's evidence of deliberate abuse (dialing a
-# known-bad prefix) rather than just a burst of otherwise-legitimate traffic.
-# These are only the FALLBACK - see get_signal_weight, which prefers a
-# staff-tunable FraudRule row over this dict, same "rules as data" doctrine
-# ComplianceRule already follows.
+# known-bad prefix) rather than just a burst of otherwise-legitimate traffic;
+# geographic dispersion and spend-limit signals sit between the two - real
+# IRSF/toll-abuse indicators, but each individually noisier than a
+# known-bad-prefix hit. These are only the FALLBACK - see get_signal_weight,
+# which prefers a staff-tunable FraudRule row over this dict, same "rules as
+# data" doctrine ComplianceRule already follows.
 RISK_SIGNAL_WINDOW_HOURS = 24
 _DEFAULT_WEIGHTS = {
     RiskSignalType.VELOCITY_EXCEEDED: 30,
     RiskSignalType.BLOCKED_DESTINATION_ATTEMPT: 40,
     RiskSignalType.GEOGRAPHIC_DISPERSION: 25,
+    RiskSignalType.SPEND_LIMIT_EXCEEDED: 35,
 }
 MAX_RISK_SCORE = 100
 AUTO_SUSPEND_THRESHOLD = 100
@@ -60,6 +64,23 @@ RISK_DECAY_HALF_LIFE_HOURS = 8.0
 GEOGRAPHIC_DISPERSION_WINDOW_MINUTES = 10
 GEOGRAPHIC_DISPERSION_COUNTRY_THRESHOLD = 5
 
+# Commercial Billing Operating Standard doc's "real-time fraud/toll-abuse
+# spend controls" - independent of call COUNT (velocity) or destination
+# (geographic dispersion), a compromised account can rack up cost fast via
+# a sustained string of calls to one expensive destination. Same
+# "conservative first pass, not a tuned production value" caveat as every
+# other threshold in this module - there's no real payment gateway yet to
+# calibrate against actual customer spend patterns.
+SPEND_WINDOW_HOURS = 24
+MAX_SPEND_CENTS_PER_WINDOW = 5000  # $50.00
+
+# Architecture doc §5 "Fraud and Risk: device fingerprinting" - detection
+# only, see RiskSignalType.DEVICE_FINGERPRINT_ABUSE's docstring for why this
+# never blocks signup/login itself. Same "conservative first pass" caveat as
+# every other threshold here.
+DEVICE_FINGERPRINT_WINDOW_HOURS = 24
+DEVICE_FINGERPRINT_ACCOUNT_THRESHOLD = 4
+
 # Inbound fraud/spam signal (Roadmap "AI-driven fraud/spam signals"): a real
 # customer calls one business; a robocall/spam campaign dials the same
 # number out to many businesses in a short window. Platform-wide (not
@@ -82,6 +103,12 @@ class VelocityLimitExceededError(Exception):
 class GeographicDispersionError(Exception):
     """Raised when an account's outbound calls fan out across too many
     distinct countries too quickly (IRSF pattern)."""
+
+
+class SpendLimitExceededError(Exception):
+    """Raised when an account's rated outbound-call spend in the trailing
+    window exceeds the configured threshold - Commercial Billing Operating
+    Standard doc's "real-time fraud/toll-abuse spend controls" ask."""
 
 
 class DestinationRuleConflictError(Exception):
@@ -196,7 +223,10 @@ def assert_geographic_dispersion_ok(db: Session, account_id: str, to_number: str
     account's outbound calls in the trailing window have touched
     GEOGRAPHIC_DISPERSION_COUNTRY_THRESHOLD+ distinct countries, counting
     the destination about to be dialed. Same "count existing, decide before
-    this one lands" shape as assert_outbound_velocity_ok."""
+    this one lands" shape as assert_outbound_velocity_ok. Uses a real
+    E.164 -> country resolution (phonenumbers), not a prefix-clustering
+    proxy - accurate enough to name the actual countries involved in the
+    recorded signal detail."""
     destination_country = _country_for_e164(to_number)
     if destination_country is None:
         return  # can't classify this destination's country - nothing to disperse-check
@@ -226,6 +256,36 @@ def assert_geographic_dispersion_ok(db: Session, account_id: str, to_number: str
         raise GeographicDispersionError(
             f"Outbound calling pattern blocked: {len(countries)} distinct countries dialed in "
             f"{GEOGRAPHIC_DISPERSION_WINDOW_MINUTES} minutes (limit {GEOGRAPHIC_DISPERSION_COUNTRY_THRESHOLD})"
+        )
+
+
+def assert_spend_limit_ok(db: Session, account_id: str) -> None:
+    """Commercial Billing Operating Standard doc's "real-time fraud/toll-
+    abuse spend controls" - sums UsageEvent.estimated_cost_cents (the same
+    rated figures app.usage.service.record_usage_event already writes) over
+    the trailing window, independent of call count or destination."""
+    from sqlalchemy import func as sa_func
+
+    from app.usage.models import UsageEvent
+
+    window_start = datetime.now(timezone.utc) - timedelta(hours=SPEND_WINDOW_HOURS)
+    total_cents = (
+        db.query(sa_func.coalesce(sa_func.sum(UsageEvent.estimated_cost_cents), 0))
+        .filter(
+            UsageEvent.account_id == account_id,
+            UsageEvent.created_at >= window_start,
+            UsageEvent.estimated_cost_cents.isnot(None),
+        )
+        .scalar()
+    )
+    if total_cents > MAX_SPEND_CENTS_PER_WINDOW:
+        record_risk_signal(
+            db, account_id=account_id, signal_type=RiskSignalType.SPEND_LIMIT_EXCEEDED,
+            detail=f"{total_cents}c rated usage in the last {SPEND_WINDOW_HOURS}h (limit {MAX_SPEND_CENTS_PER_WINDOW}c)",
+        )
+        raise SpendLimitExceededError(
+            f"Outbound call spend limit exceeded: {total_cents}c in the last {SPEND_WINDOW_HOURS}h "
+            f"(limit {MAX_SPEND_CENTS_PER_WINDOW}c)"
         )
 
 
@@ -425,6 +485,60 @@ def is_suspected_spam_caller(db: Session, from_number: str, candidate_account_id
     if candidate_account_id is not None:
         accounts.add(candidate_account_id)
     return len(accounts) >= INBOUND_SPAM_ACCOUNT_THRESHOLD
+
+
+def record_fingerprint_sighting(db: Session, *, fingerprint_hash: str, account_id: str) -> None:
+    """Called at signup (and optionally login) when the client sent a
+    fingerprint hash - see DeviceFingerprintSighting's docstring. A no-op at
+    the call site if the header is absent (never required), so this only
+    ever gets called with a real value."""
+    db.add(DeviceFingerprintSighting(fingerprint_hash=fingerprint_hash, account_id=account_id))
+    db.commit()
+
+
+def is_suspected_fingerprint_abuse(
+    db: Session, fingerprint_hash: str, candidate_account_id: str | None = None
+) -> bool:
+    """True when fingerprint_hash has touched DEVICE_FINGERPRINT_ACCOUNT_
+    THRESHOLD+ distinct accounts (platform-wide) within
+    DEVICE_FINGERPRINT_WINDOW_HOURS - the free-trial/quota abuse pattern of
+    one device spinning up many accounts. Same shape as
+    is_suspected_spam_caller; candidate_account_id folds in the account
+    that just signed up, before its own sighting row exists yet, for the
+    same reason documented there."""
+    window_start = datetime.now(timezone.utc) - timedelta(hours=DEVICE_FINGERPRINT_WINDOW_HOURS)
+    accounts = {
+        row[0]
+        for row in db.query(DeviceFingerprintSighting.account_id)
+        .filter(
+            DeviceFingerprintSighting.fingerprint_hash == fingerprint_hash,
+            DeviceFingerprintSighting.created_at >= window_start,
+        )
+        .distinct()
+        .all()
+    }
+    if candidate_account_id is not None:
+        accounts.add(candidate_account_id)
+    return len(accounts) >= DEVICE_FINGERPRINT_ACCOUNT_THRESHOLD
+
+
+def check_fingerprint_on_signup(db: Session, *, fingerprint_hash: str | None, account_id: str) -> None:
+    """Wired into signup (see app.numbering.identity.service.
+    create_account_with_owner) - records the sighting and raises a
+    RiskSignal if the fingerprint has now touched too many accounts. Never
+    raises/blocks: detection only, for the review queue
+    (open_fraud_case_if_needed), not a hard signup gate - a coarse
+    client-side fingerprint has real false-positive risk (shared office
+    network, family device)."""
+    if not fingerprint_hash:
+        return
+    if is_suspected_fingerprint_abuse(db, fingerprint_hash, candidate_account_id=account_id):
+        record_risk_signal(
+            db, account_id=account_id, signal_type=RiskSignalType.DEVICE_FINGERPRINT_ABUSE,
+            detail=f"fingerprint seen across {DEVICE_FINGERPRINT_ACCOUNT_THRESHOLD}+ accounts in "
+                   f"{DEVICE_FINGERPRINT_WINDOW_HOURS}h",
+        )
+    record_fingerprint_sighting(db, fingerprint_hash=fingerprint_hash, account_id=account_id)
 
 
 def add_blocked_destination(db: Session, *, prefix: str, reason: str, actor: str) -> BlockedDestination:

@@ -5,7 +5,7 @@ from sqlalchemy.orm import Session
 from app.core.database import get_db
 from app.core.security import decode_access_token
 from app.numbering.identity.models import User, UserRole
-from app.staff.models import PlatformStaff, PlatformStaffRole
+from app.staff.models import PlatformStaff, StaffCapabilityGrant
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
 api_key_header = APIKeyHeader(name="Authorization", auto_error=False)
@@ -112,17 +112,35 @@ def get_api_key_account_id(
     return key.account_id
 
 
-def require_staff_role(*roles: PlatformStaffRole):
-    """Segregation of duties within the ops console - e.g. only
-    COMPLIANCE_OFFICER/SUPER_ADMIN can approve/reject KYC cases; SUPPORT
-    staff are read-only. Returns a dependency, not a dependency itself -
-    use as Depends(require_staff_role(PlatformStaffRole.SUPER_ADMIN))."""
+def require_capability(capability: str):
+    """Data-driven segregation of duties (Commercial Billing Operating
+    Standard doc's "formal RBAC/segregation-of-duties matrix" ask) - see
+    app.staff.models.StaffCapabilityGrant's docstring. Looks up which
+    PlatformStaffRoles may perform `capability` from the
+    staff_capability_grants table instead of taking an explicit role list
+    as a Python argument at each call site, so who-can-do-what is data
+    (editable without a deploy) rather than scattered across route files.
+    Returns a dependency, not a dependency itself - use as
+    Depends(require_capability("billing.simulate_payment_event")).
 
-    def dependency(staff: PlatformStaff = Depends(get_current_staff)) -> PlatformStaff:
-        if staff.role not in roles:
+    Fails closed: a capability with zero configured grants (a seeding gap,
+    or a new route nobody granted yet) denies every role rather than
+    silently letting all staff through - the opposite failure mode would
+    turn a missing seed row into an unintended privilege escalation."""
+
+    def dependency(
+        staff: PlatformStaff = Depends(get_current_staff), db: Session = Depends(get_db)
+    ) -> PlatformStaff:
+        allowed_roles = {
+            row[0]
+            for row in db.query(StaffCapabilityGrant.role)
+            .filter(StaffCapabilityGrant.capability == capability)
+            .all()
+        }
+        if staff.role not in allowed_roles:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
-                detail=f"Requires one of: {', '.join(r.value for r in roles)}",
+                detail=f"Requires the '{capability}' capability",
             )
         return staff
 

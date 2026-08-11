@@ -1,7 +1,7 @@
 import enum
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, Enum, String, func
+from sqlalchemy import Boolean, DateTime, Enum, String, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -39,4 +39,29 @@ class PlatformStaff(Base):
         Enum(PlatformStaffRole, name="platform_staff_role_enum"), nullable=False
     )
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class StaffCapabilityGrant(Base):
+    """Architecture doc §10/§11 "segregation of duties for sensitive
+    actions," formalized as a queryable role x capability grid (the
+    Commercial Billing Operating Standard doc's explicit ask for a "formal
+    RBAC/segregation-of-duties matrix") instead of PlatformStaffRole
+    literals scattered as arguments across route files. Each row grants
+    one role permission to perform one named capability;
+    app.core.deps.require_capability looks this table up at request time -
+    the grid IS the authorization source of truth now, not the route code.
+    Seeded via migration to exactly match this codebase's pre-existing
+    require_staff_role(...) call sites (see that migration's docstring for
+    the full grid) - changing who can do what now means editing data, not
+    redeploying code."""
+
+    __tablename__ = "staff_capability_grants"
+    __table_args__ = (UniqueConstraint("capability", "role", name="uq_staff_capability_grant"),)
+
+    id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=new_uuid)
+    capability: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+    role: Mapped[PlatformStaffRole] = mapped_column(
+        Enum(PlatformStaffRole, name="platform_staff_role_enum"), nullable=False
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

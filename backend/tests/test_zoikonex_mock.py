@@ -4,7 +4,13 @@ import json
 from datetime import datetime, timedelta, timezone
 
 from app.billing import service
-from app.billing.models import Subscription, SubscriptionStatus, ZoikoNexSyncEvent, ZoikoNexSyncEventType
+from app.billing.models import (
+    Subscription,
+    SubscriptionStatus,
+    ZoikoNexReconciliationExceptionType,
+    ZoikoNexSyncEvent,
+    ZoikoNexSyncEventType,
+)
 from app.numbering.identity.models import Account, AccountType
 from app.staff import service as staff_service
 from app.staff.models import PlatformStaffRole
@@ -378,3 +384,266 @@ def test_reconciliation_route_returns_matching_counts(client, db_session):
     assert body["synced_subscriptions"] <= body["total_subscriptions"]
     assert body["synced_usage_events"] <= body["total_usage_events"]
     assert body["unsynced_subscriptions"] == body["total_subscriptions"] - body["synced_subscriptions"]
+
+
+# --- Reconciliation job (Architecture doc §9 "daily reconciliation jobs... exceptions must enter an operations queue") ---
+
+
+def test_reconciliation_run_finds_no_exceptions_when_everything_synced(db_session):
+    from app.usage.service import record_usage_event
+
+    account = _make_account(db_session, "Clean Reconciliation Co")
+    service.get_or_create_subscription(db_session, account.id)
+    record_usage_event(
+        db_session, account_id=account.id, event_type="call_seconds", quantity=5, unit="seconds",
+        country_band=None, idempotency_key="zn-recon-run-clean-1",
+    )
+
+    run = service.run_zoikonex_reconciliation(db_session)
+
+    # Subscriptions/usage events created by THIS test are fully synced -
+    # unlike exceptions_found below, these two counters aren't polluted by
+    # the shared dev DB's pre-existing call history, since this dev DB has
+    # no pre-existing subscription/usage-sync drift (only real leftover
+    # calls from manual end-to-end testing, which the carrier-evidence leg
+    # now legitimately flags - see the baseline-absorb pattern in the
+    # tests below for why exceptions_found isn't asserted == 0 here).
+    assert run.unsynced_subscriptions == 0
+    assert run.unsynced_usage_events == 0
+
+
+def test_reconciliation_run_detects_usage_event_missing_sync(db_session):
+    from app.usage.models import UsageEvent
+
+    # Absorbs whatever pre-existing drift already sits in this shared dev
+    # DB (e.g. real completed calls from manual end-to-end testing that
+    # the carrier-evidence leg below also watches) as "already open"
+    # before this test's own scenario, so exceptions_found below reflects
+    # only what THIS test adds - the environment isn't a pristine empty
+    # database, and other reconciliation tests in this file legitimately
+    # add their own drift too.
+    service.run_zoikonex_reconciliation(db_session)
+
+    account = _make_account(db_session, "Drifted Usage Co")
+    service.get_or_create_subscription(db_session, account.id)
+    # Bypasses record_usage_event (and therefore sync_usage_event_to_zoikonex)
+    # entirely, simulating the exact drift a sync failure after the usage
+    # event's own commit would leave behind.
+    event = UsageEvent(
+        account_id=account.id, event_type="call_seconds", quantity=10, unit="seconds",
+        country_band=None, idempotency_key="zn-recon-drift-usage-1",
+    )
+    db_session.add(event)
+    db_session.commit()
+    db_session.refresh(event)
+
+    run = service.run_zoikonex_reconciliation(db_session)
+
+    assert run.unsynced_usage_events == 1
+    assert run.exceptions_found == 1
+
+    exceptions = service.list_zoikonex_reconciliation_exceptions(db_session, resolved=False)
+    matching = [e for e in exceptions if e.subject_id == event.id]
+    assert len(matching) == 1
+    assert matching[0].exception_type == ZoikoNexReconciliationExceptionType.USAGE_EVENT_MISSING_SYNC
+    assert matching[0].account_id == account.id
+
+
+def test_reconciliation_run_detects_completed_call_missing_usage_event(db_session):
+    """The carrier-evidence leg (Commercial Billing Operating Standard
+    doc's "three-way reconciliation") - a CallRecord Twilio's own status-
+    callback marked completed, with no matching call_seconds UsageEvent,
+    is exactly the drift a failed/skipped app.media.service.
+    update_call_status usage-metering call would leave behind.
+
+    Baseline counts are captured first, not assumed to start at zero -
+    this shared dev DB carries real completed calls from manual end-to-end
+    testing elsewhere in the project, which this same carrier-evidence leg
+    legitimately also flags."""
+    from app.media.models import CallDirection, CallRecord
+
+    baseline = service.run_zoikonex_reconciliation(db_session)
+
+    account = _make_account(db_session, "Carrier Leg Co")
+    call = CallRecord(
+        account_id=account.id, direction=CallDirection.OUTBOUND,
+        from_number="+15550001111", to_number="+15550002222",
+        provider_call_sid="CAcarrierleg1", status="completed", duration=42,
+    )
+    db_session.add(call)
+    db_session.commit()
+    db_session.refresh(call)
+
+    run = service.run_zoikonex_reconciliation(db_session)
+
+    assert run.total_completed_calls == baseline.total_completed_calls + 1
+    assert run.unmatched_completed_calls == baseline.unmatched_completed_calls + 1
+    assert run.exceptions_found == 1  # baseline run above already absorbed any pre-existing drift as "open"
+
+    exceptions = service.list_zoikonex_reconciliation_exceptions(db_session, resolved=False)
+    matching = [e for e in exceptions if e.subject_id == call.id]
+    assert len(matching) == 1
+    assert matching[0].exception_type == ZoikoNexReconciliationExceptionType.CALL_RECORD_MISSING_USAGE_EVENT
+    assert matching[0].account_id == account.id
+
+
+def test_reconciliation_run_does_not_flag_a_completed_call_with_matching_usage_event(db_session):
+    from app.media.models import CallDirection, CallRecord
+    from app.usage.service import record_usage_event
+
+    baseline = service.run_zoikonex_reconciliation(db_session)
+
+    account = _make_account(db_session, "Carrier Leg Matched Co")
+    call = CallRecord(
+        account_id=account.id, direction=CallDirection.OUTBOUND,
+        from_number="+15550001111", to_number="+15550002222",
+        provider_call_sid="CAcarrierleg2", status="completed", duration=30,
+    )
+    db_session.add(call)
+    db_session.commit()
+
+    record_usage_event(
+        db_session, account_id=account.id, event_type="call_seconds", quantity=30, unit="seconds",
+        country_band=None, idempotency_key="call_seconds:CAcarrierleg2",
+    )
+
+    run = service.run_zoikonex_reconciliation(db_session)
+
+    assert run.total_completed_calls == baseline.total_completed_calls + 1
+    assert run.unmatched_completed_calls == baseline.unmatched_completed_calls
+
+
+def test_reconciliation_run_detects_subscription_missing_zoikonex_ref(db_session):
+    service.run_zoikonex_reconciliation(db_session)  # absorb pre-existing drift, see comment above
+
+    account = _make_account(db_session, "Drifted Subscription Co")
+    now = datetime.now(timezone.utc)
+    # Bypasses get_or_create_subscription (and therefore
+    # sync_subscription_to_zoikonex) entirely - zoikonex_ref stays NULL.
+    sub = Subscription(
+        account_id=account.id, plan_code="free_trial", status=SubscriptionStatus.TRIALING,
+        current_period_start=now, current_period_end=now + timedelta(days=30),
+    )
+    db_session.add(sub)
+    db_session.commit()
+
+    run = service.run_zoikonex_reconciliation(db_session)
+
+    assert run.unsynced_subscriptions == 1
+    assert run.exceptions_found == 1
+
+    exceptions = service.list_zoikonex_reconciliation_exceptions(db_session, resolved=False)
+    matching = [e for e in exceptions if e.subject_id == sub.id]
+    assert len(matching) == 1
+    assert matching[0].exception_type == ZoikoNexReconciliationExceptionType.SUBSCRIPTION_MISSING_ZOIKONEX_REF
+
+
+def test_reconciliation_rerun_does_not_duplicate_already_open_exceptions(db_session):
+    from app.usage.models import UsageEvent
+
+    service.run_zoikonex_reconciliation(db_session)  # absorb pre-existing drift, see comment above
+
+    account = _make_account(db_session, "Rerun Drift Co")
+    event = UsageEvent(
+        account_id=account.id, event_type="call_seconds", quantity=10, unit="seconds",
+        country_band=None, idempotency_key="zn-recon-rerun-1",
+    )
+    db_session.add(event)
+    db_session.commit()
+
+    first_run = service.run_zoikonex_reconciliation(db_session)
+    assert first_run.exceptions_found == 1
+
+    second_run = service.run_zoikonex_reconciliation(db_session)
+    assert second_run.exceptions_found == 0  # same drift, still open - not a new exception
+    assert second_run.unsynced_usage_events == 1  # but still reported as currently out of sync
+
+    open_exceptions = [
+        e for e in service.list_zoikonex_reconciliation_exceptions(db_session, resolved=False)
+        if e.subject_id == event.id
+    ]
+    assert len(open_exceptions) == 1
+
+
+def test_resolve_reconciliation_exception_requires_super_admin(client, db_session):
+    from app.usage.models import UsageEvent
+
+    account = _make_account(db_session, "Resolve Auth Co")
+    event = UsageEvent(
+        account_id=account.id, event_type="call_seconds", quantity=10, unit="seconds",
+        country_band=None, idempotency_key="zn-recon-resolve-auth-1",
+    )
+    db_session.add(event)
+    db_session.commit()
+    run = service.run_zoikonex_reconciliation(db_session)
+    exception_id = [e for e in service.list_zoikonex_reconciliation_exceptions(db_session) if e.run_id == run.id][0].id
+
+    support_token = _create_and_login_staff(db_session, client, "zoikonexrecon1@zoikolocal.com", role=PlatformStaffRole.SUPPORT)
+    response = client.post(
+        f"/billing/zoikonex/reconciliation/exceptions/{exception_id}/resolve",
+        json={"reason": "investigated, harmless test artifact"},
+        headers={"Authorization": f"Bearer {support_token}"},
+    )
+    assert response.status_code == 403
+
+
+def test_resolve_reconciliation_exception_succeeds_for_super_admin(client, db_session):
+    from app.usage.models import UsageEvent
+
+    account = _make_account(db_session, "Resolve Success Co")
+    event = UsageEvent(
+        account_id=account.id, event_type="call_seconds", quantity=10, unit="seconds",
+        country_band=None, idempotency_key="zn-recon-resolve-success-1",
+    )
+    db_session.add(event)
+    db_session.commit()
+    run = service.run_zoikonex_reconciliation(db_session)
+    exception_id = [e for e in service.list_zoikonex_reconciliation_exceptions(db_session) if e.run_id == run.id][0].id
+
+    admin_token = _create_and_login_staff(db_session, client, "zoikonexrecon2@zoikolocal.com", role=PlatformStaffRole.SUPER_ADMIN)
+    response = client.post(
+        f"/billing/zoikonex/reconciliation/exceptions/{exception_id}/resolve",
+        json={"reason": "confirmed test artifact, ignoring"},
+        headers={"Authorization": f"Bearer {admin_token}"},
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["resolved_by"] is not None
+    assert body["resolution_reason"] == "confirmed test artifact, ignoring"
+
+    unresolved = client.get(
+        "/billing/zoikonex/reconciliation/exceptions", params={"resolved": False},
+        headers={"Authorization": f"Bearer {admin_token}"},
+    ).json()
+    assert exception_id not in [e["id"] for e in unresolved]
+
+    resolved = client.get(
+        "/billing/zoikonex/reconciliation/exceptions", params={"resolved": True},
+        headers={"Authorization": f"Bearer {admin_token}"},
+    ).json()
+    assert exception_id in [e["id"] for e in resolved]
+
+
+def test_resolve_reconciliation_exception_returns_404_for_unknown_id(client, db_session):
+    admin_token = _create_and_login_staff(db_session, client, "zoikonexrecon3@zoikolocal.com", role=PlatformStaffRole.SUPER_ADMIN)
+    response = client.post(
+        "/billing/zoikonex/reconciliation/exceptions/00000000-0000-0000-0000-000000000000/resolve",
+        json={"reason": "no such exception"},
+        headers={"Authorization": f"Bearer {admin_token}"},
+    )
+    assert response.status_code == 404
+
+
+def test_run_reconciliation_route_accessible_to_any_staff_role(client, db_session):
+    account = _make_account(db_session, "Run Route Co")
+    service.get_or_create_subscription(db_session, account.id)
+
+    token = _create_and_login_staff(db_session, client, "zoikonexrecon4@zoikolocal.com", role=PlatformStaffRole.SUPPORT)
+    response = client.post("/billing/zoikonex/reconciliation/run", headers={"Authorization": f"Bearer {token}"})
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert "exceptions_found" in body
+
+    list_response = client.get("/billing/zoikonex/reconciliation/runs", headers={"Authorization": f"Bearer {token}"})
+    assert list_response.status_code == 200
+    assert any(run["id"] == body["id"] for run in list_response.json())

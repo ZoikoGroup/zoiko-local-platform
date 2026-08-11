@@ -36,6 +36,22 @@ class RiskSignalType(str, enum.Enum):
     # window, unlike a legitimate cross-border business's steadier spread -
     # see assert_geographic_dispersion_ok.
     GEOGRAPHIC_DISPERSION = "geographic_dispersion"
+    # Commercial Billing Operating Standard doc's "real-time fraud/toll-
+    # abuse spend controls" - a compromised account racking up outbound
+    # call cost far faster than normal, independent of call COUNT
+    # (velocity) or destination (geographic dispersion) - a sustained
+    # string of calls to one expensive premium-rate destination would
+    # trip this without necessarily tripping either of those. See
+    # assert_spend_limit_ok.
+    SPEND_LIMIT_EXCEEDED = "spend_limit_exceeded"
+    # Architecture doc §5 "Fraud and Risk: device fingerprinting" - the
+    # same browser/device signing up (or logging into) many distinct
+    # accounts in a short window, the classic free-trial/quota abuse
+    # pattern. Detection only (never blocks signup/login itself - a
+    # coarse client-side fingerprint has real false-positive risk, e.g.
+    # a shared office network or a family device) - see
+    # is_suspected_fingerprint_abuse.
+    DEVICE_FINGERPRINT_ABUSE = "device_fingerprint_abuse"
 
 
 class RiskSignal(Base):
@@ -97,6 +113,26 @@ class FraudCaseStatus(str, enum.Enum):
     OPEN = "open"
     CONFIRMED = "confirmed"
     CLEARED = "cleared"
+
+
+class DeviceFingerprintSighting(Base):
+    """Architecture doc §5 "Fraud and Risk: device fingerprinting" - one
+    row per signup/login where the client sent a fingerprint hash (see
+    frontend's coarse client-side fingerprint - navigator/screen/timezone,
+    no third-party fingerprinting SDK). Deliberately just a sightings log,
+    not a dedup/identity table - the fraud signal is "how many distinct
+    accounts has this fingerprint touched recently," computed from this
+    log by is_suspected_fingerprint_abuse, the same shape as
+    is_suspected_spam_caller's use of CallRecord."""
+
+    __tablename__ = "device_fingerprint_sightings"
+
+    id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=new_uuid)
+    fingerprint_hash: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    account_id: Mapped[str] = mapped_column(
+        UUID(as_uuid=False), ForeignKey("accounts.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
 
 
 class FraudCase(Base):

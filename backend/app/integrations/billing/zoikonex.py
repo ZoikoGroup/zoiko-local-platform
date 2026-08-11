@@ -24,9 +24,13 @@ module directly.
 
 import hashlib
 import hmac
+import math
 import uuid
 
+from sqlalchemy.orm import Session
+
 from app.core.config import settings
+from app.usage.models import DEFAULT_RATE_COUNTRY, CallingRate
 
 
 class ZoikoNexWebhookError(Exception):
@@ -65,3 +69,36 @@ def sync_usage_event(*, usage_event_id: str, account_id: str, event_type: str, q
     participant-minutes, AI processing units, storage, and premium
     number fees")."""
     return {"zoikonex_ref": f"zn_usage_{uuid.uuid4().hex[:16]}", "synced": True}
+
+
+def rate_usage_event(
+    db: Session, *, event_type: str, quantity: float, unit: str, country_band: str | None
+) -> dict:
+    """Mocks the other half of Usage sync: not just recording that usage
+    happened, but deciding what it costs. The Commercial Billing Operating
+    Standard doc (Section 19, "O1. What is ZoikoNex's role?") locks this
+    down explicitly: "All customer money calculations route through
+    documented ZoikoNex APIs/events" and lists ad-hoc retail pricing in
+    Zoiko Local service code as a P0 launch blocker. This used to be
+    computed inline in app.usage.service.record_usage_event - moved here
+    so the boundary is correct even though the engine behind it is still a
+    mock. Reads the same calling_rates reference table Zoiko Local
+    publishes as its own customer-facing rate card
+    (app.usage.service.list_calling_rates) - a real ZoikoNex would have
+    its own catalog, but the mock stands in with what's already published
+    rather than inventing a second one. Only call_seconds has a rate table
+    today; every other event_type returns no estimate rather than
+    guessing."""
+    if event_type != "call_seconds":
+        return {"estimated_cost_cents": None}
+
+    rate = None
+    if country_band is not None:
+        rate = db.query(CallingRate).filter(CallingRate.country == country_band).first()
+    if rate is None:
+        rate = db.query(CallingRate).filter(CallingRate.country == DEFAULT_RATE_COUNTRY).first()
+    if rate is None:
+        return {"estimated_cost_cents": None}
+
+    minutes = math.ceil(quantity / 60)
+    return {"estimated_cost_cents": minutes * rate.price_per_minute_cents}

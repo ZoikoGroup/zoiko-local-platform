@@ -111,3 +111,85 @@ class ZoikoNexSyncEvent(Base):
     # and skipped instead of double-applying a payment-state transition.
     external_event_id: Mapped[str | None] = mapped_column(String(100), nullable=True, unique=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+
+
+class ZoikoNexReconciliationRun(Base):
+    """Architecture doc §9: "daily reconciliation jobs compare Zoiko Local
+    entitlements and usage events with ZoikoNex invoices, payments, and
+    ledger state." Unlike get_zoikonex_reconciliation_summary (a live,
+    uncached aggregate count with no history), each run here is persisted -
+    same pattern as app.ops.models.SyntheticCheckRun - so staff can see
+    whether drift is growing or shrinking over time, not just its current
+    value. No scheduler exists in this codebase yet (see
+    app.ops.routes.run_synthetic_checks's docstring for the same gap), so
+    this is staff-triggered on demand rather than actually running daily.
+
+    total_completed_calls/unmatched_completed_calls are the third,
+    carrier-evidence leg the Commercial Billing Operating Standard doc's
+    "three-way reconciliation (Zoiko Local <-> ZoikoNex <-> carrier)" asks
+    for - CallRecord rows Twilio confirmed completed (real carrier
+    evidence, via the status-callback webhook) compared against the
+    UsageEvent Zoiko Local's own metering should have recorded for each
+    one. Still two-way against the ZoikoNex ledger itself (that side is
+    still a mock with nothing external to compare against), but this makes
+    the job genuinely three-record-source, not just Zoiko-Local-vs-itself.
+    """
+
+    __tablename__ = "zoikonex_reconciliation_runs"
+
+    id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=new_uuid)
+    total_subscriptions: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    unsynced_subscriptions: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    total_usage_events: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    unsynced_usage_events: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    total_completed_calls: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    unmatched_completed_calls: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # New exception rows created by THIS run - re-running while a prior
+    # exception is still open never double-counts it here (see
+    # app.billing.service.run_zoikonex_reconciliation), so this is "newly
+    # found drift," not "total open drift" (that's a live count via
+    # list_zoikonex_reconciliation_exceptions(resolved=False)).
+    exceptions_found: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+
+
+class ZoikoNexReconciliationExceptionType(str, enum.Enum):
+    SUBSCRIPTION_MISSING_ZOIKONEX_REF = "subscription_missing_zoikonex_ref"
+    USAGE_EVENT_MISSING_SYNC = "usage_event_missing_sync"
+    # The carrier-evidence leg - see ZoikoNexReconciliationRun's docstring.
+    CALL_RECORD_MISSING_USAGE_EVENT = "call_record_missing_usage_event"
+
+
+class ZoikoNexReconciliationException(Base):
+    """Architecture doc §9's "operations queue" for reconciliation
+    exceptions - one row per specific out-of-sync record (a Subscription
+    with no zoikonex_ref, a UsageEvent with no matching USAGE_SYNC ledger
+    row, or a carrier-confirmed completed call with no matching UsageEvent)
+    rather than only an aggregate count, so staff can work through them
+    individually. resolved_at/resolved_by/resolution_reason follow the
+    same "manual override reason" pattern the Architecture doc §10 calls
+    for under Business controls, matching this codebase's existing
+    number-renewal worklist (mark_number_renewed)."""
+
+    __tablename__ = "zoikonex_reconciliation_exceptions"
+
+    id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=new_uuid)
+    run_id: Mapped[str] = mapped_column(
+        UUID(as_uuid=False), ForeignKey("zoikonex_reconciliation_runs.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    account_id: Mapped[str] = mapped_column(UUID(as_uuid=False), nullable=False, index=True)
+    exception_type: Mapped[ZoikoNexReconciliationExceptionType] = mapped_column(
+        Enum(ZoikoNexReconciliationExceptionType, name="zoikonex_reconciliation_exception_type_enum"),
+        nullable=False, index=True,
+    )
+    # The Subscription.id or UsageEvent.id this exception is about,
+    # depending on exception_type - not a real FK since it points at
+    # different tables depending on type (same "polymorphic reference"
+    # tradeoff as AuditEvent.target being a free-form string).
+    subject_id: Mapped[str] = mapped_column(UUID(as_uuid=False), nullable=False, index=True)
+    detail: Mapped[str] = mapped_column(String(255), nullable=False)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    resolved_by: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    resolution_reason: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)

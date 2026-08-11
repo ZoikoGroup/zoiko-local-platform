@@ -1,5 +1,3 @@
-import math
-
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -35,14 +33,6 @@ def upsert_calling_rate(db: Session, *, country: str, price_per_minute_cents: in
     return rate
 
 
-def _estimate_call_cost_cents(db: Session, *, country_band: str | None, duration_seconds: float) -> int | None:
-    rate = get_calling_rate(db, country_band)
-    if rate is None:
-        return None
-    minutes = math.ceil(duration_seconds / 60)
-    return minutes * rate.price_per_minute_cents
-
-
 def record_usage_event(
     db: Session,
     *,
@@ -60,17 +50,16 @@ def record_usage_event(
     if existing is not None:
         return None
 
-    estimated_cost_cents = None
-    if event_type == "call_seconds":
-        estimated_cost_cents = _estimate_call_cost_cents(db, country_band=country_band, duration_seconds=quantity)
-
+    # estimated_cost_cents starts NULL - usage capture must never be
+    # blocked on rating, so the actual $ decision is made afterward by
+    # ZoikoNex (see sync_usage_event_to_zoikonex/zoikonex_adapter.
+    # rate_usage_event) rather than computed here ad hoc.
     event = UsageEvent(
         account_id=account_id,
         event_type=event_type,
         quantity=quantity,
-        unit=unit, 
+        unit=unit,
         country_band=country_band,
-        estimated_cost_cents=estimated_cost_cents,
         idempotency_key=idempotency_key,
     )
     db.add(event)
