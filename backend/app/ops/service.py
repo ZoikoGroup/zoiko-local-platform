@@ -13,7 +13,13 @@ from app.integrations.notifications import email as resend_email
 from app.integrations.storage import s3
 from app.integrations.telecom import twilio as telecom
 from app.integrations.video import livekit as video
-from app.ops.models import SyntheticCheckRun
+from app.notifications.service import (
+    notify_incident_declared,
+    notify_incident_resolved,
+    notify_incident_update,
+    notify_status_subscription_confirmed,
+)
+from app.ops.models import Incident, IncidentStatus, StatusSubscription, SyntheticCheckRun
 
 # Maps a provider-status entry name to the (circuit_state accessor,
 # failover_enabled setting) of the category it belongs to - only providers
@@ -201,3 +207,112 @@ def get_synthetic_check_summary(db: Session) -> dict:
             latest.append(run)
     overall_healthy = all(run.success for run in latest) if latest else True
     return {"overall_healthy": overall_healthy, "checks": latest}
+
+
+def _list_active_subscribers(db: Session) -> list:
+    from app.numbering.identity.models import User
+
+    account_ids = [
+        row[0] for row in db.query(StatusSubscription.account_id)
+        .filter(StatusSubscription.is_active.is_(True)).all()
+    ]
+    if not account_ids:
+        return []
+    return db.query(User).filter(User.account_id.in_(account_ids), User.email.isnot(None)).all()
+
+
+def create_incident(db: Session, *, title: str, affected_service: str, impact_summary: str) -> Incident:
+    incident = Incident(title=title, affected_service=affected_service, impact_summary=impact_summary)
+    db.add(incident)
+    db.commit()
+    db.refresh(incident)
+    for user in _list_active_subscribers(db):
+        notify_incident_declared(
+            db, account_id=user.account_id, account_email=user.email,
+            affected_service=affected_service, impact_summary=impact_summary,
+        )
+    return incident
+
+
+class IncidentNotFoundError(Exception):
+    """Raised when an incident id doesn't exist."""
+
+
+class IncidentAlreadyResolvedError(Exception):
+    """Raised when trying to update/resolve an incident that's already RESOLVED."""
+
+
+def update_incident(
+    db: Session, incident_id: str, *, status: IncidentStatus, impact_summary: str | None = None,
+    mitigation_summary: str | None = None,
+) -> Incident:
+    incident = db.query(Incident).filter(Incident.id == incident_id).first()
+    if incident is None:
+        raise IncidentNotFoundError(f"No such incident {incident_id!r}")
+    if incident.status == IncidentStatus.RESOLVED:
+        raise IncidentAlreadyResolvedError(f"Incident {incident_id} is already resolved")
+
+    incident.status = status
+    if impact_summary is not None:
+        incident.impact_summary = impact_summary
+    if mitigation_summary is not None:
+        incident.mitigation_summary = mitigation_summary
+    db.commit()
+    db.refresh(incident)
+    for user in _list_active_subscribers(db):
+        notify_incident_update(
+            db, account_id=user.account_id, account_email=user.email, incident_reference=incident.id,
+            status=incident.status.value, impact_summary=incident.impact_summary,
+            mitigation_summary=incident.mitigation_summary,
+        )
+    return incident
+
+
+def resolve_incident(db: Session, incident_id: str) -> Incident:
+    incident = db.query(Incident).filter(Incident.id == incident_id).first()
+    if incident is None:
+        raise IncidentNotFoundError(f"No such incident {incident_id!r}")
+    if incident.status == IncidentStatus.RESOLVED:
+        raise IncidentAlreadyResolvedError(f"Incident {incident_id} is already resolved")
+
+    incident.status = IncidentStatus.RESOLVED
+    incident.resolved_at = sa.func.now()
+    db.commit()
+    db.refresh(incident)
+    duration = incident.resolved_at - incident.started_at
+    for user in _list_active_subscribers(db):
+        notify_incident_resolved(
+            db, account_id=user.account_id, account_email=user.email, incident_reference=incident.id,
+            duration_summary=f"{int(duration.total_seconds() // 60)} minutes",
+        )
+    return incident
+
+
+def list_incidents(db: Session, *, limit: int = 50) -> list[Incident]:
+    """Public, unauthenticated - backs the status page's incident history,
+    same posture as get_public_status."""
+    return db.query(Incident).order_by(Incident.started_at.desc()).limit(limit).all()
+
+
+def subscribe_to_status(db: Session, account_id: str, account_email: str) -> StatusSubscription:
+    sub = db.query(StatusSubscription).filter(StatusSubscription.account_id == account_id).first()
+    if sub is None:
+        sub = StatusSubscription(account_id=account_id)
+        db.add(sub)
+    else:
+        sub.is_active = True
+    db.commit()
+    db.refresh(sub)
+    notify_status_subscription_confirmed(db, account_id=account_id, account_email=account_email)
+    return sub
+
+
+def unsubscribe_from_status(db: Session, account_id: str) -> None:
+    sub = db.query(StatusSubscription).filter(StatusSubscription.account_id == account_id).first()
+    if sub is not None:
+        sub.is_active = False
+        db.commit()
+
+
+def get_status_subscription(db: Session, account_id: str) -> StatusSubscription | None:
+    return db.query(StatusSubscription).filter(StatusSubscription.account_id == account_id).first()

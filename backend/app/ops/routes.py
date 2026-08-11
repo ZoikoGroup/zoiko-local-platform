@@ -2,7 +2,8 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
-from app.core.deps import get_current_staff
+from app.core.deps import get_current_staff, get_current_user, require_capability
+from app.numbering.identity.models import User
 from app.observability import service as observability_service
 from app.observability.schemas import (
     ErrorCountSummary,
@@ -12,7 +13,15 @@ from app.observability.schemas import (
     ProviderLatencySummary,
 )
 from app.ops import service
-from app.ops.schemas import SyntheticCheckRunResponse, SyntheticCheckSummaryResponse
+from app.ops.models import IncidentStatus
+from app.ops.schemas import (
+    CreateIncidentRequest,
+    IncidentResponse,
+    StatusSubscriptionResponse,
+    SyntheticCheckRunResponse,
+    SyntheticCheckSummaryResponse,
+    UpdateIncidentRequest,
+)
 from app.staff.models import PlatformStaff
 
 router = APIRouter(prefix="/ops", tags=["ops"])
@@ -135,3 +144,79 @@ async def public_status():
     provider names or raw error detail, only named components and a plain
     operational/degraded status."""
     return await service.get_public_status()
+
+
+@router.get("/incidents", response_model=list[IncidentResponse])
+def list_incidents(limit: int = 50, db: Session = Depends(get_db)):
+    """No auth - the status page's incident history, same posture as
+    /status."""
+    return service.list_incidents(db, limit=limit)
+
+
+@router.post("/incidents", response_model=IncidentResponse, status_code=status.HTTP_201_CREATED)
+def create_incident(
+    payload: CreateIncidentRequest,
+    db: Session = Depends(get_db),
+    _staff: PlatformStaff = Depends(require_capability("ops.manage_incidents")),
+):
+    return service.create_incident(
+        db, title=payload.title, affected_service=payload.affected_service, impact_summary=payload.impact_summary,
+    )
+
+
+@router.put("/incidents/{incident_id}", response_model=IncidentResponse)
+def update_incident(
+    incident_id: str,
+    payload: UpdateIncidentRequest,
+    db: Session = Depends(get_db),
+    _staff: PlatformStaff = Depends(require_capability("ops.manage_incidents")),
+):
+    try:
+        return service.update_incident(
+            db, incident_id, status=IncidentStatus(payload.status),
+            impact_summary=payload.impact_summary, mitigation_summary=payload.mitigation_summary,
+        )
+    except service.IncidentNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
+    except service.IncidentAlreadyResolvedError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e)) from e
+
+
+@router.post("/incidents/{incident_id}/resolve", response_model=IncidentResponse)
+def resolve_incident(
+    incident_id: str,
+    db: Session = Depends(get_db),
+    _staff: PlatformStaff = Depends(require_capability("ops.manage_incidents")),
+):
+    try:
+        return service.resolve_incident(db, incident_id)
+    except service.IncidentNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
+    except service.IncidentAlreadyResolvedError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e
+
+
+@router.post("/status-subscription", response_model=StatusSubscriptionResponse, status_code=status.HTTP_201_CREATED)
+def subscribe_to_status(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    return service.subscribe_to_status(db, current_user.account_id, current_user.email)
+
+
+@router.delete("/status-subscription", status_code=status.HTTP_204_NO_CONTENT)
+def unsubscribe_from_status(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    service.unsubscribe_from_status(db, current_user.account_id)
+
+
+@router.get("/status-subscription/me", response_model=StatusSubscriptionResponse | None)
+def get_my_status_subscription(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    return service.get_status_subscription(db, current_user.account_id)

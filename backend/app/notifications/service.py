@@ -1216,3 +1216,59 @@ def notify_account_suspended_for_risk(
             "case_reference": case_reference,
         },
     )
+
+
+def notify_incident_declared(
+    db: Session, *, account_id: str, account_email: str, affected_service: str, impact_summary: str
+) -> None:
+    send_notification(
+        db, event_name="ops.service_incident_declared", account_id=account_id, recipient_email=account_email,
+        context={
+            "user_display_name": account_email,
+            "incident_affected_service": affected_service,
+            "incident_started_local": _now_str(),
+            "incident_impact_summary": impact_summary,
+            "incident_status": "investigating",
+        },
+    )
+
+
+def notify_incident_update(
+    db: Session, *, account_id: str, account_email: str, incident_reference: str, status: str,
+    impact_summary: str, mitigation_summary: str | None,
+) -> None:
+    send_notification(
+        db, event_name="ops.incident_update", account_id=account_id, recipient_email=account_email,
+        context={
+            "user_display_name": account_email,
+            "incident_reference": incident_reference,
+            "incident_status": status,
+            "incident_impact_summary": impact_summary,
+            "incident_mitigation_summary": mitigation_summary or "Update in progress.",
+            "incident_next_update_at": "as soon as there's a material change",
+        },
+    )
+
+
+def notify_incident_resolved(
+    db: Session, *, account_id: str, account_email: str, incident_reference: str, duration_summary: str
+) -> None:
+    send_notification(
+        db, event_name="ops.incident_resolved", account_id=account_id, recipient_email=account_email,
+        context={
+            "user_display_name": account_email,
+            "incident_reference": incident_reference,
+            "incident_resolved_local": _now_str(),
+            "incident_duration_summary": duration_summary,
+        },
+    )
+
+
+def notify_status_subscription_confirmed(db: Session, *, account_id: str, account_email: str) -> None:
+    send_notification(
+        db, event_name="ops.status_subscription_confirmation", account_id=account_id, recipient_email=account_email,
+        context={
+            "user_display_name": account_email,
+            "status_subscription_summary": "all Zoiko Local service incidents",
+        },
+    )

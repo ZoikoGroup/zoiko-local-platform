@@ -1,11 +1,62 @@
+import enum
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, Float, String, Text, func
+from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, Float, String, Text, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import Base
 from app.core.ids import new_uuid
+
+
+class IncidentStatus(str, enum.Enum):
+    INVESTIGATING = "investigating"
+    MONITORING = "monitoring"
+    RESOLVED = "resolved"
+
+
+class Incident(Base):
+    """Email Communications System doc's OPS domain ("Service Incident
+    Declared" / "Incident Update" / "Incident Resolved") - the piece the
+    public status page (app.ops.service.get_public_status) was missing:
+    a persisted incident record subscribers actually get emailed about,
+    not just a live provider-health snapshot. Deliberately scoped to
+    real-time incidents only (declared as they're discovered, updated in
+    place, resolved) - scheduled maintenance announcements, emergency-
+    calling-specific notices, and regional/carrier-degradation framing are
+    separate OPS templates seeded registry-only for now, since they'd need
+    their own scheduling/classification concepts rather than fitting this
+    same lifecycle."""
+
+    __tablename__ = "incidents"
+
+    id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=new_uuid)
+    title: Mapped[str] = mapped_column(String(255), nullable=False)
+    affected_service: Mapped[str] = mapped_column(String(255), nullable=False)
+    status: Mapped[IncidentStatus] = mapped_column(
+        Enum(IncidentStatus, name="incident_status_enum"), nullable=False, default=IncidentStatus.INVESTIGATING
+    )
+    impact_summary: Mapped[str] = mapped_column(Text, nullable=False)
+    mitigation_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class StatusSubscription(Base):
+    """One account opted in to incident emails (OPS-009 "Status
+    Subscription Confirmation"). Not every account gets incident emails by
+    default - the doc frames this domain as opt-in ("Subscribed
+    operations"), unlike the rest of the notification estate."""
+
+    __tablename__ = "status_subscriptions"
+
+    id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=new_uuid)
+    account_id: Mapped[str] = mapped_column(
+        UUID(as_uuid=False), ForeignKey("accounts.id", ondelete="CASCADE"), unique=True, nullable=False, index=True
+    )
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
 class SyntheticCheckRun(Base):
