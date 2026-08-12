@@ -60,6 +60,17 @@ class CallRecord(Base):
     # app.risk.service.is_suspected_spam_caller). A real customer calls one
     # business; a robocall/spam campaign fans out across many.
     is_suspected_spam: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # Commercial Billing Operating Standard P0-8 "retail vs wholesale
+    # reconciliation" - Twilio's own real, documented Call resource price
+    # (what Twilio actually billed this account), not an estimate. NULL
+    # until a staff-triggered capture_wholesale_call_cost run fetches it
+    # (see app.billing.service) - there is no scheduler in this codebase,
+    # same "staff-triggered, no cron yet" posture as run_zoikonex_
+    # reconciliation. Stored as a positive integer of minor currency units
+    # (Twilio reports it as a negative decimal string, e.g. "-0.03000");
+    # the sign is a debit/credit convention, not information worth keeping.
+    wholesale_cost_cents: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    wholesale_currency: Mapped[str | None] = mapped_column(String(3), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 

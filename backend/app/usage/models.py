@@ -83,5 +83,19 @@ class UsageEvent(Base):
     # historical usage. Bumped only when the rule in record_usage_event
     # actually changes.
     meter_version: Mapped[str] = mapped_column(String(20), nullable=False, server_default="v1")
+    # Commercial Billing Operating Standard P0-8 "rating versioning" - a
+    # distinct concept from `meter_version` above: this pins which version of
+    # the *rate catalog* (CallingRate) priced the event, not which rule
+    # rounded/floored it. A fixed literal, not a real versioning system
+    # (CallingRate has no history table; upsert_calling_rate mutates in
+    # place - see its docstring), same honest "only one version exists so
+    # far" posture as ZoikoNex's own catalog_version_id="v1" elsewhere in
+    # this codebase. Recorded alongside estimated_cost_cents at rating time
+    # (see app.billing.service.sync_usage_event_to_zoikonex) - NULL until
+    # rated, same lifecycle as estimated_cost_cents itself, so a query can
+    # tell "not yet rated" apart from "rated under an unversioned catalog"
+    # (there is no such state once this exists).
+    rate_meter_version: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    rated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     idempotency_key: Mapped[str] = mapped_column(String(255), unique=True, nullable=False, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

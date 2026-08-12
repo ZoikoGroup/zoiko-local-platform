@@ -175,6 +175,30 @@ def list_zoikonex_reconciliation_exceptions(
     return service.list_zoikonex_reconciliation_exceptions(db, resolved=resolved, limit=limit)
 
 
+@router.post("/zoikonex/reconciliation/wholesale-cost-capture/run")
+def run_wholesale_cost_capture(
+    limit: int = 50,
+    db: Session = Depends(get_db),
+    _staff: PlatformStaff = Depends(get_current_staff),
+):
+    """P0-8 "retail vs wholesale reconciliation" - fetches Twilio's own real
+    Call resource price for completed calls missing a wholesale cost.
+    Staff-triggered, same diagnostic (not approval-action) posture as
+    /zoikonex/reconciliation/run above - there's no scheduler in this
+    codebase to run it automatically yet."""
+    return service.capture_wholesale_call_cost(db, limit=limit)
+
+
+@router.get("/zoikonex/reconciliation/wholesale-summary")
+def zoikonex_wholesale_reconciliation_summary(
+    db: Session = Depends(get_db),
+    _staff: PlatformStaff = Depends(get_current_staff),
+):
+    """Retail-vs-wholesale margin summary - read-only, so any staff role
+    can view it, same bar as /zoikonex/reconciliation above."""
+    return service.get_wholesale_reconciliation_summary(db)
+
+
 @router.post(
     "/zoikonex/reconciliation/exceptions/{exception_id}/resolve",
     response_model=ZoikoNexReconciliationExceptionResponse,

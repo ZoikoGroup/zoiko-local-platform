@@ -543,6 +543,227 @@ def test_reconciliation_run_does_not_flag_a_completed_call_with_matching_usage_e
     assert run.unmatched_completed_calls == baseline.unmatched_completed_calls
 
 
+def test_reconciliation_run_flags_a_usage_event_recorded_long_after_the_call(db_session):
+    """P0-8 late-event detection - a call_seconds UsageEvent is matched (not
+    CALL_RECORD_MISSING_USAGE_EVENT), but its own created_at lands more than
+    LATE_EVENT_THRESHOLD after the call it bills for, which is exactly the
+    drift a delayed/retried status-callback would leave behind.
+
+    CallRecord.created_at is backdated manually after insert - Postgres
+    freezes now() per-transaction, so the call and its usage event would
+    otherwise get an identical timestamp within this one test transaction
+    (same fix as test_billing_cycle.py's most-recently-created ordering
+    test)."""
+    from app.media.models import CallDirection, CallRecord
+    from app.usage.service import record_usage_event
+
+    baseline = service.run_zoikonex_reconciliation(db_session)
+
+    account = _make_account(db_session, "Late Usage Event Co")
+    call = CallRecord(
+        account_id=account.id, direction=CallDirection.OUTBOUND,
+        from_number="+15550001111", to_number="+15550002222",
+        provider_call_sid="CAlateusage1", status="completed", duration=30,
+    )
+    db_session.add(call)
+    db_session.commit()
+    db_session.refresh(call)
+    call.created_at = datetime.now(timezone.utc) - timedelta(hours=30)
+    db_session.commit()
+
+    record_usage_event(
+        db_session, account_id=account.id, event_type="call_seconds", quantity=30, unit="seconds",
+        country_band=None, idempotency_key="call_seconds:CAlateusage1",
+    )
+
+    run = service.run_zoikonex_reconciliation(db_session)
+
+    assert run.unmatched_completed_calls == baseline.unmatched_completed_calls  # matched, not missing
+    assert run.late_usage_events == baseline.late_usage_events + 1
+
+    exceptions = service.list_zoikonex_reconciliation_exceptions(db_session, resolved=False)
+    matching = [e for e in exceptions if e.exception_type == ZoikoNexReconciliationExceptionType.LATE_USAGE_EVENT]
+    assert len(matching) == 1
+    assert matching[0].account_id == account.id
+
+
+def test_reconciliation_run_does_not_flag_a_usage_event_recorded_promptly(db_session):
+    from app.media.models import CallDirection, CallRecord
+    from app.usage.service import record_usage_event
+
+    baseline = service.run_zoikonex_reconciliation(db_session)
+
+    account = _make_account(db_session, "Prompt Usage Event Co")
+    call = CallRecord(
+        account_id=account.id, direction=CallDirection.OUTBOUND,
+        from_number="+15550001111", to_number="+15550002222",
+        provider_call_sid="CApromptusage1", status="completed", duration=30,
+    )
+    db_session.add(call)
+    db_session.commit()
+
+    record_usage_event(
+        db_session, account_id=account.id, event_type="call_seconds", quantity=30, unit="seconds",
+        country_band=None, idempotency_key="call_seconds:CApromptusage1",
+    )
+
+    run = service.run_zoikonex_reconciliation(db_session)
+
+    assert run.late_usage_events == baseline.late_usage_events
+
+
+# --- Wholesale call cost capture (P0-8 "retail vs wholesale reconciliation") ---
+
+
+def test_capture_wholesale_call_cost_stores_twilios_real_price(db_session, monkeypatch):
+    """Scoping the mock by call_sid (rather than returning the same price
+    for every call) matters here: this shared dev DB carries other
+    completed calls with no wholesale cost yet from earlier tests/manual
+    testing in this same reconciliation suite (see the carrier-leg tests'
+    own baseline-pattern comment above), and they'd otherwise get swept
+    into this run and stamped with a price that was never really theirs.
+    limit=1000 makes sure this test's own (newest, so last-in-order) call
+    is still within the batch even if that backlog is non-trivial."""
+    from app.media.models import CallDirection, CallRecord
+
+    account = _make_account(db_session, "Wholesale Capture Co")
+    call = CallRecord(
+        account_id=account.id, direction=CallDirection.OUTBOUND,
+        from_number="+15550001111", to_number="+15550002222",
+        provider_call_sid="CAwholesale1", status="completed", duration=60,
+    )
+    db_session.add(call)
+    db_session.commit()
+
+    def _get_call(call_sid):
+        if call_sid == "CAwholesale1":
+            return {"sid": call_sid, "price": "-0.03500", "price_unit": "usd"}
+        return {"sid": call_sid, "price": None, "price_unit": None}
+
+    monkeypatch.setattr("app.billing.service.telecom.get_call", _get_call)
+
+    result = service.capture_wholesale_call_cost(db_session, limit=1000)
+
+    assert result["captured"] >= 1
+    db_session.refresh(call)
+    assert call.wholesale_cost_cents == 4  # round(0.035 * 100) = 3.5 -> 4
+    assert call.wholesale_currency == "USD"
+
+
+def test_capture_wholesale_call_cost_leaves_a_not_yet_rated_call_alone(db_session, monkeypatch):
+    from app.media.models import CallDirection, CallRecord
+
+    account = _make_account(db_session, "Wholesale Not Rated Co")
+    call = CallRecord(
+        account_id=account.id, direction=CallDirection.OUTBOUND,
+        from_number="+15550001111", to_number="+15550002222",
+        provider_call_sid="CAwholesale2", status="completed", duration=60,
+    )
+    db_session.add(call)
+    db_session.commit()
+
+    monkeypatch.setattr(
+        "app.billing.service.telecom.get_call",
+        lambda call_sid: {"sid": call_sid, "price": None, "price_unit": None},
+    )
+
+    result = service.capture_wholesale_call_cost(db_session, limit=1000)
+
+    assert result["captured"] == 0  # this mock never returns a price, for this call or any other
+    db_session.refresh(call)
+    assert call.wholesale_cost_cents is None
+
+
+def test_capture_wholesale_call_cost_counts_a_telecom_error_and_moves_on(db_session, monkeypatch):
+    from app.media.models import CallDirection, CallRecord
+    from app.integrations.telecom.twilio import TelecomError
+
+    account = _make_account(db_session, "Wholesale Error Co")
+    call = CallRecord(
+        account_id=account.id, direction=CallDirection.OUTBOUND,
+        from_number="+15550001111", to_number="+15550002222",
+        provider_call_sid="CAwholesale3", status="completed", duration=60,
+    )
+    db_session.add(call)
+    db_session.commit()
+
+    def _raise(call_sid):
+        raise TelecomError("boom")
+
+    monkeypatch.setattr("app.billing.service.telecom.get_call", _raise)
+
+    result = service.capture_wholesale_call_cost(db_session, limit=1000)
+
+    assert result["errors"] >= 1
+    assert result["captured"] == 0
+    db_session.refresh(call)
+    assert call.wholesale_cost_cents is None
+
+
+def test_wholesale_reconciliation_summary_compares_retail_and_wholesale(db_session):
+    from app.media.models import CallDirection, CallRecord
+    from app.usage.service import record_usage_event
+
+    baseline = service.get_wholesale_reconciliation_summary(db_session)
+
+    account = _make_account(db_session, "Wholesale Summary Co")
+    call = CallRecord(
+        account_id=account.id, direction=CallDirection.OUTBOUND,
+        from_number="+15550001111", to_number="+15550002222",
+        provider_call_sid="CAwholesale4", status="completed", duration=60,
+        wholesale_cost_cents=4, wholesale_currency="USD",
+    )
+    db_session.add(call)
+    db_session.commit()
+
+    event = record_usage_event(
+        db_session, account_id=account.id, event_type="call_seconds", quantity=60, unit="seconds",
+        country_band=None, idempotency_key="call_seconds:CAwholesale4",
+    )
+    event.estimated_cost_cents = 10
+    db_session.commit()
+
+    summary = service.get_wholesale_reconciliation_summary(db_session)
+
+    assert summary["calls_with_wholesale_cost"] == baseline["calls_with_wholesale_cost"] + 1
+    assert summary["retail_cost_cents"] == baseline["retail_cost_cents"] + 10
+    assert summary["wholesale_cost_cents"] == baseline["wholesale_cost_cents"] + 4
+
+
+def test_wholesale_reconciliation_summary_counts_missing_wholesale_cost(db_session):
+    from app.media.models import CallDirection, CallRecord
+
+    baseline = service.get_wholesale_reconciliation_summary(db_session)
+
+    account = _make_account(db_session, "Wholesale Missing Co")
+    call = CallRecord(
+        account_id=account.id, direction=CallDirection.OUTBOUND,
+        from_number="+15550001111", to_number="+15550002222",
+        provider_call_sid="CAwholesale5", status="completed", duration=60,
+    )
+    db_session.add(call)
+    db_session.commit()
+
+    summary = service.get_wholesale_reconciliation_summary(db_session)
+
+    assert summary["calls_missing_wholesale_cost"] == baseline["calls_missing_wholesale_cost"] + 1
+
+
+def test_wholesale_cost_capture_route_requires_staff_auth(client):
+    response = client.post("/billing/zoikonex/reconciliation/wholesale-cost-capture/run")
+    assert response.status_code == 401
+
+
+def test_wholesale_summary_route_returns_data_for_any_staff_role(client, db_session):
+    token = _create_and_login_staff(
+        db_session, client, "wholesalesummarystaff@zoikolocal.com", role=PlatformStaffRole.SUPPORT
+    )
+    response = client.get("/billing/zoikonex/reconciliation/wholesale-summary", headers={"Authorization": f"Bearer {token}"})
+    assert response.status_code == 200
+    body = response.json()
+    assert "calls_with_wholesale_cost" in body
+
+
 def test_reconciliation_run_detects_subscription_missing_zoikonex_ref(db_session):
     service.run_zoikonex_reconciliation(db_session)  # absorb pre-existing drift, see comment above
 

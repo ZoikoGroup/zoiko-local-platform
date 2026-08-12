@@ -184,6 +184,10 @@ class ZoikoNexReconciliationRun(Base):
     unsynced_usage_events: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     total_completed_calls: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     unmatched_completed_calls: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # P0-8 "late-event policy" - matched (unlike unmatched_completed_calls
+    # above) but recorded past LATE_EVENT_THRESHOLD after the call
+    # completed.
+    late_usage_events: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     # New exception rows created by THIS run - re-running while a prior
     # exception is still open never double-counts it here (see
     # app.billing.service.run_zoikonex_reconciliation), so this is "newly
@@ -198,6 +202,13 @@ class ZoikoNexReconciliationExceptionType(str, enum.Enum):
     USAGE_EVENT_MISSING_SYNC = "usage_event_missing_sync"
     # The carrier-evidence leg - see ZoikoNexReconciliationRun's docstring.
     CALL_RECORD_MISSING_USAGE_EVENT = "call_record_missing_usage_event"
+    # Commercial Billing Operating Standard P0-8 "late-event policy" - the
+    # usage event DOES exist (unlike the type above), but wasn't recorded
+    # until well after the underlying call completed. Flagged, not
+    # silently accepted, because a late event landing after its billing
+    # period has already closed and been invoiced needs a human decision
+    # (credit the current period vs. hold for the next one), not a guess.
+    LATE_USAGE_EVENT = "late_usage_event"
 
 
 class ZoikoNexReconciliationException(Base):

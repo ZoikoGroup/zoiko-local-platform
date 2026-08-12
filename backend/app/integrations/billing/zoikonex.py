@@ -411,6 +411,14 @@ def _iso_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+# Commercial Billing Operating Standard P0-8 "rating versioning" - a fixed
+# literal, not a real versioning system (CallingRate has no history table;
+# upsert_calling_rate mutates in place). Bump this string the day a real
+# rate-history mechanism exists and old UsageEvent rows need to stay
+# distinguishable from ones rated under the new logic.
+CALLING_RATE_METER_VERSION = "callingrate-v1"
+
+
 def rate_usage_event(
     db: Session, *, event_type: str, quantity: float, unit: str, country_band: str | None
 ) -> dict:
