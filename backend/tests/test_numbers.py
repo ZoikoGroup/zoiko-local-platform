@@ -699,6 +699,26 @@ def test_create_checkout_session_returns_stripe_hosted_url(client, monkeypatch):
     assert body["url"] == "https://checkout.stripe.com/c/pay/cs_test_123"
 
 
+def test_non_commercial_account_cannot_create_a_checkout_session(client, db_session, monkeypatch):
+    """Commercial Billing Operating Standard doc COM-03: non-commercial
+    billing_classification accounts (DEMO/SANDBOX/etc.) must never create
+    a live charge, even if everything else about the request is valid."""
+    from app.numbering.identity.models import Account, AccountBillingClassification
+
+    monkeypatch.setattr("app.core.config.settings.stripe_payments_secret_key", "rk_test_fake")
+    token = _signup_and_login(client, "checkoutdemo@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    account_id = client.get("/auth/me", headers=headers).json()["account_id"]
+    _reserve(client, headers, "+15550013005")
+
+    account = db_session.query(Account).filter(Account.id == account_id).first()
+    account.billing_classification = AccountBillingClassification.DEMO
+    db_session.commit()
+
+    response = client.post("/numbers/+15550013005/checkout-session", headers=headers)
+    assert response.status_code == 403
+
+
 def test_create_checkout_session_returns_502_when_stripe_call_fails(client, monkeypatch):
     from app.integrations.billing.stripe_checkout import PaymentError
 

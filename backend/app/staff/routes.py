@@ -29,12 +29,19 @@ from app.numbering.numbers.service import (
     remove_number_eligibility_rule,
     remove_supported_country,
     retry_provisioning,
+    seed_market_release_registry,
     upsert_number_eligibility_rule,
     upsert_supported_country,
 )
 from app.staff import service
 from app.staff.models import PlatformStaff, PlatformStaffRole
-from app.staff.schemas import AccessMatrixEntryResponse, AccountOverviewResponse, StaffLoginRequest, StaffTokenResponse
+from app.staff.schemas import (
+    AccessMatrixEntryResponse,
+    AccountOverviewResponse,
+    StaffLoginRequest,
+    StaffTokenResponse,
+    UpdateAccountBillingClassificationRequest,
+)
 from app.staff.service import LastGrantRemovalError, list_access_matrix
 from app.usage.schemas import CallingRateResponse, UpsertCallingRateRequest
 from app.usage.service import list_calling_rates, upsert_calling_rate
@@ -61,6 +68,36 @@ def list_accounts(
     _staff: PlatformStaff = Depends(get_current_staff),
 ):
     return service.list_accounts_overview(db)
+
+
+@router.put("/accounts/{account_id}/billing-classification", response_model=AccountOverviewResponse)
+def update_account_billing_classification(
+    account_id: str,
+    payload: UpdateAccountBillingClassificationRequest,
+    db: Session = Depends(get_db),
+    staff: PlatformStaff = Depends(require_capability("staff.manage_billing_classification")),
+):
+    """Commercial Billing Operating Standard doc P0 blocker - marks an
+    account as something other than the COMMERCIAL_STANDALONE default
+    (DEMO, SANDBOX, PARTNER_SPONSORED, etc.). SUPER_ADMIN-only capability -
+    misclassifying an account either lets it dodge real billing it should
+    have, or exposes a demo/test account to live charges."""
+    from app.numbering.identity.models import AccountBillingClassification, AccountBillingSource
+
+    try:
+        classification = AccountBillingClassification(payload.billing_classification)
+        source = AccountBillingSource(payload.billing_source)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e)) from e
+
+    try:
+        service.update_account_billing_classification(
+            db, account_id, billing_classification=classification, billing_source=source, actor=staff.id,
+        )
+    except service.AccountNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
+
+    return service.get_account_overview(db, account_id)
 
 
 @router.get("/numbers/search")
@@ -208,6 +245,9 @@ def upsert_number_eligibility_rule_route(
     return upsert_number_eligibility_rule(
         db, country=payload.country, number_type=payload.number_type,
         required_evidence=payload.required_evidence, is_active=payload.is_active,
+        emergency_calling_supported=payload.emergency_calling_supported,
+        recording_supported=payload.recording_supported,
+        allowed_calling_directions=payload.allowed_calling_directions,
     )
 
 
@@ -218,6 +258,18 @@ def remove_number_eligibility_rule_route(
     _staff: PlatformStaff = Depends(require_capability("numbers.manage_eligibility_rules")),
 ):
     remove_number_eligibility_rule(db, rule_id)
+
+
+@router.post("/number-eligibility-rules/seed-market-registry", response_model=list[NumberEligibilityRuleResponse])
+def seed_market_release_registry_route(
+    db: Session = Depends(get_db),
+    _staff: PlatformStaff = Depends(require_capability("numbers.manage_eligibility_rules")),
+):
+    """Commercial Billing Operating Standard P0-2 - seeds a market/release
+    registry row for every currently-supported country's 'local' numbers.
+    Idempotent, safe to re-run after a new country is added to the
+    supported list."""
+    return seed_market_release_registry(db)
     return None
 
 

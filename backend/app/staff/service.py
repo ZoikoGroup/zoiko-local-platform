@@ -72,10 +72,62 @@ def list_accounts_overview(db: Session) -> list[dict]:
             "owner_email": owners.get(account.id),
             "member_count": member_counts.get(account.id, 0),
             "number_count": number_counts.get(account.id, 0),
+            "billing_classification": account.billing_classification,
+            "billing_source": account.billing_source,
             "created_at": account.created_at,
         }
         for account in accounts
     ]
+
+
+class AccountNotFoundError(Exception):
+    """Raised when an account id doesn't exist."""
+
+
+def get_account_overview(db: Session, account_id: str) -> dict:
+    """Single-account counterpart to list_accounts_overview - avoids
+    pulling every account just to return one, e.g. right after a billing-
+    classification update."""
+    account = db.query(Account).filter(Account.id == account_id).first()
+    if account is None:
+        raise AccountNotFoundError(f"No such account: {account_id!r}")
+    owner = db.query(User).filter(User.account_id == account_id, User.role == UserRole.OWNER).first()
+    return {
+        "id": account.id,
+        "name": account.name,
+        "account_type": account.account_type,
+        "owner_email": owner.email if owner else None,
+        "member_count": db.query(User).filter(User.account_id == account_id).count(),
+        "number_count": db.query(PhoneNumber).filter(PhoneNumber.account_id == account_id).count(),
+        "billing_classification": account.billing_classification,
+        "billing_source": account.billing_source,
+        "created_at": account.created_at,
+    }
+
+
+def update_account_billing_classification(
+    db: Session, account_id: str, *, billing_classification, billing_source, actor: str
+) -> Account:
+    """Commercial Billing Operating Standard doc's P0 blocker: every
+    account needs a real billing_classification/billing_source, settable
+    by staff for the non-default cases (marking an account DEMO, SANDBOX,
+    a PARTNER_SPONSORED deal, etc.) - see Account model's docstring for
+    why the public signup path only ever creates COMMERCIAL_STANDALONE."""
+    account = db.query(Account).filter(Account.id == account_id).first()
+    if account is None:
+        raise AccountNotFoundError(f"No such account: {account_id!r}")
+
+    before = {"billing_classification": account.billing_classification.value, "billing_source": account.billing_source.value}
+    account.billing_classification = billing_classification
+    account.billing_source = billing_source
+    db.commit()
+    db.refresh(account)
+    log_event(
+        db, actor=actor, action="account.billing_classification_updated", target=f"account:{account.id}",
+        before=before,
+        after={"billing_classification": billing_classification.value, "billing_source": billing_source.value},
+    )
+    return account
 
 
 def list_stuck_provisioning(db: Session) -> list[dict]:

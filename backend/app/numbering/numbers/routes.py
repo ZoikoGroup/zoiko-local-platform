@@ -140,6 +140,8 @@ def create_checkout_session(
         return service.create_number_purchase_checkout_session(db, current_user.account_id, e164)
     except NumberConflictError as e:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e
+    except service.NonCommercialAccountError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e)) from e
     except stripe_checkout.PaymentError as e:
         raise HTTPException(status_code=502, detail=str(e)) from e
 
