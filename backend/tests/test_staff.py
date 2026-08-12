@@ -133,6 +133,84 @@ def test_staff_can_list_accounts_with_owner_and_counts(client, db_session):
     assert match["owner_email"] == "overviewowner@example.com"
     assert match["member_count"] == 2
     assert match["number_count"] == 0
+    # Commercial Billing Operating Standard doc P0 - every account is
+    # classified from creation, not left "unclassified".
+    assert match["billing_classification"] == "commercial_standalone"
+    assert match["billing_source"] == "direct_zoiko_local"
+
+
+def test_super_admin_can_update_an_accounts_billing_classification(client, db_session):
+    signup = client.post(
+        "/auth/signup",
+        json={
+            "account_name": "Reclassify Co", "account_type": "business",
+            "email": "reclassifyowner@example.com", "password": "supersecret123",
+        },
+    )
+    account_id = signup.json()["account_id"]
+
+    _create_staff(db_session, "staffreclassify1@zoikolocal.com")
+    staff_token = client.post(
+        "/staff/login", json={"email": "staffreclassify1@zoikolocal.com", "password": "staffpass123"}
+    ).json()["access_token"]
+
+    response = client.put(
+        f"/staff/accounts/{account_id}/billing-classification",
+        json={"billing_classification": "demo", "billing_source": "direct_zoiko_local"},
+        headers={"Authorization": f"Bearer {staff_token}"},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["billing_classification"] == "demo"
+
+    listed = client.get("/staff/accounts", headers={"Authorization": f"Bearer {staff_token}"}).json()
+    match = next(a for a in listed if a["id"] == account_id)
+    assert match["billing_classification"] == "demo"
+
+
+def test_non_super_admin_staff_cannot_update_billing_classification(client, db_session):
+    signup = client.post(
+        "/auth/signup",
+        json={
+            "account_name": "Reclassify Deny Co", "account_type": "business",
+            "email": "reclassifydenyowner@example.com", "password": "supersecret123",
+        },
+    )
+    account_id = signup.json()["account_id"]
+
+    _create_staff(db_session, "staffreclassify2@zoikolocal.com", role=PlatformStaffRole.SUPPORT)
+    staff_token = client.post(
+        "/staff/login", json={"email": "staffreclassify2@zoikolocal.com", "password": "staffpass123"}
+    ).json()["access_token"]
+
+    response = client.put(
+        f"/staff/accounts/{account_id}/billing-classification",
+        json={"billing_classification": "DEMO", "billing_source": "DIRECT_ZOIKO_LOCAL"},
+        headers={"Authorization": f"Bearer {staff_token}"},
+    )
+    assert response.status_code == 403
+
+
+def test_update_billing_classification_rejects_an_unknown_value(client, db_session):
+    signup = client.post(
+        "/auth/signup",
+        json={
+            "account_name": "Reclassify Invalid Co", "account_type": "business",
+            "email": "reclassifyinvalidowner@example.com", "password": "supersecret123",
+        },
+    )
+    account_id = signup.json()["account_id"]
+
+    _create_staff(db_session, "staffreclassify3@zoikolocal.com")
+    staff_token = client.post(
+        "/staff/login", json={"email": "staffreclassify3@zoikolocal.com", "password": "staffpass123"}
+    ).json()["access_token"]
+
+    response = client.put(
+        f"/staff/accounts/{account_id}/billing-classification",
+        json={"billing_classification": "NOT_A_REAL_CLASS", "billing_source": "DIRECT_ZOIKO_LOCAL"},
+        headers={"Authorization": f"Bearer {staff_token}"},
+    )
+    assert response.status_code == 422
 
 
 def test_search_numbers_requires_staff_auth(client):

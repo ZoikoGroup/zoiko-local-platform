@@ -146,6 +146,8 @@ def create_checkout_session(
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e
     except TestAccountRestrictedError as e:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e)) from e
+    except service.NonCommercialAccountError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e)) from e
     except stripe_checkout.PaymentError as e:
         raise HTTPException(status_code=502, detail=str(e)) from e
 

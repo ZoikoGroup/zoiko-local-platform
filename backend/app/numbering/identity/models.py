@@ -14,6 +14,37 @@ class AccountType(str, enum.Enum):
     BUSINESS = "business"
 
 
+class AccountBillingClassification(str, enum.Enum):
+    """Commercial Billing Operating Standard doc §5 P0 blocker + Table 8's
+    canonical 9-value grid - which of these an account is decides whether
+    it may ever create a real charge at all, independent of anything else
+    (quota, entitlement, KYC). COM-03: "non-commercial classes cannot
+    create live customer charges." Every account gets one; there is no
+    "unclassified" state."""
+
+    COMMERCIAL_STANDALONE = "commercial_standalone"
+    COMMERCIAL_BUNDLED = "commercial_bundled"
+    LEGACY_MIGRATION = "legacy_migration"
+    PILOT_NON_BILLABLE = "pilot_non_billable"
+    PARTNER_SPONSORED = "partner_sponsored"
+    INTERNAL = "internal"
+    DEMO = "demo"
+    SANDBOX = "sandbox"
+    QA_AUTOMATION = "qa_automation"
+
+
+class AccountBillingSource(str, enum.Enum):
+    """Doc §19 O3: "Each entitlement period resolves to one billing
+    source" - which system actually charges/entitles this account, so a
+    bundle or partner deal can never silently double-charge alongside a
+    direct Zoiko Local charge for the same period."""
+
+    DIRECT_ZOIKO_LOCAL = "direct_zoiko_local"
+    ZOIKO_ONE_BUNDLE = "zoiko_one_bundle"
+    PARTNER = "partner"
+    LEGACY = "legacy"
+
+
 class UserRole(str, enum.Enum):
     OWNER = "owner"
     ADMIN = "admin"
@@ -35,15 +66,26 @@ class Account(Base):
     account_type: Mapped[AccountType] = mapped_column(
         Enum(AccountType, name="account_type_enum"), nullable=False
     )
-    # Commercial Billing Operating Standard doc §T "billing_classification/
-    # billing_source" - this is deliberately NOT that full enum (DEMO/
-    # SANDBOX/QA_AUTOMATION/etc.), which needs its own account-classification
-    # model this codebase hasn't built yet. is_test is a narrow stopgap:
-    # a single boolean that blocks the real-money boundaries (Stripe
+    # Narrow, separate stopgap from billing_classification/billing_source
+    # below: a single boolean that blocks the real-money boundaries (Stripe
     # checkout, run_billing_cycle, credit/debit notes, refunds) for an
-    # account flagged as synthetic/test, so live charges can't happen
-    # against one by accident in the meantime.
+    # account flagged as synthetic/test - predates the full classification
+    # enum and still used independently by its own call sites (see
+    # app.numbering.numbers.service and app.billing.service).
     is_test: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # Every account gets a real classification/source at creation -
+    # COMMERCIAL_STANDALONE/DIRECT_ZOIKO_LOCAL for the normal public
+    # signup path (see create_account_with_owner). Non-default values are
+    # set later by staff (e.g. marking an account DEMO or SANDBOX) - there
+    # is no public signup path for any class other than the default.
+    billing_classification: Mapped[AccountBillingClassification] = mapped_column(
+        Enum(AccountBillingClassification, name="account_billing_classification_enum"),
+        nullable=False, default=AccountBillingClassification.COMMERCIAL_STANDALONE,
+    )
+    billing_source: Mapped[AccountBillingSource] = mapped_column(
+        Enum(AccountBillingSource, name="account_billing_source_enum"),
+        nullable=False, default=AccountBillingSource.DIRECT_ZOIKO_LOCAL,
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     users: Mapped[list["User"]] = relationship(

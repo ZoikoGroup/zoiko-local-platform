@@ -28,7 +28,14 @@ class AccountOverviewResponse(BaseModel):
     owner_email: str | None
     member_count: int
     number_count: int
+    billing_classification: str
+    billing_source: str
     created_at: datetime
+
+
+class UpdateAccountBillingClassificationRequest(BaseModel):
+    billing_classification: str
+    billing_source: str
 
 
 class AccessMatrixEntryResponse(BaseModel):

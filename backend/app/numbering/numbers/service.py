@@ -24,7 +24,7 @@ from app.notifications.service import (
     notify_number_unassigned,
     notify_number_verification_required,
 )
-from app.numbering.identity.models import Account, AccountType, User, UserRole
+from app.numbering.identity.models import Account, AccountBillingClassification, AccountType, User, UserRole
 from app.numbering.numbers.models import (
     IVROption,
     NumberEligibilityCase,
@@ -58,6 +58,25 @@ class TestAccountRestrictedError(Exception):
     """Raised when an account flagged is_test attempts a real-money action
     (Commercial Billing Operating Standard doc §14/§T) - see Account.
     is_test's docstring."""
+
+
+class NonCommercialAccountError(Exception):
+    """Raised when an account whose billing_classification forbids live
+    customer charges (Commercial Billing Operating Standard doc's Table 8
+    + "COM-03: non-commercial classes cannot create live customer
+    charges") tries to buy a number through the real Stripe payment path.
+    Only COMMERCIAL_STANDALONE accounts may - every other class is either
+    billed a different way (bundled/partner/legacy) or must never be
+    billed at all (internal/demo/sandbox/QA/pilot)."""
+
+
+def _assert_commercial_account(db: Session, account_id: str) -> None:
+    account = db.query(Account).filter(Account.id == account_id).first()
+    if account is None or account.billing_classification != AccountBillingClassification.COMMERCIAL_STANDALONE:
+        classification = account.billing_classification.value if account else "unknown"
+        raise NonCommercialAccountError(
+            f"Account billing_classification {classification!r} cannot create a live charge"
+        )
 
 
 class UnsupportedCountryError(Exception):
@@ -161,11 +180,16 @@ def list_number_eligibility_rules(db: Session) -> list[NumberEligibilityRule]:
 
 
 def upsert_number_eligibility_rule(
-    db: Session, *, country: str, number_type: str, required_evidence: list[str], is_active: bool
+    db: Session, *, country: str, number_type: str, required_evidence: list[str], is_active: bool,
+    emergency_calling_supported: bool = False, recording_supported: bool = True,
+    allowed_calling_directions: str = "both",
 ) -> NumberEligibilityRule:
     """Staff-only, SUPER_ADMIN-gated at the route - same bar as the country
     list and calling-rate changes (this decides which numbers can even be
-    purchased at all, not a routine support action)."""
+    purchased at all, not a routine support action). The three
+    market/release registry fields default to what this product actually
+    supports today (see NumberEligibilityRule's docstring) rather than an
+    unreviewed per-country legal claim."""
     country = country.upper()
     rule = (
         db.query(NumberEligibilityRule)
@@ -177,6 +201,9 @@ def upsert_number_eligibility_rule(
         db.add(rule)
     rule.required_evidence = required_evidence
     rule.is_active = is_active
+    rule.emergency_calling_supported = emergency_calling_supported
+    rule.recording_supported = recording_supported
+    rule.allowed_calling_directions = allowed_calling_directions
     db.commit()
     db.refresh(rule)
     return rule
@@ -185,6 +212,41 @@ def upsert_number_eligibility_rule(
 def remove_number_eligibility_rule(db: Session, rule_id: str) -> None:
     db.query(NumberEligibilityRule).filter(NumberEligibilityRule.id == rule_id).delete()
     db.commit()
+
+
+def seed_market_release_registry(db: Session) -> list[NumberEligibilityRule]:
+    """Commercial Billing Operating Standard P0-2: "Implement a versioned
+    market/release registry for every country and number type." Creates
+    one row per currently-supported country for 'local' numbers (the only
+    number_type this product actually sells today) that doesn't already
+    have one - is_active=False, confirmed live against purchase_number:
+    the eligibility-case gate triggers on the mere EXISTENCE of an ACTIVE
+    rule, independent of required_evidence content (see
+    NumberEligibilityRule's docstring), so seeding with is_active=True
+    would have silently required every future number purchase in every
+    market to go through a case-approval workflow nobody asked for - a
+    real regression, caught by this codebase's own test suite. This seed
+    is pure reference data until staff deliberately configure a market
+    for real (via PUT .../number-eligibility-rules).
+
+    Never touches a country that already has a row, active or not -
+    re-running this after staff has configured real required_evidence or
+    flipped is_active must not overwrite that decision back to defaults."""
+    countries = list_supported_countries(db)
+    existing = {
+        (rule.country, rule.number_type) for rule in list_number_eligibility_rules(db)
+    }
+    created = []
+    for country in countries:
+        if (country.code, "local") in existing:
+            continue
+        created.append(
+            upsert_number_eligibility_rule(
+                db, country=country.code, number_type="local", required_evidence=[], is_active=False,
+                emergency_calling_supported=False, recording_supported=True, allowed_calling_directions="both",
+            )
+        )
+    return created
 
 
 def _get_or_open_eligibility_case(db: Session, *, number: PhoneNumber, actor: str) -> NumberEligibilityCase:
@@ -567,6 +629,7 @@ def create_number_purchase_checkout_session(db: Session, account_id: str, e164: 
     account = db.query(Account).filter(Account.id == account_id).first()
     if account is not None and account.is_test:
         raise TestAccountRestrictedError(f"Account {account_id} is flagged is_test and cannot create a live checkout session")
+    _assert_commercial_account(db, account_id)
 
     now = datetime.now(timezone.utc)
     number = db.query(PhoneNumber).filter(PhoneNumber.e164 == e164).first()
