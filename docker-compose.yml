@@ -142,12 +142,21 @@ services:
       # dev setup. Add those three keys once this self-hosted option is
       # actually deployed somewhere with a real domain, before relying on
       # it for callers on hostile networks.
+      # Windows/Docker Desktop dev machine gotcha: Hyper-V dynamically
+      # reserves a range of ephemeral ports (`netsh interface ipv4 show
+      # excludedportrange protocol=udp`) that on this host happens to
+      # cover 50000-50159 - directly colliding with LiveKit's original
+      # 50000-50100 RTC range and making `docker compose up` fail with
+      # "bind: An attempt was made to access a socket in a way forbidden
+      # by its access permissions." Moved to 40000-40100, which isn't in
+      # any excluded range on this host. Not a LiveKit or app issue -
+      # re-check the exclusion list if this ever collides again.
       LIVEKIT_CONFIG: |
         port: 7880
         rtc:
           tcp_port: 7881
-          port_range_start: 50000
-          port_range_end: 50100
+          port_range_start: 40000
+          port_range_end: 40100
           use_external_ip: true
         turn:
           enabled: true
@@ -163,7 +172,7 @@ services:
     ports:
       - "7880:7880"                     # HTTP/WebSocket - client signaling + server API
       - "7881:7881"                     # TCP fallback for restrictive/UDP-blocking networks
-      - "50000-50100:50000-50100/udp"   # RTC media (WebRTC)
+      - "40000-40100:40000-40100/udp"   # RTC media (WebRTC)
       - "3478:3478/udp"                 # Embedded TURN control channel
       - "30000-30100:30000-30100/udp"   # TURN relay data (see turn.relay_range_start/end above)
 

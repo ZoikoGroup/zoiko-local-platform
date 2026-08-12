@@ -153,3 +153,27 @@ services:
         value: "false"
       - key: WEBPUSH_FAILOVER_ENABLED
         value: "false"
+
+  # Commercial Billing Operating Standard doc §31 "daily and period-close
+  # reconciliation" - runs app.ops.scheduled_reconciliation (see its module
+  # docstring) once a day. Same image as zoiko-local-api (built once,
+  # reused here with a different startCommand) rather than a separate
+  # always-on process - only DATABASE_URL is needed since this script only
+  # compares Zoiko Local's own DB state, never calls out to ZoikoNex/
+  # Twilio/etc. Not in-process (no APScheduler) deliberately: the web
+  # service runs WEB_CONCURRENCY=4 workers, which would otherwise run this
+  # job 4x every trigger with no leader election.
+  - type: cron
+    name: zoiko-local-daily-reconciliation
+    runtime: docker
+    dockerfilePath: ./backend/Dockerfile
+    dockerContext: ./backend
+    plan: starter
+    region: oregon
+    schedule: "0 6 * * *" # daily 06:00 UTC
+    dockerCommand: python -m app.ops.scheduled_reconciliation
+    envVars:
+      - key: ENVIRONMENT
+        value: production
+      - key: DATABASE_URL
+        sync: false # same real Neon connection string as zoiko-local-api above
