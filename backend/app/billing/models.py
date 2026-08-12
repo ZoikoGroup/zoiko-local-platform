@@ -106,6 +106,17 @@ class ZoikoNexSyncEventType(str, enum.Enum):
     SUBSCRIPTION_SYNC = "subscription_sync"
     USAGE_SYNC = "usage_sync"
     PAYMENT_EVENT_RECEIVED = "payment_event_received"
+    # Real invoice/payment collection via ZoikoNex's billing-invoice/
+    # payments services - see app.billing.service.run_billing_cycle.
+    INVOICE_GENERATED = "invoice_generated"
+    PAYMENT_COLLECTED = "payment_collected"
+    # Post-issue corrections (ZN-ADR-012: an ISSUED invoice's monetary
+    # fields are immutable - these are the only legal way to fix one) and
+    # refunds of a captured payment - see app.billing.service's
+    # issue_invoice_credit_note/issue_invoice_debit_note/refund_zoikonex_payment.
+    CREDIT_NOTE_ISSUED = "credit_note_issued"
+    DEBIT_NOTE_ISSUED = "debit_note_issued"
+    REFUND_ISSUED = "refund_issued"
 
 
 class ZoikoNexSyncEvent(Base):

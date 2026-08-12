@@ -92,8 +92,78 @@ def mock_zoikonex_sync(monkeypatch):
     def _fake_sync_usage_event(db, sub, usage_event_id, **kwargs):
         return {"zoikonex_ref": "zn-usage-test", "status": "NORMALISED"}
 
+    def _fake_rate_usage_in_zoikonex(db, sub, usage_event, **kwargs):
+        return {"rated_charge_id": "zn-rated-charge-test", "evidence_id": "zn-evidence-test"}
+
+    def _fake_register_plan_in_catalog(db, plan, **kwargs):
+        plan.zoikonex_product_id = plan.zoikonex_product_id or "zn-product-test"
+        plan.zoikonex_offer_id = plan.zoikonex_offer_id or "zn-offer-test"
+        plan.zoikonex_price_rule_id = plan.zoikonex_price_rule_id or "zn-price-rule-test"
+        return {
+            "product_id": plan.zoikonex_product_id, "offer_id": plan.zoikonex_offer_id,
+            "price_rule_id": plan.zoikonex_price_rule_id,
+        }
+
+    def _fake_open_bill_cycle(sub):
+        return {"bill_cycle_id": "zn-bill-cycle-test", "status": "OPEN"}
+
+    def _fake_close_bill_cycle(bill_cycle_id):
+        return {"status": "CLOSED"}
+
+    def _fake_create_invoice(sub, bill_cycle_id, **kwargs):
+        return {"invoice_id": "zn-invoice-test", "status": "DRAFT"}
+
+    def _fake_get_invoice(invoice_id):
+        # Always "DRAFT" - every test starts a fresh account/invoice, so
+        # run_billing_cycle's live-status check (see get_invoice's docstring
+        # on why create_invoice's own return value can't be trusted here)
+        # always takes the "first run this period" branch.
+        return {"invoice_id": invoice_id, "status": "DRAFT", "total_minor_units": 0}
+
+    def _fake_add_invoice_line_item(invoice_id, **kwargs):
+        return {"line_item_id": "zn-line-item-test"}
+
+    def _fake_issue_invoice(invoice_id):
+        return {"status": "ISSUED", "total_minor_units": 1999}
+
+    def _fake_determine_tax_for_invoice_line(**kwargs):
+        return {"tax_decision_id": "zn-tax-decision-test", "tax_amount_minor_units": 0}
+
+    def _fake_create_credit_note(invoice_id, **kwargs):
+        return {"credit_note_id": "zn-credit-note-test", "status": "ISSUED", "amount_minor_units": kwargs.get("amount_minor_units")}
+
+    def _fake_create_debit_note(invoice_id, **kwargs):
+        return {"debit_note_id": "zn-debit-note-test", "status": "ISSUED", "amount_minor_units": kwargs.get("amount_minor_units")}
+
+    def _fake_create_payment_intent(sub, invoice_id, **kwargs):
+        return {"payment_intent_id": "zn-payment-intent-test", "status": "CREATED"}
+
+    def _fake_authorise_payment_intent(payment_intent_id):
+        return {"status": "AUTHORISED"}
+
+    def _fake_capture_payment_intent(payment_intent_id):
+        return {"status": "CAPTURED"}
+
+    def _fake_create_refund(payment_intent_id, **kwargs):
+        return {"refund_id": "zn-refund-test", "status": "REFUNDED"}
+
     monkeypatch.setattr(billing_service.zoikonex_adapter, "sync_subscription", _fake_sync_subscription)
     monkeypatch.setattr(billing_service.zoikonex_adapter, "sync_usage_event", _fake_sync_usage_event)
+    monkeypatch.setattr(billing_service.zoikonex_adapter, "rate_usage_in_zoikonex", _fake_rate_usage_in_zoikonex)
+    monkeypatch.setattr(billing_service.zoikonex_adapter, "register_plan_in_catalog", _fake_register_plan_in_catalog)
+    monkeypatch.setattr(billing_service.zoikonex_adapter, "open_bill_cycle", _fake_open_bill_cycle)
+    monkeypatch.setattr(billing_service.zoikonex_adapter, "close_bill_cycle", _fake_close_bill_cycle)
+    monkeypatch.setattr(billing_service.zoikonex_adapter, "create_invoice", _fake_create_invoice)
+    monkeypatch.setattr(billing_service.zoikonex_adapter, "get_invoice", _fake_get_invoice)
+    monkeypatch.setattr(billing_service.zoikonex_adapter, "add_invoice_line_item", _fake_add_invoice_line_item)
+    monkeypatch.setattr(billing_service.zoikonex_adapter, "issue_invoice", _fake_issue_invoice)
+    monkeypatch.setattr(billing_service.zoikonex_adapter, "determine_tax_for_invoice_line", _fake_determine_tax_for_invoice_line)
+    monkeypatch.setattr(billing_service.zoikonex_adapter, "create_credit_note", _fake_create_credit_note)
+    monkeypatch.setattr(billing_service.zoikonex_adapter, "create_debit_note", _fake_create_debit_note)
+    monkeypatch.setattr(billing_service.zoikonex_adapter, "create_payment_intent", _fake_create_payment_intent)
+    monkeypatch.setattr(billing_service.zoikonex_adapter, "authorise_payment_intent", _fake_authorise_payment_intent)
+    monkeypatch.setattr(billing_service.zoikonex_adapter, "capture_payment_intent", _fake_capture_payment_intent)
+    monkeypatch.setattr(billing_service.zoikonex_adapter, "create_refund", _fake_create_refund)
     yield
 
 

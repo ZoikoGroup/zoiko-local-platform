@@ -1,3 +1,4 @@
+import uuid
 from datetime import datetime, timedelta
 
 import sqlalchemy as sa
@@ -132,6 +133,20 @@ def sync_usage_event_to_zoikonex(db: Session, usage_event) -> None:
     except zoikonex_adapter.ZoikoNexError:
         result = {}
 
+    # Real ZoikoNex rating (not the local estimate above) - only for
+    # call_seconds, since that's the only event type with a real,
+    # already-decided price (Zoiko Local's own CallingRate card). Every
+    # other event_type has no rate table yet, so there's nothing real to
+    # submit - see zoikonex_adapter.rate_usage_event's docstring.
+    rated = {}
+    if rating["estimated_cost_cents"] is not None:
+        try:
+            rated = zoikonex_adapter.rate_usage_in_zoikonex(
+                db, sub, usage_event, amount_minor_units=rating["estimated_cost_cents"],
+            )
+        except zoikonex_adapter.ZoikoNexError:
+            rated = {}
+
     db.add(
         ZoikoNexSyncEvent(
             account_id=usage_event.account_id,
@@ -141,6 +156,7 @@ def sync_usage_event_to_zoikonex(db: Session, usage_event) -> None:
                 "usage_event_id": usage_event.id, "event_type": usage_event.event_type,
                 "quantity": float(usage_event.quantity), "unit": usage_event.unit,
                 "estimated_cost_cents": rating["estimated_cost_cents"],
+                "zoikonex_rated_charge_id": rated.get("rated_charge_id"),
             },
         )
     )
@@ -628,6 +644,233 @@ def resolve_zoikonex_reconciliation_exception(
         after={"exception_type": exc.exception_type.value, "subject_id": exc.subject_id, "reason": reason},
     )
     return exc
+
+
+class ZoikoNexBillingCycleError(Exception):
+    """Raised when a billing cycle can't even start - e.g. the
+    subscription has never successfully synced to ZoikoNex, so there's no
+    account_id/customer_id to bill against. Distinct from a mid-pipeline
+    ZoikoNexError (rating/invoice/payment-intent/authorise), which aborts
+    the cycle the same way but with a different, already-diagnosed cause."""
+
+
+def run_billing_cycle(db: Session, account_id: str, *, actor: str) -> dict:
+    """Architecture doc §9's rating -> invoice -> payment pipeline, driven
+    against a live ZoikoNex instance using TEST_PLACEHOLDER_PRICES (see
+    that constant's docstring in app.integrations.billing.zoikonex - NOT a
+    real decided price). Staff-triggered on demand - no scheduler exists in
+    this codebase yet, same posture as run_synthetic_checks and
+    run_zoikonex_reconciliation.
+
+    Stages, in order: register the plan in ZoikoNex's catalog (once, lazily,
+    the first time any account on that plan is billed) -> open a bill cycle
+    -> create + issue an invoice carrying one line item (the plan's
+    placeholder monthly price) -> close the bill cycle -> create a payment
+    intent for the invoice total -> authorise it -> attempt capture.
+
+    Every stage after catalog registration can fail independently; each
+    failure raises immediately (nothing here is worth attempting out of
+    order) EXCEPT capture, which is allowed to fail per
+    zoikonex_adapter.capture_payment_intent's docstring - a confirmed real
+    bug in ZoikoNex's own payments<->evidence-ledger gRPC wrapper, not
+    something this codebase can fix. A failed capture still returns a
+    result describing everything that DID succeed (invoice issued, payment
+    authorised) rather than raising, since "authorised but not yet
+    captured" is a real, reportable, non-broken state - not an error.
+
+    free_trial (and any plan whose TEST_PLACEHOLDER_PRICES entry is 0) is
+    skipped before any ZoikoNex call is made - there is nothing to bill,
+    so creating a $0 invoice against a real ZoikoNex instance would just be
+    noise, not a useful proof of the pipeline.
+    """
+    sub = get_or_create_subscription(db, account_id)
+    plan = get_plan(db, sub.plan_code)
+    amount_minor_units = zoikonex_adapter.TEST_PLACEHOLDER_PRICES.get(plan.plan_code, 0)
+
+    if amount_minor_units <= 0:
+        return {"billed": False, "reason": f"plan {plan.plan_code!r} has no placeholder price to bill"}
+
+    if sub.zoikonex_account_id is None:
+        sub = sync_subscription_to_zoikonex(db, sub)
+    if sub.zoikonex_account_id is None:
+        raise ZoikoNexBillingCycleError(
+            "Cannot run a billing cycle: this subscription has never synced to ZoikoNex "
+            "(no account_id) - check ZoikoNex connectivity and retry."
+        )
+
+    zoikonex_adapter.register_plan_in_catalog(db, plan, amount_minor_units=amount_minor_units)
+
+    bill_cycle = zoikonex_adapter.open_bill_cycle(sub)
+    invoice = zoikonex_adapter.create_invoice(sub, bill_cycle["bill_cycle_id"])
+    # create_invoice's Idempotency-Key is deterministic per (sub.id,
+    # current_period_start), so a retry of an already-issued invoice
+    # replays the SAME invoice_id - but confirmed live, that replayed
+    # response body is frozen at first-creation time (always "DRAFT"),
+    # even after the invoice has since been issued. get_invoice does a
+    # live read instead of trusting create_invoice's own return value here.
+    live_invoice = zoikonex_adapter.get_invoice(invoice["invoice_id"])
+    if live_invoice["status"] == "DRAFT":
+        # First run for this subscription+period. ISSUED invoices are Class
+        # A immutable (ZN-ADR-012) - adding a line item or re-issuing one
+        # would fail with a 422, so this branch only runs once per period.
+        # tax comes from a REAL ZoikoNex tax-decision call - always 0 right
+        # now because it resolves against TAX_PLACEHOLDER_JURISDICTION_CODE's
+        # 0% policy (see that constant's docstring: real tax rates are a
+        # legal/compliance decision nobody has made yet, not something to
+        # invent the way a subscription price got a placeholder).
+        tax = zoikonex_adapter.determine_tax_for_invoice_line(
+            invoice_id=invoice["invoice_id"], taxable_amount_minor_units=amount_minor_units,
+        )
+        zoikonex_adapter.add_invoice_line_item(
+            invoice["invoice_id"],
+            description=f"{plan.name} - monthly subscription (TEST PLACEHOLDER PRICE, not a real charge)",
+            amount_minor_units=amount_minor_units,
+            tax_amount_minor_units=tax.get("tax_amount_minor_units"),
+            line_key="plan-fee",
+        )
+        issued = zoikonex_adapter.issue_invoice(invoice["invoice_id"])
+    else:
+        issued = {"status": live_invoice["status"]}
+    try:
+        zoikonex_adapter.close_bill_cycle(bill_cycle["bill_cycle_id"])
+        bill_cycle_closed, bill_cycle_close_error = True, None
+    except zoikonex_adapter.ZoikoNexError as e:
+        # Confirmed real ZoikoNex-side bug (GetBillCycle NULL-scan - see
+        # close_bill_cycle's docstring) - the invoice is already issued and
+        # immutable regardless of whether the bill cycle formally closes,
+        # so this must not block payment collection below.
+        bill_cycle_closed, bill_cycle_close_error = False, str(e)
+
+    db.add(
+        ZoikoNexSyncEvent(
+            account_id=account_id,
+            event_type=ZoikoNexSyncEventType.INVOICE_GENERATED,
+            zoikonex_ref=invoice["invoice_id"],
+            payload={
+                "plan_code": plan.plan_code, "amount_minor_units": amount_minor_units,
+                "bill_cycle_id": bill_cycle["bill_cycle_id"], "status": issued["status"],
+                "placeholder_price": True, "bill_cycle_closed": bill_cycle_closed,
+                "bill_cycle_close_error": bill_cycle_close_error,
+            },
+        )
+    )
+    db.commit()
+
+    intent = zoikonex_adapter.create_payment_intent(sub, invoice["invoice_id"], amount_minor_units=amount_minor_units)
+    zoikonex_adapter.authorise_payment_intent(intent["payment_intent_id"])
+
+    result = {
+        "billed": True, "plan_code": plan.plan_code, "amount_minor_units": amount_minor_units,
+        "invoice_id": invoice["invoice_id"], "payment_intent_id": intent["payment_intent_id"],
+        "invoice_status": issued["status"], "payment_status": "authorised", "captured": False,
+        "capture_error": None, "bill_cycle_closed": bill_cycle_closed, "bill_cycle_close_error": bill_cycle_close_error,
+    }
+    try:
+        zoikonex_adapter.capture_payment_intent(intent["payment_intent_id"])
+        result["captured"] = True
+        result["payment_status"] = "captured"
+    except zoikonex_adapter.ZoikoNexCaptureFailedError as e:
+        # Confirmed real ZoikoNex-side bug (evidence-ledger gRPC marshaling) -
+        # authorised is a genuinely successful, reportable outcome on its own.
+        result["capture_error"] = str(e)
+
+    db.add(
+        ZoikoNexSyncEvent(
+            account_id=account_id,
+            event_type=ZoikoNexSyncEventType.PAYMENT_COLLECTED,
+            zoikonex_ref=intent["payment_intent_id"],
+            payload={k: v for k, v in result.items() if k != "billed"},
+        )
+    )
+    db.commit()
+
+    log_event(
+        db, actor=actor, action="billing.cycle_run", target=f"subscription:{sub.id}",
+        after={"invoice_id": invoice["invoice_id"], "payment_status": result["payment_status"]},
+    )
+    return result
+
+
+def issue_invoice_credit_note(
+    db: Session, account_id: str, invoice_id: str, *, amount_minor_units: int, reason: str, actor: str
+) -> dict:
+    """Corrects an over-billed ISSUED invoice (ZN-ADR-012: the invoice
+    itself can never be edited once issued - see
+    zoikonex_adapter.create_credit_note's docstring). Staff-triggered,
+    per-correction - unlike run_billing_cycle's deterministic idempotency
+    keys, a fresh UUID here since a real operator issuing two separate
+    credit notes against the same invoice for two different reasons is a
+    legitimate scenario, not a retry."""
+    result = zoikonex_adapter.create_credit_note(
+        invoice_id, reason_code="CUSTOMER_REQUEST", amount_minor_units=amount_minor_units,
+        reason_description=reason, idempotency_key=str(uuid.uuid4()),
+    )
+    db.add(
+        ZoikoNexSyncEvent(
+            account_id=account_id, event_type=ZoikoNexSyncEventType.CREDIT_NOTE_ISSUED,
+            zoikonex_ref=result["credit_note_id"],
+            payload={"invoice_id": invoice_id, "amount_minor_units": amount_minor_units, "reason": reason},
+        )
+    )
+    db.commit()
+    log_event(
+        db, actor=actor, action="billing.credit_note_issued", target=f"invoice:{invoice_id}",
+        after={"credit_note_id": result["credit_note_id"], "amount_minor_units": amount_minor_units, "reason": reason},
+    )
+    return result
+
+
+def issue_invoice_debit_note(
+    db: Session, account_id: str, invoice_id: str, *, amount_minor_units: int, reason: str, actor: str
+) -> dict:
+    """Corrects an under-billed ISSUED invoice - see
+    issue_invoice_credit_note's docstring for the same rationale."""
+    result = zoikonex_adapter.create_debit_note(
+        invoice_id, reason_code="UNDERBILLED", amount_minor_units=amount_minor_units,
+        idempotency_key=str(uuid.uuid4()),
+    )
+    db.add(
+        ZoikoNexSyncEvent(
+            account_id=account_id, event_type=ZoikoNexSyncEventType.DEBIT_NOTE_ISSUED,
+            zoikonex_ref=result["debit_note_id"],
+            payload={"invoice_id": invoice_id, "amount_minor_units": amount_minor_units, "reason": reason},
+        )
+    )
+    db.commit()
+    log_event(
+        db, actor=actor, action="billing.debit_note_issued", target=f"invoice:{invoice_id}",
+        after={"debit_note_id": result["debit_note_id"], "amount_minor_units": amount_minor_units, "reason": reason},
+    )
+    return result
+
+
+def refund_zoikonex_payment(
+    db: Session, account_id: str, payment_intent_id: str, *, amount_minor_units: int, reason: str, actor: str
+) -> dict:
+    """Refunds a CAPTURED ZoikoNex payment (full or partial) - see
+    zoikonex_adapter.create_refund's docstring. Given payment capture is
+    currently broken on ZoikoNex's own side (see
+    app.integrations.billing.zoikonex's module docstring), calling this
+    against any payment intent in this environment correctly fails with
+    ZoikoNexError (409 STATE_CONFLICT, "illegal payment state transition")
+    rather than succeeding - confirmed live, not a bug in this function."""
+    result = zoikonex_adapter.create_refund(
+        payment_intent_id, refund_amount_minor_units=amount_minor_units,
+        reason_code="CUSTOMER_REQUEST", idempotency_key=str(uuid.uuid4()),
+    )
+    db.add(
+        ZoikoNexSyncEvent(
+            account_id=account_id, event_type=ZoikoNexSyncEventType.REFUND_ISSUED,
+            zoikonex_ref=result["refund_id"],
+            payload={"payment_intent_id": payment_intent_id, "amount_minor_units": amount_minor_units, "reason": reason},
+        )
+    )
+    db.commit()
+    log_event(
+        db, actor=actor, action="billing.payment_refunded", target=f"payment_intent:{payment_intent_id}",
+        after={"refund_id": result["refund_id"], "amount_minor_units": amount_minor_units, "reason": reason},
+    )
+    return result
 
 
 def get_usage_summary(db: Session, account_id: str) -> dict:

@@ -6,8 +6,16 @@ from sqlalchemy.orm import Session
 from app.billing import service
 from app.billing.schemas import (
     ChangePlanRequest,
+    CreditNoteResponse,
+    DebitNoteResponse,
+    IssueCreditNoteRequest,
+    IssueDebitNoteRequest,
     PlanResponse,
+    RefundPaymentRequest,
+    RefundResponse,
     ResolveReconciliationExceptionRequest,
+    RunBillingCycleRequest,
+    RunBillingCycleResponse,
     SimulatePaymentEventRequest,
     SubscriptionResponse,
     UsageSummaryResponse,
@@ -188,3 +196,76 @@ def resolve_zoikonex_reconciliation_exception(
         )
     except service.ReconciliationExceptionNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
+
+
+@router.post("/zoikonex/run-billing-cycle", response_model=RunBillingCycleResponse)
+def run_billing_cycle(
+    payload: RunBillingCycleRequest,
+    db: Session = Depends(get_db),
+    staff: PlatformStaff = Depends(require_capability("billing.run_billing_cycle")),
+):
+    """SUPER_ADMIN only - drives a real rating -> invoice -> payment cycle
+    against ZoikoNex for one account, using TEST_PLACEHOLDER_PRICES (see
+    app.integrations.billing.zoikonex's docstring - NOT a real decided
+    price). Same segregation-of-duties bar as simulate_payment_event above,
+    since this creates real ZoikoNex invoices and payment intents, even
+    though the amount is a placeholder."""
+    try:
+        return service.run_billing_cycle(db, payload.account_id, actor=staff.id)
+    except service.ZoikoNexBillingCycleError as e:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(e)) from e
+    except zoikonex_adapter.ZoikoNexError as e:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(e)) from e
+
+
+@router.post("/zoikonex/credit-notes", response_model=CreditNoteResponse)
+def issue_credit_note(
+    payload: IssueCreditNoteRequest,
+    db: Session = Depends(get_db),
+    staff: PlatformStaff = Depends(require_capability("billing.issue_credit_note")),
+):
+    """SUPER_ADMIN only - corrects an over-billed ISSUED invoice. Same
+    segregation-of-duties bar as run_billing_cycle - a real, money-adjacent
+    ZoikoNex write."""
+    try:
+        return service.issue_invoice_credit_note(
+            db, payload.account_id, payload.invoice_id,
+            amount_minor_units=payload.amount_minor_units, reason=payload.reason, actor=staff.id,
+        )
+    except zoikonex_adapter.ZoikoNexError as e:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(e)) from e
+
+
+@router.post("/zoikonex/debit-notes", response_model=DebitNoteResponse)
+def issue_debit_note(
+    payload: IssueDebitNoteRequest,
+    db: Session = Depends(get_db),
+    staff: PlatformStaff = Depends(require_capability("billing.issue_debit_note")),
+):
+    """SUPER_ADMIN only - corrects an under-billed ISSUED invoice."""
+    try:
+        return service.issue_invoice_debit_note(
+            db, payload.account_id, payload.invoice_id,
+            amount_minor_units=payload.amount_minor_units, reason=payload.reason, actor=staff.id,
+        )
+    except zoikonex_adapter.ZoikoNexError as e:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(e)) from e
+
+
+@router.post("/zoikonex/refunds", response_model=RefundResponse)
+def refund_payment(
+    payload: RefundPaymentRequest,
+    db: Session = Depends(get_db),
+    staff: PlatformStaff = Depends(require_capability("billing.refund_payment")),
+):
+    """SUPER_ADMIN only - refunds a CAPTURED ZoikoNex payment. Currently
+    always fails against a real ZoikoNex-side error (capture itself is
+    broken there - see app.integrations.billing.zoikonex's docstring), not
+    a bug in this endpoint - see refund_zoikonex_payment's docstring."""
+    try:
+        return service.refund_zoikonex_payment(
+            db, payload.account_id, payload.payment_intent_id,
+            amount_minor_units=payload.amount_minor_units, reason=payload.reason, actor=staff.id,
+        )
+    except zoikonex_adapter.ZoikoNexError as e:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(e)) from e

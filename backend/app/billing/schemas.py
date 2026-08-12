@@ -54,6 +54,63 @@ class SimulatePaymentEventRequest(BaseModel):
     event_type: str  # "payment_failed" | "payment_retry" | "payment_restored"
 
 
+class RunBillingCycleRequest(BaseModel):
+    account_id: str
+
+
+class RunBillingCycleResponse(BaseModel):
+    billed: bool
+    reason: str | None = None
+    plan_code: str | None = None
+    amount_minor_units: int | None = None
+    invoice_id: str | None = None
+    payment_intent_id: str | None = None
+    invoice_status: str | None = None
+    payment_status: str | None = None
+    captured: bool | None = None
+    capture_error: str | None = None
+    bill_cycle_closed: bool | None = None
+    bill_cycle_close_error: str | None = None
+
+
+class IssueCreditNoteRequest(BaseModel):
+    account_id: str
+    invoice_id: str
+    amount_minor_units: int
+    reason: str
+
+
+class IssueDebitNoteRequest(BaseModel):
+    account_id: str
+    invoice_id: str
+    amount_minor_units: int
+    reason: str
+
+
+class RefundPaymentRequest(BaseModel):
+    account_id: str
+    payment_intent_id: str
+    amount_minor_units: int
+    reason: str
+
+
+class CreditNoteResponse(BaseModel):
+    credit_note_id: str
+    status: str | None = None
+    amount_minor_units: int | None = None
+
+
+class DebitNoteResponse(BaseModel):
+    debit_note_id: str
+    status: str | None = None
+    amount_minor_units: int | None = None
+
+
+class RefundResponse(BaseModel):
+    refund_id: str | None = None
+    status: str | None = None
+
+
 class ZoikoNexSyncEventResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 

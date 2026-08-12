@@ -99,6 +99,8 @@ class Settings(BaseSettings):
     zoikonex_rating_url: str = "http://localhost:8085"
     zoikonex_billing_url: str = "http://localhost:8092"
     zoikonex_payments_url: str = "http://localhost:8096"
+    zoikonex_evidence_url: str = "http://localhost:8093"
+    zoikonex_tax_url: str = "http://localhost:8089"
     zoikonex_client_id: str = ""
     zoikonex_client_secret: str = ""
     # Verifies X-ZoikoNex-Signature (sha256=<hmac>) on inbound payment
