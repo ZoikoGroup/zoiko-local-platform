@@ -36,6 +36,7 @@ type Step = "search" | "reserved" | "compliance" | "checkout";
 
 const STATUS_STYLES: Record<string, string> = {
   reserved: "bg-amber-50 text-amber-700",
+  expired: "bg-red-50 text-red-700",
   compliance_pending: "bg-orange-50 text-orange-700",
   purchase_pending: "bg-amber-50 text-amber-700",
   provisioning: "bg-amber-50 text-amber-700",

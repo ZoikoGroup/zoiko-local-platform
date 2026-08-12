@@ -1,6 +1,6 @@
-from datetime import datetime, time
+from datetime import datetime, time, timezone
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, model_validator
 
 
 class RoutingConfigRequest(BaseModel):
@@ -95,6 +95,21 @@ class PhoneNumberResponse(BaseModel):
     whatsapp_enabled: bool
     sms_enabled: bool
     next_renewal_at: datetime | None
+
+    @model_validator(mode="after")
+    def _show_expired_reservations_honestly(self):
+        """A reservation is only ever supposed to hold for
+        RESERVATION_TTL_MINUTES (see app.numbering.numbers.service) - past
+        that, purchase_number already rejects it ("Reservation expired -
+        reserve it again"), but nothing ever told the CUSTOMER that: the
+        row just sits at status="reserved" forever with no visual
+        difference from a fresh, still-valid hold. Read-path only - this
+        does not touch the database, so a number can still be re-reserved
+        (by this account or another) the normal way; it only fixes what
+        gets displayed."""
+        if self.status == "reserved" and self.reserved_until is not None and self.reserved_until < datetime.now(timezone.utc):
+            self.status = "expired"
+        return self
 
 
 class SupportedCountryResponse(BaseModel):

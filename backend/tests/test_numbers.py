@@ -423,6 +423,35 @@ def test_cancelled_number_is_quarantined_from_reservation(client, monkeypatch):
     assert "quarantine" in response.json()["detail"].lower()
 
 
+def test_list_numbers_shows_an_expired_reservation_honestly(client, db_session):
+    """Found while manually checking a real account's My Numbers page: a
+    reservation past its RESERVATION_TTL_MINUTES window stayed labeled
+    "reserved" forever - purchase_number already rejected it ("Reservation
+    expired"), but the customer had no way to see that from the list
+    itself. Read-path-only fix (PhoneNumberResponse's model_validator) -
+    the underlying row must stay untouched (status="reserved" in the DB)
+    so the existing re-reserve/expiry-on-purchase logic keeps working."""
+    from datetime import datetime, timedelta, timezone
+
+    from app.numbering.numbers.models import PhoneNumber, PhoneNumberStatus
+
+    token = _signup_and_login(client, "expiredreservation1@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    _reserve(client, headers, "+15550009999")
+
+    number = db_session.query(PhoneNumber).filter(PhoneNumber.e164 == "+15550009999").first()
+    number.reserved_until = datetime.now(timezone.utc) - timedelta(minutes=1)
+    db_session.commit()
+
+    response = client.get("/numbers", headers=headers)
+    assert response.status_code == 200
+    listed = next(n for n in response.json() if n["e164"] == "+15550009999")
+    assert listed["status"] == "expired"
+
+    db_session.refresh(number)
+    assert number.status == PhoneNumberStatus.RESERVED  # untouched in the DB
+
+
 def test_cancelled_number_can_be_reserved_after_quarantine_period(client, db_session, monkeypatch):
     from datetime import datetime, timedelta, timezone
 
