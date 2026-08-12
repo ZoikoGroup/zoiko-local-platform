@@ -148,6 +148,41 @@ def test_summarize_call_returns_a_clean_502_when_groq_summarization_fails(client
     assert db_session.query(ConversationSummary).filter(ConversationSummary.source_id == call.id).count() == 0
 
 
+def test_summarize_call_falls_back_when_groq_returns_a_null_summary(client, db_session, monkeypatch):
+    """Confirmed live against the real Groq API: llama-3.1-8b-instant
+    sometimes returns an explicit `"summary": null` for a very short/low-
+    content transcript (e.g. "Hai, Helo, this is Renky.") even though the
+    prompt never lists null as valid for that field. conversation_summaries
+    .summary is NOT NULL (unlike every other AI-extracted field, which is
+    nullable by design) - before the fix, this crashed the INSERT with a
+    NotNullViolation that the DBAPIError handler turned into an opaque
+    "Service temporarily unavailable" 503, hiding the real cause entirely."""
+    from app.intelligence.models import ConversationSummary
+
+    token, account_id = _signup_and_login(client, "intelcallnullsummary@example.com", "Intel Call Null Summary Co")
+    call = _make_recorded_call(db_session, account_id)
+    client.post(
+        "/compliance/consent", json={"consent_type": "ai_processing"}, headers={"Authorization": f"Bearer {token}"}
+    )
+
+    monkeypatch.setattr("app.intelligence.service.download_recording", lambda url: b"fake-audio-bytes")
+    monkeypatch.setattr("app.intelligence.service.transcribe_audio", lambda audio_bytes: "Hai, Helo, this is Renky.")
+    monkeypatch.setattr(
+        "app.intelligence.service.extract_conversation_summary",
+        lambda transcript: {"summary": None, "language": "en", "urgency": "low", "action_items": [], "suggested_follow_up": None},
+    )
+
+    response = client.post(
+        f"/intelligence/calls/{call.id}/summarize", headers={"Authorization": f"Bearer {token}"}
+    )
+    assert response.status_code == 201
+    assert response.json()["summary"]  # never blank/None - a real fallback string
+
+    stored = db_session.query(ConversationSummary).filter(ConversationSummary.source_id == call.id).first()
+    assert stored is not None
+    assert stored.summary
+
+
 def test_summarize_call_degrades_gracefully_when_embedding_generation_fails(client, db_session, monkeypatch):
     """A Cohere outage must not block the summary itself - the documented
     degrade-gracefully behavior in _analyze_and_store's try/except, proven

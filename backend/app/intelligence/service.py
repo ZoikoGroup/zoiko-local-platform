@@ -92,7 +92,19 @@ def _analyze_and_store(
     if not isinstance(action_items, list):
         action_items = None
 
-    summary_text = analysis.get("summary", "")
+    # analysis.get("summary", "") is NOT enough here - Groq's smaller model
+    # (llama-3.1-8b-instant) sometimes returns an explicit `"summary": null`
+    # for very short/low-content transcripts (e.g. "Hai, Helo, this is
+    # Renky.") even though the prompt doesn't list null as a valid value for
+    # this field. `.get(key, default)` only falls back when the KEY is
+    # missing, not when its value is None - confirmed live: this crashed
+    # every such call with a NOT NULL violation on conversation_summaries
+    # .summary, surfaced to the caller as a generic "Service temporarily
+    # unavailable" 503 (the DBAPIError handler in app.main), which hid the
+    # real cause. summary is the one AI-extracted field with no nullable
+    # column to fall back to (see ConversationSummary's docstring) - a real
+    # fallback string, not an empty one, so the UI never renders a blank line.
+    summary_text = analysis.get("summary") or "No summary could be generated for this recording."
     record = ConversationSummary(
         account_id=account_id,
         source_type=source_type,
