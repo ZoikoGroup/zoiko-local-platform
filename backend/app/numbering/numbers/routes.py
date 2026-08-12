@@ -132,15 +132,24 @@ def create_checkout_session(
 ):
     """Real Stripe Checkout (test mode) - the customer-facing way to buy a
     number now goes through here instead of calling POST /purchase
-    directly (that endpoint still exists and still runs unchanged - it's
-    what the payment webhook below calls once Stripe confirms payment, and
-    what a compliance-approval retry still uses for an already-paid
-    number stuck in COMPLIANCE_PENDING)."""
+    directly. Commercial Billing Operating Standard doc's canonical chain
+    (eligibility before any charge) - quota/billing-suspended/emergency-
+    disclosure/KYC/eligibility are all checked here, BEFORE Stripe is ever
+    contacted, so a customer who still needs documents is never charged
+    while waiting on them (see service.create_number_purchase_checkout_
+    session's docstring). POST /purchase still exists and still runs
+    unchanged - it's what the payment webhook below calls once Stripe
+    confirms payment, and what a retry after case approval uses for an
+    already-paid number stuck in COMPLIANCE_PENDING."""
     try:
         return service.create_number_purchase_checkout_session(db, current_user.account_id, e164)
     except NumberConflictError as e:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e
     except service.NonCommercialAccountError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e)) from e
+    except (NumberQuotaExceededError, BillingSuspendedError) as e:
+        raise HTTPException(status_code=status.HTTP_402_PAYMENT_REQUIRED, detail=str(e)) from e
+    except (ComplianceRequiredError, EmergencyDisclosureRequiredError, NumberEligibilityRequiredError) as e:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e)) from e
     except stripe_checkout.PaymentError as e:
         raise HTTPException(status_code=502, detail=str(e)) from e

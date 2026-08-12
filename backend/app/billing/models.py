@@ -1,7 +1,7 @@
 import enum
 from datetime import datetime
 
-from sqlalchemy import DateTime, Enum, ForeignKey, Integer, String, func
+from sqlalchemy import DateTime, Enum, ForeignKey, Integer, String, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -24,9 +24,9 @@ class Plan(Base):
     hardcoded limits in Python), same discipline as this project's
     compliance rules, so plan limits can be tuned without a deploy.
 
-    No price fields - no payment processing exists here at all (that's
-    ZoikoNex's job once the connection is built). This purely gates
-    feature/resource usage.
+    No price fields - the price authority is PriceCatalogEntry below (and,
+    once registered, ZoikoNex's own product-catalogue-commercial service).
+    This table purely gates feature/resource usage.
     """
 
     __tablename__ = "plans"
@@ -47,6 +47,55 @@ class Plan(Base):
     zoikonex_product_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
     zoikonex_offer_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
     zoikonex_price_rule_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class CatalogEntryStatus(str, enum.Enum):
+    DRAFT = "draft"
+    APPROVED = "approved"
+
+
+class PriceCatalogEntry(Base):
+    """Commercial Billing Operating Standard P0-1 ("Lock the Zoiko Local
+    public and contract price catalog... Engineering and Marketing must
+    consume a versioned APPROVED price catalog; no plan name, included
+    allowance, rate, trial, setup fee or overage may be invented in code
+    or copy"). Replaces the old bare TEST_PLACEHOLDER_PRICES Python dict
+    (app.integrations.billing.zoikonex) with a real, versioned, queryable
+    table - but the VALUES themselves are still the same placeholder
+    numbers already explicitly approved for dev/test use, not a real
+    commercial decision. is_placeholder=True on every row seeded so far;
+    nothing in this codebase treats a placeholder entry as chargeable in
+    a non-development environment (see app.billing.service.
+    run_billing_cycle's catalog-status gate).
+
+    Class A once APPROVED, same discipline as ZoikoNex's own PriceRule
+    (immutable_after_status) - a real price change is a NEW catalog_version
+    row, never an edit to an existing one, so past invoices always resolve
+    against the exact version that was active when they were issued.
+    """
+
+    __tablename__ = "price_catalog_entries"
+    __table_args__ = (
+        UniqueConstraint("plan_code", "catalog_version", name="uq_price_catalog_entry_plan_version"),
+    )
+
+    id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=new_uuid)
+    plan_code: Mapped[str] = mapped_column(String(50), ForeignKey("plans.plan_code"), nullable=False, index=True)
+    catalog_version: Mapped[str] = mapped_column(String(50), nullable=False)
+    amount_minor_units: Mapped[int] = mapped_column(Integer, nullable=False)
+    currency_code: Mapped[str] = mapped_column(String(3), nullable=False, default="USD")
+    status: Mapped[CatalogEntryStatus] = mapped_column(
+        Enum(CatalogEntryStatus, name="catalog_entry_status_enum"), nullable=False, default=CatalogEntryStatus.DRAFT
+    )
+    # Explicit, unambiguous marker - deliberately separate from `status`
+    # (a DRAFT row and a placeholder row are conceptually different: a real
+    # not-yet-approved price is still a real candidate price, whereas this
+    # is fake test data that must never be mistaken for one regardless of
+    # what status it's later moved to).
+    is_placeholder: Mapped[bool] = mapped_column(nullable=False, default=True)
+    approved_by: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 

@@ -16,6 +16,29 @@ class PlanResponse(BaseModel):
     trial_days: int
 
 
+class PriceCatalogEntryResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    plan_code: str
+    catalog_version: str
+    amount_minor_units: int
+    currency_code: str
+    status: str
+    is_placeholder: bool
+    approved_by: str | None
+    approved_at: datetime | None
+    created_at: datetime
+
+
+class CreatePriceCatalogEntryRequest(BaseModel):
+    plan_code: str
+    catalog_version: str
+    amount_minor_units: int
+    currency_code: str = "USD"
+    is_placeholder: bool = True
+
+
 class SubscriptionResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 

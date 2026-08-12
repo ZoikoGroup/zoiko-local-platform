@@ -440,19 +440,22 @@ def reserve_number(db: Session, account_id: str, e164: str, country: str, number
     return number
 
 
-def purchase_number(db: Session, account_id: str, e164: str) -> PhoneNumber:
-    now = datetime.now(timezone.utc)
-    number = db.query(PhoneNumber).filter(PhoneNumber.e164 == e164).with_for_update().first()
+def _assert_purchase_eligible(db: Session, account_id: str, number: PhoneNumber, *, e164: str) -> None:
+    """Commercial Billing Operating Standard doc's canonical transaction
+    chain: "eligibility -> customer authorization -> service entitlement ->
+    provider/provisioning action -> ... -> charge/tax/fee result" - eligibility
+    comes FIRST, strictly before any charge. Also explicit at T1: "Live
+    charge authorization requires billing_classification + billing_source +
+    approved catalog/contract + active commercial account + market/service
+    eligibility" - eligibility is a precondition FOR charge authorization,
+    not something resolved afterward.
 
-    if number is None or number.account_id != account_id or number.status not in (
-        PhoneNumberStatus.RESERVED, PhoneNumberStatus.COMPLIANCE_PENDING,
-    ):
-        raise NumberConflictError(f"{e164} must be reserved by your account before purchase")
-    if number.status == PhoneNumberStatus.RESERVED and (
-        number.reserved_until is not None and number.reserved_until < now
-    ):
-        raise NumberConflictError(f"Reservation for {e164} expired — reserve it again before purchasing")
-
+    Called from create_number_purchase_checkout_session BEFORE Stripe is
+    ever involved (so a customer who needs KYC/eligibility documents is
+    never charged while still waiting on them), and again from
+    purchase_number itself as defense-in-depth against the case's status
+    changing in the gap between checkout-session creation and the
+    payment webhook actually firing."""
     # Architecture doc §5 "Subscription and Entitlement" - number allowance
     # gate. Checked before the (unwindable) emergency-disclosure/KYC checks
     # below since it's the cheapest possible reason to reject, and unlike
@@ -517,6 +520,22 @@ def purchase_number(db: Session, account_id: str, e164: str) -> PhoneNumber:
                 f"An approved market-eligibility case for {number.number_type} numbers in {number.country} "
                 "is required before purchasing this number"
             )
+
+
+def purchase_number(db: Session, account_id: str, e164: str) -> PhoneNumber:
+    now = datetime.now(timezone.utc)
+    number = db.query(PhoneNumber).filter(PhoneNumber.e164 == e164).with_for_update().first()
+
+    if number is None or number.account_id != account_id or number.status not in (
+        PhoneNumberStatus.RESERVED, PhoneNumberStatus.COMPLIANCE_PENDING,
+    ):
+        raise NumberConflictError(f"{e164} must be reserved by your account before purchase")
+    if number.status == PhoneNumberStatus.RESERVED and (
+        number.reserved_until is not None and number.reserved_until < now
+    ):
+        raise NumberConflictError(f"Reservation for {e164} expired — reserve it again before purchasing")
+
+    _assert_purchase_eligible(db, account_id, number, e164=e164)
 
     number.status = PhoneNumberStatus.PURCHASE_PENDING
     number.provisioning_started_at = now
@@ -583,22 +602,34 @@ def purchase_number(db: Session, account_id: str, e164: str) -> PhoneNumber:
 
 
 def create_number_purchase_checkout_session(db: Session, account_id: str, e164: str) -> dict:
-    """Real Stripe Checkout (test mode) for a number purchase - the payment
-    step this module's own purchase_number docstring said "can be inserted
-    before this later without a model change." Only creates the Stripe
-    session and logs it; the actual purchase (purchase_number, with every
-    existing quota/compliance/emergency-disclosure gate intact) only runs
-    once Stripe confirms payment via the checkout.session.completed
-    webhook - see complete_number_purchase_from_checkout below. Returns
-    {id, url} - the customer is redirected to url."""
+    """Real Stripe Checkout (test mode) for a number purchase.
+
+    Commercial Billing Operating Standard doc's canonical transaction chain
+    puts eligibility strictly BEFORE any charge ("eligibility -> customer
+    authorization -> service entitlement -> ... -> charge/tax/fee result";
+    T1: "Live charge authorization requires ... market/service eligibility")
+    - _assert_purchase_eligible runs here, before Stripe is ever contacted,
+    so a customer who still needs KYC/eligibility documents is never
+    charged while waiting on them. purchase_number (called once Stripe
+    confirms payment via the webhook - see complete_number_purchase_from_
+    checkout below) re-checks the same gate as defense-in-depth against the
+    case's status changing in the gap between session creation and webhook
+    delivery, then performs the actual provisioning. Returns {id, url} -
+    the customer is redirected to url."""
     _assert_commercial_account(db, account_id)
 
     now = datetime.now(timezone.utc)
     number = db.query(PhoneNumber).filter(PhoneNumber.e164 == e164).first()
-    if number is None or number.account_id != account_id or number.status != PhoneNumberStatus.RESERVED:
+    if number is None or number.account_id != account_id or number.status not in (
+        PhoneNumberStatus.RESERVED, PhoneNumberStatus.COMPLIANCE_PENDING,
+    ):
         raise NumberConflictError(f"{e164} must be reserved by your account before checkout")
-    if number.reserved_until is not None and number.reserved_until < now:
+    if number.status == PhoneNumberStatus.RESERVED and (
+        number.reserved_until is not None and number.reserved_until < now
+    ):
         raise NumberConflictError(f"Reservation for {e164} expired — reserve it again before checkout")
+
+    _assert_purchase_eligible(db, account_id, number, e164=e164)
 
     session = stripe_checkout.create_checkout_session(
         e164=e164,

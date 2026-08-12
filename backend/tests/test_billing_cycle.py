@@ -34,9 +34,10 @@ def test_run_billing_cycle_happy_path_bills_and_captures(db_session):
 
     result = service.run_billing_cycle(db_session, account.id, actor="test-actor")
 
+    catalog_entry = service.get_active_price_catalog_entry(db_session, "starter")
     assert result["billed"] is True
     assert result["plan_code"] == "starter"
-    assert result["amount_minor_units"] == zoikonex_adapter.TEST_PLACEHOLDER_PRICES["starter"]
+    assert result["amount_minor_units"] == catalog_entry.amount_minor_units
     assert result["invoice_status"] == "ISSUED"
     assert result["payment_status"] == "captured"
     assert result["captured"] is True
@@ -114,6 +115,42 @@ def test_run_billing_cycle_raises_when_never_synced_to_zoikonex(db_session, monk
         pass
 
 
+def test_run_billing_cycle_refuses_a_non_commercial_account(db_session):
+    """Commercial Billing Operating Standard P0-4: a DEMO/SANDBOX/internal
+    account must never get a live ZoikoNex charge, no matter how the
+    billing cycle is triggered."""
+    from app.numbering.identity.models import Account, AccountBillingClassification
+
+    account, _sub = _synced_paid_subscription(db_session, "Billing Cycle Demo Account Co")
+    acc = db_session.query(Account).filter(Account.id == account.id).first()
+    acc.billing_classification = AccountBillingClassification.DEMO
+    db_session.commit()
+
+    try:
+        service.run_billing_cycle(db_session, account.id, actor="test-actor")
+        assert False, "expected NonCommercialAccountError"
+    except service.NonCommercialAccountError as e:
+        assert "demo" in str(e).lower()
+
+
+def test_run_billing_cycle_refuses_a_non_direct_billing_source(db_session):
+    """Commercial Billing Operating Standard P0-5: an account meant to be
+    billed through a bundle/partner/legacy path must never ALSO get
+    charged directly through this pipeline."""
+    from app.numbering.identity.models import Account, AccountBillingSource
+
+    account, _sub = _synced_paid_subscription(db_session, "Billing Cycle Partner Account Co")
+    acc = db_session.query(Account).filter(Account.id == account.id).first()
+    acc.billing_source = AccountBillingSource.PARTNER
+    db_session.commit()
+
+    try:
+        service.run_billing_cycle(db_session, account.id, actor="test-actor")
+        assert False, "expected NonCommercialAccountError"
+    except service.NonCommercialAccountError as e:
+        assert "partner" in str(e).lower()
+
+
 def test_run_billing_cycle_handles_capture_failure_gracefully(db_session, monkeypatch):
     account, _sub = _synced_paid_subscription(db_session, "Billing Cycle Capture Fail Co")
 
@@ -164,6 +201,112 @@ def test_run_billing_cycle_includes_a_real_tax_decision_on_the_line_item(db_sess
     # docstring) - this asserts the VALUE actually reaches the line item
     # call, not that a specific tax amount was charged.
     assert captured["tax_amount_minor_units"] == 0
+
+
+# --- Price catalog (Commercial Billing Operating Standard P0-1) ---
+
+
+def test_create_price_catalog_entry_rejects_a_duplicate_version(db_session):
+    service.create_price_catalog_entry(
+        db_session, plan_code="starter", catalog_version="test-v-dup", amount_minor_units=1000, actor="test-actor"
+    )
+    try:
+        service.create_price_catalog_entry(
+            db_session, plan_code="starter", catalog_version="test-v-dup", amount_minor_units=2000, actor="test-actor"
+        )
+        assert False, "expected PriceCatalogEntryExistsError"
+    except service.PriceCatalogEntryExistsError:
+        pass
+
+
+def test_get_active_price_catalog_entry_returns_the_most_recently_created(db_session):
+    from datetime import datetime, timedelta, timezone
+
+    service.create_price_catalog_entry(
+        db_session, plan_code="starter", catalog_version="test-v-old", amount_minor_units=1000, actor="test-actor"
+    )
+    newest = service.create_price_catalog_entry(
+        db_session, plan_code="starter", catalog_version="test-v-new", amount_minor_units=2000, actor="test-actor"
+    )
+    # Postgres's now() is frozen to this test's enclosing transaction (see
+    # _db_now's docstring) - both rows above got the SAME created_at, so
+    # ordering has to be forced explicitly to test it meaningfully, the
+    # same way a real second, later request naturally would.
+    newest.created_at = datetime.now(timezone.utc) + timedelta(seconds=1)
+    db_session.commit()
+
+    active = service.get_active_price_catalog_entry(db_session, "starter")
+    assert active.id == newest.id
+
+
+def test_cannot_approve_a_placeholder_catalog_entry(db_session):
+    entry = service.create_price_catalog_entry(
+        db_session, plan_code="starter", catalog_version="test-v-placeholder", amount_minor_units=1000,
+        is_placeholder=True, actor="test-actor",
+    )
+    try:
+        service.approve_price_catalog_entry(db_session, entry.id, actor="test-actor")
+        assert False, "expected CannotApprovePlaceholderError"
+    except service.CannotApprovePlaceholderError:
+        pass
+
+
+def test_can_approve_a_real_catalog_entry(db_session):
+    from app.billing.models import CatalogEntryStatus
+
+    entry = service.create_price_catalog_entry(
+        db_session, plan_code="starter", catalog_version="test-v-real", amount_minor_units=1000,
+        is_placeholder=False, actor="test-actor",
+    )
+    approved = service.approve_price_catalog_entry(db_session, entry.id, actor="test-actor")
+    assert approved.status == CatalogEntryStatus.APPROVED
+    assert approved.approved_by == "test-actor"
+    assert approved.approved_at is not None
+
+
+def test_run_billing_cycle_refuses_a_placeholder_price_outside_development(db_session, monkeypatch):
+    """The whole point of P0-1: a placeholder must never silently become a
+    real charge just because someone deployed to a non-dev environment."""
+    monkeypatch.setattr(service.settings, "environment", "production")
+    account, _sub = _synced_paid_subscription(db_session, "Billing Cycle Placeholder Guard Co")
+
+    try:
+        service.run_billing_cycle(db_session, account.id, actor="test-actor")
+        assert False, "expected ZoikoNexBillingCycleError"
+    except service.ZoikoNexBillingCycleError as e:
+        assert "placeholder" in str(e).lower()
+
+
+def test_price_catalog_route_requires_super_admin(client, db_session):
+    support_token = _create_and_login_staff(
+        db_session, client, "pricecatalogstaff1@zoikolocal.com", role=PlatformStaffRole.SUPPORT
+    )
+    response = client.post(
+        "/billing/price-catalog",
+        json={"plan_code": "starter", "catalog_version": "test-v-route", "amount_minor_units": 1000},
+        headers={"Authorization": f"Bearer {support_token}"},
+    )
+    assert response.status_code == 403
+
+
+def test_price_catalog_route_succeeds_for_super_admin(client, db_session):
+    admin_token = _create_and_login_staff(
+        db_session, client, "pricecatalogstaff2@zoikolocal.com", role=PlatformStaffRole.SUPER_ADMIN
+    )
+    response = client.post(
+        "/billing/price-catalog",
+        json={"plan_code": "starter", "catalog_version": "test-v-route-2", "amount_minor_units": 1000},
+        headers={"Authorization": f"Bearer {admin_token}"},
+    )
+    assert response.status_code == 201, response.text
+    assert response.json()["is_placeholder"] is True
+
+    approve_response = client.post(
+        f"/billing/price-catalog/{response.json()['id']}/approve",
+        headers={"Authorization": f"Bearer {admin_token}"},
+    )
+    # Still a placeholder (default) - approval must be refused.
+    assert approve_response.status_code == 422
 
 
 # --- Invoice corrections (credit/debit notes) and refunds ---
