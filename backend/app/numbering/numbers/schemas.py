@@ -135,6 +135,9 @@ class NumberEligibilityRuleResponse(BaseModel):
     number_type: str
     required_evidence: list
     is_active: bool
+    emergency_calling_supported: bool
+    recording_supported: bool
+    allowed_calling_directions: str
 
 
 class UpsertNumberEligibilityRuleRequest(BaseModel):
@@ -142,6 +145,9 @@ class UpsertNumberEligibilityRuleRequest(BaseModel):
     number_type: str
     required_evidence: list[str] = []
     is_active: bool = True
+    emergency_calling_supported: bool = False
+    recording_supported: bool = True
+    allowed_calling_directions: str = "both"
 
 
 class NumberEligibilityCaseResponse(BaseModel):

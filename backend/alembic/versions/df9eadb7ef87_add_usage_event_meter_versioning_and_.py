@@ -12,7 +12,7 @@ import sqlalchemy as sa
 
 # revision identifiers, used by Alembic.
 revision: str = 'df9eadb7ef87'
-down_revision: Union[str, None] = '1c78de8b7051'
+down_revision: Union[str, None] = '4e292a945c18'
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
@@ -20,12 +20,11 @@ depends_on: Union[str, Sequence[str], None] = None
 # (pre-existing model/DB skew from an earlier migration, not touched here -
 # same drift stripped out of every migration this session).
 #
-# Re-pointed down_revision to 1c78de8b7051 (the latest pre-existing head on
-# this branch) and renamed the added column meter_version -> rate_meter_version
-# when cherry-picking this commit from venky - anilupdated's own
-# fea5fe50cf35 had already added an unrelated, non-nullable `meter_version`
-# column to usage_events for a different purpose (rating-rule versioning,
-# see UsageEvent.meter_version's docstring); this column versions the rate
+# Renamed the added column meter_version -> rate_meter_version when
+# cherry-picking this commit from venky - anilupdated's own fea5fe50cf35 had
+# already added an unrelated, non-nullable `meter_version` column to
+# usage_events for a different purpose (rating-rule versioning, see
+# UsageEvent.meter_version's docstring); this column versions the rate
 # catalog instead, so it needed a distinct name to avoid clobbering that.
 
 

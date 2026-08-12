@@ -9,7 +9,9 @@ from app.billing.models import (
     BillingActionRequest,
     BillingActionRequestStatus,
     BillingActionType,
+    CatalogEntryStatus,
     Plan,
+    PriceCatalogEntry,
     Subscription,
     SubscriptionStatus,
     ZoikoNexReconciliationException,
@@ -18,6 +20,7 @@ from app.billing.models import (
     ZoikoNexSyncEvent,
     ZoikoNexSyncEventType,
 )
+from app.core.config import settings
 from app.integrations.billing import zoikonex as zoikonex_adapter
 from app.integrations.telecom import twilio as telecom
 from app.ops.models import KillSwitchScope
@@ -83,6 +86,97 @@ def get_plan(db: Session, plan_code: str) -> Plan:
     if plan is None:
         raise PlanNotFoundError(f"No such plan: {plan_code!r}")
     return plan
+
+
+class PriceCatalogEntryExistsError(Exception):
+    """Raised when trying to create a catalog_version that already exists
+    for a plan - PriceCatalogEntry is Class A once created (see its
+    docstring): a price correction is always a NEW version, never an edit."""
+
+
+class CannotApprovePlaceholderError(Exception):
+    """Raised when trying to approve a catalog entry still marked
+    is_placeholder - a placeholder must be replaced by a real entry
+    (create_price_catalog_entry with is_placeholder=False) before it can
+    ever move to APPROVED. Approving fake test data would be indistinguishable
+    from a real commercial sign-off in the audit trail."""
+
+
+class PriceCatalogEntryNotFoundError(Exception):
+    """Raised when approving a price catalog entry id that doesn't exist."""
+
+
+def get_active_price_catalog_entry(db: Session, plan_code: str) -> PriceCatalogEntry | None:
+    """The "current" price for a plan - the most recently created catalog
+    entry, whether DRAFT or APPROVED. There is deliberately no query-time
+    distinction between the two here: run_billing_cycle is what decides
+    whether a DRAFT/placeholder entry is actually chargeable in the
+    current environment (Commercial Billing Operating Standard P0-1)."""
+    return (
+        db.query(PriceCatalogEntry)
+        .filter(PriceCatalogEntry.plan_code == plan_code)
+        .order_by(PriceCatalogEntry.created_at.desc())
+        .first()
+    )
+
+
+def create_price_catalog_entry(
+    db: Session, *, plan_code: str, catalog_version: str, amount_minor_units: int,
+    currency_code: str = "USD", is_placeholder: bool = True, actor: str,
+) -> PriceCatalogEntry:
+    """SUPER_ADMIN-gated at the route - locking/changing a price is a
+    commercial decision, the same bar as a calling-rate change
+    (app.usage.service.upsert_calling_rate). Always creates a NEW row;
+    never edits an existing catalog_version (Class A - see
+    PriceCatalogEntry's docstring)."""
+    existing = (
+        db.query(PriceCatalogEntry)
+        .filter(PriceCatalogEntry.plan_code == plan_code, PriceCatalogEntry.catalog_version == catalog_version)
+        .first()
+    )
+    if existing is not None:
+        raise PriceCatalogEntryExistsError(
+            f"Catalog version {catalog_version!r} already exists for plan {plan_code!r} - use a new version"
+        )
+    entry = PriceCatalogEntry(
+        plan_code=plan_code, catalog_version=catalog_version, amount_minor_units=amount_minor_units,
+        currency_code=currency_code, is_placeholder=is_placeholder,
+    )
+    db.add(entry)
+    db.commit()
+    db.refresh(entry)
+    log_event(
+        db, actor=actor, action="billing.price_catalog_entry_created", target=f"plan:{plan_code}",
+        after={
+            "catalog_version": catalog_version, "amount_minor_units": amount_minor_units,
+            "currency_code": currency_code, "is_placeholder": is_placeholder,
+        },
+    )
+    return entry
+
+
+def approve_price_catalog_entry(db: Session, entry_id: str, *, actor: str) -> PriceCatalogEntry:
+    """SUPER_ADMIN-gated at the route. Refuses to approve a placeholder
+    entry (see CannotApprovePlaceholderError) - a real price decision must
+    create its own real (is_placeholder=False) entry first."""
+    entry = db.query(PriceCatalogEntry).filter(PriceCatalogEntry.id == entry_id).first()
+    if entry is None:
+        raise PriceCatalogEntryNotFoundError(f"No such price catalog entry: {entry_id!r}")
+    if entry.is_placeholder:
+        raise CannotApprovePlaceholderError(
+            f"Catalog entry {entry_id!r} is a placeholder/test price - create a real entry "
+            f"(is_placeholder=False) before it can be approved"
+        )
+    entry.status = CatalogEntryStatus.APPROVED
+    entry.approved_by = actor
+    entry.approved_at = _db_now(db)
+    db.commit()
+    db.refresh(entry)
+    log_event(
+        db, actor=actor, action="billing.price_catalog_entry_approved", target=f"price_catalog_entry:{entry.id}",
+        after={"plan_code": entry.plan_code, "catalog_version": entry.catalog_version},
+    )
+    return entry
 
 
 def _new_period(now: datetime) -> tuple[datetime, datetime]:
@@ -838,19 +932,46 @@ class ZoikoNexBillingCycleError(Exception):
     the cycle the same way but with a different, already-diagnosed cause."""
 
 
+class NonCommercialAccountError(Exception):
+    """Raised when an account whose billing_classification/billing_source
+    forbids a direct Zoiko Local charge (Commercial Billing Operating
+    Standard P0-4/P0-5: "non-commercial classes cannot create live
+    customer charges" + "no duplicate direct Zoiko Local charge for the
+    same entitlement/period; billing_source references bundle/order")
+    reaches run_billing_cycle. Mirrors app.numbering.numbers.service's
+    identically-named gate on the number-purchase Stripe Checkout path -
+    this is the equivalent gate for the ZoikoNex subscription-billing
+    path, the OTHER real place this codebase creates a live charge."""
+
+
+def _assert_direct_commercial_account(db: Session, account_id: str) -> None:
+    from app.numbering.identity.models import Account, AccountBillingClassification, AccountBillingSource
+
+    account = db.query(Account).filter(Account.id == account_id).first()
+    if account is None or account.billing_classification != AccountBillingClassification.COMMERCIAL_STANDALONE:
+        classification = account.billing_classification.value if account else "unknown"
+        raise NonCommercialAccountError(
+            f"Account billing_classification {classification!r} cannot create a live ZoikoNex charge"
+        )
+    if account.billing_source != AccountBillingSource.DIRECT_ZOIKO_LOCAL:
+        raise NonCommercialAccountError(
+            f"Account billing_source {account.billing_source.value!r} is not billed directly by Zoiko "
+            f"Local - running a direct billing cycle here would double-charge alongside that source"
+        )
+
+
 def run_billing_cycle(db: Session, account_id: str, *, actor: str) -> dict:
-    """Architecture doc §9's rating -> invoice -> payment pipeline, driven
-    against a live ZoikoNex instance using TEST_PLACEHOLDER_PRICES (see
-    that constant's docstring in app.integrations.billing.zoikonex - NOT a
-    real decided price). Staff-triggered on demand - no scheduler exists in
-    this codebase yet, same posture as run_synthetic_checks and
+    """Architecture doc §9's rating -> invoice -> payment pipeline, priced
+    from PriceCatalogEntry (Commercial Billing Operating Standard P0-1 -
+    see that model's docstring). Staff-triggered on demand - no scheduler
+    exists in this codebase yet, same posture as run_synthetic_checks and
     run_zoikonex_reconciliation.
 
     Stages, in order: register the plan in ZoikoNex's catalog (once, lazily,
     the first time any account on that plan is billed) -> open a bill cycle
-    -> create + issue an invoice carrying one line item (the plan's
-    placeholder monthly price) -> close the bill cycle -> create a payment
-    intent for the invoice total -> authorise it -> attempt capture.
+    -> create + issue an invoice carrying one line item (the plan's catalog
+    price) -> close the bill cycle -> create a payment intent for the
+    invoice total -> authorise it -> attempt capture.
 
     Every stage after catalog registration can fail independently; each
     failure raises immediately (nothing here is worth attempting out of
@@ -862,10 +983,24 @@ def run_billing_cycle(db: Session, account_id: str, *, actor: str) -> dict:
     authorised) rather than raising, since "authorised but not yet
     captured" is a real, reportable, non-broken state - not an error.
 
-    free_trial (and any plan whose TEST_PLACEHOLDER_PRICES entry is 0) is
-    skipped before any ZoikoNex call is made - there is nothing to bill,
-    so creating a $0 invoice against a real ZoikoNex instance would just be
-    noise, not a useful proof of the pipeline.
+    A plan with no catalog entry, or a zero-amount entry (free_trial), is
+    skipped before any ZoikoNex call is made - there is nothing to bill.
+    A PLACEHOLDER catalog entry (is_placeholder=True - see
+    PriceCatalogEntry's docstring) is only chargeable in a development
+    environment - outside development this raises rather than silently
+    charging a fake test price, the same "no ad-hoc invented price" rule
+    P0-1 exists for. A real (is_placeholder=False) entry must additionally
+    be APPROVED before it's chargeable outside development. Checked before
+    the commercial-account gate below since it's the cheapest possible
+    reason to skip, same ordering rationale as the number-purchase quota
+    check elsewhere in this codebase.
+
+    Commercial Billing Operating Standard P0-4/P0-5: refuses to run at all
+    for an account whose billing_classification isn't COMMERCIAL_STANDALONE
+    or whose billing_source isn't DIRECT_ZOIKO_LOCAL (see
+    NonCommercialAccountError) - a DEMO/SANDBOX/QA account must never get
+    a live ZoikoNex charge, and an account meant to be billed through a
+    bundle/partner/legacy path must never ALSO get charged directly here.
     """
     # Commercial Billing Operating Standard doc §32.1 - checked before any
     # ZoikoNex call, whether this is invoked directly or via
@@ -875,10 +1010,26 @@ def run_billing_cycle(db: Session, account_id: str, *, actor: str) -> dict:
 
     sub = get_or_create_subscription(db, account_id)
     plan = get_plan(db, sub.plan_code)
-    amount_minor_units = zoikonex_adapter.TEST_PLACEHOLDER_PRICES.get(plan.plan_code, 0)
+    catalog_entry = get_active_price_catalog_entry(db, plan.plan_code)
 
-    if amount_minor_units <= 0:
-        return {"billed": False, "reason": f"plan {plan.plan_code!r} has no placeholder price to bill"}
+    if catalog_entry is None or catalog_entry.amount_minor_units <= 0:
+        return {"billed": False, "reason": f"plan {plan.plan_code!r} has no price catalog entry to bill"}
+    _assert_direct_commercial_account(db, account_id)
+    if settings.environment != "development":
+        if catalog_entry.is_placeholder:
+            raise ZoikoNexBillingCycleError(
+                f"Cannot bill plan {plan.plan_code!r} outside development: its price catalog entry "
+                f"({catalog_entry.catalog_version}) is still a placeholder - real pricing must be "
+                f"decided and approved first (Commercial Billing Operating Standard P0-1)."
+            )
+        if catalog_entry.status != CatalogEntryStatus.APPROVED:
+            raise ZoikoNexBillingCycleError(
+                f"Cannot bill plan {plan.plan_code!r} outside development: its price catalog entry "
+                f"({catalog_entry.catalog_version}) is not yet APPROVED."
+            )
+
+    amount_minor_units = catalog_entry.amount_minor_units
+    currency_code = catalog_entry.currency_code
 
     if sub.zoikonex_account_id is None:
         sub = sync_subscription_to_zoikonex(db, sub)
@@ -888,10 +1039,10 @@ def run_billing_cycle(db: Session, account_id: str, *, actor: str) -> dict:
             "(no account_id) - check ZoikoNex connectivity and retry."
         )
 
-    zoikonex_adapter.register_plan_in_catalog(db, plan, amount_minor_units=amount_minor_units)
+    zoikonex_adapter.register_plan_in_catalog(db, plan, amount_minor_units=amount_minor_units, currency_code=currency_code)
 
     bill_cycle = zoikonex_adapter.open_bill_cycle(sub)
-    invoice = zoikonex_adapter.create_invoice(sub, bill_cycle["bill_cycle_id"])
+    invoice = zoikonex_adapter.create_invoice(sub, bill_cycle["bill_cycle_id"], currency_code=currency_code)
     # create_invoice's Idempotency-Key is deterministic per (sub.id,
     # current_period_start), so a retry of an already-issued invoice
     # replays the SAME invoice_id - but confirmed live, that replayed
@@ -910,10 +1061,12 @@ def run_billing_cycle(db: Session, account_id: str, *, actor: str) -> dict:
         # invent the way a subscription price got a placeholder).
         tax = zoikonex_adapter.determine_tax_for_invoice_line(
             invoice_id=invoice["invoice_id"], taxable_amount_minor_units=amount_minor_units,
+            currency_code=currency_code,
         )
+        description_suffix = " (TEST PLACEHOLDER PRICE, not a real charge)" if catalog_entry.is_placeholder else ""
         zoikonex_adapter.add_invoice_line_item(
             invoice["invoice_id"],
-            description=f"{plan.name} - monthly subscription (TEST PLACEHOLDER PRICE, not a real charge)",
+            description=f"{plan.name} - monthly subscription{description_suffix}",
             amount_minor_units=amount_minor_units,
             tax_amount_minor_units=tax.get("tax_amount_minor_units"),
             line_key="plan-fee",
@@ -938,15 +1091,18 @@ def run_billing_cycle(db: Session, account_id: str, *, actor: str) -> dict:
             zoikonex_ref=invoice["invoice_id"],
             payload={
                 "plan_code": plan.plan_code, "amount_minor_units": amount_minor_units,
+                "catalog_version": catalog_entry.catalog_version,
                 "bill_cycle_id": bill_cycle["bill_cycle_id"], "status": issued["status"],
-                "placeholder_price": True, "bill_cycle_closed": bill_cycle_closed,
+                "placeholder_price": catalog_entry.is_placeholder, "bill_cycle_closed": bill_cycle_closed,
                 "bill_cycle_close_error": bill_cycle_close_error,
             },
         )
     )
     db.commit()
 
-    intent = zoikonex_adapter.create_payment_intent(sub, invoice["invoice_id"], amount_minor_units=amount_minor_units)
+    intent = zoikonex_adapter.create_payment_intent(
+        sub, invoice["invoice_id"], amount_minor_units=amount_minor_units, currency_code=currency_code,
+    )
     zoikonex_adapter.authorise_payment_intent(intent["payment_intent_id"])
 
     result = {

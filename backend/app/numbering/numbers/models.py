@@ -223,13 +223,25 @@ class NumberEligibilityRule(Base):
     to market_id, number_type, eligibility_profile... independently." Data-
     driven per (country, number_type), same "rules as data, never hardcoded
     if-statements" discipline as app.compliance.models.ComplianceRule - a
-    combination with no row here (the default; none are seeded) needs no
-    eligibility case at all, so existing purchase/reservation behavior is
-    completely unaffected until staff explicitly configure one. Kept
-    separate from ComplianceRule because this gates a specific requested
-    NUMBER (e.g. proof of local presence for one geographic-restricted
-    number type in one country), not the account-level KYC/KYB identity
-    ComplianceRule already covers.
+    combination with no ACTIVE row here needs no eligibility case at all -
+    confirmed live in purchase_number: the gate triggers on the mere
+    EXISTENCE of an active rule (is_active=True), regardless of whether
+    required_evidence is empty, since opening a case still requires it to
+    reach APPROVED before purchase proceeds. seed_market_release_registry
+    therefore seeds every supported country with is_active=False - real,
+    queryable reference data for the P0-2 registry fields below, with zero
+    change to today's purchase behavior. A market's rows only start
+    gating once staff explicitly flip is_active=True (with real
+    required_evidence, once one is actually decided for that market).
+    Kept separate from ComplianceRule because this gates a specific
+    requested NUMBER (e.g. proof of local presence for one geographic-
+    restricted number type in one country), not the account-level
+    KYC/KYB identity ComplianceRule already covers.
+
+    emergency_calling_supported/recording_supported/allowed_calling_directions
+    (see their own column comments) are the P0-2 "market/release registry"
+    fields - deliberately scoped to what this product actually supports,
+    not an attempt to encode real per-country telecom/privacy law.
     """
 
     __tablename__ = "number_eligibility_rules"
@@ -240,6 +252,25 @@ class NumberEligibilityRule(Base):
     number_type: Mapped[str] = mapped_column(String(30), nullable=False, index=True)
     required_evidence: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    # Commercial Billing Operating Standard §7 P0-2: "emergency-service
+    # capability, ... recording/transcription... inbound/outbound calling".
+    # Deliberately scoped to what ZOIKO LOCAL'S OWN PRODUCT actually
+    # supports in this market, not an attempt to encode each country's real
+    # telecom/privacy law (that would mean inventing legal facts nobody has
+    # reviewed - the same category of problem TEST_PLACEHOLDER_PRICES was
+    # created to avoid for pricing). emergency_calling_supported=False is
+    # simply true everywhere right now (no real E911/999 routing exists
+    # anywhere in this codebase - see the emergency-disclosure consent gate
+    # in app.compliance already required before every number purchase).
+    # recording_supported/allowed_calling_directions reflect what's
+    # actually built and already gated by the existing AI-processing/
+    # recording consent flow, not a new legal claim.
+    emergency_calling_supported: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    recording_supported: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    allowed_calling_directions: Mapped[str] = mapped_column(
+        Enum("inbound_only", "outbound_only", "both", name="calling_direction_enum"),
+        nullable=False, default="both",
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 

@@ -16,8 +16,9 @@ What's real here:
 - Raw usage ingestion (usage-ingestion-mediation's /v1/usage/ingest) -
   tested end to end.
 - Plan catalog registration (product-catalogue-commercial: Product +
-  Offer + PriceRule) - tested end to end. Uses TEST_PLACEHOLDER_PRICES
-  below, NOT a real commercial price - see that constant's docstring.
+  Offer + PriceRule) - tested end to end. Priced from
+  app.billing.models.PriceCatalogEntry, NOT a real commercial price yet -
+  see that model's docstring.
 - Real usage rating via rating-charging's /v1/postpaid/rate (bill-cycle
   accumulation) - tested end to end, using the placeholder-priced
   estimate from rate_usage_event as the amount, since ZoikoNex's own
@@ -201,23 +202,6 @@ def _request(method: str, base_url: str, path: str, *, _allow_404: bool = False,
     return response.json() if response.content else {}
 
 
-# --- Placeholder pricing ---
-#
-# NOT REAL PRICES. Nobody at Zoiko has decided what a plan actually costs
-# yet (a business decision, not an engineering one) - these exist purely
-# so the rating -> invoice -> payment pipeline can be built and proven
-# against ZoikoNex end to end today, with a one-line swap to real numbers
-# once pricing is decided. Every log line and sync-event payload that
-# touches these values is labeled "placeholder"/"test price" so nobody
-# mistakes a test invoice for a real bill.
-TEST_PLACEHOLDER_PRICES: dict[str, int] = {
-    "free_trial": 0,
-    "starter": 1999,      # $19.99 - PLACEHOLDER, not a real decided price
-    "business": 4999,     # $49.99 - PLACEHOLDER, not a real decided price
-    "enterprise": 19999,  # $199.99 - PLACEHOLDER, not a real decided price
-}
-
-
 # --- Plan catalog registration (product-catalogue-commercial) ---
 
 def register_plan_in_catalog(
@@ -227,15 +211,15 @@ def register_plan_in_catalog(
     Product + Offer + PriceRule - idempotent (a plan already carrying
     zoikonex_product_id is returned as-is, never re-registered).
 
-    Called from app.billing.service.run_billing_cycle using
-    TEST_PLACEHOLDER_PRICES - NOT a real commercial price (see that
-    constant's docstring). Plan itself still has no price fields (see
-    Plan's docstring) - the real price lives only in ZoikoNex's own
-    catalog once this runs, same as it would with a real price. Re-run
-    once real pricing is decided by simply swapping TEST_PLACEHOLDER_PRICES
-    for the real numbers - this function's idempotency guard means the
-    OLD placeholder registration must be cleared (zoikonex_product_id set
-    back to NULL) for a plan before it will pick up a new price, since a
+    Called from app.billing.service.run_billing_cycle, which resolves
+    amount_minor_units from app.billing.models.PriceCatalogEntry (the
+    Commercial Billing Operating Standard P0-1 "versioned APPROVED price
+    catalog" - see that model's docstring) - NOT invented here. Plan
+    itself still has no price fields (see Plan's docstring) - the real
+    price lives in PriceCatalogEntry, and once this runs, also in
+    ZoikoNex's own catalog. Re-run after a real price catalog version is
+    approved by clearing the OLD registration (zoikonex_product_id back to
+    NULL) for a plan before it will pick up the new price, since a
     PriceRule change is a commercial decision, not something this function
     does silently on every call.
     """
@@ -562,8 +546,9 @@ def plan_product_id(db: Session, sub) -> str | None:
 # NOT REAL TAX RATES. Real sales/telecom tax rates are a legal/compliance
 # decision (varies by jurisdiction, changes over time, subject to audit) -
 # nobody at Zoiko has made that decision, same class of problem as
-# TEST_PLACEHOLDER_PRICES above but higher-stakes to guess wrong on, so
-# this deliberately registers a single 0%-rate policy under a jurisdiction
+# app.billing.models.PriceCatalogEntry's placeholder prices but higher-
+# stakes to guess wrong on, so this deliberately registers a single
+# 0%-rate policy under a jurisdiction
 # code that cannot be mistaken for a real one ("ZZ" is ISO 3166's reserved
 # user-assigned/unknown-country code - never a real jurisdiction). Every
 # invoice still gets a REAL tax-decision call and a REAL tax_decision_id

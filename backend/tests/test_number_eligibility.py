@@ -36,6 +36,23 @@ def _stub_buy_number(monkeypatch):
     )
 
 
+def _set_eligibility_rule(db_session, *, country: str, number_type: str = "local", required_evidence: list[str]) -> NumberEligibilityRule:
+    """Replaces any existing rule for (country, number_type) rather than a
+    blind insert - seed_market_release_registry is a real feature now
+    (Commercial Billing Operating Standard P0-2) that legitimately creates
+    a row for every supported country including this test file's DE/FR
+    fixtures, so a raw db_session.add() here would collide with it in any
+    environment where that seed has actually run, exactly as it does
+    against this shared dev database."""
+    db_session.query(NumberEligibilityRule).filter(
+        NumberEligibilityRule.country == country, NumberEligibilityRule.number_type == number_type,
+    ).delete()
+    rule = NumberEligibilityRule(country=country, number_type=number_type, required_evidence=required_evidence)
+    db_session.add(rule)
+    db_session.commit()
+    return rule
+
+
 def _create_super_admin(client, db_session, email: str) -> str:
     from app.staff import service as staff_service
     from app.staff.models import PlatformStaffRole
@@ -60,8 +77,7 @@ def test_purchase_succeeds_when_no_eligibility_rule_is_active(client, monkeypatc
 
 def test_purchase_is_blocked_without_an_approved_eligibility_case(client, db_session, monkeypatch):
     _stub_buy_number(monkeypatch)
-    db_session.add(NumberEligibilityRule(country="DE", number_type="local", required_evidence=["business_address_proof"]))
-    db_session.commit()
+    _set_eligibility_rule(db_session, country="DE", required_evidence=["business_address_proof"])
 
     token = _signup_and_login(client, "eligbuyer2@example.com")
     headers = {"Authorization": f"Bearer {token}"}
@@ -74,8 +90,7 @@ def test_purchase_is_blocked_without_an_approved_eligibility_case(client, db_ses
 
 def test_purchase_blocked_by_eligibility_persists_compliance_pending_status(client, db_session, monkeypatch):
     _stub_buy_number(monkeypatch)
-    db_session.add(NumberEligibilityRule(country="DE", number_type="local", required_evidence=["business_address_proof"]))
-    db_session.commit()
+    _set_eligibility_rule(db_session, country="DE", required_evidence=["business_address_proof"])
 
     token = _signup_and_login(client, "eligbuyer3@example.com")
     headers = {"Authorization": f"Bearer {token}"}
@@ -91,8 +106,7 @@ def test_purchase_blocked_by_eligibility_persists_compliance_pending_status(clie
 
 def test_purchase_succeeds_once_eligibility_case_is_approved(client, db_session, monkeypatch):
     _stub_buy_number(monkeypatch)
-    db_session.add(NumberEligibilityRule(country="DE", number_type="local", required_evidence=["business_address_proof"]))
-    db_session.commit()
+    _set_eligibility_rule(db_session, country="DE", required_evidence=["business_address_proof"])
 
     token = _signup_and_login(client, "eligbuyer4@example.com")
     headers = {"Authorization": f"Bearer {token}"}
@@ -120,8 +134,7 @@ def test_purchase_succeeds_once_eligibility_case_is_approved(client, db_session,
 
 def test_rejected_eligibility_case_can_be_retried_with_fresh_evidence(client, db_session, monkeypatch):
     _stub_buy_number(monkeypatch)
-    db_session.add(NumberEligibilityRule(country="DE", number_type="local", required_evidence=["business_address_proof"]))
-    db_session.commit()
+    _set_eligibility_rule(db_session, country="DE", required_evidence=["business_address_proof"])
 
     token = _signup_and_login(client, "eligbuyer5@example.com")
     headers = {"Authorization": f"Bearer {token}"}
@@ -150,8 +163,7 @@ def test_rejected_eligibility_case_can_be_retried_with_fresh_evidence(client, db
 
 def test_customer_cannot_submit_evidence_to_another_accounts_eligibility_case(client, db_session, monkeypatch):
     _stub_buy_number(monkeypatch)
-    db_session.add(NumberEligibilityRule(country="DE", number_type="local", required_evidence=["business_address_proof"]))
-    db_session.commit()
+    _set_eligibility_rule(db_session, country="DE", required_evidence=["business_address_proof"])
 
     owner_token = _signup_and_login(client, "eligowner6@example.com")
     owner_headers = {"Authorization": f"Bearer {owner_token}"}
@@ -218,3 +230,61 @@ def test_deactivating_an_eligibility_rule_unblocks_purchase(client, db_session, 
 
     unblocked = client.post("/numbers/purchase", json={"e164": "+33142685099"}, headers=headers)
     assert unblocked.status_code == 200, unblocked.text
+
+
+# --- Market/release registry fields (Commercial Billing Operating Standard P0-2) ---
+
+
+def test_upsert_eligibility_rule_defaults_the_registry_fields(client, db_session):
+    """Defaults reflect what this product actually supports today (see
+    NumberEligibilityRule's docstring), not an invented per-country legal
+    claim - emergency_calling_supported=False because no real E911/999
+    routing exists anywhere yet."""
+    staff_token = _create_super_admin(client, db_session, "eligstaff8@zoikolocal.com")
+
+    response = client.put(
+        "/staff/number-eligibility-rules",
+        json={"country": "DE", "number_type": "local", "required_evidence": [], "is_active": True},
+        headers={"Authorization": f"Bearer {staff_token}"},
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["emergency_calling_supported"] is False
+    assert body["recording_supported"] is True
+    assert body["allowed_calling_directions"] == "both"
+
+
+def test_seed_market_release_registry_covers_every_supported_country(client, db_session):
+    from app.numbering.numbers import service as numbers_service
+
+    staff_token = _create_super_admin(client, db_session, "eligstaff9@zoikolocal.com")
+
+    response = client.post(
+        "/staff/number-eligibility-rules/seed-market-registry",
+        headers={"Authorization": f"Bearer {staff_token}"},
+    )
+    assert response.status_code == 200, response.text
+    seeded_countries = {r["country"] for r in response.json()}
+    supported_countries = {c.code for c in numbers_service.list_supported_countries(db_session)}
+    assert seeded_countries == supported_countries
+    for rule in response.json():
+        assert rule["number_type"] == "local"
+        assert rule["emergency_calling_supported"] is False
+
+
+def test_seed_market_release_registry_requires_super_admin(client, db_session):
+    from app.staff import service as staff_service
+    from app.staff.models import PlatformStaffRole
+
+    staff_service.create_staff(
+        db_session, email="eligsupport2@zoikolocal.com", password="staffpass123", role=PlatformStaffRole.SUPPORT,
+    )
+    token = client.post(
+        "/staff/login", json={"email": "eligsupport2@zoikolocal.com", "password": "staffpass123"}
+    ).json()["access_token"]
+
+    response = client.post(
+        "/staff/number-eligibility-rules/seed-market-registry",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert response.status_code == 403

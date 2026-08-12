@@ -8,9 +8,13 @@ from app.billing.models import BillingActionRequestStatus, BillingActionType
 from app.billing.schemas import (
     BillingActionRequestResponse,
     ChangePlanRequest,
+    CreatePriceCatalogEntryRequest,
+    CreditNoteResponse,
+    DebitNoteResponse,
     IssueCreditNoteRequest,
     IssueDebitNoteRequest,
     PlanResponse,
+    PriceCatalogEntryResponse,
     RefundPaymentRequest,
     RejectBillingActionRequest,
     ResolveReconciliationExceptionRequest,
@@ -36,6 +40,47 @@ router = APIRouter(prefix="/billing", tags=["billing"])
 @router.get("/plans", response_model=list[PlanResponse])
 def list_plans(db: Session = Depends(get_db), _current_user: User = Depends(get_current_user)):
     return service.list_plans(db)
+
+
+@router.get("/price-catalog/{plan_code}", response_model=PriceCatalogEntryResponse | None)
+def get_price_catalog_entry(
+    plan_code: str, db: Session = Depends(get_db), _staff: PlatformStaff = Depends(get_current_staff),
+):
+    return service.get_active_price_catalog_entry(db, plan_code)
+
+
+@router.post("/price-catalog", response_model=PriceCatalogEntryResponse, status_code=status.HTTP_201_CREATED)
+def create_price_catalog_entry(
+    payload: CreatePriceCatalogEntryRequest,
+    db: Session = Depends(get_db),
+    staff: PlatformStaff = Depends(require_capability("billing.manage_price_catalog")),
+):
+    """SUPER_ADMIN only - Commercial Billing Operating Standard P0-1. Always
+    creates a NEW catalog_version row; never edits an existing one (Class A -
+    see PriceCatalogEntry's docstring)."""
+    try:
+        return service.create_price_catalog_entry(
+            db, plan_code=payload.plan_code, catalog_version=payload.catalog_version,
+            amount_minor_units=payload.amount_minor_units, currency_code=payload.currency_code,
+            is_placeholder=payload.is_placeholder, actor=staff.id,
+        )
+    except service.PriceCatalogEntryExistsError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e
+
+
+@router.post("/price-catalog/{entry_id}/approve", response_model=PriceCatalogEntryResponse)
+def approve_price_catalog_entry(
+    entry_id: str, db: Session = Depends(get_db),
+    staff: PlatformStaff = Depends(require_capability("billing.manage_price_catalog")),
+):
+    """SUPER_ADMIN only. Refuses a placeholder entry - see
+    CannotApprovePlaceholderError."""
+    try:
+        return service.approve_price_catalog_entry(db, entry_id, actor=staff.id)
+    except service.PriceCatalogEntryNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
+    except service.CannotApprovePlaceholderError as e:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e)) from e
 
 
 @router.get("/subscription", response_model=SubscriptionResponse)
@@ -229,9 +274,9 @@ def request_run_billing_cycle(
     staff: PlatformStaff = Depends(require_capability("billing.run_billing_cycle")),
 ):
     """SUPER_ADMIN only - stages a real rating -> invoice -> payment cycle
-    against ZoikoNex for one account (TEST_PLACEHOLDER_PRICES, see
-    app.integrations.billing.zoikonex's docstring - NOT a real decided
-    price) for a *different* staff member to approve via POST
+    against ZoikoNex for one account, priced from PriceCatalogEntry (see
+    that model's docstring - may still be a placeholder, not a real
+    decided price), for a *different* staff member to approve via POST
     /billing/actions/{id}/approve - see BillingActionRequest's docstring
     for why this is no longer a single-staff action."""
     return service.request_billing_action(
@@ -323,6 +368,8 @@ def approve_billing_action(
     except KillSwitchTrippedError as e:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e)) from e
     except service.TestAccountRestrictedError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e)) from e
+    except service.NonCommercialAccountError as e:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e)) from e
 
 
