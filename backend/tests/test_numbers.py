@@ -549,6 +549,27 @@ def test_search_rejects_an_uncurated_country(client):
     assert response.status_code == 422
 
 
+def test_search_rejects_a_non_numeric_area_code_with_a_clean_message(client, monkeypatch):
+    """Confirmed live: a city name (or any non-numeric text) typed into the
+    area code field used to reach Twilio raw and come back as their own
+    400 verbatim ("chicao is not a valid integer: 'AreaCode'", vendor field
+    name and docs link included). Caught before Twilio is ever called -
+    stubbing search_available_numbers to fail the test loudly if it is."""
+    def _fail_if_called(*args, **kwargs):
+        raise AssertionError("Twilio should never be called for an invalid area code")
+
+    monkeypatch.setattr("app.numbering.numbers.service.telecom.search_available_numbers", _fail_if_called)
+
+    token = _signup_and_login(client, "areacodeinvalid1@example.com")
+    response = client.get(
+        "/numbers/search", params={"country": "US", "area_code": "chicao"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert response.status_code == 422
+    assert "chicao" in response.json()["detail"]
+    assert "AreaCode" not in response.json()["detail"]  # no raw vendor field name leaking through
+
+
 def test_reserve_rejects_an_uncurated_country(client):
     token = _signup_and_login(client, "countriesreserve1@example.com")
     response = client.post(

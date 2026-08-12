@@ -28,6 +28,7 @@ from app.numbering.numbers.schemas import (
 from app.numbering.numbers.service import (
     ComplianceRequiredError,
     EmergencyDisclosureRequiredError,
+    InvalidAreaCodeError,
     NumberConflictError,
     NumberEligibilityCaseNotFoundError,
     NumberEligibilityRequiredError,
@@ -56,6 +57,8 @@ def search_numbers(
     try:
         return service.search_numbers(db, country, number_type=number_type, area_code=area_code)
     except UnsupportedCountryError as e:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e)) from e
+    except InvalidAreaCodeError as e:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e)) from e
     except TelecomError as e:
         raise HTTPException(status_code=502, detail=str(e)) from e

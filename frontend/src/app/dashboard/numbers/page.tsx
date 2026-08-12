@@ -836,9 +836,10 @@ export default function NumbersPage() {
             </select>
             <input
               value={areaCode}
-              onChange={(e) => setAreaCode(e.target.value)}
-              placeholder="Area code (optional)"
-              className="w-40 rounded-lg border border-slate-300 px-3 py-2 text-sm placeholder:text-slate-400"
+              onChange={(e) => setAreaCode(e.target.value.replace(/\D/g, ""))}
+              inputMode="numeric"
+              placeholder="Area code, e.g. 312 (optional)"
+              className="w-48 rounded-lg border border-slate-300 px-3 py-2 text-sm placeholder:text-slate-400"
             />
             <button
               onClick={handleSearch}

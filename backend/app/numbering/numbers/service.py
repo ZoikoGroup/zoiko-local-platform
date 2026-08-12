@@ -60,6 +60,15 @@ class UnsupportedCountryError(Exception):
     platform hasn't reviewed yet."""
 
 
+class InvalidAreaCodeError(Exception):
+    """Raised for a non-numeric area code (e.g. a city name typed into the
+    field instead of its numeric code) - confirmed live: without this,
+    Twilio's own 400 for a bad AreaCode value ("chicao is not a valid
+    integer: 'AreaCode'") passed straight through to the customer verbatim,
+    vendor field name, error code and docs link included. Caught before
+    ever calling Twilio, not just reworded after the fact."""
+
+
 def list_supported_countries(db: Session) -> list[SupportedCountry]:
     return db.query(SupportedCountry).order_by(SupportedCountry.sort_order, SupportedCountry.code).all()
 
@@ -298,7 +307,11 @@ SMS_REQUIREMENT_TYPE = "sms_business_messaging"
 
 def search_numbers(db: Session, country: str, number_type: str = "local", area_code: str | None = None) -> list[dict]:
     _assert_supported_country(db, country)
-    return telecom.search_available_numbers(country, number_type=number_type, area_code=area_code)
+    if area_code is not None and area_code.strip() and not area_code.strip().isdigit():
+        raise InvalidAreaCodeError(
+            f"{area_code!r} isn't a valid area code - enter digits only, e.g. 312 for Chicago."
+        )
+    return telecom.search_available_numbers(country, number_type=number_type, area_code=area_code.strip() if area_code else area_code)
 
 
 def reserve_number(db: Session, account_id: str, e164: str, country: str, number_type: str = "local") -> PhoneNumber:
