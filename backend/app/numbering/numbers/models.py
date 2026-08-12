@@ -2,7 +2,7 @@ import enum
 import uuid
 from datetime import datetime, time
 
-from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, Integer, String, Time, func
+from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, Integer, JSON, String, Time, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -57,6 +57,16 @@ class PhoneNumber(Base):
         UUID(as_uuid=False), ForeignKey("accounts.id", ondelete="CASCADE"), nullable=False, index=True
     )
     reserved_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    # Commercial Billing Operating Standard doc §7 "Number Inventory,
+    # Eligibility, Reservation & Provisioning" - the search step already
+    # accepts a number_type ("local", "toll_free", ...), but until now
+    # nothing persisted which type was actually reserved. Needed so
+    # NumberEligibilityRule (below) can key market/number-type-specific
+    # requirements the same way ComplianceRule keys KYC requirements by
+    # country - defaults to "local" (the only type this platform actually
+    # sells end-to-end today) so every existing row is unaffected.
+    number_type: Mapped[str] = mapped_column(String(30), nullable=False, default="local", server_default="local")
 
     # Roadmap §6 number lifecycle - "Quarantine period before reuse, default
     # 90 days." Set when the number moves to CANCELLED; checked by
@@ -189,3 +199,78 @@ class RingGroupDestination(Base):
     destination_number: Mapped[str] = mapped_column(String(20), nullable=False)
     ring_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class NumberEligibilityCaseStatus(str, enum.Enum):
+    PENDING = "pending"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+    EXPIRED = "expired"
+
+
+class NumberEligibilityRule(Base):
+    """Commercial Billing Operating Standard doc §7 C1/C3: "Implement a
+    versioned market/release registry... covering availability, eligibility
+    documents, geographic/address restrictions..." and "Each number binds
+    to market_id, number_type, eligibility_profile... independently." Data-
+    driven per (country, number_type), same "rules as data, never hardcoded
+    if-statements" discipline as app.compliance.models.ComplianceRule - a
+    combination with no row here (the default; none are seeded) needs no
+    eligibility case at all, so existing purchase/reservation behavior is
+    completely unaffected until staff explicitly configure one. Kept
+    separate from ComplianceRule because this gates a specific requested
+    NUMBER (e.g. proof of local presence for one geographic-restricted
+    number type in one country), not the account-level KYC/KYB identity
+    ComplianceRule already covers.
+    """
+
+    __tablename__ = "number_eligibility_rules"
+    __table_args__ = (UniqueConstraint("country", "number_type", name="uq_number_eligibility_rule_country_type"),)
+
+    id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=new_uuid)
+    country: Mapped[str] = mapped_column(String(2), nullable=False, index=True)
+    number_type: Mapped[str] = mapped_column(String(30), nullable=False, index=True)
+    required_evidence: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class NumberEligibilityCase(Base):
+    """Commercial Billing Operating Standard doc §7 C3: "eligibility_case
+    links requested number/market to evidence, reviewer/automation result,
+    provider submission and expiry. Reject incomplete cases without
+    charging recurring rental." One case per requested number (not per
+    account - see NumberEligibilityRule's docstring for why this is
+    distinct from app.compliance.models.ComplianceCase). Evidence here is
+    lightweight structured metadata the customer/staff exchange, not a
+    file-upload feature - extend to real document storage the same way
+    ComplianceCase does (app.integrations.storage.s3) if/when a specific
+    market's eligibility profile actually needs it; deliberately not built
+    for this first pass since no active rule exists yet to need it.
+    "Reject incomplete cases without charging recurring rental" is
+    satisfied structurally: next_renewal_at is only ever set once a number
+    reaches ACTIVE (see app.numbering.numbers.service.purchase_number),
+    which can't happen while a case here is anything but APPROVED.
+    """
+
+    __tablename__ = "number_eligibility_cases"
+
+    id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=new_uuid)
+    phone_number_id: Mapped[str] = mapped_column(
+        UUID(as_uuid=False), ForeignKey("phone_numbers.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    account_id: Mapped[str] = mapped_column(
+        UUID(as_uuid=False), ForeignKey("accounts.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    country: Mapped[str] = mapped_column(String(2), nullable=False)
+    number_type: Mapped[str] = mapped_column(String(30), nullable=False)
+    status: Mapped[NumberEligibilityCaseStatus] = mapped_column(
+        Enum(NumberEligibilityCaseStatus, name="number_eligibility_case_status_enum"),
+        nullable=False,
+        default=NumberEligibilityCaseStatus.PENDING,
+    )
+    evidence: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    review_notes: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

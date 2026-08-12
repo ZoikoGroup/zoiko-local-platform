@@ -845,3 +845,47 @@ def test_put_preferences_forbidden_for_viewer(client):
         "/notifications/preferences", headers={"Authorization": f"Bearer {viewer_token}"}
     )
     assert get_response.status_code == 200
+
+
+# --- Registry-only domains (DEVICE/SUP/MKTG/PART) ---
+# None of these have a real trigger yet - no desk-phone/SIP feature, no
+# support ticketing, no marketing tool, no partner program - so there's
+# nothing to test at a call-site level. This just guards the seeded copy
+# itself: right template counts, and every {token} is well-formed enough
+# for str.format() to eventually render it without raising.
+
+
+def test_registry_only_domains_are_seeded_with_the_expected_counts(db_session):
+    from app.notifications.models import NotificationTemplate
+
+    expected_counts = {"DEVICE": 11, "SUP": 5, "MKTG": 8, "PART": 8}
+    for domain, expected in expected_counts.items():
+        actual = db_session.query(NotificationTemplate).filter(NotificationTemplate.domain == domain).count()
+        assert actual == expected, f"{domain}: expected {expected} templates, found {actual}"
+
+
+def test_registry_only_domain_templates_have_well_formed_format_strings(db_session):
+    import string
+
+    from app.notifications.models import NotificationTemplate
+
+    templates = (
+        db_session.query(NotificationTemplate)
+        .filter(NotificationTemplate.domain.in_(["DEVICE", "SUP", "MKTG", "PART"]))
+        .all()
+    )
+    assert len(templates) == 32
+    for template in templates:
+        fields = {
+            f[1]
+            for text in (template.subject_template, template.body_template)
+            for f in string.Formatter().parse(text)
+            if f[1] is not None
+        }
+        # A dummy context covering every field discovered across both
+        # strings - this only proves .format() won't raise (no stray/
+        # mismatched braces from the doc-to-template conversion), not
+        # that the copy itself is correct.
+        context = {f: "x" for f in fields}
+        template.subject_template.format(**context)
+        template.body_template.format(**context)

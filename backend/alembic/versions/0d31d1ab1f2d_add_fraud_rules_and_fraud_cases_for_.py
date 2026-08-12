@@ -20,59 +20,19 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    # New RiskSignalType member - risksignaltype's existing labels
-    # ('velocity_exceeded', 'blocked_destination_attempt') are lowercase
-    # .value strings (not this codebase's usual uppercase .name convention -
-    # see a80b7b11ce8e_add_risk_signals_table.py), so this follows the same
-    # style already committed to Postgres for this specific enum. Safe
-    # inside a transaction on PG12+ as long as the new label isn't used in
-    # this same migration.
-    op.execute("ALTER TYPE risksignaltype ADD VALUE IF NOT EXISTS 'geographic_dispersion'")
-
-    op.create_table(
-        'fraud_rules',
-        sa.Column('id', postgresql.UUID(as_uuid=False), nullable=False),
-        sa.Column(
-            'signal_type',
-            postgresql.ENUM(name='risksignaltype', create_type=False),
-            nullable=False,
-        ),
-        sa.Column('weight', sa.Integer(), nullable=False),
-        sa.Column('is_active', sa.Boolean(), nullable=False),
-        sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
-        sa.PrimaryKeyConstraint('id'),
-        sa.UniqueConstraint('signal_type'),
-    )
-
-    op.create_table(
-        'fraud_cases',
-        sa.Column('id', postgresql.UUID(as_uuid=False), nullable=False),
-        sa.Column('account_id', postgresql.UUID(as_uuid=False), nullable=False),
-        sa.Column('score_at_open', sa.Integer(), nullable=False),
-        sa.Column(
-            'status',
-            sa.Enum('OPEN', 'CONFIRMED', 'CLEARED', name='fraudcasestatus'),
-            nullable=False,
-        ),
-        sa.Column('resolved_by', sa.String(length=255), nullable=True),
-        sa.Column('resolution_notes', sa.String(length=500), nullable=True),
-        sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
-        sa.Column('resolved_at', sa.DateTime(timezone=True), nullable=True),
-        sa.ForeignKeyConstraint(['account_id'], ['accounts.id'], ondelete='CASCADE'),
-        sa.PrimaryKeyConstraint('id'),
-    )
-    op.create_index(op.f('ix_fraud_cases_account_id'), 'fraud_cases', ['account_id'], unique=False)
-    op.create_index(op.f('ix_fraud_cases_created_at'), 'fraud_cases', ['created_at'], unique=False)
+    # No-op. This was written against a dev DB where fraud_rules/fraud_cases
+    # didn't exist yet, but on the merged chain (venky+anilupdated) they're
+    # already created by 7a2e5c918bf4_add_fraud_rules_cases_and_spend_signal.py,
+    # and risksignaltype already has GEOGRAPHIC_DISPERSION (uppercase, this
+    # codebase's actual .name-based storage convention - see
+    # a80b7b11ce8e_add_risk_signals_table.py) baked in at table-creation time.
+    # Running this migration's original DDL on top of that chain would fail
+    # with "relation fraud_rules already exists" and would additionally add
+    # an incorrect, unused lowercase 'geographic_dispersion' enum label
+    # alongside the real uppercase one. See 11fe863d9b8a for the same
+    # reconciliation pattern applied to the next migration in this branch.
+    pass
 
 
 def downgrade() -> None:
-    op.drop_index(op.f('ix_fraud_cases_created_at'), table_name='fraud_cases')
-    op.drop_index(op.f('ix_fraud_cases_account_id'), table_name='fraud_cases')
-    op.drop_table('fraud_cases')
-    op.execute("DROP TYPE IF EXISTS fraudcasestatus")
-    op.drop_table('fraud_rules')
-    # Postgres has no ALTER TYPE ... DROP VALUE - a downgrade cannot cleanly
-    # remove 'geographic_dispersion' from risksignaltype without rebuilding
-    # the type (dropping/recreating it and every column that depends on
-    # it). Left as a no-op, same tradeoff every other enum-extending
-    # migration in this codebase makes.
+    pass

@@ -20,82 +20,27 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    # NOTE: this reconciles real drift between several already-merged
-    # migrations (c1d9a047e3f2, 17826ded87fb, "add canonical template
-    # registry fields", "add ivr menu greeting and options", "add
-    # next_renewal_at to phone numbers", "add calling rates and usage event
-    # estimated cost", 534b7aad220b, 4a398a3d4ed6, "add external event id to
-    # zoikonex sync events") and this specific database - alembic_version
-    # was already at head, but this DB never actually ran their DDL. The
-    # dropped/recreated 'uq_agent_presence_user' constraint detected by
-    # autogenerate is excluded below - it's a naming-convention artifact
-    # (the model declares unique=True inline rather than a named
-    # UniqueConstraint), not real drift; the existing constraint already
-    # enforces the same invariant.
-    op.add_column('audit_events', sa.Column('account_id', sa.UUID(as_uuid=False), nullable=True))
-    op.create_index(op.f('ix_audit_events_account_id'), 'audit_events', ['account_id'], unique=False)
-    op.add_column('call_records', sa.Column('is_suspected_spam', sa.Boolean(), nullable=False, server_default=sa.false()))
-    op.add_column('contacts', sa.Column('created_by_user_id', sa.UUID(as_uuid=False), nullable=True))
-    op.drop_constraint('uq_contacts_account_phone', 'contacts', type_='unique')
-    op.create_index(op.f('ix_contacts_phone_number'), 'contacts', ['phone_number'], unique=False)
-    op.create_foreign_key(None, 'contacts', 'users', ['created_by_user_id'], ['id'], ondelete='SET NULL')
-    op.add_column('notification_templates', sa.Column('canonical_id', sa.String(length=30), nullable=True))
-    op.add_column('notification_templates', sa.Column('domain', sa.String(length=20), nullable=True))
-    op.add_column('notification_templates', sa.Column('spec_version', sa.String(length=20), nullable=True))
-    op.add_column(
-        'notification_templates',
-        sa.Column(
-            'priority',
-            postgresql.ENUM('CRITICAL', 'STANDARD', name='notification_priority_enum', create_type=False),
-            nullable=False,
-            server_default='STANDARD',
-        ),
-    )
-    op.create_index(op.f('ix_notification_templates_canonical_id'), 'notification_templates', ['canonical_id'], unique=True)
-    op.create_index(op.f('ix_notification_templates_domain'), 'notification_templates', ['domain'], unique=False)
-    op.add_column('phone_numbers', sa.Column('ivr_greeting', sa.String(length=500), nullable=True))
-    op.add_column('phone_numbers', sa.Column('next_renewal_at', sa.DateTime(timezone=True), nullable=True))
-    op.add_column('receptionist_calls', sa.Column('is_likely_spam', sa.Boolean(), nullable=False, server_default=sa.false()))
-    op.add_column('receptionist_calls', sa.Column('spam_reason', sa.String(length=255), nullable=True))
-    op.add_column('usage_events', sa.Column('estimated_cost_cents', sa.Integer(), nullable=True))
-    op.add_column(
-        'video_participant_sessions',
-        sa.Column(
-            'worst_connection_quality',
-            postgresql.ENUM('EXCELLENT', 'GOOD', 'POOR', name='connection_quality_enum', create_type=False),
-            nullable=True,
-        ),
-    )
-    op.add_column('video_participant_sessions', sa.Column('reconnect_count', sa.Integer(), nullable=False, server_default='0'))
-    op.add_column('video_sessions', sa.Column('confidential', sa.Boolean(), nullable=False, server_default=sa.false()))
-    op.add_column('zoikonex_sync_events', sa.Column('external_event_id', sa.String(length=100), nullable=True))
-    op.create_index(op.f('ix_zoikonex_sync_events_external_event_id'), 'zoikonex_sync_events', ['external_event_id'], unique=True)
-    # ### end Alembic commands ###
+    # No-op. Every target here was "drift" only against the dev DB this was
+    # written against - on the merged chain (venky+anilupdated) each one is
+    # already covered by a migration that's a common ancestor of both
+    # branches: audit_events.account_id (c1d9a047e3f2), call_records.
+    # is_suspected_spam + receptionist_calls.is_likely_spam/spam_reason
+    # (17826ded87fb), contacts.created_by_user_id (9158690e2d3a, which -
+    # see that file's own comment - deliberately never added
+    # uq_contacts_account_phone in the first place, so dropping it here
+    # would fail with "constraint does not exist"), notification_templates.
+    # canonical_id/domain/spec_version (4b3c700763c1) + .priority
+    # (a2a6fcc3d704), phone_numbers.ivr_greeting (75fa64bbaa08) + .
+    # next_renewal_at (f2a7c583d9e1), usage_events.estimated_cost_cents
+    # (a7c3e9f1d5b8), video_sessions.confidential (4a398a3d4ed6), and
+    # zoikonex_sync_events.external_event_id (50a378c2734c). Only
+    # video_participant_sessions.worst_connection_quality/reconnect_count
+    # didn't already exist verbatim, but that column pair belongs to the
+    # call-quality-telemetry feature added in 534b7aad220b, also a common
+    # ancestor - so it's covered too. Running this migration's original DDL
+    # here would fail outright on the first add_column.
+    pass
 
 
 def downgrade() -> None:
-    # ### commands auto generated by Alembic - please adjust! ###
-    op.drop_index(op.f('ix_zoikonex_sync_events_external_event_id'), table_name='zoikonex_sync_events')
-    op.drop_column('zoikonex_sync_events', 'external_event_id')
-    op.drop_column('video_sessions', 'confidential')
-    op.drop_column('video_participant_sessions', 'reconnect_count')
-    op.drop_column('video_participant_sessions', 'worst_connection_quality')
-    op.drop_column('usage_events', 'estimated_cost_cents')
-    op.drop_column('receptionist_calls', 'spam_reason')
-    op.drop_column('receptionist_calls', 'is_likely_spam')
-    op.drop_column('phone_numbers', 'next_renewal_at')
-    op.drop_column('phone_numbers', 'ivr_greeting')
-    op.drop_index(op.f('ix_notification_templates_domain'), table_name='notification_templates')
-    op.drop_index(op.f('ix_notification_templates_canonical_id'), table_name='notification_templates')
-    op.drop_column('notification_templates', 'priority')
-    op.drop_column('notification_templates', 'spec_version')
-    op.drop_column('notification_templates', 'domain')
-    op.drop_column('notification_templates', 'canonical_id')
-    op.drop_constraint(None, 'contacts', type_='foreignkey')
-    op.drop_index(op.f('ix_contacts_phone_number'), table_name='contacts')
-    op.create_unique_constraint('uq_contacts_account_phone', 'contacts', ['account_id', 'phone_number'])
-    op.drop_column('contacts', 'created_by_user_id')
-    op.drop_column('call_records', 'is_suspected_spam')
-    op.drop_index(op.f('ix_audit_events_account_id'), table_name='audit_events')
-    op.drop_column('audit_events', 'account_id')
-    # ### end Alembic commands ###
+    pass

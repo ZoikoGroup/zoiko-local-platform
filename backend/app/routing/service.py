@@ -19,6 +19,8 @@ from zoneinfo import ZoneInfo
 from sqlalchemy.orm import Session
 
 from app.audit.service import log_event
+from app.notifications.service import notify_call_flow_published, notify_call_flow_rolled_back
+from app.numbering.identity.models import User, UserRole
 from app.numbering.numbers.models import PhoneNumber
 from app.queues.models import CallQueue
 from app.routing.models import CallFlow, CallFlowVersion, CallFlowVersionStatus
@@ -321,6 +323,17 @@ def publish_flow(db: Session, account_id: str, call_flow_id: str, actor_id: str)
 
     log_event(db, actor_id=account_id, action="call_flow.published", target_type="call_flow", target_id=flow.id,
                metadata={"version": published_version.version})
+
+    numbers = db.query(PhoneNumber).filter(PhoneNumber.call_flow_id == flow.id).all()
+    owner = db.query(User).filter(User.account_id == account_id, User.role == UserRole.OWNER).first()
+    actor = db.query(User).filter(User.id == actor_id).first()
+    if owner is not None:
+        notify_call_flow_published(
+            db, account_id=account_id, account_email=owner.email, flow_name=flow.name,
+            number_summary=", ".join(n.e164 for n in numbers) if numbers else "no assigned numbers yet",
+            actor_display_name=actor.email if actor is not None else "an account admin",
+        )
+
     return True, [], published_version
 
 
@@ -358,6 +371,13 @@ def rollback_flow(db: Session, account_id: str, call_flow_id: str, target_versio
 
     log_event(db, actor_id=account_id, action="call_flow.rolled_back", target_type="call_flow", target_id=flow.id,
                metadata={"restored_version": target_version, "new_version": rolled_back.version})
+
+    owner = db.query(User).filter(User.account_id == account_id, User.role == UserRole.OWNER).first()
+    if owner is not None:
+        notify_call_flow_rolled_back(
+            db, account_id=account_id, account_email=owner.email, flow_name=flow.name, restored_version=target_version,
+        )
+
     return rolled_back
 
 

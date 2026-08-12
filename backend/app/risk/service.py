@@ -1,12 +1,12 @@
-import math
+import phonenumbers
 from datetime import datetime, timedelta, timezone
 
-import phonenumbers
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.audit.service import log_event
 from app.media.models import CallDirection, CallRecord
+from app.notifications.service import notify_account_suspended_for_risk, notify_account_warning
 from app.numbering.numbers.service import suspend_numbers_for_account_by_system
 from app.risk.models import (
     BlockedDestination,
@@ -29,12 +29,10 @@ MAX_OUTBOUND_CALLS_PER_WINDOW = 20
 # fraud models"). Defaults are a conservative first pass, same caveat as the
 # velocity threshold above - a blocked-destination attempt is weighted higher
 # than a velocity hit because it's evidence of deliberate abuse (dialing a
-# known-bad prefix) rather than just a burst of otherwise-legitimate traffic;
-# geographic dispersion and spend-limit signals sit between the two - real
-# IRSF/toll-abuse indicators, but each individually noisier than a
-# known-bad-prefix hit. These are only the FALLBACK - see get_signal_weight,
-# which prefers a staff-tunable FraudRule row over this dict, same "rules as
-# data" doctrine ComplianceRule already follows.
+# known-bad prefix) rather than just a burst of otherwise-legitimate traffic.
+# These are only the FALLBACK - see get_signal_weight, which prefers a
+# staff-tunable FraudRule row over this dict, same "rules as data" doctrine
+# ComplianceRule already follows.
 RISK_SIGNAL_WINDOW_HOURS = 24
 _DEFAULT_WEIGHTS = {
     RiskSignalType.VELOCITY_EXCEEDED: 30,
@@ -75,9 +73,9 @@ SPEND_WINDOW_HOURS = 24
 MAX_SPEND_CENTS_PER_WINDOW = 5000  # $50.00
 
 # Architecture doc §5 "Fraud and Risk: device fingerprinting" - detection
-# only, see RiskSignalType.DEVICE_FINGERPRINT_ABUSE's docstring for why this
-# never blocks signup/login itself. Same "conservative first pass" caveat as
-# every other threshold here.
+# only, see RiskSignalType.DEVICE_FINGERPRINT_ABUSE's docstring for why
+# this never blocks signup/login itself. Same "conservative first pass"
+# caveat as every other threshold here.
 DEVICE_FINGERPRINT_WINDOW_HOURS = 24
 DEVICE_FINGERPRINT_ACCOUNT_THRESHOLD = 4
 
@@ -89,6 +87,12 @@ DEVICE_FINGERPRINT_ACCOUNT_THRESHOLD = 4
 # value" caveat as the outbound velocity threshold above.
 INBOUND_SPAM_WINDOW_MINUTES = 60
 INBOUND_SPAM_ACCOUNT_THRESHOLD = 3
+
+
+def _get_account_owner(db: Session, account_id: str):
+    from app.numbering.identity.models import User, UserRole
+
+    return db.query(User).filter(User.account_id == account_id, User.role == UserRole.OWNER).first()
 
 
 class DestinationBlockedError(Exception):
@@ -169,7 +173,7 @@ def _auto_resolve_open_case_for_suspended_account(db: Session, account_id: str) 
     )
     if case is not None:
         resolve_fraud_case(
-            db, case.id, status=FraudCaseStatus.CONFIRMED, resolved_by="system:risk_engine",
+            db, case.id, status=FraudCaseStatus.CONFIRMED, actor="system:risk_engine",
             notes="Auto-resolved: account was auto-suspended before human review completed.",
         )
 
@@ -224,9 +228,7 @@ def assert_geographic_dispersion_ok(db: Session, account_id: str, to_number: str
     GEOGRAPHIC_DISPERSION_COUNTRY_THRESHOLD+ distinct countries, counting
     the destination about to be dialed. Same "count existing, decide before
     this one lands" shape as assert_outbound_velocity_ok. Uses a real
-    E.164 -> country resolution (phonenumbers), not a prefix-clustering
-    proxy - accurate enough to name the actual countries involved in the
-    recorded signal detail."""
+    E.164-to-country parse (phonenumbers), not a coarse proxy."""
     destination_country = _country_for_e164(to_number)
     if destination_country is None:
         return  # can't classify this destination's country - nothing to disperse-check
@@ -262,8 +264,10 @@ def assert_geographic_dispersion_ok(db: Session, account_id: str, to_number: str
 def assert_spend_limit_ok(db: Session, account_id: str) -> None:
     """Commercial Billing Operating Standard doc's "real-time fraud/toll-
     abuse spend controls" - sums UsageEvent.estimated_cost_cents (the same
-    rated figures app.usage.service.record_usage_event already writes) over
-    the trailing window, independent of call count or destination."""
+    rated figures app.usage.service.record_usage_event already writes)
+    over the trailing window, independent of call count or destination.
+    Anil's anilupdated branch didn't build this leg of the fraud model -
+    kept from the merge's other side."""
     from sqlalchemy import func as sa_func
 
     from app.usage.models import UsageEvent
@@ -357,6 +361,12 @@ def maybe_auto_suspend_for_risk(db: Session, account_id: str) -> bool:
             target=f"account:{account_id}",
             after={"score": score, "numbers_suspended": [n.e164 for n in suspended]},
         )
+        owner = _get_account_owner(db, account_id)
+        if owner is not None:
+            notify_account_suspended_for_risk(
+                db, account_id=account_id, account_email=owner.email,
+                reason_category=f"risk score {score}/{MAX_RISK_SCORE}", case_reference=account_id,
+            )
     return True
 
 
@@ -387,6 +397,19 @@ def open_fraud_case_if_needed(db: Session, account_id: str) -> FraudCase | None:
         db, actor="system:risk_engine", action="risk.fraud_case_opened",
         target=f"account:{account_id}", after={"case_id": case.id, "score": score},
     )
+    owner = _get_account_owner(db, account_id)
+    if owner is not None:
+        signal_types = {
+            s.signal_type.value
+            for s in db.query(RiskSignal).filter(RiskSignal.account_id == account_id).order_by(
+                RiskSignal.created_at.desc()
+            ).limit(5)
+        }
+        notify_account_warning(
+            db, account_id=account_id, account_email=owner.email,
+            policy_area=", ".join(sorted(signal_types)) or "unusual account activity",
+            case_reference=case.id,
+        )
     return case
 
 
@@ -411,8 +434,11 @@ class InvalidFraudCaseResolutionError(Exception):
 
 
 def resolve_fraud_case(
-    db: Session, case_id: str, *, status: FraudCaseStatus, resolved_by: str, notes: str | None = None
+    db: Session, case_id: str, *, status: FraudCaseStatus, actor: str, notes: str | None = None
 ) -> FraudCase:
+    """CONFIRMED or CLEARED, staff's call after reviewing the account's
+    signal history - same "manual override reason" posture as every other
+    sensitive staff action in this codebase."""
     if status == FraudCaseStatus.OPEN:
         raise InvalidFraudCaseResolutionError("A case can only be resolved as 'confirmed' or 'cleared'")
     case = db.query(FraudCase).filter(FraudCase.id == case_id).first()
@@ -422,13 +448,13 @@ def resolve_fraud_case(
         raise FraudCaseAlreadyResolvedError(f"Case {case_id} is already {case.status.value}")
 
     case.status = status
-    case.resolved_by = resolved_by
+    case.resolved_by = actor
     case.resolution_notes = notes
     case.resolved_at = datetime.now(timezone.utc)
     db.commit()
     db.refresh(case)
     log_event(
-        db, actor=resolved_by, action="risk.fraud_case_resolved",
+        db, actor=actor, action="risk.fraud_case_resolved",
         target=f"fraud_case:{case.id}", after={"status": status.value, "notes": notes},
     )
     return case
@@ -489,9 +515,9 @@ def is_suspected_spam_caller(db: Session, from_number: str, candidate_account_id
 
 def record_fingerprint_sighting(db: Session, *, fingerprint_hash: str, account_id: str) -> None:
     """Called at signup (and optionally login) when the client sent a
-    fingerprint hash - see DeviceFingerprintSighting's docstring. A no-op at
-    the call site if the header is absent (never required), so this only
-    ever gets called with a real value."""
+    fingerprint hash - see DeviceFingerprintSighting's docstring. Silently
+    a no-op design choice at the call site if the header is absent (never
+    required), so this only ever gets called with a real value."""
     db.add(DeviceFingerprintSighting(fingerprint_hash=fingerprint_hash, account_id=account_id))
     db.commit()
 
@@ -525,8 +551,8 @@ def is_suspected_fingerprint_abuse(
 def check_fingerprint_on_signup(db: Session, *, fingerprint_hash: str | None, account_id: str) -> None:
     """Wired into signup (see app.numbering.identity.service.
     create_account_with_owner) - records the sighting and raises a
-    RiskSignal if the fingerprint has now touched too many accounts. Never
-    raises/blocks: detection only, for the review queue
+    RiskSignal if the fingerprint has now touched too many accounts.
+    Never raises/blocks: detection only, for the review queue
     (open_fraud_case_if_needed), not a hard signup gate - a coarse
     client-side fingerprint has real false-positive risk (shared office
     network, family device)."""

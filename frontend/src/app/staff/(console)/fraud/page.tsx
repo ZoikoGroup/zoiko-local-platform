@@ -1,17 +1,21 @@
 "use client";
 
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState, useCallback, type FormEvent } from "react";
 import { useRouter } from "next/navigation";
 import {
   listFraudCases,
   resolveFraudCase,
   listFraudRules,
   upsertFraudRule,
+  listBlockedDestinations,
+  addBlockedDestination,
+  removeBlockedDestination,
   ApiError,
   type FraudCase,
   type FraudCaseStatus,
   type FraudRule,
   type RiskSignalType,
+  type BlockedDestination,
 } from "@/lib/api";
 import { clearStaffToken, useStaffToken } from "@/lib/staffAuth";
 
@@ -28,7 +32,7 @@ const KNOWN_SIGNAL_TYPES: { type: RiskSignalType; label: string; defaultWeight: 
   { type: "geographic_dispersion", label: "Geographic dispersion (IRSF)", defaultWeight: 25 },
 ];
 
-const SECTIONS = ["cases", "rules"] as const;
+const SECTIONS = ["cases", "rules", "destinations"] as const;
 type Section = (typeof SECTIONS)[number];
 
 export default function StaffFraudPage() {
@@ -54,7 +58,7 @@ export default function StaffFraudPage() {
               section === s ? "bg-slate-700 text-white" : "text-slate-400 hover:text-slate-200"
             }`}
           >
-            {s === "cases" ? "Review Queue" : "Scoring Rules"}
+            {s === "cases" ? "Review Queue" : s === "rules" ? "Scoring Rules" : "Blocked Destinations"}
           </button>
         ))}
       </div>
@@ -65,11 +69,9 @@ export default function StaffFraudPage() {
         </p>
       )}
 
-      {section === "cases" ? (
-        <FraudCasesSection token={token} onError={setError} />
-      ) : (
-        <FraudRulesSection token={token} onError={setError} />
-      )}
+      {section === "cases" && <FraudCasesSection token={token} onError={setError} />}
+      {section === "rules" && <FraudRulesSection token={token} onError={setError} />}
+      {section === "destinations" && <BlockedDestinationsSection token={token} onError={setError} />}
     </>
   );
 }
@@ -372,6 +374,129 @@ function FraudRulesSection({
           </div>
         );
       })}
+    </div>
+  );
+}
+
+function BlockedDestinationsSection({
+  token,
+  onError,
+}: {
+  token: string;
+  onError: (message: string | null) => void;
+}) {
+  const router = useRouter();
+  const [destinations, setDestinations] = useState<BlockedDestination[]>([]);
+  const [prefix, setPrefix] = useState("");
+  const [reason, setReason] = useState("");
+  const [adding, setAdding] = useState(false);
+  const [loading, setLoading] = useState(true);
+
+  const load = useCallback(() => {
+    setLoading(true);
+    return listBlockedDestinations(token)
+      .then((data) => {
+        setDestinations(data);
+        onError(null);
+      })
+      .catch((err) => {
+        if (err instanceof ApiError && err.status === 401) {
+          clearStaffToken();
+          router.replace("/staff/login");
+          return;
+        }
+        onError("Couldn't load blocked destinations.");
+      })
+      .finally(() => setLoading(false));
+  }, [token, router, onError]);
+
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  async function handleAdd(e: FormEvent) {
+    e.preventDefault();
+    if (!prefix.trim() || !reason.trim()) return;
+    setAdding(true);
+    onError(null);
+    try {
+      await addBlockedDestination(token, { prefix: prefix.trim(), reason: reason.trim() });
+      setPrefix("");
+      setReason("");
+      await load();
+    } catch (err) {
+      onError(
+        err instanceof ApiError && err.status === 403
+          ? "Only a Super Admin can manage blocked destinations."
+          : "Couldn't add the blocked destination."
+      );
+    } finally {
+      setAdding(false);
+    }
+  }
+
+  async function handleRemove(ruleId: string) {
+    onError(null);
+    try {
+      await removeBlockedDestination(token, ruleId);
+      await load();
+    } catch {
+      onError("Couldn't remove the blocked destination.");
+    }
+  }
+
+  if (loading) return <p className="text-sm text-slate-400">Loading...</p>;
+
+  return (
+    <div className="bg-slate-900 border border-slate-800 rounded-lg p-4 space-y-3">
+      <p className="text-xs text-slate-400">Super Admin only. Every outbound call is checked against this list.</p>
+
+      <form onSubmit={handleAdd} className="flex flex-wrap items-center gap-2">
+        <input
+          value={prefix}
+          onChange={(e) => setPrefix(e.target.value)}
+          placeholder="+1900"
+          className="text-sm rounded-lg bg-slate-800 border border-slate-700 text-white px-2.5 py-1.5 w-32 placeholder:text-slate-500"
+        />
+        <input
+          value={reason}
+          onChange={(e) => setReason(e.target.value)}
+          placeholder="reason"
+          className="flex-1 min-w-[10rem] text-sm rounded-lg bg-slate-800 border border-slate-700 text-white px-2.5 py-1.5 placeholder:text-slate-500"
+        />
+        <button
+          type="submit"
+          disabled={adding || !prefix.trim() || !reason.trim()}
+          className="text-xs font-medium rounded-lg px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 text-white"
+        >
+          {adding ? "Adding..." : "Add"}
+        </button>
+      </form>
+
+      {destinations.length === 0 ? (
+        <p className="text-sm text-slate-400">No blocked destinations configured.</p>
+      ) : (
+        <ul className="space-y-1.5">
+          {destinations.map((d) => (
+            <li
+              key={d.id}
+              className="flex items-center justify-between gap-3 text-sm bg-slate-950 border border-slate-800 rounded-lg px-3 py-2"
+            >
+              <div>
+                <span className="font-mono text-slate-200">{d.prefix}</span>
+                <span className="text-slate-500 ml-2">{d.reason}</span>
+              </div>
+              <button
+                type="button"
+                onClick={() => handleRemove(d.id)}
+                className="text-xs font-medium rounded-lg px-2.5 py-1 bg-slate-800 hover:bg-slate-700 text-white shrink-0"
+              >
+                Remove
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
     </div>
   );
 }

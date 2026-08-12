@@ -106,10 +106,10 @@ def list_fraud_cases(
     _staff: PlatformStaff = Depends(get_current_staff),
 ):
     """Review queue for accounts whose decayed risk score crossed
-    REVIEW_THRESHOLD but not (yet) AUTO_SUSPEND_THRESHOLD - the earlywarning
-    tier auto-suspension alone doesn't surface. Any staff role can view it
-    (diagnostic, same posture as the risk score view above); resolving one
-    is the sensitive action, gated below."""
+    REVIEW_THRESHOLD but not (yet) AUTO_SUSPEND_THRESHOLD - the early-
+    warning tier auto-suspension alone doesn't surface. Any staff role can
+    view it (diagnostic, same posture as the risk score view above);
+    resolving one is the sensitive action, gated below."""
     return service.list_fraud_cases(db, status=case_status)
 
 
@@ -122,7 +122,7 @@ def resolve_fraud_case(
 ):
     try:
         return service.resolve_fraud_case(
-            db, case_id, status=payload.status, resolved_by=staff.id, notes=payload.notes,
+            db, case_id, status=payload.status, actor=staff.id, notes=payload.notes,
         )
     except service.FraudCaseNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e

@@ -1087,7 +1087,7 @@ export function guestJoinVideoRoom(roomName: string, displayName: string): Promi
 }
 
 export type WaitingStatus = {
-  status: "pending" | "admitted" | "denied" | "expired";
+  status: "pending" | "admitted" | "denied";
   token: string | null;
   url: string | null;
   recording: boolean;
@@ -1133,16 +1133,6 @@ export function startVideoRecording(
   roomName: string
 ): Promise<{ room_name: string; recording: boolean }> {
   return request(`/media/video/rooms/${encodeURIComponent(roomName)}/recording/start`, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${token}` },
-  });
-}
-
-export function stopVideoRecording(
-  token: string,
-  roomName: string
-): Promise<{ room_name: string; recording: boolean }> {
-  return request(`/media/video/rooms/${encodeURIComponent(roomName)}/recording/stop`, {
     method: "POST",
     headers: { Authorization: `Bearer ${token}` },
   });
@@ -1500,12 +1490,8 @@ export function removeBlockedDestination(staffToken: string, ruleId: string): Pr
   });
 }
 
-// Roadmap doc §13 Risk Register "anomalous usage" review queue - opened
-// automatically when an account's risk score crosses REVIEW_THRESHOLD
-// (below the auto-suspend threshold), for a human to confirm or clear.
-// See listFraudCases/resolveFraudCase further down (Fraud model section) -
-// both staff/(console)/risk and staff/(console)/fraud share that one
-// implementation rather than each keeping its own duplicate.
+// Fraud case review queue and scoring rules are defined further down,
+// alongside listFraudRules/upsertFraudRule (see "Fraud model" section).
 
 // --- Contacts ---
 

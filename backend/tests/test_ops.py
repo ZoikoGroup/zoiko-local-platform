@@ -273,3 +273,123 @@ def test_synthetic_checks_summary_is_unhealthy_when_any_check_fails(client, db_s
 
     response = client.get("/ops/synthetic-checks/summary", headers=headers)
     assert response.json()["overall_healthy"] is False
+
+
+# --- Incidents and status subscriptions ---
+
+
+def _signup_and_login(client, email: str) -> str:
+    client.post(
+        "/auth/signup",
+        json={"account_name": "Incident Test Co", "account_type": "business", "email": email, "password": "supersecret123"},
+    )
+    return client.post("/auth/login", json={"email": email, "password": "supersecret123"}).json()["access_token"]
+
+
+def test_create_incident_requires_the_ops_capability(client):
+    response = client.post(
+        "/ops/incidents", json={"title": "Outage", "affected_service": "voice", "impact_summary": "calls delayed"},
+    )
+    assert response.status_code == 401
+
+
+def test_compliance_officer_cannot_create_an_incident(client, db_session):
+    token = _create_and_login_staff(client=client, db_session=db_session, email="opsincident1@zoikolocal.com", role=PlatformStaffRole.COMPLIANCE_OFFICER)
+    response = client.post(
+        "/ops/incidents", json={"title": "Outage", "affected_service": "voice", "impact_summary": "calls delayed"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert response.status_code == 403
+
+
+def test_support_staff_can_create_update_and_resolve_an_incident(client, db_session):
+    token = _create_and_login_staff(db_session, client, "opsincident2@zoikolocal.com")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    created = client.post(
+        "/ops/incidents", json={"title": "Outage", "affected_service": "voice", "impact_summary": "calls delayed"},
+        headers=headers,
+    )
+    assert created.status_code == 201
+    incident = created.json()
+    assert incident["status"] == "investigating"
+
+    updated = client.put(
+        f"/ops/incidents/{incident['id']}",
+        json={"status": "monitoring", "mitigation_summary": "failover engaged"},
+        headers=headers,
+    )
+    assert updated.status_code == 200
+    assert updated.json()["status"] == "monitoring"
+    assert updated.json()["mitigation_summary"] == "failover engaged"
+
+    resolved = client.post(f"/ops/incidents/{incident['id']}/resolve", headers=headers)
+    assert resolved.status_code == 200
+    assert resolved.json()["status"] == "resolved"
+    assert resolved.json()["resolved_at"] is not None
+
+    public_list = client.get("/ops/incidents").json()
+    assert any(i["id"] == incident["id"] for i in public_list)
+
+
+def test_cannot_update_or_resolve_an_already_resolved_incident(client, db_session):
+    token = _create_and_login_staff(db_session, client, "opsincident3@zoikolocal.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    incident = client.post(
+        "/ops/incidents", json={"title": "Outage", "affected_service": "voice", "impact_summary": "x"},
+        headers=headers,
+    ).json()
+    client.post(f"/ops/incidents/{incident['id']}/resolve", headers=headers)
+
+    response = client.post(f"/ops/incidents/{incident['id']}/resolve", headers=headers)
+    assert response.status_code == 409
+
+
+def test_subscribing_notifies_the_subscriber(client, monkeypatch):
+    monkeypatch.setattr("app.core.config.settings.resend_api_key", "")
+    token = _signup_and_login(client, "subscriber1@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    response = client.post("/ops/status-subscription", headers=headers)
+    assert response.status_code == 201
+    assert response.json()["is_active"] is True
+
+    notifications = client.get("/notifications/me", headers=headers).json()
+    matches = [n for n in notifications if n["event_name"] == "ops.status_subscription_confirmation"]
+    assert len(matches) == 1
+    assert matches[0]["status"] == "sent"
+
+
+def test_declaring_an_incident_notifies_active_subscribers_only(client, db_session, monkeypatch):
+    monkeypatch.setattr("app.core.config.settings.resend_api_key", "")
+    sub_token = _signup_and_login(client, "subscriber2@example.com")
+    sub_headers = {"Authorization": f"Bearer {sub_token}"}
+    client.post("/ops/status-subscription", headers=sub_headers)
+
+    unsub_token = _signup_and_login(client, "nonsubscriber1@example.com")
+    unsub_headers = {"Authorization": f"Bearer {unsub_token}"}
+
+    staff_token = _create_and_login_staff(db_session, client, "opsincident4@zoikolocal.com")
+    client.post(
+        "/ops/incidents", json={"title": "Outage", "affected_service": "voice", "impact_summary": "calls delayed"},
+        headers={"Authorization": f"Bearer {staff_token}"},
+    )
+
+    sub_notifications = client.get("/notifications/me", headers=sub_headers).json()
+    assert any(n["event_name"] == "ops.service_incident_declared" for n in sub_notifications)
+
+    unsub_notifications = client.get("/notifications/me", headers=unsub_headers).json()
+    assert not any(n["event_name"] == "ops.service_incident_declared" for n in unsub_notifications)
+
+
+def test_unsubscribing_stops_incident_notifications(client, monkeypatch):
+    monkeypatch.setattr("app.core.config.settings.resend_api_key", "")
+    token = _signup_and_login(client, "subscriber3@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    client.post("/ops/status-subscription", headers=headers)
+
+    unsubscribe_response = client.delete("/ops/status-subscription", headers=headers)
+    assert unsubscribe_response.status_code == 204
+
+    me = client.get("/ops/status-subscription/me", headers=headers).json()
+    assert me["is_active"] is False

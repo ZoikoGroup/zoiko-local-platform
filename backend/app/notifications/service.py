@@ -1160,3 +1160,133 @@ def notify_integration_removed(
             "event_occurred_at": _now_str(),
         },
     )
+
+
+def notify_call_flow_published(
+    db: Session, *, account_id: str, account_email: str, flow_name: str, number_summary: str, actor_display_name: str,
+) -> None:
+    send_notification(
+        db, event_name="route.call_flow_published", account_id=account_id, recipient_email=account_email,
+        context={
+            "user_display_name": account_email,
+            "route_name": flow_name,
+            "route_version": "1",
+            "route_number_summary": number_summary,
+            "actor_display_name": actor_display_name,
+            "route_effective_at": _now_str(),
+        },
+    )
+
+
+def notify_call_flow_rolled_back(
+    db: Session, *, account_id: str, account_email: str, flow_name: str, restored_version: int,
+) -> None:
+    send_notification(
+        db, event_name="route.call_flow_rollback", account_id=account_id, recipient_email=account_email,
+        context={
+            "user_display_name": account_email,
+            "route_name": flow_name,
+            "route_version": str(restored_version),
+            "event_occurred_at": _now_str(),
+            "route_rollback_reason": "requested by an account admin",
+        },
+    )
+
+
+def notify_recipient_opted_out(
+    db: Session, *, account_id: str, account_email: str, destination_masked: str, sender_summary: str,
+) -> None:
+    send_notification(
+        db, event_name="msg.recipient_opted_out", account_id=account_id, recipient_email=account_email,
+        context={
+            "user_display_name": account_email,
+            "message_destination_masked": destination_masked,
+            "messaging_sender_summary": sender_summary,
+            "event_occurred_at": _now_str(),
+        },
+    )
+
+
+def notify_account_warning(
+    db: Session, *, account_id: str, account_email: str, policy_area: str, case_reference: str
+) -> None:
+    send_notification(
+        db, event_name="trust.account_warning", account_id=account_id, recipient_email=account_email,
+        context={
+            "user_display_name": account_email,
+            "scope_summary": "your account",
+            "decision_policy_area": policy_area,
+            "case_reference": case_reference,
+        },
+    )
+
+
+def notify_account_suspended_for_risk(
+    db: Session, *, account_id: str, account_email: str, reason_category: str, case_reference: str
+) -> None:
+    send_notification(
+        db, event_name="trust.account_suspended_or_disabled", account_id=account_id, recipient_email=account_email,
+        context={
+            "user_display_name": account_email,
+            "restriction_status": "suspended",
+            "restriction_start_at": _now_str(),
+            "decision_reason_category": reason_category,
+            "case_reference": case_reference,
+        },
+    )
+
+
+def notify_incident_declared(
+    db: Session, *, account_id: str, account_email: str, affected_service: str, impact_summary: str
+) -> None:
+    send_notification(
+        db, event_name="ops.service_incident_declared", account_id=account_id, recipient_email=account_email,
+        context={
+            "user_display_name": account_email,
+            "incident_affected_service": affected_service,
+            "incident_started_local": _now_str(),
+            "incident_impact_summary": impact_summary,
+            "incident_status": "investigating",
+        },
+    )
+
+
+def notify_incident_update(
+    db: Session, *, account_id: str, account_email: str, incident_reference: str, status: str,
+    impact_summary: str, mitigation_summary: str | None,
+) -> None:
+    send_notification(
+        db, event_name="ops.incident_update", account_id=account_id, recipient_email=account_email,
+        context={
+            "user_display_name": account_email,
+            "incident_reference": incident_reference,
+            "incident_status": status,
+            "incident_impact_summary": impact_summary,
+            "incident_mitigation_summary": mitigation_summary or "Update in progress.",
+            "incident_next_update_at": "as soon as there's a material change",
+        },
+    )
+
+
+def notify_incident_resolved(
+    db: Session, *, account_id: str, account_email: str, incident_reference: str, duration_summary: str
+) -> None:
+    send_notification(
+        db, event_name="ops.incident_resolved", account_id=account_id, recipient_email=account_email,
+        context={
+            "user_display_name": account_email,
+            "incident_reference": incident_reference,
+            "incident_resolved_local": _now_str(),
+            "incident_duration_summary": duration_summary,
+        },
+    )
+
+
+def notify_status_subscription_confirmed(db: Session, *, account_id: str, account_email: str) -> None:
+    send_notification(
+        db, event_name="ops.status_subscription_confirmation", account_id=account_id, recipient_email=account_email,
+        context={
+            "user_display_name": account_email,
+            "status_subscription_summary": "all Zoiko Local service incidents",
+        },
+    )

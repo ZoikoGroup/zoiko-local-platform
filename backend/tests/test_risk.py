@@ -244,11 +244,19 @@ def test_outbound_call_geographic_dispersion_limit_is_enforced(client, db_sessio
 
     from app.risk.service import GEOGRAPHIC_DISPERSION_COUNTRY_THRESHOLD
 
-    # Real, structurally-valid E.164 numbers spanning distinct countries -
-    # assert_geographic_dispersion_ok resolves the actual country via
-    # phonenumbers, not a prefix-clustering heuristic.
-    country_numbers = ["+14155552671", "+442071838750", "+33142685300", "+4930123456", "+81312345678"]
-    for destination in country_numbers[: GEOGRAPHIC_DISPERSION_COUNTRY_THRESHOLD - 1]:
+    # Real-shaped E.164 numbers matching phonenumbers' own region metadata
+    # for a distinct country each (assert_geographic_dispersion_ok now
+    # parses the actual destination country via the phonenumbers library,
+    # not a coarse leading-digit prefix - see app/risk/service.py's
+    # _country_for_e164).
+    distinct_country_numbers = [
+        "+14155552671",  # US
+        "+442071838750",  # GB
+        "+33142685300",  # FR
+        "+4930123456",  # DE
+        "+81312345678",  # JP
+    ]
+    for destination in distinct_country_numbers[: GEOGRAPHIC_DISPERSION_COUNTRY_THRESHOLD - 1]:
         response = client.post(
             "/media/voice/outbound",
             json={"to": destination, "from": "+15550007777"},
@@ -258,7 +266,7 @@ def test_outbound_call_geographic_dispersion_limit_is_enforced(client, db_sessio
 
     over_limit_response = client.post(
         "/media/voice/outbound",
-        json={"to": country_numbers[GEOGRAPHIC_DISPERSION_COUNTRY_THRESHOLD - 1], "from": "+15550007777"},
+        json={"to": distinct_country_numbers[GEOGRAPHIC_DISPERSION_COUNTRY_THRESHOLD - 1], "from": "+15550007777"},
         headers=headers,
     )
     assert over_limit_response.status_code == 429
@@ -337,11 +345,11 @@ def test_get_signal_weight_uses_active_fraud_rule_override(db_session):
     assert get_signal_weight(db_session, RiskSignalType.SPEND_LIMIT_EXCEEDED) == 99
 
 
-def test_get_signal_weight_ignores_inactive_fraud_rule(db_session):
-    # An inactive FraudRule contributes 0, not the hardcoded default - that's
-    # the whole point of is_active (see FraudRule's docstring: "turn a noisy
-    # signal off entirely"). Falling back to the default weight instead
-    # would mean staff can never actually fully silence a signal.
+def test_get_signal_weight_is_zero_for_an_explicitly_deactivated_fraud_rule(db_session):
+    """An inactive FraudRule row means staff explicitly silenced this signal
+    type - it must contribute 0, not fall back to the built-in default
+    (that fallback is only for signal types with no row at all). Otherwise
+    staff would have no way to actually turn a noisy signal off."""
     from app.risk.models import FraudRule, RiskSignalType
     from app.risk.service import get_signal_weight
 
