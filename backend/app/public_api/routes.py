@@ -13,6 +13,7 @@ from app.media import service as media_service
 from app.media.models import CallRecord, Voicemail
 from app.numbering.identity.models import User, UserRole
 from app.numbering.numbers.models import PhoneNumber
+from app.ops.service import KillSwitchTrippedError
 from app.public_api.schemas import (
     CreateContactRequest,
     PlaceCallRequest,
@@ -140,6 +141,8 @@ def place_call(
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(e)) from e
     except risk_service.SpendLimitExceededError as e:
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(e)) from e
+    except KillSwitchTrippedError as e:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e)) from e
     except TelecomError as e:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(e)) from e
     return result

@@ -21,6 +21,8 @@ from app.notifications.service import notify_call_summary_available, notify_voic
 from app.numbering.identity.models import User, UserRole
 from app.numbering.numbers.service import NumberConflictError, assert_number_access, assigned_number_ids
 from app.numbering.numbers.models import PhoneNumber
+from app.ops.models import KillSwitchScope
+from app.ops.service import assert_kill_switch_not_active
 from app.retention.service import PURGED_MARKER
 from app.usage import service as usage_service
 
@@ -163,6 +165,12 @@ def _assert_can_access_number(db: Session, user: User, phone_number_id: str | No
 
 
 def summarize_voicemail(db: Session, user: User, voicemail_id: str) -> ConversationSummary:
+    # Commercial Billing Operating Standard doc §32.1 - checked before any
+    # transcription/LLM cost is actually incurred, not just before storing
+    # the result (see _analyze_and_store's own billing-suspension gate for
+    # the account-specific equivalent).
+    assert_kill_switch_not_active(db, KillSwitchScope.AI_PROCESSING)
+
     voicemail = db.query(Voicemail).filter(Voicemail.id == voicemail_id).first()
     if voicemail is None or voicemail.account_id != user.account_id:
         raise SummaryAuthorizationError(f"{voicemail_id} is not a voicemail owned by your account")
@@ -183,6 +191,8 @@ def summarize_voicemail(db: Session, user: User, voicemail_id: str) -> Conversat
 
 
 def summarize_call(db: Session, user: User, call_id: str) -> ConversationSummary:
+    assert_kill_switch_not_active(db, KillSwitchScope.AI_PROCESSING)
+
     call = db.query(CallRecord).filter(CallRecord.id == call_id).first()
     if call is None or call.account_id != user.account_id:
         raise SummaryAuthorizationError(f"{call_id} is not a call owned by your account")
@@ -209,6 +219,8 @@ def summarize_video_session(db: Session, user: User, room_name: str) -> Conversa
     """Keyed by room_name, not id - matches every other video action
     (join/end/recording), which are all addressed by room_name in the API,
     so the frontend never needs to know a session's internal id."""
+    assert_kill_switch_not_active(db, KillSwitchScope.AI_PROCESSING)
+
     session = db.query(VideoSession).filter(VideoSession.room_name == room_name).first()
     if session is None or session.account_id != user.account_id:
         raise SummaryAuthorizationError(f"{room_name} is not a video session owned by your account")

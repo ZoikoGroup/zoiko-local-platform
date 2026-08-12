@@ -35,6 +35,15 @@ class Account(Base):
     account_type: Mapped[AccountType] = mapped_column(
         Enum(AccountType, name="account_type_enum"), nullable=False
     )
+    # Commercial Billing Operating Standard doc §T "billing_classification/
+    # billing_source" - this is deliberately NOT that full enum (DEMO/
+    # SANDBOX/QA_AUTOMATION/etc.), which needs its own account-classification
+    # model this codebase hasn't built yet. is_test is a narrow stopgap:
+    # a single boolean that blocks the real-money boundaries (Stripe
+    # checkout, run_billing_cycle, credit/debit notes, refunds) for an
+    # account flagged as synthetic/test, so live charges can't happen
+    # against one by accident in the meantime.
+    is_test: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     users: Mapped[list["User"]] = relationship(

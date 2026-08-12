@@ -243,7 +243,8 @@ def test_refund_zoikonex_payment_propagates_zoikonex_error(db_session, monkeypat
         pass
 
 
-# --- Staff route ---
+# --- Staff route (maker-checker: request as one staff member, approve as a
+# different one - see app.billing.models.BillingActionRequest's docstring) ---
 
 
 def test_run_billing_cycle_route_requires_super_admin(client, db_session):
@@ -253,7 +254,7 @@ def test_run_billing_cycle_route_requires_super_admin(client, db_session):
         db_session, client, "billingcyclestaff1@zoikolocal.com", role=PlatformStaffRole.SUPPORT
     )
     response = client.post(
-        "/billing/zoikonex/run-billing-cycle",
+        "/billing/zoikonex/run-billing-cycle/request",
         json={"account_id": account.id},
         headers={"Authorization": f"Bearer {support_token}"},
     )
@@ -263,16 +264,48 @@ def test_run_billing_cycle_route_requires_super_admin(client, db_session):
 def test_run_billing_cycle_route_succeeds_for_super_admin(client, db_session):
     account, _sub = _synced_paid_subscription(db_session, "Billing Cycle Route Success Co")
 
-    admin_token = _create_and_login_staff(
+    requester_token = _create_and_login_staff(
         db_session, client, "billingcyclestaff2@zoikolocal.com", role=PlatformStaffRole.SUPER_ADMIN
     )
-    response = client.post(
-        "/billing/zoikonex/run-billing-cycle",
+    requested = client.post(
+        "/billing/zoikonex/run-billing-cycle/request",
+        json={"account_id": account.id},
+        headers={"Authorization": f"Bearer {requester_token}"},
+    )
+    assert requested.status_code == 201, requested.text
+    assert requested.json()["status"] == "pending"
+    action_id = requested.json()["id"]
+
+    approver_token = _create_and_login_staff(
+        db_session, client, "billingcyclestaff2approver@zoikolocal.com", role=PlatformStaffRole.SUPER_ADMIN
+    )
+    approved = client.post(
+        f"/billing/actions/{action_id}/approve",
+        headers={"Authorization": f"Bearer {approver_token}"},
+    )
+    assert approved.status_code == 200, approved.text
+    assert approved.json()["status"] == "executed"
+    assert approved.json()["result"]["billed"] is True
+
+
+def test_billing_action_cannot_be_approved_by_its_own_requester(client, db_session):
+    account, _sub = _synced_paid_subscription(db_session, "Self Approval Blocked Co")
+
+    admin_token = _create_and_login_staff(
+        db_session, client, "selfapprovestaff@zoikolocal.com", role=PlatformStaffRole.SUPER_ADMIN
+    )
+    requested = client.post(
+        "/billing/zoikonex/run-billing-cycle/request",
         json={"account_id": account.id},
         headers={"Authorization": f"Bearer {admin_token}"},
     )
-    assert response.status_code == 200, response.text
-    assert response.json()["billed"] is True
+    action_id = requested.json()["id"]
+
+    response = client.post(
+        f"/billing/actions/{action_id}/approve",
+        headers={"Authorization": f"Bearer {admin_token}"},
+    )
+    assert response.status_code == 403, response.text
 
 
 def test_credit_note_route_requires_super_admin(client, db_session):
@@ -282,7 +315,7 @@ def test_credit_note_route_requires_super_admin(client, db_session):
         db_session, client, "creditnotestaff1@zoikolocal.com", role=PlatformStaffRole.SUPPORT
     )
     response = client.post(
-        "/billing/zoikonex/credit-notes",
+        "/billing/zoikonex/credit-notes/request",
         json={"account_id": account.id, "invoice_id": "zn-invoice-test", "amount_minor_units": 500, "reason": "test"},
         headers={"Authorization": f"Bearer {support_token}"},
     )
@@ -292,16 +325,26 @@ def test_credit_note_route_requires_super_admin(client, db_session):
 def test_credit_note_route_succeeds_for_super_admin(client, db_session):
     account, _sub = _synced_paid_subscription(db_session, "Credit Note Route Success Co")
 
-    admin_token = _create_and_login_staff(
+    requester_token = _create_and_login_staff(
         db_session, client, "creditnotestaff2@zoikolocal.com", role=PlatformStaffRole.SUPER_ADMIN
     )
-    response = client.post(
-        "/billing/zoikonex/credit-notes",
+    requested = client.post(
+        "/billing/zoikonex/credit-notes/request",
         json={"account_id": account.id, "invoice_id": "zn-invoice-test", "amount_minor_units": 500, "reason": "test"},
-        headers={"Authorization": f"Bearer {admin_token}"},
+        headers={"Authorization": f"Bearer {requester_token}"},
     )
-    assert response.status_code == 200, response.text
-    assert response.json()["credit_note_id"] == "zn-credit-note-test"
+    assert requested.status_code == 201, requested.text
+    action_id = requested.json()["id"]
+
+    approver_token = _create_and_login_staff(
+        db_session, client, "creditnotestaff2approver@zoikolocal.com", role=PlatformStaffRole.SUPER_ADMIN
+    )
+    approved = client.post(
+        f"/billing/actions/{action_id}/approve",
+        headers={"Authorization": f"Bearer {approver_token}"},
+    )
+    assert approved.status_code == 200, approved.text
+    assert approved.json()["result"]["credit_note_id"] == "zn-credit-note-test"
 
 
 def test_debit_note_route_requires_super_admin(client, db_session):
@@ -311,7 +354,7 @@ def test_debit_note_route_requires_super_admin(client, db_session):
         db_session, client, "debitnotestaff1@zoikolocal.com", role=PlatformStaffRole.SUPPORT
     )
     response = client.post(
-        "/billing/zoikonex/debit-notes",
+        "/billing/zoikonex/debit-notes/request",
         json={"account_id": account.id, "invoice_id": "zn-invoice-test", "amount_minor_units": 200, "reason": "test"},
         headers={"Authorization": f"Bearer {support_token}"},
     )
@@ -321,16 +364,26 @@ def test_debit_note_route_requires_super_admin(client, db_session):
 def test_debit_note_route_succeeds_for_super_admin(client, db_session):
     account, _sub = _synced_paid_subscription(db_session, "Debit Note Route Success Co")
 
-    admin_token = _create_and_login_staff(
+    requester_token = _create_and_login_staff(
         db_session, client, "debitnotestaff2@zoikolocal.com", role=PlatformStaffRole.SUPER_ADMIN
     )
-    response = client.post(
-        "/billing/zoikonex/debit-notes",
+    requested = client.post(
+        "/billing/zoikonex/debit-notes/request",
         json={"account_id": account.id, "invoice_id": "zn-invoice-test", "amount_minor_units": 200, "reason": "test"},
-        headers={"Authorization": f"Bearer {admin_token}"},
+        headers={"Authorization": f"Bearer {requester_token}"},
     )
-    assert response.status_code == 200, response.text
-    assert response.json()["debit_note_id"] == "zn-debit-note-test"
+    assert requested.status_code == 201, requested.text
+    action_id = requested.json()["id"]
+
+    approver_token = _create_and_login_staff(
+        db_session, client, "debitnotestaff2approver@zoikolocal.com", role=PlatformStaffRole.SUPER_ADMIN
+    )
+    approved = client.post(
+        f"/billing/actions/{action_id}/approve",
+        headers={"Authorization": f"Bearer {approver_token}"},
+    )
+    assert approved.status_code == 200, approved.text
+    assert approved.json()["result"]["debit_note_id"] == "zn-debit-note-test"
 
 
 def test_refund_route_requires_super_admin(client, db_session):
@@ -340,7 +393,7 @@ def test_refund_route_requires_super_admin(client, db_session):
         db_session, client, "refundstaff1@zoikolocal.com", role=PlatformStaffRole.SUPPORT
     )
     response = client.post(
-        "/billing/zoikonex/refunds",
+        "/billing/zoikonex/refunds/request",
         json={"account_id": account.id, "payment_intent_id": "zn-payment-intent-test", "amount_minor_units": 500, "reason": "test"},
         headers={"Authorization": f"Bearer {support_token}"},
     )
@@ -350,13 +403,23 @@ def test_refund_route_requires_super_admin(client, db_session):
 def test_refund_route_succeeds_for_super_admin(client, db_session):
     account, _sub = _synced_paid_subscription(db_session, "Refund Route Success Co")
 
-    admin_token = _create_and_login_staff(
+    requester_token = _create_and_login_staff(
         db_session, client, "refundstaff2@zoikolocal.com", role=PlatformStaffRole.SUPER_ADMIN
     )
-    response = client.post(
-        "/billing/zoikonex/refunds",
+    requested = client.post(
+        "/billing/zoikonex/refunds/request",
         json={"account_id": account.id, "payment_intent_id": "zn-payment-intent-test", "amount_minor_units": 500, "reason": "test"},
-        headers={"Authorization": f"Bearer {admin_token}"},
+        headers={"Authorization": f"Bearer {requester_token}"},
     )
-    assert response.status_code == 200, response.text
-    assert response.json()["refund_id"] == "zn-refund-test"
+    assert requested.status_code == 201, requested.text
+    action_id = requested.json()["id"]
+
+    approver_token = _create_and_login_staff(
+        db_session, client, "refundstaff2approver@zoikolocal.com", role=PlatformStaffRole.SUPER_ADMIN
+    )
+    approved = client.post(
+        f"/billing/actions/{action_id}/approve",
+        headers={"Authorization": f"Bearer {approver_token}"},
+    )
+    assert approved.status_code == 200, approved.text
+    assert approved.json()["result"]["refund_id"] == "zn-refund-test"

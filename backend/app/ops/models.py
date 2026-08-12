@@ -82,3 +82,38 @@ class SyntheticCheckRun(Base):
     duration_ms: Mapped[float] = mapped_column(Float, nullable=False)
     detail: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+
+
+class KillSwitchScope(str, enum.Enum):
+    NUMBER_PROVISIONING = "number_provisioning"
+    OUTBOUND_CALLING = "outbound_calling"
+    AI_PROCESSING = "ai_processing"
+    PAYMENTS_BILLING = "payments_billing"
+
+
+class PlatformKillSwitch(Base):
+    """Commercial Billing Operating Standard doc §32.1 - "granular controls
+    for new number provisioning, number release, new chargeable outbound
+    calling... AI processing... payments/top-ups" to "stop new harm without
+    destroying customer evidence or unrelated service" during an incident.
+    One row per scope (upserted, not appended - see
+    app.ops.service.set_kill_switch), so there's always exactly one current
+    is_active state per scope with a full activate/deactivate audit trail
+    via audit_event, not a growing table of toggle history here. Per §32.1,
+    emergency-service obligations must not be blocked by a commercial kill
+    switch - satisfied by construction today since no scope here gates any
+    real emergency-calling code path (see EmergencyDisclosureRequiredError's
+    docstring on why real E911 doesn't exist in this codebase yet)."""
+
+    __tablename__ = "platform_kill_switches"
+
+    id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=new_uuid)
+    scope: Mapped[KillSwitchScope] = mapped_column(
+        Enum(KillSwitchScope, name="kill_switch_scope_enum"), unique=True, nullable=False, index=True,
+    )
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    reason: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    activated_by: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    activated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    deactivated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

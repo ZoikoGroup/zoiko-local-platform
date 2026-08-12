@@ -13,10 +13,12 @@ from app.observability.schemas import (
     ProviderLatencySummary,
 )
 from app.ops import service
-from app.ops.models import IncidentStatus
+from app.ops.models import IncidentStatus, KillSwitchScope
 from app.ops.schemas import (
     CreateIncidentRequest,
     IncidentResponse,
+    KillSwitchResponse,
+    SetKillSwitchRequest,
     StatusSubscriptionResponse,
     SyntheticCheckRunResponse,
     SyntheticCheckSummaryResponse,
@@ -220,3 +222,38 @@ def get_my_status_subscription(
     current_user: User = Depends(get_current_user),
 ):
     return service.get_status_subscription(db, current_user.account_id)
+
+
+@router.get("/kill-switches", response_model=list[KillSwitchResponse])
+def list_kill_switches(
+    db: Session = Depends(get_db),
+    _staff: PlatformStaff = Depends(get_current_staff),
+):
+    """Any staff role can view current kill-switch state (diagnostic, same
+    posture as other status endpoints); activating/deactivating one is the
+    sensitive action, gated below."""
+    return service.list_kill_switches(db)
+
+
+@router.post("/kill-switches/{scope}/activate", response_model=KillSwitchResponse)
+def activate_kill_switch(
+    scope: KillSwitchScope,
+    payload: SetKillSwitchRequest,
+    db: Session = Depends(get_db),
+    staff: PlatformStaff = Depends(require_capability("ops.manage_kill_switches")),
+):
+    """SUPER_ADMIN only - halts new activity in this scope platform-wide
+    (Commercial Billing Operating Standard doc §32.1). Does not touch
+    activity already in flight or destroy any existing customer evidence -
+    see PlatformKillSwitch's docstring."""
+    return service.set_kill_switch(db, scope, True, actor=staff.id, reason=payload.reason)
+
+
+@router.post("/kill-switches/{scope}/deactivate", response_model=KillSwitchResponse)
+def deactivate_kill_switch(
+    scope: KillSwitchScope,
+    db: Session = Depends(get_db),
+    staff: PlatformStaff = Depends(require_capability("ops.manage_kill_switches")),
+):
+    """SUPER_ADMIN only."""
+    return service.set_kill_switch(db, scope, False, actor=staff.id)

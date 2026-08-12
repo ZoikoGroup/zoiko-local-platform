@@ -175,7 +175,10 @@ def upsert_supported_country_route(
 ):
     # SUPER_ADMIN only - expanding the launch country list is a compliance/
     # commercial decision, same bar as a calling-rate change above.
-    return upsert_supported_country(db, code=payload.code, name=payload.name, sort_order=payload.sort_order)
+    return upsert_supported_country(
+        db, code=payload.code, name=payload.name, sort_order=payload.sort_order,
+        emergency_calling_supported=payload.emergency_calling_supported,
+    )
 
 
 @router.delete("/countries/{code}", status_code=status.HTTP_204_NO_CONTENT)

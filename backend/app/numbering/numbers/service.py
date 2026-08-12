@@ -13,6 +13,8 @@ from app.core.config import settings
 from app.events.service import publish_number_activated, publish_number_reserved, publish_number_suspended
 from app.integrations.billing import stripe_checkout
 from app.integrations.telecom import twilio as telecom
+from app.ops.models import KillSwitchScope
+from app.ops.service import assert_kill_switch_not_active
 from app.notifications.service import (
     notify_number_activated,
     notify_number_assigned,
@@ -52,6 +54,12 @@ class NumberConflictError(Exception):
     account already holds it, or the caller's own reservation lapsed."""
 
 
+class TestAccountRestrictedError(Exception):
+    """Raised when an account flagged is_test attempts a real-money action
+    (Commercial Billing Operating Standard doc §14/§T) - see Account.
+    is_test's docstring."""
+
+
 class UnsupportedCountryError(Exception):
     """Raised for a country outside Zoiko Local's curated launch list (the
     SupportedCountry table) - narrower than Twilio's own coverage since a
@@ -64,18 +72,27 @@ def list_supported_countries(db: Session) -> list[SupportedCountry]:
     return db.query(SupportedCountry).order_by(SupportedCountry.sort_order, SupportedCountry.code).all()
 
 
-def upsert_supported_country(db: Session, *, code: str, name: str, sort_order: int = 0) -> SupportedCountry:
+def upsert_supported_country(
+    db: Session, *, code: str, name: str, sort_order: int = 0, emergency_calling_supported: bool = False
+) -> SupportedCountry:
     """Staff-only, SUPER_ADMIN-gated at the route (see app.staff.routes) -
     expanding the launch country list is a compliance/commercial decision,
     the same bar as a calling-rate change (app.usage.service.
-    upsert_calling_rate)."""
+    upsert_calling_rate). emergency_calling_supported defaults False -
+    setting it True is a Legal/Compliance claim that real E911 evidence
+    exists for this country (Commercial Billing Operating Standard doc
+    §10), not an engineering default to flip casually."""
     country = db.query(SupportedCountry).filter(SupportedCountry.code == code).first()
     if country is None:
-        country = SupportedCountry(code=code, name=name, sort_order=sort_order)
+        country = SupportedCountry(
+            code=code, name=name, sort_order=sort_order,
+            emergency_calling_supported=emergency_calling_supported,
+        )
         db.add(country)
     else:
         country.name = name
         country.sort_order = sort_order
+        country.emergency_calling_supported = emergency_calling_supported
     db.commit()
     db.refresh(country)
     return country
@@ -366,6 +383,11 @@ def reserve_number(db: Session, account_id: str, e164: str, country: str, number
 
 
 def purchase_number(db: Session, account_id: str, e164: str) -> PhoneNumber:
+    # Commercial Billing Operating Standard doc §32.1 - checked before
+    # anything else so a tripped switch blocks new provisioning without
+    # touching this number's existing reservation/eligibility state.
+    assert_kill_switch_not_active(db, KillSwitchScope.NUMBER_PROVISIONING)
+
     now = datetime.now(timezone.utc)
     number = db.query(PhoneNumber).filter(PhoneNumber.e164 == e164).with_for_update().first()
 
@@ -389,8 +411,19 @@ def purchase_number(db: Session, account_id: str, e164: str) -> PhoneNumber:
     billing_service.assert_billing_not_suspended(db, account_id)
 
     if not has_active_consent(db, account_id, ConsentType.EMERGENCY_CALLING_ACKNOWLEDGED):
+        # Commercial Billing Operating Standard doc §10 - the disclosure
+        # must reflect this specific number's market, not a single generic
+        # sentence for every country (see SupportedCountry.
+        # emergency_calling_supported's docstring). Still gates on the same
+        # GLOBAL-or-jurisdiction consent check as before (has_active_consent
+        # unchanged) - only the message text is country-aware.
+        country = db.query(SupportedCountry).filter(SupportedCountry.code == number.country).first()
+        if country is not None and country.emergency_calling_supported:
+            capability_clause = "may not work reliably"
+        else:
+            capability_clause = f"is NOT currently supported in {number.country}"
         raise EmergencyDisclosureRequiredError(
-            "You must acknowledge that emergency (911/999) calling may not work reliably through "
+            f"You must acknowledge that emergency (911/999) calling {capability_clause} through "
             "this service before purchasing a number — grant it via POST /compliance/consent first"
         )
 
@@ -516,6 +549,12 @@ def create_number_purchase_checkout_session(db: Session, account_id: str, e164: 
     once Stripe confirms payment via the checkout.session.completed
     webhook - see complete_number_purchase_from_checkout below. Returns
     {id, url} - the customer is redirected to url."""
+    # Commercial Billing Operating Standard doc §14/§T stopgap - see
+    # Account.is_test's docstring. Checked before ever reaching Stripe.
+    account = db.query(Account).filter(Account.id == account_id).first()
+    if account is not None and account.is_test:
+        raise TestAccountRestrictedError(f"Account {account_id} is flagged is_test and cannot create a live checkout session")
+
     now = datetime.now(timezone.utc)
     number = db.query(PhoneNumber).filter(PhoneNumber.e164 == e164).first()
     if number is None or number.account_id != account_id or number.status != PhoneNumberStatus.RESERVED:
@@ -703,6 +742,22 @@ class NotDueForRenewalError(Exception):
     doesn't have a next_renewal_at in the past."""
 
 
+# Commercial Billing Operating Standard doc §D2/§NUM-01 - "billing meter
+# excludes FAILED/REJECTED/CANCELED... failed provisioning cannot produce
+# active recurring rental." This codebase has no FAILED/REJECTED
+# PhoneNumberStatus (a failed purchase reverts the row to RESERVED, which
+# is already excluded here) - ACTIVE is the only billable state today.
+# Centralized as a set (rather than an inline `== ACTIVE` check duplicated
+# at every call site) so it stays usable in a SQL .in_() filter AND as a
+# single, auditable, unit-testable point of truth as the state machine
+# evolves - see is_number_billable.
+BILLABLE_NUMBER_STATUSES = {PhoneNumberStatus.ACTIVE}
+
+
+def is_number_billable(status: PhoneNumberStatus) -> bool:
+    return status in BILLABLE_NUMBER_STATUSES
+
+
 def list_due_renewals(db: Session) -> list[PhoneNumber]:
     """Numbers whose lifecycle renewal date has passed. There's no real
     payment gateway to charge yet (same gap purchase_number's docstring
@@ -712,7 +767,7 @@ def list_due_renewals(db: Session) -> list[PhoneNumber]:
     return (
         db.query(PhoneNumber)
         .filter(
-            PhoneNumber.status == PhoneNumberStatus.ACTIVE,
+            PhoneNumber.status.in_(BILLABLE_NUMBER_STATUSES),
             PhoneNumber.next_renewal_at.isnot(None),
             PhoneNumber.next_renewal_at <= now,
         )
@@ -730,7 +785,7 @@ def mark_number_renewed(db: Session, staff_id: str, number_id: str) -> PhoneNumb
     must not invent a punitive failure mode that isn't backed by one."""
     number = db.query(PhoneNumber).filter(PhoneNumber.id == number_id).with_for_update().first()
     now = datetime.now(timezone.utc)
-    if number is None or number.status != PhoneNumberStatus.ACTIVE or (
+    if number is None or not is_number_billable(number.status) or (
         number.next_renewal_at is None or number.next_renewal_at > now
     ):
         raise NotDueForRenewalError(f"{number_id} is not currently due for renewal")

@@ -50,3 +50,20 @@ class StatusSubscriptionResponse(BaseModel):
     id: str
     account_id: str
     is_active: bool
+
+
+class KillSwitchResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    scope: str
+    is_active: bool
+    reason: str | None
+    activated_by: str | None
+    activated_at: datetime | None
+    deactivated_at: datetime | None
+    created_at: datetime
+
+
+class SetKillSwitchRequest(BaseModel):
+    reason: str | None = None

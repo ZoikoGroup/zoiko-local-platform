@@ -1,4 +1,5 @@
 import uuid
+from datetime import date
 
 from sqlalchemy.orm import Session
 
@@ -42,6 +43,8 @@ def submit_porting_request(
     carrier_account_number: str,
     billing_name: str,
     billing_address: str,
+    authorization_evidence_url: str | None = None,
+    target_completion_date: date | None = None,
 ) -> PortingRequest:
     if db.query(PhoneNumber).filter(PhoneNumber.e164 == phone_number).first() is not None:
         raise PortingRequestConflictError(f"{phone_number} is already a number on this platform")
@@ -66,6 +69,8 @@ def submit_porting_request(
         carrier_account_number=carrier_account_number,
         billing_name=billing_name,
         billing_address=billing_address,
+        authorization_evidence_url=authorization_evidence_url,
+        target_completion_date=target_completion_date,
     )
     db.add(request)
     db.commit()

@@ -43,6 +43,8 @@ from app.media.models import (
 from app.numbering.identity.models import User, UserRole
 from app.numbering.numbers.models import PhoneNumber, PhoneNumberStatus
 from app.numbering.numbers.service import NumberConflictError, assert_number_access, assigned_number_ids
+from app.ops.models import KillSwitchScope
+from app.ops.service import assert_kill_switch_not_active
 from app.retention.service import PURGED_MARKER
 from app.risk import service as risk_service
 from app.usage import service as usage_service
@@ -178,6 +180,11 @@ def _dispatch_outbound_call(
     """Shared core of place_outbound_call and place_outbound_call_for_account
     - everything after "is this number really available to the caller" is
     identical for both a logged-in user and a public API key."""
+    # Commercial Billing Operating Standard doc §32.1 - checked first,
+    # alongside (not instead of) the per-account risk gates below; this one
+    # is platform-wide and manually triggered, not account-specific.
+    assert_kill_switch_not_active(db, KillSwitchScope.OUTBOUND_CALLING)
+
     # Graceful degradation (Architecture doc §9) - outbound calling pauses
     # once a payment grace period expires; inbound calls are deliberately
     # never gated this way (see billing_service.assert_billing_not_suspended).
@@ -273,10 +280,14 @@ def update_call_status(db: Session, provider_call_sid: str, status: str, duratio
         publish_call_ended(call.account_id, call_sid=provider_call_sid, status=status, duration_seconds=duration)
 
     # Usage Metering (Roadmap §2 Voice scope; Architecture §7 "Usage Event"
-    # data model) - a completed call with a real duration and a known
-    # account is a ratable event, regardless of whether ZoikoNex exists yet
-    # to consume it.
-    if status == "completed" and duration is not None and call.account_id is not None:
+    # data model) - every terminal call, not just completed ones, is a usage
+    # event (Commercial Billing Operating Standard doc §E1: normalized usage
+    # needs a disposition regardless of billability; §E2: attempted/busy/
+    # no-answer/failed calls may carry real wholesale cost even though
+    # they're not retail-billable). record_usage_event itself decides
+    # billed quantity from `disposition` - this call site just reports what
+    # actually happened.
+    if status in TERMINAL_CALL_STATUSES and call.account_id is not None:
         country_band = None
         if call.phone_number_id is not None:
             number = db.query(PhoneNumber).filter(PhoneNumber.id == call.phone_number_id).first()
@@ -285,10 +296,11 @@ def update_call_status(db: Session, provider_call_sid: str, status: str, duratio
             db,
             account_id=call.account_id,
             event_type="call_seconds",
-            quantity=duration,
+            quantity=duration or 0,
             unit="seconds",
             country_band=country_band,
             idempotency_key=f"call_seconds:{provider_call_sid}",
+            disposition=status,
         )
 
     return call
