@@ -19,6 +19,7 @@ from app.billing.models import (
 )
 from app.core.config import settings
 from app.integrations.billing import zoikonex as zoikonex_adapter
+from app.integrations.telecom import twilio as telecom
 from app.notifications.service import (
     notify_payment_failed,
     notify_payment_reminder,
@@ -35,6 +36,13 @@ _PERIOD_LENGTH = timedelta(days=30)
 # constant (not per-plan) since the doc describes it as a platform-wide
 # policy, not a plan feature.
 GRACE_PERIOD_DAYS = 7
+# Commercial Billing Operating Standard P0-8 "late-event policy" - how long
+# after a call completes its usage event can still land before
+# run_zoikonex_reconciliation flags it. Deliberately generous (this is
+# "did this miss a billing cycle," not a real-time metering SLA) - no
+# specific number is given in the doc, same "reasonable Phase-1 default,
+# not invented precision" posture as GRACE_PERIOD_DAYS above.
+LATE_EVENT_THRESHOLD = timedelta(hours=24)
 
 
 def _db_now(db: Session) -> datetime:
@@ -217,6 +225,13 @@ def sync_usage_event_to_zoikonex(db: Session, usage_event) -> None:
         unit=usage_event.unit, country_band=usage_event.country_band,
     )
     usage_event.estimated_cost_cents = rating["estimated_cost_cents"]
+    if rating["estimated_cost_cents"] is not None:
+        # P0-8 "rating versioning" - only stamped when a rate table
+        # actually applied (never for an event_type with no CallingRate
+        # coverage yet - leaving meter_version NULL there is the honest
+        # "not rated at all" state, not "rated under version X").
+        usage_event.meter_version = zoikonex_adapter.CALLING_RATE_METER_VERSION
+        usage_event.rated_at = _db_now(db)
 
     sub = db.query(Subscription).filter(Subscription.account_id == usage_event.account_id).first()
     try:
@@ -590,6 +605,7 @@ def run_zoikonex_reconciliation(db: Session) -> ZoikoNexReconciliationRun:
         ZoikoNexReconciliationExceptionType.SUBSCRIPTION_MISSING_ZOIKONEX_REF: set(),
         ZoikoNexReconciliationExceptionType.USAGE_EVENT_MISSING_SYNC: set(),
         ZoikoNexReconciliationExceptionType.CALL_RECORD_MISSING_USAGE_EVENT: set(),
+        ZoikoNexReconciliationExceptionType.LATE_USAGE_EVENT: set(),
     }
     for exc in db.query(ZoikoNexReconciliationException).filter(
         ZoikoNexReconciliationException.resolved_at.is_(None)
@@ -650,8 +666,9 @@ def run_zoikonex_reconciliation(db: Session) -> ZoikoNexReconciliationRun:
     # matching UsageEvent's idempotency_key is always
     # f"call_seconds:{provider_call_sid}" (see update_call_status) - no
     # join table needed, just that exact string.
-    existing_call_usage_keys = {
-        row[0] for row in db.query(UsageEvent.idempotency_key).filter(UsageEvent.event_type == "call_seconds").all()
+    call_usage_events_by_key = {
+        event.idempotency_key: event
+        for event in db.query(UsageEvent).filter(UsageEvent.event_type == "call_seconds").all()
     }
     completed_calls = (
         db.query(CallRecord)
@@ -665,23 +682,49 @@ def run_zoikonex_reconciliation(db: Session) -> ZoikoNexReconciliationRun:
     )
     run.total_completed_calls = len(completed_calls)
     for call in completed_calls:
-        if f"call_seconds:{call.provider_call_sid}" in existing_call_usage_keys:
-            continue
-        run.unmatched_completed_calls += 1
-        if call.id in already_open[ZoikoNexReconciliationExceptionType.CALL_RECORD_MISSING_USAGE_EVENT]:
-            continue
-        new_exceptions.append(
-            ZoikoNexReconciliationException(
-                run_id=run.id,
-                account_id=call.account_id,
-                exception_type=ZoikoNexReconciliationExceptionType.CALL_RECORD_MISSING_USAGE_EVENT,
-                subject_id=call.id,
-                detail=(
-                    f"Call {call.provider_call_sid} completed ({call.duration}s, carrier-confirmed) "
-                    f"but has no matching call_seconds usage event."
-                ),
+        usage_event = call_usage_events_by_key.get(f"call_seconds:{call.provider_call_sid}")
+        if usage_event is None:
+            run.unmatched_completed_calls += 1
+            if call.id in already_open[ZoikoNexReconciliationExceptionType.CALL_RECORD_MISSING_USAGE_EVENT]:
+                continue
+            new_exceptions.append(
+                ZoikoNexReconciliationException(
+                    run_id=run.id,
+                    account_id=call.account_id,
+                    exception_type=ZoikoNexReconciliationExceptionType.CALL_RECORD_MISSING_USAGE_EVENT,
+                    subject_id=call.id,
+                    detail=(
+                        f"Call {call.provider_call_sid} completed ({call.duration}s, carrier-confirmed) "
+                        f"but has no matching call_seconds usage event."
+                    ),
+                )
             )
-        )
+            continue
+
+        # P0-8 "late-event policy" - the usage event exists, but arrived
+        # well after the call it bills for actually completed. Flagged
+        # even though it's matched - a late event that lands after its
+        # billing period has already invoiced needs a human decision, not
+        # a silent pass. LATE_EVENT_THRESHOLD is deliberately generous (not
+        # a tight SLA check) since this is about "did this miss a billing
+        # cycle," not real-time metering latency.
+        delay = usage_event.created_at - call.created_at
+        if delay <= LATE_EVENT_THRESHOLD:
+            continue
+        run.late_usage_events += 1
+        if usage_event.id not in already_open[ZoikoNexReconciliationExceptionType.LATE_USAGE_EVENT]:
+            new_exceptions.append(
+                ZoikoNexReconciliationException(
+                    run_id=run.id,
+                    account_id=call.account_id,
+                    exception_type=ZoikoNexReconciliationExceptionType.LATE_USAGE_EVENT,
+                    subject_id=usage_event.id,
+                    detail=(
+                        f"Usage event for call {call.provider_call_sid} was recorded "
+                        f"{delay.total_seconds() / 3600:.1f}h after the call completed."
+                    ),
+                )
+            )
 
     run.exceptions_found = len(new_exceptions)
     for exc in new_exceptions:
@@ -689,6 +732,123 @@ def run_zoikonex_reconciliation(db: Session) -> ZoikoNexReconciliationRun:
     db.commit()
     db.refresh(run)
     return run
+
+
+def capture_wholesale_call_cost(db: Session, *, limit: int = 50) -> dict:
+    """Commercial Billing Operating Standard P0-8 "retail vs wholesale
+    reconciliation" - fetches Twilio's own real, documented Call resource
+    price for completed calls that don't have a wholesale cost captured
+    yet, and stores it on CallRecord.
+
+    Staff-triggered, not a scheduled job - there is no cron/scheduler
+    anywhere in this codebase yet (same posture as run_zoikonex_
+    reconciliation above). limit bounds how many calls one run fetches, so
+    a large backlog doesn't turn one staff click into an unbounded burst of
+    Twilio API calls.
+
+    Twilio rates calls asynchronously, so price can still be None
+    shortly after a call ends - those calls are left alone (not marked
+    permanently failed) and simply get picked up by a later run."""
+    from app.media.models import CallRecord
+
+    calls = (
+        db.query(CallRecord)
+        .filter(
+            CallRecord.status == "completed",
+            CallRecord.provider_call_sid.isnot(None),
+            CallRecord.wholesale_cost_cents.is_(None),
+        )
+        .order_by(CallRecord.created_at.asc())
+        .limit(limit)
+        .all()
+    )
+
+    captured = 0
+    not_yet_rated = 0
+    errors = 0
+    for call in calls:
+        try:
+            details = telecom.get_call(call.provider_call_sid)
+        except telecom.TelecomError:
+            errors += 1
+            continue
+
+        price = details.get("price")
+        price_unit = details.get("price_unit")
+        if price is None or price_unit is None:
+            not_yet_rated += 1
+            continue
+
+        call.wholesale_cost_cents = round(abs(float(price)) * 100)
+        call.wholesale_currency = price_unit.upper()
+        db.commit()
+        db.refresh(call)
+        log_event(
+            db, actor="system:wholesale_cost_capture", action="call.wholesale_cost_captured",
+            target=f"call_record:{call.id}", account_id=call.account_id,
+            after={"wholesale_cost_cents": call.wholesale_cost_cents, "wholesale_currency": call.wholesale_currency},
+        )
+        captured += 1
+
+    return {
+        "calls_checked": len(calls),
+        "captured": captured,
+        "not_yet_rated": not_yet_rated,
+        "errors": errors,
+    }
+
+
+def get_wholesale_reconciliation_summary(db: Session) -> dict:
+    """Retail-vs-wholesale comparison for completed calls with a rated
+    call_seconds UsageEvent - the other half of P0-8 alongside
+    capture_wholesale_call_cost. Reports honestly on coverage gaps
+    (calls with no wholesale cost captured yet) rather than excluding
+    them silently, since a partial reconciliation that looks complete is
+    worse than one that visibly isn't."""
+    from app.media.models import CallRecord
+    from app.usage.models import UsageEvent
+
+    completed_calls = (
+        db.query(CallRecord)
+        .filter(CallRecord.status == "completed", CallRecord.provider_call_sid.isnot(None))
+        .all()
+    )
+    usage_by_key = {
+        event.idempotency_key: event
+        for event in db.query(UsageEvent).filter(UsageEvent.event_type == "call_seconds").all()
+    }
+
+    calls_with_wholesale_cost = 0
+    calls_missing_wholesale_cost = 0
+    retail_cost_cents = 0
+    wholesale_cost_cents = 0
+    currencies_seen: set[str] = set()
+
+    for call in completed_calls:
+        if call.wholesale_cost_cents is None:
+            calls_missing_wholesale_cost += 1
+            continue
+        calls_with_wholesale_cost += 1
+        wholesale_cost_cents += call.wholesale_cost_cents
+        if call.wholesale_currency:
+            currencies_seen.add(call.wholesale_currency)
+
+        usage_event = usage_by_key.get(f"call_seconds:{call.provider_call_sid}")
+        if usage_event is not None and usage_event.estimated_cost_cents is not None:
+            retail_cost_cents += usage_event.estimated_cost_cents
+
+    # A single margin number only means something if every wholesale cost
+    # captured so far is in the same currency - reported honestly instead
+    # of silently summing across currencies if that's ever not true.
+    single_currency = next(iter(currencies_seen)) if len(currencies_seen) == 1 else None
+    return {
+        "calls_with_wholesale_cost": calls_with_wholesale_cost,
+        "calls_missing_wholesale_cost": calls_missing_wholesale_cost,
+        "retail_cost_cents": retail_cost_cents,
+        "wholesale_cost_cents": wholesale_cost_cents,
+        "currency": single_currency,
+        "mixed_currencies": sorted(currencies_seen) if len(currencies_seen) > 1 else None,
+    }
 
 
 def list_zoikonex_reconciliation_runs(db: Session, *, limit: int = 200) -> list[ZoikoNexReconciliationRun]:

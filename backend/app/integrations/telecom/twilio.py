@@ -276,13 +276,23 @@ def place_call(
 
 
 def get_call(call_sid: str) -> dict:
+    """price/price_unit are Twilio's own real, documented Call resource
+    fields (what Twilio actually billed this account for the call) - not an
+    estimate this codebase invents. price is a decimal string in major
+    currency units (e.g. "-0.03000" = 3 cents, negative because it's a
+    debit) and can be None for a while after the call ends, since Twilio
+    rates calls asynchronously - see capture_wholesale_call_cost's retry
+    posture in app.billing.service for the caller-side handling of that."""
     def _primary() -> dict:
         try:
             with trace_provider_call("twilio", "get_call"):
                 call = _client().calls(call_sid).fetch()
         except TwilioException as e:
             raise TelecomError(str(e)) from e
-        return {"sid": call.sid, "status": call.status, "to": call.to, "from": call.from_, "duration": call.duration}
+        return {
+            "sid": call.sid, "status": call.status, "to": call.to, "from": call.from_, "duration": call.duration,
+            "price": call.price, "price_unit": call.price_unit,
+        }
 
     secondary_fn = (lambda: secondary.get_call(call_sid)) if settings.telecom_failover_enabled else None
     return with_failover(_breaker, _primary, secondary_fn, TelecomError)
