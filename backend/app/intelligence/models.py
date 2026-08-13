@@ -3,7 +3,7 @@ import uuid
 from datetime import datetime
 
 from pgvector.sqlalchemy import Vector
-from sqlalchemy import JSON, DateTime, Enum, ForeignKey, Index, String, Text, func
+from sqlalchemy import JSON, DateTime, Enum, ForeignKey, Index, Integer, String, Text, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -20,6 +20,48 @@ class SummarySourceType(str, enum.Enum):
     VOICEMAIL = "voicemail"
     CALL = "call"
     VIDEO = "video"
+
+
+class AIJobStatus(str, enum.Enum):
+    RUNNING = "running"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+
+
+class AIJob(Base):
+    """Retry lineage and failure observability for AI summarization jobs -
+    the gap a previous audit flagged: before this, a failed transcription
+    or LLM call left NO row anywhere (ConversationSummary is only ever
+    created on success), so "why did this recording never get a summary"
+    was unanswerable without grepping raw logs, and a retried job looked
+    identical to a first attempt. One row per (source_type, source_id) -
+    a retry after failure updates the SAME row (attempt_count increments)
+    rather than creating a new one, so the row's own history tells the
+    whole story of one job across every attempt. Deliberately doesn't
+    replace ConversationSummary (the actual result) - see
+    app.intelligence.service._run_ai_job for how the two connect."""
+
+    __tablename__ = "ai_jobs"
+    __table_args__ = (
+        UniqueConstraint("source_type", "source_id", name="uq_ai_job_source"),
+    )
+
+    id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=new_uuid)
+    account_id: Mapped[str] = mapped_column(
+        UUID(as_uuid=False), ForeignKey("accounts.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    source_type: Mapped[SummarySourceType] = mapped_column(Enum(SummarySourceType, name="summary_source_type_enum"), nullable=False)
+    source_id: Mapped[str] = mapped_column(UUID(as_uuid=False), nullable=False, index=True)
+    status: Mapped[AIJobStatus] = mapped_column(Enum(AIJobStatus, name="ai_job_status_enum"), nullable=False)
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Set only once the job actually succeeds - the real result lives in
+    # ConversationSummary, this is just a pointer to it.
+    conversation_summary_id: Mapped[str | None] = mapped_column(
+        UUID(as_uuid=False), ForeignKey("conversation_summaries.id", ondelete="SET NULL"), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
 
 class ConversationSummary(Base):
