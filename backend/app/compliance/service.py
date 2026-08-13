@@ -259,6 +259,12 @@ def approve_case(db: Session, case: ComplianceCase, *, actor: str) -> Compliance
     publish_compliance_case_approved(
         case.account_id, case_id=case.id, jurisdiction=case.jurisdiction, requirement_type=case.requirement_type,
     )
+    # Deferred import: app.risk.service imports this module (has_approved_
+    # case/is_requirement_active via app.numbering.numbers.service), so the
+    # reverse import must happen at call time, not at module load time.
+    from app.risk.service import step_up_risk_state_after_kyc_approval
+
+    step_up_risk_state_after_kyc_approval(db, case.account_id)
 
     owner_email = _account_owner_email(db, case.account_id)
     if owner_email:

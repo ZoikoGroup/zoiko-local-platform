@@ -903,3 +903,160 @@ def test_stripe_payment_webhook_ignores_unrelated_event_types(client, monkeypatc
     )
     response = client.post("/numbers/payments/webhook", content=body, headers={"Stripe-Signature": signature})
     assert response.status_code == 204
+
+
+# --- Market Activation Registry ---
+
+
+def _upsert_market_country(client, staff_headers, code: str, name: str = "Market Test Country"):
+    response = client.put("/staff/countries", json={"code": code, "name": name}, headers=staff_headers)
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+def _set_market_status(client, staff_headers, code: str, market_status: str, reason: str = "test setup"):
+    response = client.put(
+        f"/staff/countries/{code}/market-status",
+        json={"status": market_status, "reason": reason},
+        headers=staff_headers,
+    )
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+def test_search_is_blocked_for_a_closed_market(client, db_session):
+    staff_token = _create_staff_and_login(client, db_session, "staffmarket1@zoikolocal.com")
+    staff_headers = {"Authorization": f"Bearer {staff_token}"}
+    _upsert_market_country(client, staff_headers, "M1")
+    _set_market_status(client, staff_headers, "M1", "closed")
+
+    token = _signup_and_login(client, "marketclosed1@example.com")
+    response = client.get(
+        "/numbers/search", params={"country": "M1"}, headers={"Authorization": f"Bearer {token}"}
+    )
+    assert response.status_code == 403
+    assert "not currently available" in response.json()["detail"]
+
+
+def test_reserve_is_blocked_for_a_suspended_market(client, db_session):
+    staff_token = _create_staff_and_login(client, db_session, "staffmarket2@zoikolocal.com")
+    staff_headers = {"Authorization": f"Bearer {staff_token}"}
+    _upsert_market_country(client, staff_headers, "M2")
+    _set_market_status(client, staff_headers, "M2", "suspended")
+
+    token = _signup_and_login(client, "marketsuspended1@example.com")
+    response = client.post(
+        "/numbers/reserve", json={"e164": "+9990002222", "country": "M2"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert response.status_code == 403
+
+
+def test_purchase_is_blocked_for_a_non_test_account_in_controlled_beta(client, db_session, monkeypatch):
+    """CONTROLLED_BETA and INTERNAL_TEST only let is_test accounts through -
+    a regular customer account must still be refused at purchase time even
+    if it somehow got past search/reserve (belt-and-suspenders re-check, same
+    pattern as the KYC/eligibility re-check in _assert_purchase_eligible)."""
+    _stub_buy_number(monkeypatch)
+    staff_token = _create_staff_and_login(client, db_session, "staffmarket3@zoikolocal.com")
+    staff_headers = {"Authorization": f"Bearer {staff_token}"}
+    _upsert_market_country(client, staff_headers, "M3")
+
+    token = _signup_and_login(client, "marketbeta1@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    _reserve(client, headers, "+9990003333", country="M3")
+
+    # Flip the market to CONTROLLED_BETA only after reserving - reserve_number
+    # itself also checks this, so demonstrating the purchase-time re-check
+    # needs the country to still be PAID_OPEN at reservation time.
+    _set_market_status(client, staff_headers, "M3", "controlled_beta")
+
+    response = client.post("/numbers/purchase", json={"e164": "+9990003333"}, headers=headers)
+    assert response.status_code == 403
+    assert "not yet open for general commercial sale" in response.json()["detail"]
+
+
+def test_purchase_succeeds_for_a_test_account_in_controlled_beta(client, db_session, monkeypatch):
+    from app.numbering.identity.models import Account
+
+    _stub_buy_number(monkeypatch)
+    staff_token = _create_staff_and_login(client, db_session, "staffmarket4@zoikolocal.com")
+    staff_headers = {"Authorization": f"Bearer {staff_token}"}
+    _upsert_market_country(client, staff_headers, "M4")
+
+    token = _signup_and_login(client, "marketbeta2@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    account_id = client.get("/auth/me", headers=headers).json()["account_id"]
+    account = db_session.query(Account).filter(Account.id == account_id).first()
+    account.is_test = True
+    db_session.commit()
+
+    _reserve(client, headers, "+9990004444", country="M4")
+    _set_market_status(client, staff_headers, "M4", "controlled_beta")
+
+    response = client.post("/numbers/purchase", json={"e164": "+9990004444"}, headers=headers)
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "active"
+
+
+def test_a_newly_added_country_defaults_to_closed(client, db_session):
+    """Fail-closed default (Production Readiness Standard doc Annex B) -
+    upsert_supported_country doesn't set market_status at all, so a freshly
+    added country must not be immediately sellable."""
+    staff_token = _create_staff_and_login(client, db_session, "staffmarket5@zoikolocal.com")
+    staff_headers = {"Authorization": f"Bearer {staff_token}"}
+    country = _upsert_market_country(client, staff_headers, "M5")
+    assert country["market_status"] == "closed"
+
+    token = _signup_and_login(client, "marketdefault1@example.com")
+    response = client.get(
+        "/numbers/search", params={"country": "M5"}, headers={"Authorization": f"Bearer {token}"}
+    )
+    assert response.status_code == 403
+
+
+def test_staff_can_open_a_market_for_paid_sale(client, db_session, monkeypatch):
+    """M6 isn't a real Twilio-recognized country code - stubbed here (same
+    pattern as _stub_buy_number) purely so the real object under test
+    (market_status gating) reaches telecom.search_available_numbers at all,
+    rather than getting a genuine 502 from Twilio rejecting an unknown
+    country code."""
+    monkeypatch.setattr(
+        "app.numbering.numbers.service.telecom.search_available_numbers",
+        lambda country, number_type, area_code: [],
+    )
+    staff_token = _create_staff_and_login(client, db_session, "staffmarket6@zoikolocal.com")
+    staff_headers = {"Authorization": f"Bearer {staff_token}"}
+    _upsert_market_country(client, staff_headers, "M6")
+
+    updated = _set_market_status(client, staff_headers, "M6", "paid_open", reason="Legal sign-off received")
+    assert updated["market_status"] == "paid_open"
+
+    token = _signup_and_login(client, "marketopen1@example.com")
+    response = client.get(
+        "/numbers/search", params={"country": "M6"}, headers={"Authorization": f"Bearer {token}"}
+    )
+    assert response.status_code == 200
+
+
+def test_set_market_activation_status_rejects_an_unsupported_country(client, db_session):
+    staff_token = _create_staff_and_login(client, db_session, "staffmarket7@zoikolocal.com")
+    response = client.put(
+        "/staff/countries/ZZ/market-status",
+        json={"status": "paid_open", "reason": "n/a"},
+        headers={"Authorization": f"Bearer {staff_token}"},
+    )
+    assert response.status_code == 404
+
+
+def test_set_market_activation_status_rejects_an_invalid_status_value(client, db_session):
+    staff_token = _create_staff_and_login(client, db_session, "staffmarket8@zoikolocal.com")
+    staff_headers = {"Authorization": f"Bearer {staff_token}"}
+    _upsert_market_country(client, staff_headers, "M8")
+
+    response = client.put(
+        "/staff/countries/M8/market-status",
+        json={"status": "not_a_real_status", "reason": "n/a"},
+        headers=staff_headers,
+    )
+    assert response.status_code == 422

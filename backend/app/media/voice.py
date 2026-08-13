@@ -249,6 +249,8 @@ async def outbound_call(
         raise HTTPException(status_code=403, detail=str(e)) from e
     except risk_service.VelocityLimitExceededError as e:
         raise HTTPException(status_code=429, detail=str(e)) from e
+    except risk_service.ConcurrentCallLimitExceededError as e:
+        raise HTTPException(status_code=429, detail=str(e)) from e
     except risk_service.GeographicDispersionError as e:
         raise HTTPException(status_code=429, detail=str(e)) from e
     except risk_service.SpendLimitExceededError as e:

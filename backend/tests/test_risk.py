@@ -37,6 +37,26 @@ def _active_number(db_session, account_id: str, e164: str) -> PhoneNumber:
     return number
 
 
+def _promote_to_paid_normal(db_session, account_id: str) -> None:
+    """Every fresh signup starts at AccountRiskState.TRIAL_LOW (see
+    Account.risk_state's default), whose concurrent-call limit is 1 - see
+    MAX_CONCURRENT_CALLS_BY_RISK_STATE. The stubbed telecom.place_call used
+    throughout this file returns a non-terminal status ("queued") and never
+    advances (no real Twilio status callback ever fires in a test), so
+    without this, tests that place several outbound calls back-to-back to
+    exercise velocity/dispersion limits would instead hit the unrelated
+    concurrent-call limit on their second call. Real-world sequential
+    calling wouldn't hit this the same way (each call's real status
+    callback typically lands before the next one is placed) - this promotes
+    the account so these tests isolate the limit they're actually about."""
+    from app.numbering.identity.models import Account
+    from app.risk.models import AccountRiskState
+
+    account = db_session.query(Account).filter(Account.id == account_id).first()
+    account.risk_state = AccountRiskState.PAID_NORMAL
+    db_session.commit()
+
+
 def test_customer_cannot_manage_blocked_destinations(client):
     token = _signup_and_login(client, "riskcustomer@example.com")
     response = client.post(
@@ -116,6 +136,7 @@ def test_outbound_call_velocity_limit_is_enforced(client, db_session, monkeypatc
     token = _signup_and_login(client, "riskvelocity@example.com")
     account_id = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"}).json()["account_id"]
     _active_number(db_session, account_id, "+15550008888")
+    _promote_to_paid_normal(db_session, account_id)
     headers = {"Authorization": f"Bearer {token}"}
 
     from app.risk.service import MAX_OUTBOUND_CALLS_PER_WINDOW
@@ -240,6 +261,7 @@ def test_outbound_call_geographic_dispersion_limit_is_enforced(client, db_sessio
     token = _signup_and_login(client, "riskdispersion@example.com")
     account_id = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"}).json()["account_id"]
     _active_number(db_session, account_id, "+15550007777")
+    _promote_to_paid_normal(db_session, account_id)
     headers = {"Authorization": f"Bearer {token}"}
 
     from app.risk.service import GEOGRAPHIC_DISPERSION_COUNTRY_THRESHOLD
@@ -559,3 +581,366 @@ def test_inbound_call_fanning_out_across_accounts_gets_flagged_via_the_real_webh
         "/media/voice/calls", headers={"Authorization": f"Bearer {tokens[0]}"}
     ).json()
     assert first_account_calls[0]["is_suspected_spam"] is False
+
+
+# --- Trial-abuse step-up model (Production Readiness Standard doc) ---
+
+
+def test_new_account_defaults_to_trial_low(client, db_session):
+    from app.numbering.identity.models import Account
+    from app.risk.models import AccountRiskState
+
+    token = _signup_and_login(client, "risktrialdefault@example.com")
+    account_id = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"}).json()["account_id"]
+
+    account = db_session.query(Account).filter(Account.id == account_id).first()
+    assert account.risk_state == AccountRiskState.TRIAL_LOW
+
+
+def test_concurrent_call_limit_blocks_a_second_in_flight_call_for_a_trial_account(client, db_session, monkeypatch):
+    """A brand-new TRIAL_LOW account's concurrent-call limit is 1 - the
+    stubbed telecom.place_call below returns a non-terminal ("queued")
+    status and never advances, so the first call stays "in flight" for the
+    second call's check, exactly like a real second call placed before the
+    first one's Twilio status callback has arrived."""
+    monkeypatch.setattr(
+        "app.media.service.telecom.place_call",
+        lambda **kwargs: {"sid": "CAconcurrent1", "status": "queued", "to": kwargs["to"], "from": kwargs["from_"]},
+    )
+    token = _signup_and_login(client, "riskconcurrent1@example.com")
+    account_id = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"}).json()["account_id"]
+    _active_number(db_session, account_id, "+15550009090")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    first = client.post(
+        "/media/voice/outbound", json={"to": "+15551110000", "from": "+15550009090"}, headers=headers,
+    )
+    assert first.status_code == 200, first.text
+
+    second = client.post(
+        "/media/voice/outbound", json={"to": "+15551110001", "from": "+15550009090"}, headers=headers,
+    )
+    assert second.status_code == 429
+    assert "concurrent" in second.json()["detail"].lower()
+
+
+def test_concurrent_call_limit_allows_up_to_the_paid_normal_tier(client, db_session, monkeypatch):
+    monkeypatch.setattr(
+        "app.media.service.telecom.place_call",
+        lambda **kwargs: {"sid": "CAconcurrent2", "status": "queued", "to": kwargs["to"], "from": kwargs["from_"]},
+    )
+    from app.risk.service import MAX_CONCURRENT_CALLS_BY_RISK_STATE
+    from app.risk.models import AccountRiskState
+
+    token = _signup_and_login(client, "riskconcurrent2@example.com")
+    account_id = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"}).json()["account_id"]
+    _active_number(db_session, account_id, "+15550009091")
+    _promote_to_paid_normal(db_session, account_id)
+    headers = {"Authorization": f"Bearer {token}"}
+
+    limit = MAX_CONCURRENT_CALLS_BY_RISK_STATE[AccountRiskState.PAID_NORMAL]
+    for _ in range(limit):
+        response = client.post(
+            "/media/voice/outbound", json={"to": "+15551110002", "from": "+15550009091"}, headers=headers,
+        )
+        assert response.status_code == 200, response.text
+
+    over_limit = client.post(
+        "/media/voice/outbound", json={"to": "+15551110002", "from": "+15550009091"}, headers=headers,
+    )
+    assert over_limit.status_code == 429
+
+
+def test_completed_call_frees_up_the_concurrent_call_slot(client, db_session, monkeypatch):
+    """A call that's actually ended (Twilio status callback delivered) must
+    not keep counting against the concurrent-call limit forever - the gate
+    is about calls genuinely in flight right now, not a lifetime cap."""
+    monkeypatch.setattr(
+        "app.media.service.telecom.place_call",
+        lambda **kwargs: {"sid": "CAconcurrent3", "status": "queued", "to": kwargs["to"], "from": kwargs["from_"]},
+    )
+    token = _signup_and_login(client, "riskconcurrent3@example.com")
+    account_id = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"}).json()["account_id"]
+    _active_number(db_session, account_id, "+15550009092")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    first = client.post(
+        "/media/voice/outbound", json={"to": "+15551110003", "from": "+15550009092"}, headers=headers,
+    )
+    assert first.status_code == 200, first.text
+
+    callback_url = "http://testserver/media/voice/status-callback"
+    callback_params = {"CallSid": "CAconcurrent3", "CallStatus": "completed", "CallDuration": "10"}
+    signature = _twilio_signature(callback_url, callback_params)
+    callback_response = client.post(
+        "/media/voice/status-callback", data=callback_params, headers={"X-Twilio-Signature": signature}
+    )
+    assert callback_response.status_code == 204
+
+    second = client.post(
+        "/media/voice/outbound", json={"to": "+15551110004", "from": "+15550009092"}, headers=headers,
+    )
+    assert second.status_code == 200, second.text
+
+
+def test_kyc_approval_steps_up_trial_low_to_trial_verified(client, db_session):
+    from app.compliance.models import ComplianceRule
+    from app.numbering.identity.models import Account
+    from app.risk.models import AccountRiskState
+    from app.staff.models import PlatformStaffRole
+
+    db_session.add(
+        ComplianceRule(country="GB", requirement_type="kyc_individual", required_documents=["government_id"])
+    )
+    db_session.commit()
+
+    token = _signup_and_login(client, "risktrialverified1@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    account_id = client.get("/auth/me", headers=headers).json()["account_id"]
+
+    case_response = client.post(
+        "/compliance/cases", json={"jurisdiction": "GB", "requirement_type": "kyc_individual"}, headers=headers
+    )
+    case_id = case_response.json()["id"]
+
+    staff_token = _create_staff_and_login(
+        client, db_session, "stafftrialverified1@zoikolocal.com", PlatformStaffRole.SUPER_ADMIN
+    )
+    approve = client.post(
+        f"/compliance/cases/{case_id}/approve", headers={"Authorization": f"Bearer {staff_token}"}
+    )
+    assert approve.status_code == 200
+
+    account = db_session.query(Account).filter(Account.id == account_id).first()
+    assert account.risk_state == AccountRiskState.TRIAL_VERIFIED
+
+
+def test_number_purchase_steps_up_trial_account_to_paid_normal(client, db_session, monkeypatch):
+    from app.numbering.identity.models import Account
+    from app.risk.models import AccountRiskState
+
+    monkeypatch.setattr(
+        "app.numbering.numbers.service.telecom.buy_number",
+        lambda e164: {"sid": "PN_fake_riskstepup", "phone_number": e164, "capabilities": {}},
+    )
+    token = _signup_and_login(client, "riskpaidstepup1@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    account_id = client.get("/auth/me", headers=headers).json()["account_id"]
+    client.post("/compliance/consent", json={"consent_type": "emergency_calling_acknowledged"}, headers=headers)
+
+    # AU (not one of the shared dev DB's seeded KYC-rule countries -
+    # US/GB/CA/NG/ZA/GH/KE/MX - see test_numbers.py's _reserve helper
+    # comments) - keeps this test's purchase from being blocked by an
+    # unrelated compliance case requirement.
+    reserve = client.post(
+        "/numbers/reserve", json={"e164": "+15550070090", "country": "AU"}, headers=headers,
+    )
+    assert reserve.status_code == 201, reserve.text
+    purchase = client.post("/numbers/purchase", json={"e164": "+15550070090"}, headers=headers)
+    assert purchase.status_code == 200, purchase.text
+
+    account = db_session.query(Account).filter(Account.id == account_id).first()
+    assert account.risk_state == AccountRiskState.PAID_NORMAL
+
+
+def test_purchase_does_not_downgrade_an_account_under_review(client, db_session, monkeypatch):
+    from app.numbering.identity.models import Account
+    from app.risk.models import AccountRiskState
+
+    monkeypatch.setattr(
+        "app.numbering.numbers.service.telecom.buy_number",
+        lambda e164: {"sid": "PN_fake_riskstepup2", "phone_number": e164, "capabilities": {}},
+    )
+    token = _signup_and_login(client, "riskpaidstepup2@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    account_id = client.get("/auth/me", headers=headers).json()["account_id"]
+    client.post("/compliance/consent", json={"consent_type": "emergency_calling_acknowledged"}, headers=headers)
+
+    reserve = client.post(
+        "/numbers/reserve", json={"e164": "+15550070091", "country": "AU"}, headers=headers,
+    )
+    assert reserve.status_code == 201, reserve.text
+
+    account = db_session.query(Account).filter(Account.id == account_id).first()
+    account.risk_state = AccountRiskState.REVIEW_REQUIRED
+    db_session.commit()
+
+    purchase = client.post("/numbers/purchase", json={"e164": "+15550070091"}, headers=headers)
+    assert purchase.status_code == 200, purchase.text
+
+    db_session.refresh(account)
+    assert account.risk_state == AccountRiskState.REVIEW_REQUIRED
+
+
+def test_fraud_case_opening_sets_review_required(db_session):
+    from app.risk.models import AccountRiskState, RiskSignalType
+    from app.risk.service import record_risk_signal
+    from app.numbering.identity.models import Account
+
+    account_id = _real_accounts(db_session, 1, "riskstate-review")[0]
+    record_risk_signal(db_session, account_id=account_id, signal_type=RiskSignalType.BLOCKED_DESTINATION_ATTEMPT, detail="t1")
+    record_risk_signal(db_session, account_id=account_id, signal_type=RiskSignalType.BLOCKED_DESTINATION_ATTEMPT, detail="t2")
+
+    account = db_session.query(Account).filter(Account.id == account_id).first()
+    assert account.risk_state == AccountRiskState.REVIEW_REQUIRED
+
+
+def test_auto_suspend_sets_suspended_fraud(db_session):
+    from app.risk.models import AccountRiskState, RiskSignalType
+    from app.risk.service import record_risk_signal
+    from app.numbering.identity.models import Account
+
+    account_id = _real_accounts(db_session, 1, "riskstate-suspend")[0]
+    for i in range(3):  # 3 * 40 = 120, capped at 100 -> crosses AUTO_SUSPEND_THRESHOLD
+        record_risk_signal(db_session, account_id=account_id, signal_type=RiskSignalType.BLOCKED_DESTINATION_ATTEMPT, detail=f"t{i}")
+
+    account = db_session.query(Account).filter(Account.id == account_id).first()
+    assert account.risk_state == AccountRiskState.SUSPENDED_FRAUD
+
+
+def test_clearing_a_fraud_case_restores_the_account_to_its_baseline_tier(client, db_session):
+    from app.risk.models import AccountRiskState, FraudCase, RiskSignalType
+    from app.risk.service import record_risk_signal
+    from app.numbering.identity.models import Account
+    from app.staff.models import PlatformStaffRole
+
+    account_id = _real_accounts(db_session, 1, "riskstate-clear")[0]
+    record_risk_signal(db_session, account_id=account_id, signal_type=RiskSignalType.BLOCKED_DESTINATION_ATTEMPT, detail="t1")
+    record_risk_signal(db_session, account_id=account_id, signal_type=RiskSignalType.BLOCKED_DESTINATION_ATTEMPT, detail="t2")
+
+    account = db_session.query(Account).filter(Account.id == account_id).first()
+    assert account.risk_state == AccountRiskState.REVIEW_REQUIRED
+    case = db_session.query(FraudCase).filter(FraudCase.account_id == account_id).first()
+
+    officer_token = _create_staff_and_login(
+        client, db_session, "riskstateclearofficer@zoikolocal.com", PlatformStaffRole.COMPLIANCE_OFFICER
+    )
+    response = client.post(
+        f"/risk/fraud-cases/{case.id}/resolve",
+        json={"status": "cleared", "notes": "false positive"},
+        headers={"Authorization": f"Bearer {officer_token}"},
+    )
+    assert response.status_code == 200, response.text
+
+    db_session.refresh(account)
+    # No KYC approval, no completed purchase behind this account - baseline
+    # falls all the way back to TRIAL_LOW, not straight to PAID_NORMAL.
+    assert account.risk_state == AccountRiskState.TRIAL_LOW
+
+
+def test_confirming_a_fraud_case_forces_suspended_fraud(client, db_session):
+    from app.risk.models import AccountRiskState, FraudCase, FraudCaseStatus
+    from app.numbering.identity.models import Account
+    from app.staff.models import PlatformStaffRole
+
+    account_id = _real_accounts(db_session, 1, "riskstate-confirm")[0]
+    case = FraudCase(account_id=account_id, score_at_open=70, status=FraudCaseStatus.OPEN)
+    db_session.add(case)
+    db_session.commit()
+
+    officer_token = _create_staff_and_login(
+        client, db_session, "riskstateconfirmofficer@zoikolocal.com", PlatformStaffRole.COMPLIANCE_OFFICER
+    )
+    response = client.post(
+        f"/risk/fraud-cases/{case.id}/resolve",
+        json={"status": "confirmed", "notes": "verified abuse"},
+        headers={"Authorization": f"Bearer {officer_token}"},
+    )
+    assert response.status_code == 200, response.text
+
+    account = db_session.query(Account).filter(Account.id == account_id).first()
+    assert account.risk_state == AccountRiskState.SUSPENDED_FRAUD
+
+
+def test_staff_reinstatement_restores_baseline_risk_state(client, db_session):
+    from app.risk.models import AccountRiskState, RiskSignalType
+    from app.risk.service import record_risk_signal
+    from app.numbering.identity.models import Account
+    from app.numbering.numbers.models import PhoneNumber, PhoneNumberStatus as NumberStatus
+    from app.staff.models import PlatformStaffRole
+
+    account_id = _real_accounts(db_session, 1, "riskstate-reinstate")[0]
+    db_session.add(
+        PhoneNumber(e164="+15550070092", country="US", status=NumberStatus.ACTIVE, account_id=account_id)
+    )
+    db_session.commit()
+
+    for i in range(3):  # crosses AUTO_SUSPEND_THRESHOLD
+        record_risk_signal(db_session, account_id=account_id, signal_type=RiskSignalType.BLOCKED_DESTINATION_ATTEMPT, detail=f"t{i}")
+
+    account = db_session.query(Account).filter(Account.id == account_id).first()
+    assert account.risk_state == AccountRiskState.SUSPENDED_FRAUD
+
+    admin_token = _create_staff_and_login(
+        client, db_session, "riskstatereinstateadmin@zoikolocal.com", PlatformStaffRole.SUPER_ADMIN
+    )
+    response = client.post(
+        f"/risk/accounts/{account_id}/reinstate",
+        json={"reason": "confirmed false positive"},
+        headers={"Authorization": f"Bearer {admin_token}"},
+    )
+    assert response.status_code == 200, response.text
+
+    db_session.refresh(account)
+    # This account has an ACTIVE phone number on file -> baseline is
+    # PAID_NORMAL, not TRIAL_LOW.
+    assert account.risk_state == AccountRiskState.PAID_NORMAL
+
+
+def test_account_risk_summary_includes_risk_state(client, db_session):
+    from app.staff.models import PlatformStaffRole
+
+    account_id = _real_accounts(db_session, 1, "riskstate-summary")[0]
+    staff_token = _create_staff_and_login(
+        client, db_session, "riskstatesummarystaff@zoikolocal.com", PlatformStaffRole.SUPPORT
+    )
+    response = client.get(
+        f"/risk/accounts/{account_id}/score", headers={"Authorization": f"Bearer {staff_token}"}
+    )
+    assert response.status_code == 200
+    assert response.json()["risk_state"] == "trial_low"
+
+
+def test_staff_manual_risk_state_override(client, db_session):
+    from app.staff.models import PlatformStaffRole
+
+    account_id = _real_accounts(db_session, 1, "riskstate-override")[0]
+    admin_token = _create_staff_and_login(
+        client, db_session, "riskstateoverrideadmin@zoikolocal.com", PlatformStaffRole.SUPER_ADMIN
+    )
+    response = client.put(
+        f"/risk/accounts/{account_id}/risk-state",
+        json={"state": "suspended_fraud", "reason": "external law-enforcement tip"},
+        headers={"Authorization": f"Bearer {admin_token}"},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["risk_state"] == "suspended_fraud"
+
+
+def test_support_staff_cannot_manually_override_risk_state(client, db_session):
+    from app.staff.models import PlatformStaffRole
+
+    account_id = _real_accounts(db_session, 1, "riskstate-override-denied")[0]
+    support_token = _create_staff_and_login(
+        client, db_session, "riskstateoverridesupport@zoikolocal.com", PlatformStaffRole.SUPPORT
+    )
+    response = client.put(
+        f"/risk/accounts/{account_id}/risk-state",
+        json={"state": "paid_normal", "reason": "n/a"},
+        headers={"Authorization": f"Bearer {support_token}"},
+    )
+    assert response.status_code == 403
+
+
+def test_manual_risk_state_override_rejects_an_unknown_account(client, db_session):
+    from app.staff.models import PlatformStaffRole
+
+    admin_token = _create_staff_and_login(
+        client, db_session, "riskstateoverrideunknown@zoikolocal.com", PlatformStaffRole.SUPER_ADMIN
+    )
+    response = client.put(
+        "/risk/accounts/00000000-0000-0000-0000-000000000000/risk-state",
+        json={"state": "paid_normal", "reason": "n/a"},
+        headers={"Authorization": f"Bearer {admin_token}"},
+    )
+    assert response.status_code == 404

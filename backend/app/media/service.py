@@ -28,6 +28,7 @@ from app.notifications.service import (
     notify_voicemail_received,
 )
 from app.media.models import (
+    TERMINAL_CALL_STATUSES,
     CallDirection,
     CallRecord,
     ConnectionQuality,
@@ -48,9 +49,6 @@ from app.ops.service import assert_kill_switch_not_active
 from app.retention.service import PURGED_MARKER
 from app.risk import service as risk_service
 from app.usage import service as usage_service
-
-
-TERMINAL_CALL_STATUSES = {"completed", "failed", "busy", "no-answer", "canceled"}
 
 
 class CallAuthorizationError(Exception):
@@ -201,6 +199,7 @@ def _dispatch_outbound_call(
         )
         raise
     risk_service.assert_outbound_velocity_ok(db, account_id)
+    risk_service.assert_concurrent_call_limit_ok(db, account_id)
     risk_service.assert_geographic_dispersion_ok(db, account_id, to)
     risk_service.assert_spend_limit_ok(db, account_id)
 

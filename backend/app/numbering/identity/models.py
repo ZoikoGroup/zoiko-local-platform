@@ -7,6 +7,7 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
 from app.core.ids import new_uuid
+from app.risk.models import AccountRiskState
 
 
 class AccountType(str, enum.Enum):
@@ -85,6 +86,15 @@ class Account(Base):
     billing_source: Mapped[AccountBillingSource] = mapped_column(
         Enum(AccountBillingSource, name="account_billing_source_enum"),
         nullable=False, default=AccountBillingSource.DIRECT_ZOIKO_LOCAL,
+    )
+    # Production Readiness Standard doc's "trial-abuse step-up model" - see
+    # AccountRiskState's docstring. Every new account starts at the tightest
+    # tier (fail-closed, same posture as MarketActivationStatus.CLOSED) -
+    # existing accounts are backfilled to PAID_NORMAL by this column's
+    # migration to preserve today's de facto unrestricted behavior.
+    risk_state: Mapped[AccountRiskState] = mapped_column(
+        Enum(AccountRiskState, name="account_risk_state_enum"),
+        nullable=False, default=AccountRiskState.TRIAL_LOW,
     )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 

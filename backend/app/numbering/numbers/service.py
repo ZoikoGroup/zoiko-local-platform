@@ -27,6 +27,7 @@ from app.notifications.service import (
 from app.numbering.identity.models import Account, AccountBillingClassification, AccountType, User, UserRole
 from app.numbering.numbers.models import (
     IVROption,
+    MarketActivationStatus,
     NumberEligibilityCase,
     NumberEligibilityCaseStatus,
     NumberEligibilityRule,
@@ -96,6 +97,18 @@ class InvalidAreaCodeError(Exception):
     ever calling Twilio, not just reworded after the fact."""
 
 
+class MarketNotActivatedError(Exception):
+    """Production Readiness Standard doc §6.2 "Market Activation Registry" -
+    raised when a country is on the SupportedCountry list (so
+    UnsupportedCountryError doesn't apply) but its market_status doesn't
+    permit this caller to search/reserve/purchase there right now. CLOSED
+    and SUSPENDED block everyone; INTERNAL_TEST and CONTROLLED_BETA block
+    everyone except accounts flagged is_test - there's no invite-list
+    model yet to distinguish "internal tester" from "invited beta
+    customer", so both non-PAID_OPEN-but-active states share the same
+    is_test gate for now (see _assert_market_activated's docstring)."""
+
+
 def list_supported_countries(db: Session) -> list[SupportedCountry]:
     return db.query(SupportedCountry).order_by(SupportedCountry.sort_order, SupportedCountry.code).all()
 
@@ -135,6 +148,54 @@ def _assert_supported_country(db: Session, country: str) -> None:
     exists = db.query(SupportedCountry).filter(SupportedCountry.code == country).first() is not None
     if not exists:
         raise UnsupportedCountryError(f"{country!r} is not on Zoiko Local's supported country list yet")
+
+
+def _assert_market_activated(db: Session, country: str, account_id: str) -> None:
+    """Production Readiness Standard doc §6.2/Annex B - "Market availability
+    is policy-controlled and default-deny." Separate from
+    _assert_supported_country (which only asks "do we have a row for this
+    country at all") - a country can be on the launch list yet still be
+    CLOSED/SUSPENDED for everyone, or INTERNAL_TEST/CONTROLLED_BETA for
+    testers only. Callers run _assert_supported_country first so a
+    genuinely unknown country still gets that clearer error instead of
+    this one."""
+    supported = db.query(SupportedCountry).filter(SupportedCountry.code == country).first()
+    if supported is None or supported.market_status == MarketActivationStatus.PAID_OPEN:
+        return
+    if supported.market_status in (MarketActivationStatus.INTERNAL_TEST, MarketActivationStatus.CONTROLLED_BETA):
+        account = db.query(Account).filter(Account.id == account_id).first()
+        if account is not None and account.is_test:
+            return
+        raise MarketNotActivatedError(
+            f"{country!r} is not yet open for general commercial sale"
+        )
+    raise MarketNotActivatedError(f"{country!r} is not currently available")
+
+
+def set_market_activation_status(
+    db: Session, code: str, *, status: MarketActivationStatus, actor: str, reason: str
+) -> SupportedCountry:
+    """Staff-only, SUPER_ADMIN-gated at the route - moving a market between
+    CLOSED/INTERNAL_TEST/CONTROLLED_BETA/PAID_OPEN/SUSPENDED is exactly the
+    kind of commercial/legal decision this doc's Rule of Authority reserves
+    from Engineering self-ratification; this function is the enforcement
+    mechanism a human decision is recorded through, not the decision
+    itself. `reason` is mandatory - see Annex B's "every override... has
+    actor, reason, timestamp and evidence"."""
+    country = db.query(SupportedCountry).filter(SupportedCountry.code == code).first()
+    if country is None:
+        raise UnsupportedCountryError(f"{code!r} is not on Zoiko Local's supported country list yet")
+    previous_status = country.market_status
+    country.market_status = status
+    db.commit()
+    db.refresh(country)
+    log_event(
+        db, actor=actor, action="market.activation_status_changed",
+        target=f"supported_country:{code}", reason=reason,
+        before={"market_status": previous_status.value},
+        after={"market_status": status.value},
+    )
+    return country
 
 
 class ComplianceRequiredError(Exception):
@@ -384,8 +445,11 @@ def _kyc_requirement_type(db: Session, account_id: str) -> str:
 SMS_REQUIREMENT_TYPE = "sms_business_messaging"
 
 
-def search_numbers(db: Session, country: str, number_type: str = "local", area_code: str | None = None) -> list[dict]:
+def search_numbers(
+    db: Session, country: str, *, account_id: str, number_type: str = "local", area_code: str | None = None,
+) -> list[dict]:
     _assert_supported_country(db, country)
+    _assert_market_activated(db, country, account_id)
     if area_code is not None and area_code.strip() and not area_code.strip().isdigit():
         raise InvalidAreaCodeError(
             f"{area_code!r} isn't a valid area code - enter digits only, e.g. 312 for Chicago."
@@ -400,6 +464,7 @@ def reserve_number(db: Session, account_id: str, e164: str, country: str, number
     requests both try to INSERT a brand-new row for the same number.
     """
     _assert_supported_country(db, country)
+    _assert_market_activated(db, country, account_id)
     now = datetime.now(timezone.utc)
     number = db.query(PhoneNumber).filter(PhoneNumber.e164 == e164).with_for_update().first()
 
@@ -473,6 +538,12 @@ def _assert_purchase_eligible(db: Session, account_id: str, number: PhoneNumber,
     purchase_number itself as defense-in-depth against the case's status
     changing in the gap between checkout-session creation and the
     payment webhook actually firing."""
+    # Production Readiness Standard doc §6.2 - re-checked here too (already
+    # checked once at reserve_number time) as the same defense-in-depth
+    # against the market being suspended in the gap between reservation
+    # and purchase - "New sales/provisioning blocked immediately" on
+    # SUSPENDED means an in-flight reservation shouldn't complete either.
+    _assert_market_activated(db, number.country, account_id)
     # Architecture doc §5 "Subscription and Entitlement" - number allowance
     # gate. Checked before the (unwindable) emergency-disclosure/KYC checks
     # below since it's the cheapest possible reason to reject, and unlike
@@ -622,6 +693,15 @@ def purchase_number(db: Session, account_id: str, e164: str) -> PhoneNumber:
         target_type="phone_number", target_id=number.id, metadata={"e164": e164, "provider_sid": bought["sid"]},
     )
     publish_number_activated(account_id, number_id=number.id, e164=e164)
+
+    # Trial-abuse step-up model (Production Readiness Standard doc) -
+    # reaching ACTIVE is the "graduated into a real paying customer" moment.
+    # Deferred import: app.risk.service imports this module (for
+    # suspend_numbers_for_account_by_system), so the reverse import must
+    # happen at call time, not at module load time.
+    from app.risk.service import step_up_risk_state_after_purchase
+
+    step_up_risk_state_after_purchase(db, account_id)
 
     owner = db.query(User).filter(User.account_id == account_id, User.role == UserRole.OWNER).first()
     if owner is not None:
@@ -1002,6 +1082,14 @@ def reactivate_numbers_for_account_by_staff(
                 db, account_id=account_id, account_email=owner.email, e164=number.e164,
                 organization_name=account.name if account else "your organization",
             )
+
+    # Trial-abuse step-up model - lifts a SUSPENDED_FRAUD account's risk
+    # tier back to whatever its KYC/purchase history actually supports, now
+    # that staff has decided its numbers are safe to reactivate. Deferred
+    # import - see step_up_risk_state_after_purchase's call site above.
+    from app.risk.service import restore_risk_state_after_reinstatement
+
+    restore_risk_state_after_reinstatement(db, account_id, actor=staff_id)
 
     return numbers
 

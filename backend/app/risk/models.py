@@ -52,6 +52,46 @@ class RiskSignalType(str, enum.Enum):
     # a shared office network or a family device) - see
     # is_suspected_fingerprint_abuse.
     DEVICE_FINGERPRINT_ABUSE = "device_fingerprint_abuse"
+    # Production Readiness Standard doc's "trial-abuse step-up model" -
+    # placing more calls at once than the account's current AccountRiskState
+    # tier allows (see MAX_CONCURRENT_CALLS_BY_RISK_STATE) - a fresh, unpaid
+    # trial account trying to run many simultaneous outbound calls is a
+    # classic toll-fraud/robo-dial pattern this catches independent of the
+    # existing per-window velocity check.
+    CONCURRENT_CALL_LIMIT_EXCEEDED = "concurrent_call_limit_exceeded"
+
+
+class AccountRiskState(str, enum.Enum):
+    """Production Readiness Standard doc's "trial-abuse step-up model" -
+    a graduated trust tier per account, replacing the old binary "trial vs
+    is_test" distinction with something the fraud engine can actually step
+    an account up or down through as evidence accumulates. Every account
+    gets one; there is no "unset" state (see Account.risk_state's default).
+
+    TRIAL_LOW: the default for every new signup - unverified, tightest
+    concurrent-call limit (see MAX_CONCURRENT_CALLS_BY_RISK_STATE below).
+    TRIAL_VERIFIED: stepped up once the account has a real KYC/KYB approval
+    on file (see step_up_risk_state_after_kyc_approval) - still not a
+    paying customer, but a verified identity earns looser limits.
+    PAID_NORMAL: stepped up once the account completes its first real
+    number purchase (see step_up_risk_state_after_purchase) - the normal
+    steady-state tier for a real commercial account.
+    REVIEW_REQUIRED: set automatically the moment a FraudCase opens for the
+    account (decayed risk score crossed REVIEW_THRESHOLD) - heavily
+    restricted while a human reviews it, same review-tier concept as
+    FraudCase itself, just expressed as a call-limiting state rather than
+    only a staff worklist entry.
+    SUSPENDED_FRAUD: set automatically the moment the risk engine
+    auto-suspends the account's numbers (score crossed
+    AUTO_SUSPEND_THRESHOLD) - blocks all outbound calling outright, on top
+    of (not instead of) the existing number-suspension action.
+    """
+
+    TRIAL_LOW = "trial_low"
+    TRIAL_VERIFIED = "trial_verified"
+    PAID_NORMAL = "paid_normal"
+    REVIEW_REQUIRED = "review_required"
+    SUSPENDED_FRAUD = "suspended_fraud"
 
 
 class RiskSignal(Base):

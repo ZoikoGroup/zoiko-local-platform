@@ -13,6 +13,24 @@ def new_uuid() -> str:
     return str(uuid.uuid4())
 
 
+class MarketActivationStatus(str, enum.Enum):
+    """Production Readiness Standard doc §6.2 "Market Activation Registry" -
+    a graduated rollout state per country, replacing the old binary "is it
+    in SupportedCountry or not" model. "Provider has numbers there" and
+    "Zoiko intends to operate there" are explicitly NOT sufficient
+    activation criteria per that doc - a country can now move through
+    internal testing and invite-only beta before real commercial sale,
+    and be pulled instantly without deleting its SupportedCountry row
+    (which would also wipe its emergency_calling_supported/eligibility
+    history)."""
+
+    CLOSED = "closed"
+    INTERNAL_TEST = "internal_test"
+    CONTROLLED_BETA = "controlled_beta"
+    PAID_OPEN = "paid_open"
+    SUSPENDED = "suspended"
+
+
 class SupportedCountry(Base):
     """Zoiko Local's curated launch-country list (Architecture doc's
     "6-8 priority countries", not "whatever Twilio happens to expose").
@@ -37,6 +55,19 @@ class SupportedCountry(Base):
     # disclosure-accuracy flag, not a claim of real E911 capability; flip it
     # only once real emergency-routing evidence for that country exists.
     emergency_calling_supported: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # Production Readiness Standard doc §6.2/§6.3 - defaults CLOSED for any
+    # NEW country going forward (fail-closed: "provider has numbers there"
+    # is not activation), matching Annex B's "Market availability is
+    # policy-controlled and default-deny." The migration backfills this
+    # project's existing pre-seeded countries to PAID_OPEN to preserve
+    # their current behavior - an honest "already de facto sellable in
+    # this dev/demo build" carry-forward, not a real Legal/Tax/Compliance
+    # PAID_OPEN sign-off per that doc's §6.3 minimum market file, which
+    # nothing in this codebase has been through yet.
+    market_status: Mapped[MarketActivationStatus] = mapped_column(
+        Enum(MarketActivationStatus, name="market_activation_status_enum"),
+        nullable=False, default=MarketActivationStatus.CLOSED,
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 

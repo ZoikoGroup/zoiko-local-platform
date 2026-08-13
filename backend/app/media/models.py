@@ -18,6 +18,14 @@ class CallDirection(str, enum.Enum):
     OUTBOUND = "outbound"
 
 
+# CallRecord.status is a plain Twilio-mirrored string, not an enum - these
+# are the values that mean the call has actually ended. Lives here (models),
+# not in media/service.py where it originated, so app.risk.service can use
+# the same set to count in-flight calls (see assert_concurrent_call_limit_ok)
+# without importing media/service.py, which already imports app.risk.service.
+TERMINAL_CALL_STATUSES = {"completed", "failed", "busy", "no-answer", "canceled"}
+
+
 class ConnectionQuality(str, enum.Enum):
     """Mirrors the LiveKit client SDK's own ConnectionQuality enum
     (livekit-client's ConnectionQuality.Excellent/Good/Poor) - the client

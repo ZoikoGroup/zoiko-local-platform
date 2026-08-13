@@ -118,6 +118,7 @@ class SupportedCountryResponse(BaseModel):
     code: str
     name: str
     emergency_calling_supported: bool
+    market_status: str
 
 
 class UpsertSupportedCountryRequest(BaseModel):
@@ -125,6 +126,16 @@ class UpsertSupportedCountryRequest(BaseModel):
     name: str
     sort_order: int = 0
     emergency_calling_supported: bool = False
+
+
+class SetMarketActivationStatusRequest(BaseModel):
+    status: str
+    # Production Readiness Standard doc Annex B - "Every override ...
+    # market activation - has actor, reason, timestamp and evidence."
+    # actor/timestamp come from the authenticated staff session and
+    # log_event's own audit row; this is the one piece only the caller
+    # can supply.
+    reason: str
 
 
 class NumberEligibilityRuleResponse(BaseModel):

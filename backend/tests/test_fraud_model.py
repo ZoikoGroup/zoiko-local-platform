@@ -36,6 +36,19 @@ def _place_call(client, headers, to: str, from_number: str):
     return client.post("/media/voice/outbound", json={"to": to, "from": from_number}, headers=headers)
 
 
+def _promote_to_paid_normal(db_session, account_id: str) -> None:
+    """See test_risk.py's helper of the same name - avoids the new
+    AccountRiskState.TRIAL_LOW concurrent-call limit (1) interfering with
+    tests placing several outbound calls back-to-back to exercise the
+    (unrelated) geographic-dispersion limit."""
+    from app.numbering.identity.models import Account
+    from app.risk.models import AccountRiskState
+
+    account = db_session.query(Account).filter(Account.id == account_id).first()
+    account.risk_state = AccountRiskState.PAID_NORMAL
+    db_session.commit()
+
+
 # --- Geographic dispersion (IRSF pattern) ---
 
 # One real-shaped E.164 number per distinct country, matching phonenumbers'
@@ -60,6 +73,7 @@ def test_geographic_dispersion_allowed_below_threshold(client, db_session, monke
     token = _signup_and_login(client, "fraudgeo1@example.com")
     account_id = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"}).json()["account_id"]
     _active_number(db_session, account_id, "+15550070001")
+    _promote_to_paid_normal(db_session, account_id)
     headers = {"Authorization": f"Bearer {token}"}
 
     for destination in _COUNTRY_NUMBERS[: GEOGRAPHIC_DISPERSION_COUNTRY_THRESHOLD - 1]:
@@ -77,6 +91,7 @@ def test_geographic_dispersion_blocks_at_threshold(client, db_session, monkeypat
     token = _signup_and_login(client, "fraudgeo2@example.com")
     account_id = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"}).json()["account_id"]
     _active_number(db_session, account_id, "+15550070002")
+    _promote_to_paid_normal(db_session, account_id)
     headers = {"Authorization": f"Bearer {token}"}
 
     for destination in _COUNTRY_NUMBERS[: GEOGRAPHIC_DISPERSION_COUNTRY_THRESHOLD - 1]:
@@ -100,6 +115,7 @@ def test_geographic_dispersion_signal_is_recorded(client, db_session, monkeypatc
     token = _signup_and_login(client, "fraudgeo3@example.com")
     account_id = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"}).json()["account_id"]
     _active_number(db_session, account_id, "+15550070003")
+    _promote_to_paid_normal(db_session, account_id)
     headers = {"Authorization": f"Bearer {token}"}
 
     for destination in _COUNTRY_NUMBERS[: GEOGRAPHIC_DISPERSION_COUNTRY_THRESHOLD - 1]:

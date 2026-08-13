@@ -15,6 +15,7 @@ from app.risk.schemas import (
     FraudCaseResponse,
     FraudRuleResponse,
     FraudRuleUpsertRequest,
+    SetAccountRiskStateRequest,
 )
 from app.staff.models import PlatformStaff
 
@@ -59,6 +60,27 @@ def get_account_risk_score(
     """Staff-only view of an account's rolling risk score (Roadmap doc §13
     Risk Register: "account risk scoring") - the same signals and threshold
     that drive automatic suspension, visible before or after it fires."""
+    return service.get_account_risk_summary(db, account_id)
+
+
+@router.put("/accounts/{account_id}/risk-state", response_model=AccountRiskSummaryResponse)
+def set_account_risk_state(
+    account_id: str,
+    payload: SetAccountRiskStateRequest,
+    db: Session = Depends(get_db),
+    staff: PlatformStaff = Depends(require_capability("risk.manage_account_risk_state")),
+):
+    """Production Readiness Standard doc "Rule of Authority" - a human can
+    always override the fraud engine's trial-abuse step-up tier in either
+    direction, with a mandatory reason. Same SUPER_ADMIN/COMPLIANCE_OFFICER
+    bar as the reinstate/resolve-fraud-case actions below, since this can
+    just as easily loosen an account's limits as tighten them."""
+    try:
+        service.set_account_risk_state(
+            db, account_id, state=payload.state, actor=staff.id, reason=payload.reason,
+        )
+    except service.AccountNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
     return service.get_account_risk_summary(db, account_id)
 
 

@@ -2,7 +2,7 @@ from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict
 
-from app.risk.models import FraudCaseStatus, RiskSignalType
+from app.risk.models import AccountRiskState, FraudCaseStatus, RiskSignalType
 
 
 class BlockedDestinationCreate(BaseModel):
@@ -31,6 +31,7 @@ class RiskSignalResponse(BaseModel):
 class AccountRiskSummaryResponse(BaseModel):
     account_id: str
     score: int
+    risk_state: AccountRiskState
     auto_suspend_threshold: int
     review_threshold: int
     window_hours: int
@@ -39,6 +40,13 @@ class AccountRiskSummaryResponse(BaseModel):
 
 class AccountReinstateRequest(BaseModel):
     reason: str | None = None
+
+
+class SetAccountRiskStateRequest(BaseModel):
+    state: AccountRiskState
+    # Mandatory, same "every override has actor, reason, timestamp and
+    # evidence" posture as SetMarketActivationStatusRequest.reason.
+    reason: str
 
 
 class FraudRuleResponse(BaseModel):

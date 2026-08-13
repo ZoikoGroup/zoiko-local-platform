@@ -5,10 +5,12 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.audit.service import log_event
-from app.media.models import CallDirection, CallRecord
+from app.media.models import TERMINAL_CALL_STATUSES, CallDirection, CallRecord
 from app.notifications.service import notify_account_suspended_for_risk, notify_account_warning
+from app.numbering.identity.models import Account
 from app.numbering.numbers.service import suspend_numbers_for_account_by_system
 from app.risk.models import (
+    AccountRiskState,
     BlockedDestination,
     DeviceFingerprintSighting,
     FraudCase,
@@ -39,6 +41,7 @@ _DEFAULT_WEIGHTS = {
     RiskSignalType.BLOCKED_DESTINATION_ATTEMPT: 40,
     RiskSignalType.GEOGRAPHIC_DISPERSION: 25,
     RiskSignalType.SPEND_LIMIT_EXCEEDED: 35,
+    RiskSignalType.CONCURRENT_CALL_LIMIT_EXCEEDED: 20,
 }
 MAX_RISK_SCORE = 100
 AUTO_SUSPEND_THRESHOLD = 100
@@ -79,6 +82,21 @@ MAX_SPEND_CENTS_PER_WINDOW = 5000  # $50.00
 DEVICE_FINGERPRINT_WINDOW_HOURS = 24
 DEVICE_FINGERPRINT_ACCOUNT_THRESHOLD = 4
 
+# Production Readiness Standard doc's "trial-abuse step-up model" - how many
+# outbound calls an account may have in flight AT ONCE, keyed by its current
+# AccountRiskState tier. Same "conservative first pass, not a tuned
+# production value" caveat as every other threshold in this module.
+# SUSPENDED_FRAUD is 0 (blocks all outbound calling outright); REVIEW_REQUIRED
+# is deliberately as tight as TRIAL_LOW - an account under active fraud
+# review gets no more trust than a brand-new signup until a human clears it.
+MAX_CONCURRENT_CALLS_BY_RISK_STATE = {
+    AccountRiskState.TRIAL_LOW: 1,
+    AccountRiskState.TRIAL_VERIFIED: 3,
+    AccountRiskState.PAID_NORMAL: 10,
+    AccountRiskState.REVIEW_REQUIRED: 1,
+    AccountRiskState.SUSPENDED_FRAUD: 0,
+}
+
 # Inbound fraud/spam signal (Roadmap "AI-driven fraud/spam signals"): a real
 # customer calls one business; a robocall/spam campaign dials the same
 # number out to many businesses in a short window. Platform-wide (not
@@ -115,8 +133,19 @@ class SpendLimitExceededError(Exception):
     Standard doc's "real-time fraud/toll-abuse spend controls" ask."""
 
 
+class ConcurrentCallLimitExceededError(Exception):
+    """Raised when an account already has as many outbound calls in flight
+    as its current AccountRiskState tier allows - see
+    MAX_CONCURRENT_CALLS_BY_RISK_STATE."""
+
+
 class DestinationRuleConflictError(Exception):
     """Raised when adding a blocked-destination prefix that already exists."""
+
+
+class AccountNotFoundError(Exception):
+    """Raised when set_account_risk_state is called for an account_id that
+    doesn't exist."""
 
 
 def is_destination_blocked(db: Session, to_number: str) -> BlockedDestination | None:
@@ -207,6 +236,38 @@ def assert_outbound_velocity_ok(db: Session, account_id: str) -> None:
         raise VelocityLimitExceededError(
             f"Outbound call rate limit exceeded: {recent_count} calls in the last "
             f"{VELOCITY_WINDOW_MINUTES} minutes (limit {MAX_OUTBOUND_CALLS_PER_WINDOW})"
+        )
+
+
+def assert_concurrent_call_limit_ok(db: Session, account_id: str) -> None:
+    """Production Readiness Standard doc's "trial-abuse step-up model" -
+    unlike assert_outbound_velocity_ok (calls per rolling time window), this
+    counts calls that are IN FLIGHT right now (status not yet terminal) and
+    compares against the account's current AccountRiskState tier, not a
+    single platform-wide number. A brand-new TRIAL_LOW account trying to
+    run several outbound calls simultaneously is stopped here even if each
+    individual call is well under the velocity window's rate limit."""
+    account = db.query(Account).filter(Account.id == account_id).first()
+    risk_state = account.risk_state if account is not None else AccountRiskState.TRIAL_LOW
+    limit = MAX_CONCURRENT_CALLS_BY_RISK_STATE[risk_state]
+
+    in_flight_count = (
+        db.query(CallRecord)
+        .filter(
+            CallRecord.account_id == account_id,
+            CallRecord.direction == CallDirection.OUTBOUND,
+            CallRecord.status.notin_(TERMINAL_CALL_STATUSES),
+        )
+        .count()
+    )
+    if in_flight_count >= limit:
+        record_risk_signal(
+            db, account_id=account_id, signal_type=RiskSignalType.CONCURRENT_CALL_LIMIT_EXCEEDED,
+            detail=f"{in_flight_count} outbound calls already in flight ({risk_state.value} tier, limit {limit})",
+        )
+        raise ConcurrentCallLimitExceededError(
+            f"Concurrent outbound call limit exceeded: {in_flight_count} calls already in flight "
+            f"(limit {limit} for the {risk_state.value} tier)"
         )
 
 
@@ -329,9 +390,11 @@ def get_account_risk_summary(db: Session, account_id: str) -> dict:
         .order_by(RiskSignal.created_at.desc())
         .all()
     )
+    account = db.query(Account).filter(Account.id == account_id).first()
     return {
         "account_id": account_id,
         "score": _decayed_score(db, signals),
+        "risk_state": account.risk_state if account is not None else AccountRiskState.TRIAL_LOW,
         "auto_suspend_threshold": AUTO_SUSPEND_THRESHOLD,
         "review_threshold": REVIEW_THRESHOLD,
         "window_hours": RISK_SIGNAL_WINDOW_HOURS,
@@ -354,6 +417,10 @@ def maybe_auto_suspend_for_risk(db: Session, account_id: str) -> bool:
 
     suspended = suspend_numbers_for_account_by_system(
         db, account_id, reason=f"risk: automatic suspension - risk score {score}/{MAX_RISK_SCORE}",
+    )
+    _transition_risk_state(
+        db, account_id, AccountRiskState.SUSPENDED_FRAUD, actor="system:risk_engine",
+        reason=f"automatic suspension - risk score {score}/{MAX_RISK_SCORE}",
     )
     if suspended:
         log_event(
@@ -396,6 +463,10 @@ def open_fraud_case_if_needed(db: Session, account_id: str) -> FraudCase | None:
     log_event(
         db, actor="system:risk_engine", action="risk.fraud_case_opened",
         target=f"account:{account_id}", after={"case_id": case.id, "score": score},
+    )
+    _transition_risk_state(
+        db, account_id, AccountRiskState.REVIEW_REQUIRED, actor="system:risk_engine",
+        reason=f"fraud case {case.id} opened - risk score {score}/{MAX_RISK_SCORE}",
     )
     owner = _get_account_owner(db, account_id)
     if owner is not None:
@@ -457,7 +528,157 @@ def resolve_fraud_case(
         db, actor=actor, action="risk.fraud_case_resolved",
         target=f"fraud_case:{case.id}", after={"status": status.value, "notes": notes},
     )
+    if status == FraudCaseStatus.CLEARED:
+        # Human reviewer found nothing - release the account back to
+        # whatever tier it would be at on the merits (KYC/purchase history),
+        # not straight back to REVIEW_REQUIRED's tighter limits.
+        _force_set_risk_state(
+            db, case.account_id, _compute_baseline_risk_state(db, case.account_id),
+            actor=actor, reason=f"fraud case {case.id} cleared: {notes or 'no notes'}",
+        )
+    elif status == FraudCaseStatus.CONFIRMED:
+        # Human reviewer confirmed real fraud - same outbound-blocking tier
+        # as an automatic AUTO_SUSPEND_THRESHOLD suspension, even if this
+        # particular account never crossed that score threshold itself.
+        _transition_risk_state(
+            db, case.account_id, AccountRiskState.SUSPENDED_FRAUD,
+            actor=actor, reason=f"fraud case {case.id} confirmed: {notes or 'no notes'}",
+        )
     return case
+
+
+# Combined ordering across ALL AccountRiskState values (not just the three
+# baseline tiers) - lets _transition_risk_state make one "only move forward"
+# check regardless of whether the two states being compared are both
+# baseline tiers or involve REVIEW_REQUIRED/SUSPENDED_FRAUD.
+_RISK_STATE_RANK = {
+    AccountRiskState.TRIAL_LOW: 0,
+    AccountRiskState.TRIAL_VERIFIED: 1,
+    AccountRiskState.PAID_NORMAL: 2,
+    AccountRiskState.REVIEW_REQUIRED: 3,
+    AccountRiskState.SUSPENDED_FRAUD: 4,
+}
+
+
+def _force_set_risk_state(db: Session, account_id: str, new_state: AccountRiskState, *, actor: str, reason: str) -> None:
+    """Unconditional - the caller (a human resolving a fraud case, staff
+    reinstating an account, or a staff manual override) has already made
+    the actual decision; this just persists and audits it. Contrast with
+    _transition_risk_state, which enforces "only move forward" for the
+    automatic fraud-engine transitions."""
+    account = db.query(Account).filter(Account.id == account_id).first()
+    if account is None or account.risk_state == new_state:
+        return
+    before_state = account.risk_state
+    account.risk_state = new_state
+    db.commit()
+    log_event(
+        db, actor=actor, action="risk.account_risk_state_changed",
+        target=f"account:{account_id}", reason=reason,
+        before={"risk_state": before_state.value}, after={"risk_state": new_state.value},
+    )
+
+
+def _transition_risk_state(db: Session, account_id: str, new_state: AccountRiskState, *, actor: str, reason: str) -> None:
+    """Automatic fraud-engine transition - only ever moves an account
+    "forward" (see _RISK_STATE_RANK). Guards against, e.g., a KYC-approval
+    step-up accidentally downgrading an account a later signal had already
+    pushed to REVIEW_REQUIRED or SUSPENDED_FRAUD."""
+    account = db.query(Account).filter(Account.id == account_id).first()
+    if account is None or _RISK_STATE_RANK[new_state] <= _RISK_STATE_RANK[account.risk_state]:
+        return
+    _force_set_risk_state(db, account_id, new_state, actor=actor, reason=reason)
+
+
+def _compute_baseline_risk_state(db: Session, account_id: str) -> AccountRiskState:
+    """What tier an account belongs at on the merits alone - KYC/purchase
+    history - ignoring any REVIEW_REQUIRED/SUSPENDED_FRAUD overlay a fraud
+    signal may have added on top. Used to decide what to restore an account
+    to once a human clears it (resolve_fraud_case) or reinstates its
+    numbers (restore_risk_state_after_reinstatement), not during normal
+    step-up (see step_up_risk_state_after_kyc_approval/_after_purchase,
+    which only ever move an account forward one tier at a time)."""
+    from app.compliance.models import ComplianceCase, ComplianceCaseStatus
+    from app.numbering.numbers.models import PhoneNumber, PhoneNumberStatus
+
+    has_active_number = (
+        db.query(PhoneNumber)
+        .filter(PhoneNumber.account_id == account_id, PhoneNumber.status == PhoneNumberStatus.ACTIVE)
+        .first()
+        is not None
+    )
+    if has_active_number:
+        return AccountRiskState.PAID_NORMAL
+
+    has_kyc_approval = (
+        db.query(ComplianceCase)
+        .filter(ComplianceCase.account_id == account_id, ComplianceCase.status == ComplianceCaseStatus.APPROVED)
+        .first()
+        is not None
+    )
+    if has_kyc_approval:
+        return AccountRiskState.TRIAL_VERIFIED
+
+    return AccountRiskState.TRIAL_LOW
+
+
+def step_up_risk_state_after_kyc_approval(db: Session, account_id: str) -> None:
+    """Called once a ComplianceCase is approved (app.compliance.service.
+    approve_case) - a trial account that's proven a real identity earns
+    looser concurrent-call limits, even though it still hasn't paid for
+    anything. Only ever promotes TRIAL_LOW -> TRIAL_VERIFIED (see
+    _transition_risk_state) - a no-op for an account already at
+    PAID_NORMAL or under REVIEW_REQUIRED/SUSPENDED_FRAUD."""
+    _transition_risk_state(
+        db, account_id, AccountRiskState.TRIAL_VERIFIED,
+        actor="system:risk_engine", reason="KYC/compliance case approved",
+    )
+
+
+def step_up_risk_state_after_purchase(db: Session, account_id: str) -> None:
+    """Called once a number purchase actually reaches ACTIVE
+    (app.numbering.numbers.service.purchase_number) - the moment a trial
+    account graduates into a real paying customer. Only ever promotes
+    TRIAL_LOW/TRIAL_VERIFIED -> PAID_NORMAL (see _transition_risk_state) -
+    a no-op for an account already PAID_NORMAL or under REVIEW_REQUIRED/
+    SUSPENDED_FRAUD."""
+    _transition_risk_state(
+        db, account_id, AccountRiskState.PAID_NORMAL,
+        actor="system:risk_engine", reason="first number purchase completed",
+    )
+
+
+def restore_risk_state_after_reinstatement(db: Session, account_id: str, *, actor: str) -> None:
+    """Called from app.numbering.numbers.service.
+    reactivate_numbers_for_account_by_staff - staff reactivating a
+    risk-suspended account's numbers is exactly the kind of human decision
+    that should also lift the account back out of SUSPENDED_FRAUD, onto
+    whatever tier its KYC/purchase history actually supports (see
+    _compute_baseline_risk_state), not leave it silently capped at 0
+    concurrent calls after staff already decided it's fine."""
+    _force_set_risk_state(
+        db, account_id, _compute_baseline_risk_state(db, account_id),
+        actor=actor, reason="numbers reinstated by staff after risk suspension",
+    )
+
+
+def set_account_risk_state(
+    db: Session, account_id: str, *, state: AccountRiskState, actor: str, reason: str
+) -> Account:
+    """Staff manual override - the Production Readiness Standard doc's
+    "Rule of Authority": a human can always override the automatic fraud
+    engine's tier in either direction (tighten an account the model hasn't
+    caught yet, or release one it flagged too aggressively), with a
+    mandatory reason recorded the same way set_market_activation_status
+    records one for a market-activation override. Unlike
+    _transition_risk_state, this never checks rank - a staff override is
+    the authority the rank check exists to defer to."""
+    account = db.query(Account).filter(Account.id == account_id).first()
+    if account is None:
+        raise AccountNotFoundError(f"No such account {account_id!r}")
+    _force_set_risk_state(db, account_id, state, actor=actor, reason=reason)
+    db.refresh(account)
+    return account
 
 
 def list_fraud_rules(db: Session) -> list[FraudRule]:

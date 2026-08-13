@@ -30,6 +30,7 @@ from app.numbering.numbers.service import (
     ComplianceRequiredError,
     EmergencyDisclosureRequiredError,
     InvalidAreaCodeError,
+    MarketNotActivatedError,
     NumberConflictError,
     NumberEligibilityCaseNotFoundError,
     NumberEligibilityRequiredError,
@@ -57,9 +58,13 @@ def search_numbers(
     current_user: User = Depends(get_current_user),
 ):
     try:
-        return service.search_numbers(db, country, number_type=number_type, area_code=area_code)
+        return service.search_numbers(
+            db, country, account_id=current_user.account_id, number_type=number_type, area_code=area_code,
+        )
     except UnsupportedCountryError as e:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e)) from e
+    except MarketNotActivatedError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e)) from e
     except InvalidAreaCodeError as e:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e)) from e
     except TelecomError as e:
@@ -78,6 +83,8 @@ def reserve_number(
         )
     except UnsupportedCountryError as e:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e)) from e
+    except MarketNotActivatedError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e)) from e
     except NumberConflictError as e:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e
 
@@ -92,6 +99,8 @@ def purchase_number(
         return service.purchase_number(db, current_user.account_id, payload.e164)
     except NumberConflictError as e:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e
+    except MarketNotActivatedError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e)) from e
     except (NumberQuotaExceededError, BillingSuspendedError) as e:
         raise HTTPException(status_code=status.HTTP_402_PAYMENT_REQUIRED, detail=str(e)) from e
     except (ComplianceRequiredError, EmergencyDisclosureRequiredError, NumberEligibilityRequiredError) as e:
@@ -149,6 +158,8 @@ def create_checkout_session(
         return service.create_number_purchase_checkout_session(db, current_user.account_id, e164)
     except NumberConflictError as e:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e
+    except MarketNotActivatedError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e)) from e
     except TestAccountRestrictedError as e:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e)) from e
     except service.NonCommercialAccountError as e:

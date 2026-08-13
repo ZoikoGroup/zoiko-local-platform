@@ -10,15 +10,17 @@ from app.numbering.numbers.schemas import (
     NumberEligibilityCaseResponse,
     NumberEligibilityRuleResponse,
     ResolveNumberEligibilityCaseRequest,
+    SetMarketActivationStatusRequest,
     SupportedCountryResponse,
     UpsertNumberEligibilityRuleRequest,
     UpsertSupportedCountryRequest,
 )
-from app.numbering.numbers.models import NumberEligibilityCaseStatus
+from app.numbering.numbers.models import MarketActivationStatus, NumberEligibilityCaseStatus
 from app.numbering.numbers.service import (
     NoStuckProvisioningError,
     NotDueForRenewalError,
     NumberEligibilityCaseNotFoundError,
+    UnsupportedCountryError,
     approve_number_eligibility_case,
     list_all_eligibility_cases,
     list_number_eligibility_rules,
@@ -30,6 +32,7 @@ from app.numbering.numbers.service import (
     remove_supported_country,
     retry_provisioning,
     seed_market_release_registry,
+    set_market_activation_status,
     upsert_number_eligibility_rule,
     upsert_supported_country,
 )
@@ -226,6 +229,31 @@ def remove_supported_country_route(
 ):
     remove_supported_country(db, code)
     return None
+
+
+@router.put("/countries/{code}/market-status", response_model=SupportedCountryResponse)
+def set_market_activation_status_route(
+    code: str,
+    payload: SetMarketActivationStatusRequest,
+    db: Session = Depends(get_db),
+    staff: PlatformStaff = Depends(require_capability("numbers.manage_country_list")),
+):
+    """Production Readiness Standard doc §6.2 "Market Activation Registry" -
+    same SUPER_ADMIN bar as the country list itself (PUT /countries above),
+    since moving a country between CLOSED/INTERNAL_TEST/CONTROLLED_BETA/
+    PAID_OPEN/SUSPENDED is exactly the "Rule of Authority" kind of call
+    Engineering doesn't get to self-ratify."""
+    try:
+        market_status = MarketActivationStatus(payload.status)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e)) from e
+
+    try:
+        return set_market_activation_status(
+            db, code, status=market_status, actor=staff.id, reason=payload.reason,
+        )
+    except UnsupportedCountryError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
 
 
 @router.get("/number-eligibility-rules", response_model=list[NumberEligibilityRuleResponse])
