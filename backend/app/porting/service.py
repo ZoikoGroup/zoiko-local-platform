@@ -127,6 +127,8 @@ def list_all_porting_requests(db: Session, status: str | None = None) -> list[di
             "carrier_account_number": r.carrier_account_number,
             "billing_name": r.billing_name,
             "billing_address": r.billing_address,
+            "authorization_evidence_url": r.authorization_evidence_url,
+            "target_completion_date": r.target_completion_date,
             "status": r.status,
             "rejection_reason": r.rejection_reason,
             "twilio_incoming_number_sid": r.twilio_incoming_number_sid,

@@ -885,6 +885,7 @@ def _seed_active_session_with_real_owner(client, db_session, email: str, room_na
     return session, {"Authorization": f"Bearer {token}"}
 
 
+@pytest.mark.live
 def test_host_can_list_and_admit_a_waiting_guest(client, db_session):
     from jose import jwt as jose_jwt
 
@@ -991,7 +992,7 @@ def test_start_recording_is_blocked_unconditionally_for_a_confidential_session(c
     assert session.recording_egress_id is None
 
 
-async def _fake_create_room(room_name):
+async def _fake_create_room(room_name, max_participants=None):
     return None
 
 
@@ -1021,6 +1022,7 @@ def test_report_call_quality_requires_auth(client):
     assert response.status_code == 401
 
 
+@pytest.mark.live
 def test_report_call_quality_404s_with_no_open_participant_session(client):
     token = _signup_and_login(client, "qualitynosession@example.com")
     headers = {"Authorization": f"Bearer {token}"}
@@ -1048,6 +1050,7 @@ def _open_participant_session(db_session, video_session_id: str, participant_ide
     return row
 
 
+@pytest.mark.live
 def test_report_call_quality_records_the_sample(client, db_session):
     token = _signup_and_login(client, "qualitysample1@example.com")
     headers = {"Authorization": f"Bearer {token}"}
@@ -1068,6 +1071,7 @@ def test_report_call_quality_records_the_sample(client, db_session):
     client.post(f"/media/video/rooms/{room_name}/end", headers=headers)
 
 
+@pytest.mark.live
 def test_report_call_quality_keeps_the_worst_value_seen(client, db_session):
     token = _signup_and_login(client, "qualitysample2@example.com")
     headers = {"Authorization": f"Bearer {token}"}
@@ -1087,6 +1091,7 @@ def test_report_call_quality_keeps_the_worst_value_seen(client, db_session):
     client.post(f"/media/video/rooms/{room_name}/end", headers=headers)
 
 
+@pytest.mark.live
 def test_report_call_quality_counts_reconnects(client, db_session):
     token = _signup_and_login(client, "qualityreconnect@example.com")
     headers = {"Authorization": f"Bearer {token}"}

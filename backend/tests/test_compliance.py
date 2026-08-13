@@ -4,6 +4,8 @@ import json
 import logging
 import time
 
+import pytest
+
 from app.compliance.models import ComplianceRule
 
 
@@ -203,6 +205,7 @@ def test_compliance_officer_can_approve_a_case(client, db_session):
     assert response.json()["status"] == "approved"
 
 
+@pytest.mark.live
 def test_submit_document_adds_it_to_the_case(client):
     token = _signup_and_login(client, "docsubmit1@example.com")
     headers = {"Authorization": f"Bearer {token}"}
@@ -262,6 +265,7 @@ def test_submit_document_on_missing_case_is_404(client):
     assert response.status_code == 404
 
 
+@pytest.mark.live
 def test_document_download_url_returns_a_real_presigned_link(client):
     token = _signup_and_login(client, "docdownload1@example.com")
     headers = {"Authorization": f"Bearer {token}"}
