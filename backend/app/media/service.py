@@ -184,6 +184,9 @@ def _dispatch_outbound_call(
     # alongside (not instead of) the per-account risk gates below; this one
     # is platform-wide and manually triggered, not account-specific.
     assert_kill_switch_not_active(db, KillSwitchScope.OUTBOUND_CALLING)
+    # Production Readiness Standard Table 15's "Tenant" kill-switch scope -
+    # halts just this one account's outbound calling without suspending it.
+    risk_service.assert_account_kill_switch_not_active(db, account_id, KillSwitchScope.OUTBOUND_CALLING)
 
     # Graceful degradation (Architecture doc §9) - outbound calling pauses
     # once a payment grace period expires; inbound calls are deliberately
@@ -203,9 +206,18 @@ def _dispatch_outbound_call(
     risk_service.assert_outbound_velocity_ok(db, account_id)
     risk_service.assert_geographic_dispersion_ok(db, account_id, to)
     risk_service.assert_spend_limit_ok(db, account_id)
+    # Production Readiness Standard Table 15 "Usage ceilings" - concurrent-
+    # call and lifetime-trial-spend hard limits, distinct from the rolling-
+    # window checks above.
+    risk_service.assert_concurrency_limit_ok(db, account_id)
+    risk_service.assert_cumulative_trial_usage_ok(db, account_id)
 
     twiml = telecom.build_say_response(message)
-    result = telecom.place_call(to=to, from_=from_number, twiml=twiml, status_callback_url=status_callback_url)
+    time_limit = risk_service.get_call_time_limit_for_account(db, account_id)
+    result = telecom.place_call(
+        to=to, from_=from_number, twiml=twiml, status_callback_url=status_callback_url,
+        time_limit_seconds=time_limit,
+    )
 
     record_call(
         db,

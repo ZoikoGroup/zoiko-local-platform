@@ -7,6 +7,7 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
 from app.core.ids import new_uuid
+from app.risk.models import RiskState
 
 
 class AccountType(str, enum.Enum):
@@ -89,6 +90,12 @@ class Account(Base):
     # directly - consolidating the two overlapping "is this account real
     # money" signals into one is a real follow-up, not a merge-conflict fix.
     is_test: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # Production Readiness Standard §5.3/Table 16 - see RiskState's
+    # docstring. Every account starts TRIAL_LOW; app.risk.service moves it
+    # through the lifecycle (never edited directly elsewhere).
+    risk_state: Mapped[RiskState] = mapped_column(
+        Enum(RiskState, name="risk_state_enum"), nullable=False, default=RiskState.TRIAL_LOW,
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     users: Mapped[list["User"]] = relationship(

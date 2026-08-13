@@ -8,7 +8,9 @@ from app.audit.service import log_event
 from app.media.models import CallDirection, CallRecord
 from app.notifications.service import notify_account_suspended_for_risk, notify_account_warning
 from app.numbering.numbers.service import suspend_numbers_for_account_by_system
+from app.ops.models import KillSwitchScope
 from app.risk.models import (
+    AccountKillSwitch,
     BlockedDestination,
     DeviceFingerprintSighting,
     FraudCase,
@@ -16,6 +18,7 @@ from app.risk.models import (
     FraudRule,
     RiskSignal,
     RiskSignalType,
+    RiskState,
 )
 
 # Roadmap doc has no fixed number here - this is a conservative first pass
@@ -78,6 +81,222 @@ MAX_SPEND_CENTS_PER_WINDOW = 5000  # $50.00
 # caveat as every other threshold here.
 DEVICE_FINGERPRINT_WINDOW_HOURS = 24
 DEVICE_FINGERPRINT_ACCOUNT_THRESHOLD = 4
+
+# Production Readiness Standard Table 15 "Usage ceilings" - hard limits
+# distinct from the rolling-window checks above. Same "conservative first
+# pass, not a tuned production value" caveat as every other threshold here.
+MAX_CONCURRENT_CALLS_TRIAL = 3
+MAX_CONCURRENT_CALLS_VERIFIED_OR_PAID = 10
+# Lifetime (not rolling-window) cap - independent of MAX_SPEND_CENTS_PER_WINDOW,
+# which only looks at the trailing SPEND_WINDOW_HOURS. Only enforced while an
+# account is still in a TRIAL_* risk state (see assert_cumulative_trial_usage_ok) -
+# a PAID_NORMAL account has already stepped up past this ceiling entirely.
+MAX_TRIAL_LIFETIME_SPEND_CENTS = 2000  # $20.00
+# Twilio Calls.create's own time_limit parameter (seconds) - hangs up the
+# call automatically once reached, a real hard cap rather than a check that
+# only runs before the call starts. Only applied to TRIAL_* accounts; a
+# PAID_NORMAL account gets no cap (None) from get_call_time_limit_for_account.
+MAX_TRIAL_CALL_DURATION_SECONDS = 600  # 10 minutes
+
+_CALL_IN_PROGRESS_STATUSES = ("queued", "ringing", "in-progress")
+
+
+class ConcurrencyLimitExceededError(Exception):
+    """Raised when an account already has too many simultaneous in-progress
+    calls to place another one."""
+
+
+class CumulativeTrialUsageExceededError(Exception):
+    """Raised when a still-trial account's all-time rated usage exceeds
+    MAX_TRIAL_LIFETIME_SPEND_CENTS - distinct from the rolling-window
+    SpendLimitExceededError above."""
+
+
+class AccountKillSwitchTrippedError(Exception):
+    """Raised by assert_account_kill_switch_not_active - staff have halted
+    this one account's activity in this scope without suspending the whole
+    account (Production Readiness Standard Table 15's "Tenant" kill-switch
+    scope)."""
+
+
+def _baseline_risk_state(db: Session, account) -> RiskState:
+    """The risk-state tier an account would sit at absent any open fraud
+    concern - what REVIEW_REQUIRED/SUSPENDED_FRAUD fall back to once
+    resolved/reinstated. PAID_NORMAL once on any plan other than
+    free_trial (a real step up in trust, gated by ZoikoNex billing
+    actually running); TRIAL_VERIFIED once the account has completed at
+    least one real Stripe checkout for a number purchase (the only place
+    this codebase collects a real payment method today - Table 15's
+    "Payment trust" step-up); TRIAL_LOW otherwise."""
+    from app.billing.service import get_or_create_subscription
+    from app.numbering.numbers.models import PhoneNumber, PhoneNumberStatus
+
+    sub = get_or_create_subscription(db, account.id)
+    if sub.plan_code != "free_trial":
+        return RiskState.PAID_NORMAL
+
+    has_purchased = (
+        db.query(PhoneNumber)
+        .filter(
+            PhoneNumber.account_id == account.id,
+            PhoneNumber.status.in_([PhoneNumberStatus.ACTIVE, PhoneNumberStatus.SUSPENDED, PhoneNumberStatus.CANCELLED]),
+        )
+        .first()
+        is not None
+    )
+    return RiskState.TRIAL_VERIFIED if has_purchased else RiskState.TRIAL_LOW
+
+
+def recompute_risk_state(db: Session, account_id: str) -> RiskState:
+    """Re-derives and persists risk_state from current facts - called after
+    every event that could change it (signal recorded, case resolved,
+    account reinstated, plan changed). Never downgrades OUT of
+    SUSPENDED_FRAUD here - only an explicit staff reinstate
+    (numbering.numbers.service.reactivate_numbers_for_account_by_staff)
+    does that, same as the existing suspend/reinstate split."""
+    from app.numbering.identity.models import Account
+
+    account = db.query(Account).filter(Account.id == account_id).first()
+    if account is None or account.risk_state == RiskState.SUSPENDED_FRAUD:
+        return account.risk_state if account else RiskState.TRIAL_LOW
+
+    score = compute_account_risk_score(db, account_id)
+    if score >= AUTO_SUSPEND_THRESHOLD:
+        new_state = RiskState.SUSPENDED_FRAUD
+    elif score >= REVIEW_THRESHOLD:
+        new_state = RiskState.REVIEW_REQUIRED
+    else:
+        new_state = _baseline_risk_state(db, account)
+
+    if new_state != account.risk_state:
+        account.risk_state = new_state
+        db.commit()
+    return new_state
+
+
+def assert_concurrency_limit_ok(db: Session, account_id: str) -> None:
+    """Production Readiness Standard Table 15 "Usage ceilings: Hard limits
+    on concurrent calls." Counts CallRecord rows still in a live Twilio
+    call-status (queued/ringing/in-progress) for this account - a
+    compromised trial account placing many calls at once is a real abuse
+    pattern the rolling-window velocity check (calls per N minutes) can
+    miss if they're spaced out but overlapping."""
+    from app.numbering.identity.models import Account
+
+    account = db.query(Account).filter(Account.id == account_id).first()
+    limit = (
+        MAX_CONCURRENT_CALLS_VERIFIED_OR_PAID
+        if account is not None and account.risk_state in (RiskState.TRIAL_VERIFIED, RiskState.PAID_NORMAL)
+        else MAX_CONCURRENT_CALLS_TRIAL
+    )
+    in_progress = (
+        db.query(CallRecord)
+        .filter(
+            CallRecord.account_id == account_id, CallRecord.direction == CallDirection.OUTBOUND,
+            CallRecord.status.in_(_CALL_IN_PROGRESS_STATUSES),
+        )
+        .count()
+    )
+    if in_progress >= limit:
+        raise ConcurrencyLimitExceededError(
+            f"Too many simultaneous outbound calls: {in_progress} already in progress (limit {limit})"
+        )
+
+
+def assert_cumulative_trial_usage_ok(db: Session, account_id: str) -> None:
+    """Production Readiness Standard Table 15 "Usage ceilings: ...
+    cumulative trial usage." Only applies while the account is still in a
+    TRIAL_* risk_state - once it's genuinely PAID_NORMAL (or under active
+    review/suspension) this lifetime cap no longer makes sense to check."""
+    from sqlalchemy import func as sa_func
+
+    from app.numbering.identity.models import Account
+    from app.usage.models import UsageEvent
+
+    account = db.query(Account).filter(Account.id == account_id).first()
+    if account is None or account.risk_state not in (RiskState.TRIAL_LOW, RiskState.TRIAL_VERIFIED):
+        return
+
+    total_cents = (
+        db.query(sa_func.coalesce(sa_func.sum(UsageEvent.estimated_cost_cents), 0))
+        .filter(UsageEvent.account_id == account_id, UsageEvent.estimated_cost_cents.isnot(None))
+        .scalar()
+    )
+    if total_cents > MAX_TRIAL_LIFETIME_SPEND_CENTS:
+        record_risk_signal(
+            db, account_id=account_id, signal_type=RiskSignalType.SPEND_LIMIT_EXCEEDED,
+            detail=f"lifetime trial usage {total_cents}c exceeds cap {MAX_TRIAL_LIFETIME_SPEND_CENTS}c",
+        )
+        raise CumulativeTrialUsageExceededError(
+            f"Trial usage limit reached: {total_cents}c all-time (limit {MAX_TRIAL_LIFETIME_SPEND_CENTS}c) - "
+            f"upgrade to a paid plan to continue"
+        )
+
+
+def get_call_time_limit_for_account(db: Session, account_id: str) -> int | None:
+    """Hard per-call duration cap (Twilio Calls.create's time_limit) for
+    still-trial accounts - None (no cap) once verified/paid. Enforced by
+    Twilio hanging up the call server-side, not a pre-call check, since
+    duration isn't known until the call is already in progress."""
+    from app.numbering.identity.models import Account
+
+    account = db.query(Account).filter(Account.id == account_id).first()
+    if account is not None and account.risk_state in (RiskState.TRIAL_VERIFIED, RiskState.PAID_NORMAL):
+        return None
+    return MAX_TRIAL_CALL_DURATION_SECONDS
+
+
+def set_account_kill_switch(
+    db: Session, account_id: str, scope: KillSwitchScope, is_active: bool, *, actor: str, reason: str | None = None
+) -> AccountKillSwitch:
+    """Staff-only (ops.manage_kill_switches - same capability as the
+    platform-wide switch). Upserts the one row for this account+scope -
+    same shape/rationale as app.ops.service.set_kill_switch."""
+    switch = (
+        db.query(AccountKillSwitch)
+        .filter(AccountKillSwitch.account_id == account_id, AccountKillSwitch.scope == scope)
+        .first()
+    )
+    now = datetime.now(timezone.utc)
+    if switch is None:
+        switch = AccountKillSwitch(account_id=account_id, scope=scope)
+        db.add(switch)
+    switch.is_active = is_active
+    switch.reason = reason
+    if is_active:
+        switch.activated_by = actor
+        switch.activated_at = now
+        switch.deactivated_at = None
+    else:
+        switch.deactivated_at = now
+    db.commit()
+    db.refresh(switch)
+    log_event(
+        db, actor=actor, action="risk.account_kill_switch_activated" if is_active else "risk.account_kill_switch_deactivated",
+        target=f"account:{account_id}", after={"scope": scope.value, "reason": reason},
+    )
+    return switch
+
+
+def list_account_kill_switches(db: Session, account_id: str) -> list[AccountKillSwitch]:
+    return db.query(AccountKillSwitch).filter(AccountKillSwitch.account_id == account_id).order_by(AccountKillSwitch.scope).all()
+
+
+def assert_account_kill_switch_not_active(db: Session, account_id: str, scope: KillSwitchScope) -> None:
+    """Call alongside (not instead of) app.ops.service.
+    assert_kill_switch_not_active - that one halts the whole platform for
+    this scope; this one halts just this one account, without suspending
+    it outright (Production Readiness Standard Table 15's "Tenant" scope)."""
+    switch = (
+        db.query(AccountKillSwitch)
+        .filter(AccountKillSwitch.account_id == account_id, AccountKillSwitch.scope == scope)
+        .first()
+    )
+    if switch is not None and switch.is_active:
+        raise AccountKillSwitchTrippedError(
+            f"{scope.value} is currently halted for this account" + (f": {switch.reason}" if switch.reason else "")
+        )
+
 
 # Inbound fraud/spam signal (Roadmap "AI-driven fraud/spam signals"): a real
 # customer calls one business; a robocall/spam campaign dials the same
@@ -155,6 +374,7 @@ def record_risk_signal(db: Session, *, account_id: str, signal_type: RiskSignalT
         _auto_resolve_open_case_for_suspended_account(db, account_id)
     else:
         open_fraud_case_if_needed(db, account_id)
+    recompute_risk_state(db, account_id)
     return signal
 
 
@@ -322,6 +542,8 @@ def compute_account_risk_score(db: Session, account_id: str) -> int:
 
 
 def get_account_risk_summary(db: Session, account_id: str) -> dict:
+    from app.numbering.identity.models import Account
+
     window_start = datetime.now(timezone.utc) - timedelta(hours=RISK_SIGNAL_WINDOW_HOURS)
     signals = (
         db.query(RiskSignal)
@@ -329,9 +551,11 @@ def get_account_risk_summary(db: Session, account_id: str) -> dict:
         .order_by(RiskSignal.created_at.desc())
         .all()
     )
+    account = db.query(Account).filter(Account.id == account_id).first()
     return {
         "account_id": account_id,
         "score": _decayed_score(db, signals),
+        "risk_state": account.risk_state if account is not None else RiskState.TRIAL_LOW,
         "auto_suspend_threshold": AUTO_SUSPEND_THRESHOLD,
         "review_threshold": REVIEW_THRESHOLD,
         "window_hours": RISK_SIGNAL_WINDOW_HOURS,
@@ -457,6 +681,19 @@ def resolve_fraud_case(
         db, actor=actor, action="risk.fraud_case_resolved",
         target=f"fraud_case:{case.id}", after={"status": status.value, "notes": notes},
     )
+    if status == FraudCaseStatus.CLEARED:
+        # A human reviewed the signal history and decided it wasn't fraud -
+        # the numeric score doesn't itself drop just because a case was
+        # cleared (it only decays by time), so recompute_risk_state's
+        # score-driven logic alone would immediately put REVIEW_REQUIRED
+        # right back. Explicitly restoring the baseline here is the actual
+        # "staff cleared this account" signal.
+        from app.numbering.identity.models import Account
+
+        account = db.query(Account).filter(Account.id == case.account_id).first()
+        if account is not None and account.risk_state != RiskState.SUSPENDED_FRAUD:
+            account.risk_state = _baseline_risk_state(db, account)
+            db.commit()
     return case
 
 

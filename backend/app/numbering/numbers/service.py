@@ -613,6 +613,12 @@ def purchase_number(db: Session, account_id: str, e164: str) -> PhoneNumber:
     # anything else so a tripped switch blocks new provisioning without
     # touching this number's existing reservation/eligibility state.
     assert_kill_switch_not_active(db, KillSwitchScope.NUMBER_PROVISIONING)
+    # Deferred import - see reactivate_numbers_for_account_by_staff's
+    # comment on why (app.risk.service imports this module already).
+    # Production Readiness Standard Table 15's "Tenant" kill-switch scope.
+    from app.risk.service import assert_account_kill_switch_not_active
+
+    assert_account_kill_switch_not_active(db, account_id, KillSwitchScope.NUMBER_PROVISIONING)
 
     now = datetime.now(timezone.utc)
     number = db.query(PhoneNumber).filter(PhoneNumber.e164 == e164).with_for_update().first()
@@ -1059,6 +1065,21 @@ def reactivate_numbers_for_account_by_staff(
     for number in numbers:
         number.status = PhoneNumberStatus.ACTIVE
     db.commit()
+
+    # Deferred import - app.risk.service imports this module (for
+    # suspend_numbers_for_account_by_system), so a module-level import here
+    # would be circular. Explicit staff reinstate is the one place
+    # risk_state is allowed to leave SUSPENDED_FRAUD (see
+    # recompute_risk_state's docstring) - drops straight to the account's
+    # current baseline tier rather than through REVIEW_REQUIRED, since a
+    # staff member choosing to reinstate is a stronger signal than the
+    # score-decay path alone.
+    from app.risk.service import RiskState, _baseline_risk_state
+
+    account_for_risk = db.query(Account).filter(Account.id == account_id).first()
+    if account_for_risk is not None and account_for_risk.risk_state == RiskState.SUSPENDED_FRAUD:
+        account_for_risk.risk_state = _baseline_risk_state(db, account_for_risk)
+        db.commit()
 
     owner = db.query(User).filter(User.account_id == account_id, User.role == UserRole.OWNER).first()
     account = db.query(Account).filter(Account.id == account_id).first()

@@ -110,7 +110,7 @@ def test_outbound_call_to_blocked_destination_is_rejected(client, db_session):
 def test_outbound_call_velocity_limit_is_enforced(client, db_session, monkeypatch):
     monkeypatch.setattr(
         "app.media.service.telecom.place_call",
-        lambda **kwargs: {"sid": "CAvelocity", "status": "queued", "to": kwargs["to"], "from": kwargs["from_"]},
+        lambda **kwargs: {"sid": "CAvelocity", "status": "completed", "to": kwargs["to"], "from": kwargs["from_"]},
     )
 
     token = _signup_and_login(client, "riskvelocity@example.com")
@@ -234,7 +234,7 @@ def test_is_suspected_spam_caller_ignores_outbound_calls(db_session):
 def test_outbound_call_geographic_dispersion_limit_is_enforced(client, db_session, monkeypatch):
     monkeypatch.setattr(
         "app.media.service.telecom.place_call",
-        lambda **kwargs: {"sid": "CAdispersion", "status": "queued", "to": kwargs["to"], "from": kwargs["from_"]},
+        lambda **kwargs: {"sid": "CAdispersion", "status": "completed", "to": kwargs["to"], "from": kwargs["from_"]},
     )
 
     token = _signup_and_login(client, "riskdispersion@example.com")

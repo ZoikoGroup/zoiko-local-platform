@@ -2,7 +2,8 @@ from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict
 
-from app.risk.models import FraudCaseStatus, RiskSignalType
+from app.ops.models import KillSwitchScope
+from app.risk.models import FraudCaseStatus, RiskSignalType, RiskState
 
 
 class BlockedDestinationCreate(BaseModel):
@@ -31,6 +32,7 @@ class RiskSignalResponse(BaseModel):
 class AccountRiskSummaryResponse(BaseModel):
     account_id: str
     score: int
+    risk_state: RiskState
     auto_suspend_threshold: int
     review_threshold: int
     window_hours: int
@@ -38,6 +40,24 @@ class AccountRiskSummaryResponse(BaseModel):
 
 
 class AccountReinstateRequest(BaseModel):
+    reason: str | None = None
+
+
+class AccountKillSwitchResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    account_id: str
+    scope: KillSwitchScope
+    is_active: bool
+    reason: str | None
+    activated_by: str | None
+    activated_at: datetime | None
+    deactivated_at: datetime | None
+    created_at: datetime
+
+
+class SetAccountKillSwitchRequest(BaseModel):
     reason: str | None = None
 
 
