@@ -1,7 +1,7 @@
 # Runbook: Database Unreachable or Degraded
 
 Production uses Neon Postgres (not the local docker-compose instance —
-see root `CLAUDE.md`). Local dev uses `postgresql+psycopg2://zoiko:zoiko@localhost:5433/zoiko_local`
+see root `CLAUDE.md`). Local dev uses `postgresql+psycopg2://zoiko:zoiko@localhost:5435/zoiko_local`
 via docker-compose.
 
 ## What it looks like to users

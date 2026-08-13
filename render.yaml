@@ -95,6 +95,16 @@ services:
       - key: STRIPE_IDENTITY_WEBHOOK_SECRET
         sync: false
 
+      # Stripe Payments (integrations/billing/stripe_checkout.py) - separate
+      # key from Stripe Identity above, scoped to "One-time payments" only.
+      # Powers real Stripe Checkout for number purchases - without these,
+      # create_checkout_session/refund_payment/construct_webhook_event all
+      # raise PaymentError, so the entire number-purchase flow is broken.
+      - key: STRIPE_PAYMENTS_SECRET_KEY
+        sync: false
+      - key: STRIPE_PAYMENTS_WEBHOOK_SECRET
+        sync: false
+
       # Resend (integrations/notifications)
       - key: RESEND_API_KEY
         sync: false

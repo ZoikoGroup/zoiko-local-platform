@@ -19,10 +19,20 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    # No-op: this chain's read_at column is the same one a3f5c9d2e148 already
-    # added on the parallel (venky) branch, merged in by a later revision -
-    # applying both would try to add the column twice.
-    pass
+    # CORRECTION: this and a3f5c9d2e148 (the parallel/venky-branch migration
+    # this comment originally deferred to) BOTH assumed the other actually
+    # added this column - neither did, so a genuinely fresh chain never
+    # creates notification_deliveries.read_at at all, same "migration
+    # stamped past without its DDL actually running" root cause as the
+    # fraud_rules/fraud_cases gap fixed in 7a2e5c918bf4. Confirmed live
+    # running this chain against a fresh database. Guarded with has_column()
+    # so it's correct regardless of which of the two migrations a future
+    # chain edit runs first, and a no-op wherever the column already exists.
+    bind = op.get_bind()
+    inspector = sa.inspect(bind)
+    columns = {c["name"] for c in inspector.get_columns("notification_deliveries")}
+    if "read_at" not in columns:
+        op.add_column("notification_deliveries", sa.Column("read_at", sa.DateTime(timezone=True), nullable=True))
 
 
 def downgrade() -> None:

@@ -80,12 +80,23 @@ def upgrade() -> None:
             sa.UniqueConstraint('signal_type'),
         )
 
-    # risksignaltype's existing labels are lowercase .value-style (a
-    # documented exception to this codebase's usual uppercase-.name
-    # convention for enums - see 0d31d1ab1f2d's note on adding
-    # 'geographic_dispersion') - must match, not the uppercase this
-    # migration originally used.
-    op.execute("ALTER TYPE risksignaltype ADD VALUE IF NOT EXISTS 'spend_limit_exceeded'")
+    # CORRECTION: an earlier version of this comment claimed risksignaltype's
+    # labels were lowercase .value-style and "must match" - backwards. Proven
+    # wrong by actually running this migration chain against a genuinely
+    # fresh database (this project's CI, and any new local/Neon instance):
+    # a80b7b11ce8e (an ancestor of this revision on every path that reaches
+    # it) creates risksignaltype with UPPERCASE .name-style labels
+    # ('VELOCITY_EXCEEDED', ...), this codebase's actual, consistent
+    # convention for every enum column (call_direction_enum etc.). The
+    # lowercase values below/in the bulk_insert only ever "worked" on one
+    # long-lived dev database where risksignaltype had separately drifted to
+    # lowercase from unrelated history - fixed there directly (see migration
+    # 351fca0d8b24), but that never fixed this migration's own DDL, so a
+    # truly fresh database (CI's ephemeral Postgres, a new teammate's local
+    # docker-compose Postgres, a new Neon branch) still hit "invalid input
+    # value for enum risksignaltype" on this exact bulk_insert - confirmed
+    # live running this chain from scratch against a fresh local Postgres.
+    op.execute("ALTER TYPE risksignaltype ADD VALUE IF NOT EXISTS 'SPEND_LIMIT_EXCEEDED'")
 
     # Seed weights matching the values service.py already hardcodes for
     # these three pre-existing signal types (see risk/service.py's
@@ -106,9 +117,9 @@ def upgrade() -> None:
     op.bulk_insert(
         fraud_rules_table,
         [
-            {"id": str(uuid.uuid4()), "signal_type": "velocity_exceeded", "weight": 30, "is_active": True},
-            {"id": str(uuid.uuid4()), "signal_type": "blocked_destination_attempt", "weight": 40, "is_active": True},
-            {"id": str(uuid.uuid4()), "signal_type": "geographic_dispersion", "weight": 25, "is_active": True},
+            {"id": str(uuid.uuid4()), "signal_type": "VELOCITY_EXCEEDED", "weight": 30, "is_active": True},
+            {"id": str(uuid.uuid4()), "signal_type": "BLOCKED_DESTINATION_ATTEMPT", "weight": 40, "is_active": True},
+            {"id": str(uuid.uuid4()), "signal_type": "GEOGRAPHIC_DISPERSION", "weight": 25, "is_active": True},
         ],
     )
 

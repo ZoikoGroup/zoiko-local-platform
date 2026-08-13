@@ -19,11 +19,16 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    # No-op: this chain's read_at column is the same one 141799fdba9b
-    # already added on the parallel branch, merged in by a later revision -
-    # applying both would try to add the column twice. Mirrors the identical
-    # fix already made on 141799fdba9b's side of this same duplicate pair.
-    pass
+    # CORRECTION: this and 141799fdba9b BOTH assumed the other actually
+    # added this column - neither did on a genuinely fresh chain (confirmed
+    # live). Guarded with has_column() so it's correct regardless of
+    # execution order - see 141799fdba9b's corrected comment for the full
+    # story.
+    bind = op.get_bind()
+    inspector = sa.inspect(bind)
+    columns = {c["name"] for c in inspector.get_columns("notification_deliveries")}
+    if "read_at" not in columns:
+        op.add_column("notification_deliveries", sa.Column("read_at", sa.DateTime(timezone=True), nullable=True))
 
 
 def downgrade() -> None:

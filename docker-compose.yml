@@ -10,7 +10,11 @@ services:
       POSTGRES_PASSWORD: zoiko
       POSTGRES_DB: zoiko_local
     ports:
-      - "5433:5432"  # host 5433 -> avoids conflict with other local Postgres containers on 5432
+      - "5435:5432"  # host 5435 -> avoids conflict with native PostgreSQL 13/16/18 Windows services
+                      # already bound to 5432/5433/5434 on this dev machine (5433 in particular is
+                      # postgresql-x64-16 - confirmed live: it silently wins the port over Docker's
+                      # forwarding, so any client connecting to host 5433 was actually talking to
+                      # that native install, not this container, with completely different credentials)
     volumes:
       - zoiko_pgdata:/var/lib/postgresql/data
 

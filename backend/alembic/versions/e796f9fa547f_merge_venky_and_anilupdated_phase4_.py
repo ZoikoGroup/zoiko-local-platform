@@ -24,15 +24,28 @@ def upgrade() -> None:
     # data-driven RBAC gating venky's require_capability system already
     # applies to every other sensitive risk/fraud action in this merge -
     # SUPER_ADMIN only, same bar as risk.manage_blocked_destinations.
-    grants_table = sa.table(
-        'staff_capability_grants',
-        sa.column('id', sa.UUID(as_uuid=False)),
-        sa.column('capability', sa.String),
-        sa.column('role', sa.String),
-    )
-    op.bulk_insert(
-        grants_table,
-        [{"id": str(uuid.uuid4()), "capability": "risk.manage_fraud_rules", "role": "SUPER_ADMIN"}],
+    #
+    # Guarded with a NOT EXISTS check: d05ac876b3ab (written on venky,
+    # elsewhere in this same merged history) seeds this identical
+    # (capability, role) row too, and d05ac876b3ab's own comment already
+    # anticipated this collision - but only guarded ITS side, assuming this
+    # migration would always run first. Confirmed live running this chain
+    # against a genuinely fresh database: this revision's two merge parents
+    # (e7b2c9a1f5d6, 8e3f1a5d92c7) resolve such that d05ac876b3ab actually
+    # runs BEFORE this one, so the unguarded insert here hit
+    # uq_staff_capability_grant. Guarding both sides makes it correct
+    # regardless of which order a future chain edit produces.
+    op.execute(
+        sa.text(
+            """
+            INSERT INTO staff_capability_grants (id, capability, role)
+            SELECT :id, :capability, :role
+            WHERE NOT EXISTS (
+                SELECT 1 FROM staff_capability_grants
+                WHERE capability = :capability AND role = :role
+            )
+            """
+        ).bindparams(id=str(uuid.uuid4()), capability="risk.manage_fraud_rules", role="SUPER_ADMIN")
     )
 
 
