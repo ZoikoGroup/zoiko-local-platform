@@ -106,15 +106,36 @@ class PriceCatalogEntryNotFoundError(Exception):
     """Raised when approving a price catalog entry id that doesn't exist."""
 
 
-def get_active_price_catalog_entry(db: Session, plan_code: str) -> PriceCatalogEntry | None:
-    """The "current" price for a plan - the most recently created catalog
-    entry, whether DRAFT or APPROVED. There is deliberately no query-time
-    distinction between the two here: run_billing_cycle is what decides
-    whether a DRAFT/placeholder entry is actually chargeable in the
-    current environment (Commercial Billing Operating Standard P0-1)."""
+class CannotActivateEntryError(Exception):
+    """Raised when trying to activate a catalog entry that isn't APPROVED
+    yet (PROPOSED/ACTIVE/RETIRED can't jump straight to ACTIVE - see
+    activate_price_catalog_entry)."""
+
+
+def get_active_price_catalog_entry(db: Session, plan_code: str, *, market: str = "GLOBAL") -> PriceCatalogEntry | None:
+    """The "current" price for a plan+market. Prefers the entry actually
+    promoted to ACTIVE (see activate_price_catalog_entry) - Production
+    Readiness & Go-Live Decision Standard §2.3/Table 8's PROPOSED/APPROVED/
+    ACTIVE/RETIRED lifecycle. Falls back to the most recently created
+    entry for this plan+market regardless of status when nothing has ever
+    been activated yet - preserves the original P0-1 dev/test convenience
+    (create a catalog entry, bill against it immediately in development)
+    without requiring every test/dev workflow to also call activate.
+    run_billing_cycle's own status/is_placeholder checks are what actually
+    keep a non-ACTIVE entry from being charged outside development."""
+    active = (
+        db.query(PriceCatalogEntry)
+        .filter(
+            PriceCatalogEntry.plan_code == plan_code, PriceCatalogEntry.market == market,
+            PriceCatalogEntry.status == CatalogEntryStatus.ACTIVE,
+        )
+        .first()
+    )
+    if active is not None:
+        return active
     return (
         db.query(PriceCatalogEntry)
-        .filter(PriceCatalogEntry.plan_code == plan_code)
+        .filter(PriceCatalogEntry.plan_code == plan_code, PriceCatalogEntry.market == market)
         .order_by(PriceCatalogEntry.created_at.desc())
         .first()
     )
@@ -123,12 +144,16 @@ def get_active_price_catalog_entry(db: Session, plan_code: str) -> PriceCatalogE
 def create_price_catalog_entry(
     db: Session, *, plan_code: str, catalog_version: str, amount_minor_units: int,
     currency_code: str = "USD", is_placeholder: bool = True, actor: str,
+    price_book_version: str | None = None, market: str = "GLOBAL",
+    effective_from: datetime | None = None, effective_to: datetime | None = None,
 ) -> PriceCatalogEntry:
     """SUPER_ADMIN-gated at the route - locking/changing a price is a
     commercial decision, the same bar as a calling-rate change
     (app.usage.service.upsert_calling_rate). Always creates a NEW row;
     never edits an existing catalog_version (Class A - see
-    PriceCatalogEntry's docstring)."""
+    PriceCatalogEntry's docstring). Starts life as PROPOSED (the model
+    default) regardless of caller - only approve_price_catalog_entry and
+    activate_price_catalog_entry advance the lifecycle."""
     existing = (
         db.query(PriceCatalogEntry)
         .filter(PriceCatalogEntry.plan_code == plan_code, PriceCatalogEntry.catalog_version == catalog_version)
@@ -141,6 +166,8 @@ def create_price_catalog_entry(
     entry = PriceCatalogEntry(
         plan_code=plan_code, catalog_version=catalog_version, amount_minor_units=amount_minor_units,
         currency_code=currency_code, is_placeholder=is_placeholder,
+        price_book_version=price_book_version, market=market,
+        effective_from=effective_from, effective_to=effective_to,
     )
     db.add(entry)
     db.commit()
@@ -150,15 +177,25 @@ def create_price_catalog_entry(
         after={
             "catalog_version": catalog_version, "amount_minor_units": amount_minor_units,
             "currency_code": currency_code, "is_placeholder": is_placeholder,
+            "price_book_version": price_book_version, "market": market,
         },
     )
     return entry
 
 
-def approve_price_catalog_entry(db: Session, entry_id: str, *, actor: str) -> PriceCatalogEntry:
+def approve_price_catalog_entry(
+    db: Session, entry_id: str, *, actor: str, approval_evidence: str,
+) -> PriceCatalogEntry:
     """SUPER_ADMIN-gated at the route. Refuses to approve a placeholder
     entry (see CannotApprovePlaceholderError) - a real price decision must
-    create its own real (is_placeholder=False) entry first."""
+    create its own real (is_placeholder=False) entry first.
+    approval_evidence (Production Readiness Standard Table 8 - "Commercial/
+    Finance approval ID and change authority") is the actual sign-off
+    reference (e.g. a Commercial/Finance ticket or decision-record ID),
+    distinct from approved_by/approved_at which just record who clicked
+    approve in this system and when. APPROVED is not yet chargeable on its
+    own - see activate_price_catalog_entry for the step that actually puts
+    a version into effect."""
     entry = db.query(PriceCatalogEntry).filter(PriceCatalogEntry.id == entry_id).first()
     if entry is None:
         raise PriceCatalogEntryNotFoundError(f"No such price catalog entry: {entry_id!r}")
@@ -168,13 +205,52 @@ def approve_price_catalog_entry(db: Session, entry_id: str, *, actor: str) -> Pr
             f"(is_placeholder=False) before it can be approved"
         )
     entry.status = CatalogEntryStatus.APPROVED
+    entry.approval_evidence = approval_evidence
     entry.approved_by = actor
     entry.approved_at = _db_now(db)
     db.commit()
     db.refresh(entry)
     log_event(
         db, actor=actor, action="billing.price_catalog_entry_approved", target=f"price_catalog_entry:{entry.id}",
-        after={"plan_code": entry.plan_code, "catalog_version": entry.catalog_version},
+        after={"plan_code": entry.plan_code, "catalog_version": entry.catalog_version, "approval_evidence": approval_evidence},
+    )
+    return entry
+
+
+def activate_price_catalog_entry(db: Session, entry_id: str, *, actor: str) -> PriceCatalogEntry:
+    """Promotes an APPROVED entry to ACTIVE - the step that actually makes
+    it the version run_billing_cycle will charge outside development
+    (Production Readiness Standard §2.3/Table 8). At most one ACTIVE entry
+    can exist per plan_code+market: whatever was previously ACTIVE for the
+    same plan_code+market is moved to RETIRED in the same transaction,
+    never deleted, so past invoices remain reproducible against the exact
+    version that was active when they were issued."""
+    entry = db.query(PriceCatalogEntry).filter(PriceCatalogEntry.id == entry_id).first()
+    if entry is None:
+        raise PriceCatalogEntryNotFoundError(f"No such price catalog entry: {entry_id!r}")
+    if entry.status != CatalogEntryStatus.APPROVED:
+        raise CannotActivateEntryError(
+            f"Catalog entry {entry_id!r} is {entry.status.value!r}, not APPROVED - only an APPROVED entry can be activated"
+        )
+    previously_active = (
+        db.query(PriceCatalogEntry)
+        .filter(
+            PriceCatalogEntry.plan_code == entry.plan_code, PriceCatalogEntry.market == entry.market,
+            PriceCatalogEntry.status == CatalogEntryStatus.ACTIVE,
+        )
+        .all()
+    )
+    for old in previously_active:
+        old.status = CatalogEntryStatus.RETIRED
+    entry.status = CatalogEntryStatus.ACTIVE
+    if entry.effective_from is None:
+        entry.effective_from = _db_now(db)
+    db.commit()
+    db.refresh(entry)
+    log_event(
+        db, actor=actor, action="billing.price_catalog_entry_activated", target=f"price_catalog_entry:{entry.id}",
+        after={"plan_code": entry.plan_code, "market": entry.market, "catalog_version": entry.catalog_version},
+        before={"retired_entry_ids": [old.id for old in previously_active]},
     )
     return entry
 
@@ -1020,10 +1096,11 @@ def run_billing_cycle(db: Session, account_id: str, *, actor: str) -> dict:
                 f"({catalog_entry.catalog_version}) is still a placeholder - real pricing must be "
                 f"decided and approved first (Commercial Billing Operating Standard P0-1)."
             )
-        if catalog_entry.status != CatalogEntryStatus.APPROVED:
+        if catalog_entry.status != CatalogEntryStatus.ACTIVE:
             raise ZoikoNexBillingCycleError(
                 f"Cannot bill plan {plan.plan_code!r} outside development: its price catalog entry "
-                f"({catalog_entry.catalog_version}) is not yet APPROVED."
+                f"({catalog_entry.catalog_version}) is {catalog_entry.status.value!r}, not ACTIVE - "
+                f"see activate_price_catalog_entry."
             )
 
     amount_minor_units = catalog_entry.amount_minor_units

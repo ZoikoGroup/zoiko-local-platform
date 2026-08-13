@@ -59,8 +59,22 @@ class Plan(Base):
 
 
 class CatalogEntryStatus(str, enum.Enum):
-    DRAFT = "draft"
+    # Renamed from the original DRAFT (migration 8f3c1a9d2b47 - ALTER TYPE
+    # ... RENAME VALUE, not a new state) to match the Production Readiness
+    # & Go-Live Decision Standard's exact vocabulary (§2.3/Table 8):
+    # "PROPOSED / APPROVED / ACTIVE / RETIRED".
+    PROPOSED = "proposed"
     APPROVED = "approved"
+    # New: a plan+market can have many APPROVED historical versions but at
+    # most one ACTIVE one at a time (see app.billing.service.
+    # activate_price_catalog_entry) - this is the version run_billing_cycle
+    # actually charges against, distinct from merely being signed off.
+    ACTIVE = "active"
+    # New: set automatically on whatever was ACTIVE when a new version is
+    # activated for the same plan_code+market. Never deleted - preserves
+    # the "past invoices remain reproducible against the version that was
+    # active when issued" guarantee even after supersession.
+    RETIRED = "retired"
 
 
 class PriceCatalogEntry(Base):
@@ -81,6 +95,18 @@ class PriceCatalogEntry(Base):
     (immutable_after_status) - a real price change is a NEW catalog_version
     row, never an edit to an existing one, so past invoices always resolve
     against the exact version that was active when they were issued.
+
+    Production Readiness & Go-Live Decision Standard §2.3/Table 8 fields
+    added on top of the original P0-1 shape: price_book_version groups
+    entries created/ratified together into one named release (e.g.
+    "2026-UK-001") - deliberately separate from catalog_version, which
+    stays the existing per-plan Class A version key; market scopes a price
+    to a country/commercial market (defaults GLOBAL, since nothing here is
+    market-specific yet); effective_from/effective_to bound when a version
+    may be sold while preserving historical truth; approval_evidence is
+    the Commercial/Finance approval reference (ticket/decision ID),
+    distinct from approved_by/approved_at (who and when actually clicked
+    approve in this system).
     """
 
     __tablename__ = "price_catalog_entries"
@@ -94,14 +120,19 @@ class PriceCatalogEntry(Base):
     amount_minor_units: Mapped[int] = mapped_column(Integer, nullable=False)
     currency_code: Mapped[str] = mapped_column(String(3), nullable=False, default="USD")
     status: Mapped[CatalogEntryStatus] = mapped_column(
-        Enum(CatalogEntryStatus, name="catalog_entry_status_enum"), nullable=False, default=CatalogEntryStatus.DRAFT
+        Enum(CatalogEntryStatus, name="catalog_entry_status_enum"), nullable=False, default=CatalogEntryStatus.PROPOSED
     )
     # Explicit, unambiguous marker - deliberately separate from `status`
-    # (a DRAFT row and a placeholder row are conceptually different: a real
-    # not-yet-approved price is still a real candidate price, whereas this
-    # is fake test data that must never be mistaken for one regardless of
-    # what status it's later moved to).
+    # (a PROPOSED row and a placeholder row are conceptually different: a
+    # real not-yet-approved price is still a real candidate price, whereas
+    # this is fake test data that must never be mistaken for one regardless
+    # of what status it's later moved to).
     is_placeholder: Mapped[bool] = mapped_column(nullable=False, default=True)
+    price_book_version: Mapped[str | None] = mapped_column(String(50), nullable=True, index=True)
+    market: Mapped[str] = mapped_column(String(10), nullable=False, default="GLOBAL", server_default="GLOBAL")
+    effective_from: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    effective_to: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    approval_evidence: Mapped[str | None] = mapped_column(String(255), nullable=True)
     approved_by: Mapped[str | None] = mapped_column(String(100), nullable=True)
     approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
