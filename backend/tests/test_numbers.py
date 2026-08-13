@@ -579,6 +579,109 @@ def test_reserve_rejects_an_uncurated_country(client):
     assert response.status_code == 422
 
 
+# --- Market Activation Registry (Production Readiness Standard §6.2) ---
+
+
+def test_new_supported_country_defaults_to_closed(db_session):
+    from app.numbering.numbers import service as numbers_service
+    from app.numbering.numbers.models import MarketActivationState
+
+    country = numbers_service.upsert_supported_country(db_session, code="ZY", name="Testland")
+    assert country.activation_state == MarketActivationState.CLOSED
+
+
+def test_closed_market_blocks_search_and_reserve(client, db_session):
+    from app.numbering.numbers import service as numbers_service
+    from app.numbering.numbers.models import MarketActivationState
+
+    numbers_service.set_market_activation_state(
+        db_session, "US", MarketActivationState.CLOSED, actor="test-actor", notes="test lockdown"
+    )
+    token = _signup_and_login(client, "marketclosed1@example.com")
+
+    search_response = client.get(
+        "/numbers/search", params={"country": "US"}, headers={"Authorization": f"Bearer {token}"}
+    )
+    assert search_response.status_code == 422
+
+    reserve_response = client.post(
+        "/numbers/reserve", json={"e164": "+15550001234", "country": "US"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert reserve_response.status_code == 422
+
+
+def test_suspended_market_blocks_reserve(client, db_session):
+    from app.numbering.numbers import service as numbers_service
+    from app.numbering.numbers.models import MarketActivationState
+
+    numbers_service.set_market_activation_state(
+        db_session, "GB", MarketActivationState.SUSPENDED, actor="test-actor",
+    )
+    token = _signup_and_login(client, "marketsuspended1@example.com")
+
+    response = client.post(
+        "/numbers/reserve", json={"e164": "+442079460800", "country": "GB"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert response.status_code == 422
+
+
+def test_controlled_beta_market_still_allows_reserve(client, db_session):
+    """CONTROLLED_BETA is the backfilled default for every pre-existing
+    country (see the market-activation-registry migration) - existing
+    reserve/purchase flows must keep working under it."""
+    from app.numbering.numbers import service as numbers_service
+    from app.numbering.numbers.models import MarketActivationState
+
+    country = numbers_service.list_supported_countries(db_session)
+    us = next(c for c in country if c.code == "US")
+    assert us.activation_state == MarketActivationState.CONTROLLED_BETA
+
+    token = _signup_and_login(client, "marketbeta1@example.com")
+    response = client.post(
+        "/numbers/reserve", json={"e164": "+15550002468", "country": "US"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert response.status_code == 201
+
+
+def test_set_market_activation_state_route_rejects_an_invalid_state(client, db_session):
+    from app.staff import service as staff_service
+    from app.staff.models import PlatformStaffRole
+
+    staff_service.create_staff(db_session, email="marketstaff1@zoikolocal.com", password="staffpass123", role=PlatformStaffRole.SUPER_ADMIN)
+    token = client.post(
+        "/staff/login", json={"email": "marketstaff1@zoikolocal.com", "password": "staffpass123"}
+    ).json()["access_token"]
+
+    response = client.put(
+        "/staff/countries/US/activation-state", json={"state": "not_a_real_state"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert response.status_code == 422
+
+
+def test_set_market_activation_state_route_updates_and_records_actor(client, db_session):
+    from app.staff import service as staff_service
+    from app.staff.models import PlatformStaffRole
+
+    staff = staff_service.create_staff(db_session, email="marketstaff2@zoikolocal.com", password="staffpass123", role=PlatformStaffRole.SUPER_ADMIN)
+    token = client.post(
+        "/staff/login", json={"email": "marketstaff2@zoikolocal.com", "password": "staffpass123"}
+    ).json()["access_token"]
+
+    response = client.put(
+        "/staff/countries/GB/activation-state", json={"state": "paid_open", "notes": "Legal sign-off ref LEGAL-42"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["activation_state"] == "paid_open"
+    assert body["activation_notes"] == "Legal sign-off ref LEGAL-42"
+    assert body["activation_changed_by"] == staff.id
+
+
 # --- Renewal flow ---
 
 
@@ -832,6 +935,48 @@ def test_stripe_payment_webhook_refunds_a_genuine_fulfillment_failure(client, db
     numbers = client.get("/numbers", headers=headers).json()
     number = next(n for n in numbers if n["e164"] == "+15550013007")
     assert number["status"] == "reserved"  # released back, not stranded
+
+
+def test_stripe_payment_webhook_refunds_when_reservation_expired_before_it_arrived(client, db_session, monkeypatch):
+    """Confirmed live during a production acceptance test (2026-08-13): a
+    real Stripe payment that completes after RESERVATION_TTL_MINUTES has
+    already lapsed was silently kept - purchase_number's ReservationExpired
+    Error used to be indistinguishable from the harmless "already
+    fulfilled/duplicate webhook" NumberConflictError case, so no refund
+    ever fired. This is the real customer-money scenario that fix covers -
+    distinct from the "genuine fulfillment failure" (Twilio rejects the
+    purchase) and "idempotent replay" (already ACTIVE) tests above/below,
+    where the number itself is still sitting RESERVED, just past its TTL."""
+    from datetime import datetime, timedelta, timezone
+
+    from app.numbering.numbers.models import PhoneNumber
+
+    monkeypatch.setattr("app.core.config.settings.stripe_payments_webhook_secret", "whsec_test")
+    refund_calls = []
+    monkeypatch.setattr(
+        "app.numbering.numbers.service.stripe_checkout.refund_payment",
+        lambda payment_intent_id: refund_calls.append(payment_intent_id) or {"id": "re_test", "status": "succeeded"},
+    )
+
+    token = _signup_and_login(client, "checkoutrefund4@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    account_id = client.get("/auth/me", headers=headers).json()["account_id"]
+    _reserve(client, headers, "+15550013010")
+
+    number = db_session.query(PhoneNumber).filter(PhoneNumber.e164 == "+15550013010").first()
+    number.reserved_until = datetime.now(timezone.utc) - timedelta(minutes=1)
+    db_session.commit()
+
+    body, signature = _stripe_webhook_body_and_signature(
+        "whsec_test", "checkout.session.completed",
+        {
+            "id": "cs_test_expired", "payment_intent": "pi_test_expired_reservation",
+            "metadata": {"e164": "+15550013010", "account_id": account_id},
+        },
+    )
+    response = client.post("/numbers/payments/webhook", content=body, headers={"Stripe-Signature": signature})
+    assert response.status_code == 204
+    assert refund_calls == ["pi_test_expired_reservation"]
 
 
 def test_stripe_payment_webhook_does_not_refund_a_compliance_pending_outcome(client, db_session, monkeypatch):

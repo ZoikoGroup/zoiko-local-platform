@@ -27,6 +27,7 @@ from app.notifications.service import (
 from app.numbering.identity.models import Account, AccountBillingClassification, AccountType, User, UserRole
 from app.numbering.numbers.models import (
     IVROption,
+    MarketActivationState,
     NumberEligibilityCase,
     NumberEligibilityCaseStatus,
     NumberEligibilityRule,
@@ -52,6 +53,20 @@ NUMBER_PURCHASE_CURRENCY = "usd"
 class NumberConflictError(Exception):
     """Raised when a number can't be reserved/purchased because another
     account already holds it, or the caller's own reservation lapsed."""
+
+
+class ReservationExpiredError(NumberConflictError):
+    """Raised specifically when the account's OWN reservation on this
+    number lapsed (RESERVATION_TTL_MINUTES) - a subclass of
+    NumberConflictError so anything already catching that broadly still
+    catches this, but distinct enough that complete_number_purchase_from_
+    checkout can tell it apart from "already fulfilled/duplicate webhook."
+    Confirmed live (Commercial Billing Operating Standard acceptance test,
+    2026-08-13): before this existed, a real Stripe payment that completed
+    after the reservation had already expired was silently kept with no
+    number delivered and no refund issued, because this case raised the
+    same NumberConflictError as the harmless "already fulfilled" case and
+    complete_number_purchase_from_checkout couldn't distinguish them."""
 
 
 class NonCommercialAccountError(Exception):
@@ -134,9 +149,50 @@ def remove_supported_country(db: Session, code: str) -> None:
 
 
 def _assert_supported_country(db: Session, country: str) -> None:
-    exists = db.query(SupportedCountry).filter(SupportedCountry.code == country).first() is not None
-    if not exists:
+    """Market Activation Registry enforcement (Production Readiness &
+    Go-Live Decision Standard §6.2) - blocks the two states the doc is
+    unambiguous about (CLOSED: never activated; SUSPENDED: "new sales/
+    provisioning blocked immediately"). INTERNAL_TEST/CONTROLLED_BETA/
+    PAID_OPEN all pass this check today - see SupportedCountry's
+    docstring for why those three aren't behaviorally distinguished yet."""
+    row = db.query(SupportedCountry).filter(SupportedCountry.code == country).first()
+    if row is None:
         raise UnsupportedCountryError(f"{country!r} is not on Zoiko Local's supported country list yet")
+    if row.activation_state in (MarketActivationState.CLOSED, MarketActivationState.SUSPENDED):
+        raise UnsupportedCountryError(
+            f"{country!r} is {row.activation_state.value!r} in the Market Activation Registry - "
+            f"not available for number purchase right now"
+        )
+
+
+def set_market_activation_state(
+    db: Session, code: str, state: MarketActivationState, *, actor: str, notes: str | None = None,
+) -> SupportedCountry:
+    """Staff-only (numbers.manage_country_list - same bar as adding a
+    country to the list at all). Deliberately does NOT attempt to enforce
+    Table 6.3's "minimum market file before PAID_OPEN" checklist (legal
+    entity, telecom authorization, tax registration, etc.) in code - this
+    codebase has no real content for any of those items yet, and a
+    software gate that can't actually verify a legal/tax/telecom
+    determination would just be theater. This function trusts the actor
+    (Legal/Tax/Compliance per the doc's ownership table) to only move a
+    country to PAID_OPEN once that real-world review has actually
+    happened; `notes` is where they record what it was."""
+    country = db.query(SupportedCountry).filter(SupportedCountry.code == code).first()
+    if country is None:
+        raise UnsupportedCountryError(f"{code!r} is not on Zoiko Local's supported country list yet")
+    previous_state = country.activation_state
+    country.activation_state = state
+    country.activation_notes = notes
+    country.activation_changed_by = actor
+    country.activation_changed_at = datetime.now(timezone.utc)
+    db.commit()
+    db.refresh(country)
+    log_event(
+        db, actor=actor, action="numbers.market_activation_state_changed", target=f"supported_country:{code}",
+        before={"activation_state": previous_state.value}, after={"activation_state": state.value, "notes": notes},
+    )
+    return country
 
 
 class ComplianceRequiredError(Exception):
@@ -568,7 +624,7 @@ def purchase_number(db: Session, account_id: str, e164: str) -> PhoneNumber:
     if number.status == PhoneNumberStatus.RESERVED and (
         number.reserved_until is not None and number.reserved_until < now
     ):
-        raise NumberConflictError(f"Reservation for {e164} expired — reserve it again before purchasing")
+        raise ReservationExpiredError(f"Reservation for {e164} expired — reserve it again before purchasing")
 
     _assert_purchase_eligible(db, account_id, number, e164=e164)
 
@@ -669,7 +725,7 @@ def create_number_purchase_checkout_session(db: Session, account_id: str, e164: 
     if number.status == PhoneNumberStatus.RESERVED and (
         number.reserved_until is not None and number.reserved_until < now
     ):
-        raise NumberConflictError(f"Reservation for {e164} expired — reserve it again before checkout")
+        raise ReservationExpiredError(f"Reservation for {e164} expired — reserve it again before checkout")
 
     _assert_purchase_eligible(db, account_id, number, e164=e164)
 
@@ -697,26 +753,38 @@ def complete_number_purchase_from_checkout(
     error) for every known way purchase_number can fail to actually reach
     ACTIVE after a successful payment:
 
-    - NumberConflictError: the number is no longer purchasable (already
-      bought, or the webhook was retried after already succeeding once) -
-      idempotency against Stripe's at-least-once webhook delivery. Not
-      refunded - this path means the number was already (or is being)
-      fulfilled, or a duplicate delivery of an already-handled event.
+    - NumberConflictError (NOT the ReservationExpiredError subclass below):
+      the number is no longer purchasable because it's already bought, or
+      the webhook was retried after already succeeding once - idempotency
+      against Stripe's at-least-once webhook delivery. Not refunded - this
+      path means the number was already (or is being) fulfilled, or a
+      duplicate delivery of an already-handled event.
     - ComplianceRequiredError / NumberEligibilityRequiredError:
       purchase_number already persisted the number into COMPLIANCE_PENDING
       and (for the KYC case) sent its own customer notification - correct
       behavior, nothing further for this handler to do. Not refunded - the
       customer still gets the number once the relevant case clears, this
       isn't a failure.
-    - NumberQuotaExceededError / BillingSuspendedError /
-      EmergencyDisclosureRequiredError / TelecomError: genuine post-
-      payment fulfillment failures - the customer paid and won't be
-      getting a number for it. Automatically refunded via Stripe (if
-      payment_intent_id is available) so no real launch would leave a
-      collected-but-unfulfilled payment sitting uncorrected.
+    - ReservationExpiredError / NumberQuotaExceededError /
+      BillingSuspendedError / EmergencyDisclosureRequiredError /
+      TelecomError: genuine post-payment fulfillment failures - the
+      customer paid and won't be getting a number for it. Automatically
+      refunded via Stripe (if payment_intent_id is available) so no real
+      launch would leave a collected-but-unfulfilled payment sitting
+      uncorrected. ReservationExpiredError was folded into the no-refund
+      NumberConflictError bucket until a live acceptance test (2026-08-13)
+      caught it silently keeping a real completed payment - see that
+      exception's own docstring.
     """
     try:
         return purchase_number(db, account_id, e164)
+    except ReservationExpiredError:
+        if payment_intent_id:
+            try:
+                stripe_checkout.refund_payment(payment_intent_id)
+            except stripe_checkout.PaymentError:
+                pass
+        return None
     except (NumberConflictError, ComplianceRequiredError, NumberEligibilityRequiredError):
         return None
     except (
