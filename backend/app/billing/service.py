@@ -226,11 +226,9 @@ def sync_usage_event_to_zoikonex(db: Session, usage_event) -> None:
     )
     usage_event.estimated_cost_cents = rating["estimated_cost_cents"]
     if rating["estimated_cost_cents"] is not None:
-        # P0-8 "rating versioning" - only stamped when a rate table
-        # actually applied (never for an event_type with no CallingRate
-        # coverage yet - leaving meter_version NULL there is the honest
-        # "not rated at all" state, not "rated under version X").
-        usage_event.meter_version = zoikonex_adapter.CALLING_RATE_METER_VERSION
+        # P0-8 - only stamped when a rate table actually applied (never for
+        # an event_type with no CallingRate coverage yet - leaving rated_at
+        # NULL there is the honest "not rated at all" state).
         usage_event.rated_at = _db_now(db)
 
     sub = db.query(Subscription).filter(Subscription.account_id == usage_event.account_id).first()
