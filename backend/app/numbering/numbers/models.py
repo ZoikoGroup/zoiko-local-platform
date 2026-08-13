@@ -29,6 +29,14 @@ class SupportedCountry(Base):
     code: Mapped[str] = mapped_column(String(2), unique=True, nullable=False, index=True)
     name: Mapped[str] = mapped_column(String(100), nullable=False)
     sort_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # Commercial Billing Operating Standard doc §10/§S1/§34 - "a number/
+    # calling service cannot be marketed as emergency-capable unless the
+    # applicable configuration and evidence are approved." Defaults False
+    # (matches reality: no market here has verified E911 evidence/routing -
+    # see EmergencyDisclosureRequiredError's docstring). This is a
+    # disclosure-accuracy flag, not a claim of real E911 capability; flip it
+    # only once real emergency-routing evidence for that country exists.
+    emergency_calling_supported: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 

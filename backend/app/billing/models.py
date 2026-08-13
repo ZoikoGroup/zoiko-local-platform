@@ -37,6 +37,14 @@ class Plan(Base):
     max_team_seats: Mapped[int] = mapped_column(Integer, nullable=False)
     monthly_voice_minutes: Mapped[int] = mapped_column(Integer, nullable=False)
     monthly_video_minutes: Mapped[int] = mapped_column(Integer, nullable=False)
+    # Per-room capacity, not a monthly quota (see monthly_video_minutes for
+    # that) - Roadmap doc §8: "Phase 1 capacity: 1:1 and small-group video,
+    # target up to 8 participants" vs the later "larger meetings" tier
+    # (Architecture doc Phase 3). Passed straight to the Provider Gateway's
+    # create_room() (see media.service.create_video_session) - previously
+    # every plan silently got the same flat 50-participant LiveKit-side cap
+    # regardless of tier.
+    max_video_participants: Mapped[int] = mapped_column(Integer, nullable=False, server_default="8")
     monthly_ai_summaries: Mapped[int] = mapped_column(Integer, nullable=False)
     trial_days: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     sort_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
@@ -200,9 +208,10 @@ class ZoikoNexReconciliationRun(Base):
     uncached aggregate count with no history), each run here is persisted -
     same pattern as app.ops.models.SyntheticCheckRun - so staff can see
     whether drift is growing or shrinking over time, not just its current
-    value. No scheduler exists in this codebase yet (see
-    app.ops.routes.run_synthetic_checks's docstring for the same gap), so
-    this is staff-triggered on demand rather than actually running daily.
+    value. Runs daily via app.ops.scheduled_reconciliation (see its
+    module docstring - a Render Cron Job service, not in-process); staff
+    can also still trigger POST /billing/zoikonex/reconciliation/run
+    on demand between scheduled runs.
 
     total_completed_calls/unmatched_completed_calls are the third,
     carrier-evidence leg the Commercial Billing Operating Standard doc's
@@ -283,4 +292,59 @@ class ZoikoNexReconciliationException(Base):
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     resolved_by: Mapped[str | None] = mapped_column(String(100), nullable=True)
     resolution_reason: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+
+
+class BillingActionType(str, enum.Enum):
+    CREDIT_NOTE = "credit_note"
+    DEBIT_NOTE = "debit_note"
+    REFUND = "refund"
+    RUN_BILLING_CYCLE = "run_billing_cycle"
+
+
+class BillingActionRequestStatus(str, enum.Enum):
+    PENDING = "pending"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+    EXECUTED = "executed"
+
+
+class BillingActionRequest(Base):
+    """Commercial Billing Operating Standard doc's RBAC/segregation-of-
+    duties doctrine (§26: "Approver... cannot self-approve where policy
+    applies") for the highest-risk money-moving ZoikoNex actions this
+    codebase has (credit note, debit note, refund, run-billing-cycle) -
+    every one of them previously executed on a single staff member's
+    say-so the moment they held the per-action capability. This table adds
+    a second, distinct staff actor: `requested_by` stages the action and
+    its original payload; `approved_by` (enforced != requested_by at the
+    service layer, see approve_billing_action) actually executes it. Not
+    retrofitted onto every sensitive action in this codebase - scoped to
+    the 4 newest, real-money-moving ones; extending the same pattern to
+    e.g. number release or port cancellation is a separate decision."""
+
+    __tablename__ = "billing_action_requests"
+
+    id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=new_uuid)
+    action_type: Mapped[BillingActionType] = mapped_column(
+        Enum(BillingActionType, name="billing_action_type_enum"), nullable=False, index=True,
+    )
+    # The original request body (account_id, invoice_id/payment_intent_id,
+    # amount_minor_units, reason, etc. depending on action_type) - staged
+    # here rather than executed immediately, then replayed verbatim by
+    # approve_billing_action so the approver is authorizing exactly what
+    # was requested, not a re-typed summary of it.
+    payload: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    requested_by: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+    status: Mapped[BillingActionRequestStatus] = mapped_column(
+        Enum(BillingActionRequestStatus, name="billing_action_request_status_enum"),
+        nullable=False, default=BillingActionRequestStatus.PENDING, index=True,
+    )
+    approved_by: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    rejection_reason: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # The real ZoikoNex response (credit_note_id/debit_note_id/refund_id/
+    # billing-cycle summary) once EXECUTED - an audit trail of what the
+    # approval actually did, not just that it happened.
+    result: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)

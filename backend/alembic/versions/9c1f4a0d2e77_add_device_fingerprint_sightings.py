@@ -18,7 +18,12 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    op.execute("ALTER TYPE risksignaltype ADD VALUE IF NOT EXISTS 'DEVICE_FINGERPRINT_ABUSE'")
+    # risksignaltype's existing labels are lowercase .value-style (a
+    # documented exception to this codebase's usual uppercase-.name
+    # convention for enums - see 0d31d1ab1f2d's note on adding
+    # 'geographic_dispersion') - must match, not the uppercase this
+    # migration originally used.
+    op.execute("ALTER TYPE risksignaltype ADD VALUE IF NOT EXISTS 'device_fingerprint_abuse'")
 
     op.create_table(
         'device_fingerprint_sightings',

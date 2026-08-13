@@ -64,12 +64,30 @@ class UsageEvent(Base):
     # which have no rate table yet. An estimate for visibility, not a real
     # charge - see CallingRate's docstring on the same gap.
     estimated_cost_cents: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    # Commercial Billing Operating Standard P0-8 - stamped alongside
-    # estimated_cost_cents at rating time (see app.billing.service.
-    # sync_usage_event_to_zoikonex) - NULL until rated, so a query can tell
-    # "not yet rated" apart from "rated a while ago." meter_version (which
-    # version of the rating RULE produced quantity/estimated_cost_cents) is
-    # a separate field - see its own docstring below.
+    # Commercial Billing Operating Standard doc §E2 - the provider-reported
+    # outcome (e.g. "completed"/"busy"/"no-answer"/"failed" for calls) that
+    # justified whether/how this event was billable. NULL for event types
+    # with no disposition concept (video minutes, AI summaries) - those are
+    # only ever recorded on their own success path already.
+    disposition: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    # §E5/E6 - the unrounded, unfloored measurement (e.g. raw call seconds)
+    # kept alongside `quantity` (the rated/floored figure actually used for
+    # estimated_cost_cents) so a rounding/minimum-increment rule is always
+    # traceable back to what was actually measured, never silently replacing
+    # it. NULL when quantity already IS the raw measurement (no rating rule
+    # applies to this event_type yet).
+    raw_quantity: Mapped[float | None] = mapped_column(Numeric(12, 2), nullable=True)
+    # §E1/§30 "Identity" - which version of the rating rule (rounding,
+    # minimum increment, disposition-billability policy) produced `quantity`
+    # from `raw_quantity`, so a future rule change never silently reinterprets
+    # historical usage. Bumped only when the rule in record_usage_event
+    # actually changes.
+    meter_version: Mapped[str] = mapped_column(String(20), nullable=False, server_default="v1")
+    # P0-8 - stamped alongside estimated_cost_cents at ZoikoNex-sync rating
+    # time (see app.billing.service.sync_usage_event_to_zoikonex) - NULL
+    # until rated, so a query can tell "not yet rated" apart from "rated a
+    # while ago." Distinct from meter_version above, which versions the
+    # record_usage_event-time rating RULE, not the ZoikoNex-sync step.
     rated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     idempotency_key: Mapped[str] = mapped_column(String(255), unique=True, nullable=False, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

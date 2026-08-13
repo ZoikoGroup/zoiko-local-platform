@@ -7,6 +7,7 @@ from app.core.deps import get_current_user, require_admin, require_writer
 from app.integrations.billing import stripe_checkout
 from app.integrations.telecom.twilio import TelecomError
 from app.numbering.identity.models import User
+from app.ops.service import KillSwitchTrippedError
 from app.numbering.numbers import service
 from app.numbering.numbers.schemas import (
     AssignNumberRequest,
@@ -32,6 +33,7 @@ from app.numbering.numbers.service import (
     NumberConflictError,
     NumberEligibilityCaseNotFoundError,
     NumberEligibilityRequiredError,
+    TestAccountRestrictedError,
     UnsupportedCountryError,
 )
 
@@ -96,6 +98,8 @@ def purchase_number(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e)) from e
     except TelecomError as e:
         raise HTTPException(status_code=502, detail=str(e)) from e
+    except KillSwitchTrippedError as e:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e)) from e
 
 
 @router.get("/eligibility-cases", response_model=list[NumberEligibilityCaseResponse])
@@ -146,6 +150,8 @@ def create_checkout_session(
     except NumberConflictError as e:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e
     except service.NonCommercialAccountError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e)) from e
+    except TestAccountRestrictedError as e:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e)) from e
     except (NumberQuotaExceededError, BillingSuspendedError) as e:
         raise HTTPException(status_code=status.HTTP_402_PAYMENT_REQUIRED, detail=str(e)) from e

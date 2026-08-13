@@ -41,7 +41,9 @@ class QualitySampleRequest(BaseModel):
 
 
 @router.post("/rooms", status_code=status.HTTP_201_CREATED)
+@limiter.limit("20/minute")
 async def create_room(
+    request: Request,
     body: CreateRoomRequest = CreateRoomRequest(),
     db: Session = Depends(get_db),
     current_user: User = Depends(require_writer),
@@ -171,6 +173,8 @@ async def admit_waiting_guest(
         raise HTTPException(status_code=403, detail=str(e)) from e
     except media_service.WaitingGuestNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e)) from e
+    except media_service.WaitingGuestNoLongerPendingError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
     return {"admitted": True}
 
 
@@ -187,6 +191,8 @@ async def deny_waiting_guest(
         raise HTTPException(status_code=403, detail=str(e)) from e
     except media_service.WaitingGuestNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e)) from e
+    except media_service.WaitingGuestNoLongerPendingError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
     return {"denied": True}
 
 
@@ -224,6 +230,25 @@ async def start_recording(
     return {"room_name": session.room_name, "recording": True}
 
 
+@router.post("/rooms/{room_name}/recording/stop")
+async def stop_recording(
+    room_name: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_writer),
+):
+    """Manual stop, independent of ending the call - see
+    media_service.stop_video_recording's docstring. recording flips back
+    to False in the response immediately, but recording_url on GET /rooms
+    only populates once LiveKit's egress_ended webhook arrives."""
+    try:
+        session = await media_service.stop_video_recording(db, current_user, room_name)
+    except media_service.VideoSessionAuthorizationError as e:
+        raise HTTPException(status_code=403, detail=str(e)) from e
+    except VideoError as e:
+        raise HTTPException(status_code=502, detail=str(e)) from e
+    return {"room_name": session.room_name, "recording": False}
+
+
 @router.post("/webhook")
 async def livekit_webhook(request: Request, db: Session = Depends(get_db)):
     """Requires the webhook URL to be configured in the LiveKit Cloud project
@@ -251,7 +276,7 @@ async def list_rooms(
             "status": s.status.value,
             "started_at": s.started_at,
             "ended_at": s.ended_at,
-            "recording_in_progress": s.recording_egress_id is not None and s.recording_url is None,
+            "recording_in_progress": media_service.is_recording_in_progress(s),
             "recording_url": media_service.get_recording_download_url(s),
             "participant_minutes": media_service.get_participant_minutes(db, s.id),
             "confidential": s.confidential,

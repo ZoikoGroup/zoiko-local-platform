@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: ["main", "venky", "anil", "merge"]
+    branches: ["main", "venky", "anil", "merge", "dev", "anilupdated"]
   pull_request:
 
 jobs:
@@ -72,8 +72,33 @@ jobs:
 
       - run: npm ci
 
+      - run: npm run lint
+
       - run: npx tsc --noEmit
+
+      - run: npm test
 
       - run: npm run build
         env:
           NEXT_PUBLIC_API_BASE_URL: https://placeholder.invalid
+
+  # Deploys backend/Dockerfile to Render (render.yaml) only after both jobs
+  # above actually pass - deliberately NOT relying on Render's own
+  # auto-deploy-on-push, which would deploy a commit regardless of whether
+  # its tests passed (a race between "push landed" and "CI finished").
+  # Requires a repo secret RENDER_DEPLOY_HOOK_URL (Render dashboard ->
+  # zoiko-local-api service -> Settings -> Deploy Hook - no Render API key
+  # needed, the hook URL itself is the credential). Only fires on an actual
+  # push to dev, never on a pull_request event.
+  deploy:
+    needs: [backend, frontend]
+    if: github.ref == 'refs/heads/dev' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger Render deploy
+        run: |
+          if [ -z "${{ secrets.RENDER_DEPLOY_HOOK_URL }}" ]; then
+            echo "::error::RENDER_DEPLOY_HOOK_URL secret is not set - see this job's comment in ci.yml for where to get it"
+            exit 1
+          fi
+          curl -fsS -X POST "${{ secrets.RENDER_DEPLOY_HOOK_URL }}"

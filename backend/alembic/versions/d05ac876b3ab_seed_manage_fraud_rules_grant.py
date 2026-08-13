@@ -26,15 +26,23 @@ def upgrade() -> None:
     # 403s for every staff role, same bar as risk.resolve_fraud_case
     # (ce2bebedfe43) but SUPER_ADMIN-only since tuning the scoring model
     # itself is more sensitive than resolving one case.
-    grants_table = sa.table(
-        'staff_capability_grants',
-        sa.column('id', sa.UUID(as_uuid=False)),
-        sa.column('capability', sa.String),
-        sa.column('role', sa.String),
-    )
-    op.bulk_insert(
-        grants_table,
-        [{"id": str(uuid.uuid4()), "capability": "risk.manage_fraud_rules", "role": "SUPER_ADMIN"}],
+    #
+    # Guarded with a NOT EXISTS check: e796f9fa547f (the anilupdated<->venky
+    # phase4 migration merge point earlier in this same history) already
+    # seeded this identical (capability, role) row independently before this
+    # migration was written on venky - without the guard, any chain that
+    # passes through both migrations hits uq_staff_capability_grant.
+    op.execute(
+        sa.text(
+            """
+            INSERT INTO staff_capability_grants (id, capability, role)
+            SELECT :id, :capability, :role
+            WHERE NOT EXISTS (
+                SELECT 1 FROM staff_capability_grants
+                WHERE capability = :capability AND role = :role
+            )
+            """
+        ).bindparams(id=str(uuid.uuid4()), capability="risk.manage_fraud_rules", role="SUPER_ADMIN")
     )
 
 

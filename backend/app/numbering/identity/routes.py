@@ -27,7 +27,9 @@ MFA_TOKEN_EXPIRE_MINUTES = 5
 
 
 @router.post("/signup", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
+@limiter.limit("5/minute")
 def signup(
+    request: Request,
     payload: SignupRequest,
     db: Session = Depends(get_db),
     x_device_fingerprint: str | None = Header(default=None),
@@ -112,7 +114,9 @@ def mfa_setup(db: Session = Depends(get_db), current_user: User = Depends(get_cu
 
 
 @router.post("/mfa/enable", status_code=status.HTTP_204_NO_CONTENT)
+@limiter.limit("5/minute")
 def mfa_enable(
+    request: Request,
     payload: MfaCodeRequest,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
@@ -124,7 +128,9 @@ def mfa_enable(
 
 
 @router.post("/mfa/disable", status_code=status.HTTP_204_NO_CONTENT)
+@limiter.limit("5/minute")
 def mfa_disable(
+    request: Request,
     payload: MfaCodeRequest,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),

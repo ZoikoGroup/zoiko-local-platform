@@ -79,6 +79,16 @@ class Account(Base):
         Enum(AccountBillingSource, name="account_billing_source_enum"),
         nullable=False, default=AccountBillingSource.DIRECT_ZOIKO_LOCAL,
     )
+    # Commercial Billing Operating Standard doc §T "billing_classification/
+    # billing_source" - is_test was built independently (concurrent session,
+    # same day) as a narrower stopgap for the same problem, before its
+    # author knew billing_classification/billing_source above already
+    # existed on another branch. Kept as its own column rather than rewired
+    # into billing_classification during this merge, since several already-
+    # tested call sites (Stripe checkout, billing actions) gate on it
+    # directly - consolidating the two overlapping "is this account real
+    # money" signals into one is a real follow-up, not a merge-conflict fix.
+    is_test: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     users: Mapped[list["User"]] = relationship(

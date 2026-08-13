@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import date, datetime
 
 from pydantic import BaseModel, ConfigDict
 
@@ -10,6 +10,8 @@ class PortingRequestCreate(BaseModel):
     carrier_account_number: str
     billing_name: str
     billing_address: str
+    authorization_evidence_url: str | None = None
+    target_completion_date: date | None = None
 
 
 class PortingRequestRejectRequest(BaseModel):
@@ -31,6 +33,8 @@ class PortingRequestResponse(BaseModel):
     carrier_account_number: str
     billing_name: str
     billing_address: str
+    authorization_evidence_url: str | None
+    target_completion_date: date | None
     status: str
     rejection_reason: str | None
     twilio_incoming_number_sid: str | None

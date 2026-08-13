@@ -991,7 +991,7 @@ def test_start_recording_is_blocked_unconditionally_for_a_confidential_session(c
     assert session.recording_egress_id is None
 
 
-async def _fake_create_room(room_name):
+async def _fake_create_room(room_name, max_participants=None):
     return None
 
 

@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.orm import Session
 
 from app.billing.schemas import UsageSummaryResponse
@@ -7,11 +7,13 @@ from app.billing import service as billing_service
 from app.contacts import service as contacts_service
 from app.core.database import get_db
 from app.core.deps import get_api_key_account_id
+from app.core.rate_limit import limiter
 from app.intelligence.models import ConversationSummary
 from app.media import service as media_service
 from app.media.models import CallRecord, Voicemail
 from app.numbering.identity.models import User, UserRole
 from app.numbering.numbers.models import PhoneNumber
+from app.ops.service import KillSwitchTrippedError
 from app.public_api.schemas import (
     CreateContactRequest,
     PlaceCallRequest,
@@ -60,7 +62,10 @@ _LIST_LIMIT = 200
 
 
 @router.get("/numbers", response_model=list[PublicNumberResponse])
-def list_numbers(account_id: str = Depends(get_api_key_account_id), db: Session = Depends(get_db)):
+@limiter.limit("60/minute")
+def list_numbers(
+    request: Request, account_id: str = Depends(get_api_key_account_id), db: Session = Depends(get_db)
+):
     return (
         db.query(PhoneNumber)
         .filter(PhoneNumber.account_id == account_id)
@@ -71,7 +76,10 @@ def list_numbers(account_id: str = Depends(get_api_key_account_id), db: Session 
 
 
 @router.get("/calls", response_model=list[PublicCallResponse])
-def list_calls(account_id: str = Depends(get_api_key_account_id), db: Session = Depends(get_db)):
+@limiter.limit("60/minute")
+def list_calls(
+    request: Request, account_id: str = Depends(get_api_key_account_id), db: Session = Depends(get_db)
+):
     return (
         db.query(CallRecord)
         .filter(CallRecord.account_id == account_id)
@@ -82,7 +90,10 @@ def list_calls(account_id: str = Depends(get_api_key_account_id), db: Session = 
 
 
 @router.get("/voicemails", response_model=list[PublicVoicemailResponse])
-def list_voicemails(account_id: str = Depends(get_api_key_account_id), db: Session = Depends(get_db)):
+@limiter.limit("60/minute")
+def list_voicemails(
+    request: Request, account_id: str = Depends(get_api_key_account_id), db: Session = Depends(get_db)
+):
     return (
         db.query(Voicemail)
         .filter(Voicemail.account_id == account_id)
@@ -93,7 +104,10 @@ def list_voicemails(account_id: str = Depends(get_api_key_account_id), db: Sessi
 
 
 @router.get("/summaries", response_model=list[PublicSummaryResponse])
-def list_summaries(account_id: str = Depends(get_api_key_account_id), db: Session = Depends(get_db)):
+@limiter.limit("60/minute")
+def list_summaries(
+    request: Request, account_id: str = Depends(get_api_key_account_id), db: Session = Depends(get_db)
+):
     return (
         db.query(ConversationSummary)
         .filter(ConversationSummary.account_id == account_id)
@@ -104,7 +118,9 @@ def list_summaries(account_id: str = Depends(get_api_key_account_id), db: Sessio
 
 
 @router.post("/calls", response_model=PlaceCallResponse, status_code=status.HTTP_201_CREATED)
+@limiter.limit("20/minute")
 def place_call(
+    request: Request,
     payload: PlaceCallRequest,
     account_id: str = Depends(get_api_key_account_id),
     db: Session = Depends(get_db),
@@ -125,18 +141,25 @@ def place_call(
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(e)) from e
     except risk_service.SpendLimitExceededError as e:
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(e)) from e
+    except KillSwitchTrippedError as e:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e)) from e
     except TelecomError as e:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(e)) from e
     return result
 
 
 @router.get("/contacts", response_model=list[PublicContactResponse])
-def list_contacts(account_id: str = Depends(get_api_key_account_id), db: Session = Depends(get_db)):
+@limiter.limit("60/minute")
+def list_contacts(
+    request: Request, account_id: str = Depends(get_api_key_account_id), db: Session = Depends(get_db)
+):
     return contacts_service.list_contacts(db, account_id)
 
 
 @router.post("/contacts", response_model=PublicContactResponse, status_code=status.HTTP_201_CREATED)
+@limiter.limit("30/minute")
 def create_contact(
+    request: Request,
     payload: CreateContactRequest,
     account_id: str = Depends(get_api_key_account_id),
     db: Session = Depends(get_db),
@@ -148,7 +171,10 @@ def create_contact(
 
 
 @router.get("/usage", response_model=UsageSummaryResponse)
-def usage_summary(account_id: str = Depends(get_api_key_account_id), db: Session = Depends(get_db)):
+@limiter.limit("60/minute")
+def usage_summary(
+    request: Request, account_id: str = Depends(get_api_key_account_id), db: Session = Depends(get_db)
+):
     """Read-only - this account's current billing period usage against its
     plan limits, the same data the customer-facing Billing page shows.
     No plan-change or payment action is exposed here - see this module's
@@ -157,12 +183,17 @@ def usage_summary(account_id: str = Depends(get_api_key_account_id), db: Session
 
 
 @router.get("/webhooks", response_model=list[WebhookEndpointResponse])
-def list_webhooks(account_id: str = Depends(get_api_key_account_id), db: Session = Depends(get_db)):
+@limiter.limit("60/minute")
+def list_webhooks(
+    request: Request, account_id: str = Depends(get_api_key_account_id), db: Session = Depends(get_db)
+):
     return webhooks_service.list_endpoints(db, account_id)
 
 
 @router.post("/webhooks", response_model=WebhookEndpointCreatedResponse, status_code=status.HTTP_201_CREATED)
+@limiter.limit("10/minute")
 def create_webhook(
+    request: Request,
     payload: CreateWebhookEndpointRequest,
     account_id: str = Depends(get_api_key_account_id),
     db: Session = Depends(get_db),
@@ -183,7 +214,9 @@ def create_webhook(
 
 
 @router.delete("/webhooks/{endpoint_id}", status_code=status.HTTP_204_NO_CONTENT)
+@limiter.limit("10/minute")
 def delete_webhook(
+    request: Request,
     endpoint_id: str,
     account_id: str = Depends(get_api_key_account_id),
     db: Session = Depends(get_db),
@@ -197,7 +230,9 @@ def delete_webhook(
 
 
 @router.get("/webhooks/deliveries", response_model=list[WebhookDeliveryResponse])
+@limiter.limit("60/minute")
 def list_webhook_deliveries(
+    request: Request,
     endpoint_id: str | None = None,
     account_id: str = Depends(get_api_key_account_id),
     db: Session = Depends(get_db),

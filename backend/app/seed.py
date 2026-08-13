@@ -4,6 +4,7 @@ Run with: python -m app.seed
 """
 
 from app.compliance.models import ComplianceRule
+from app.core.config import settings
 from app.core.database import Base, SessionLocal, engine
 from app.numbering.identity import service
 from app.staff import service as staff_service
@@ -65,6 +66,17 @@ def seed_compliance_rules(db):
 
 
 def run():
+    # This seeds demo/staff accounts with hardcoded, checked-into-this-repo
+    # passwords (see below) - fine for a throwaway local dev database, a
+    # standing backdoor superadmin if ever run against a real one. Refuses
+    # to run anywhere DATABASE_URL might plausibly be a real deployment.
+    if settings.environment != "development":
+        raise RuntimeError(
+            f"Refusing to run app.seed with environment={settings.environment!r} - "
+            "this creates hardcoded demo credentials (including a SUPER_ADMIN staff "
+            "account) and must only ever run against a local development database."
+        )
+
     Base.metadata.create_all(bind=engine)
     db = SessionLocal()
     try:

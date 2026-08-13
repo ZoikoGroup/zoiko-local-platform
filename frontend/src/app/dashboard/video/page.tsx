@@ -9,6 +9,7 @@ import {
   joinVideoRoom,
   endVideoRoom,
   startVideoRecording,
+  stopVideoRecording,
   reportCallQuality,
   summarizeVideoSession,
   grantAiProcessingConsent,
@@ -547,6 +548,20 @@ export default function VideoPage() {
     }
   }
 
+  async function handleStopRecording() {
+    if (!token || !roomName) return;
+    setRecordingState("busy");
+    setRecordingError(null);
+    try {
+      await stopVideoRecording(token, roomName);
+      setRecordingState("idle");
+    } catch (err) {
+      setRecordingState("active");
+      const message = err instanceof ApiError || err instanceof Error ? err.message : "Unknown error.";
+      setRecordingError(`Couldn't stop recording: ${message}`);
+    }
+  }
+
   async function handleGrantConsentAndRecord() {
     if (!token) return;
     try {
@@ -1010,6 +1025,14 @@ export default function VideoPage() {
                 className="text-xs font-medium rounded-lg px-3 py-2 bg-slate-800 text-white disabled:opacity-60"
               >
                 {recordingState === "busy" ? "Starting..." : "Record"}
+              </button>
+            )}
+            {recordingState === "active" && (
+              <button
+                onClick={handleStopRecording}
+                className="text-xs font-medium rounded-lg px-3 py-2 bg-red-700 hover:bg-red-600 text-white"
+              >
+                Stop Recording
               </button>
             )}
             <button

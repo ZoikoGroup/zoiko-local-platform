@@ -16,6 +16,7 @@ from app.integrations.telecom.twilio import TelecomError
 from app.integrations.transcription.groq import TranscriptionError
 from app.intelligence import service
 from app.numbering.identity.models import User
+from app.ops.service import KillSwitchTrippedError
 
 router = APIRouter(prefix="/intelligence", tags=["intelligence"])
 
@@ -58,6 +59,8 @@ def summarize_voicemail(
         raise HTTPException(status_code=403, detail=str(e)) from e
     except BillingSuspendedError as e:
         raise HTTPException(status_code=402, detail=str(e)) from e
+    except KillSwitchTrippedError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
     except (TelecomError, TranscriptionError, LLMError) as e:
         raise HTTPException(status_code=502, detail=str(e)) from e
     return _summary_response(record)
@@ -79,6 +82,8 @@ def summarize_call(
         raise HTTPException(status_code=409, detail=str(e)) from e
     except BillingSuspendedError as e:
         raise HTTPException(status_code=402, detail=str(e)) from e
+    except KillSwitchTrippedError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
     except (TelecomError, TranscriptionError, LLMError) as e:
         raise HTTPException(status_code=502, detail=str(e)) from e
     return _summary_response(record)
@@ -100,6 +105,8 @@ def summarize_video_session(
         raise HTTPException(status_code=409, detail=str(e)) from e
     except BillingSuspendedError as e:
         raise HTTPException(status_code=402, detail=str(e)) from e
+    except KillSwitchTrippedError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
     except (StorageError, TranscriptionError, LLMError) as e:
         raise HTTPException(status_code=502, detail=str(e)) from e
     return _summary_response(record)

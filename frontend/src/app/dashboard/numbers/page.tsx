@@ -154,9 +154,9 @@ export default function NumbersPage() {
     const params = new URLSearchParams(window.location.search);
     const checkout = params.get("checkout");
     if (checkout === "success" || checkout === "cancelled") {
-      setCheckoutResult(checkout);
       window.history.replaceState({}, "", window.location.pathname);
       if (checkout === "success") loadMyNumbers();
+      Promise.resolve().then(() => setCheckoutResult(checkout));
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);

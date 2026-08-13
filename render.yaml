@@ -4,18 +4,31 @@
 #
 # One-time setup:
 #   1. Render dashboard -> New -> Blueprint -> connect this repo.
-#   2. Render reads this file and creates the service below.
+#   2. Render reads this file and creates both services below.
 #   3. Fill in every env var below marked `sync: false` in the dashboard -
 #      Render intentionally does not store secret values in this file.
-#   4. Run `alembic upgrade head` once against the target DATABASE_URL
-#      (Render's Shell tab on the service, or from your own machine) -
-#      migrations are not run automatically on deploy.
+#   4. Migrations run automatically on every deploy - backend/Dockerfile's
+#      CMD runs `alembic upgrade head` before starting uvicorn. Fine at
+#      numInstances=1 (this blueprint's default); there's no distributed
+#      locking, so don't scale past one instance without moving this to a
+#      real release-phase step first (see the Dockerfile's own comment).
 #
 # The frontend deploys separately to Vercel (not Render) - see frontend/
 # README or CLAUDE.md for that side; only NEXT_PUBLIC_API_BASE_URL needs to
 # point at this service's Render URL once it's live.
 
 services:
+  # Shared rate-limit counter store (backend/app/core/rate_limit.py) - the
+  # backend runs WEB_CONCURRENCY=4 uvicorn workers, and without a shared
+  # store each one counts rate-limit hits independently (see
+  # startup_checks.py / this session's rate-limit fix). Not exposed to the
+  # public internet - only the backend service (same private network) needs
+  # to reach it, so ipAllowList stays empty.
+  - type: keyvalue
+    name: zoiko-local-redis
+    plan: starter
+    ipAllowList: []
+
   - type: web
     name: zoiko-local-api
     runtime: docker
@@ -25,6 +38,11 @@ services:
     region: oregon
     healthCheckPath: /health
     envVars:
+      - key: REDIS_URL
+        fromService:
+          name: zoiko-local-redis
+          type: keyvalue
+          property: connectionString
       # Core
       - key: ENVIRONMENT
         value: production
@@ -135,3 +153,27 @@ services:
         value: "false"
       - key: WEBPUSH_FAILOVER_ENABLED
         value: "false"
+
+  # Commercial Billing Operating Standard doc §31 "daily and period-close
+  # reconciliation" - runs app.ops.scheduled_reconciliation (see its module
+  # docstring) once a day. Same image as zoiko-local-api (built once,
+  # reused here with a different startCommand) rather than a separate
+  # always-on process - only DATABASE_URL is needed since this script only
+  # compares Zoiko Local's own DB state, never calls out to ZoikoNex/
+  # Twilio/etc. Not in-process (no APScheduler) deliberately: the web
+  # service runs WEB_CONCURRENCY=4 workers, which would otherwise run this
+  # job 4x every trigger with no leader election.
+  - type: cron
+    name: zoiko-local-daily-reconciliation
+    runtime: docker
+    dockerfilePath: ./backend/Dockerfile
+    dockerContext: ./backend
+    plan: starter
+    region: oregon
+    schedule: "0 6 * * *" # daily 06:00 UTC
+    dockerCommand: python -m app.ops.scheduled_reconciliation
+    envVars:
+      - key: ENVIRONMENT
+        value: production
+      - key: DATABASE_URL
+        sync: false # same real Neon connection string as zoiko-local-api above

@@ -41,6 +41,8 @@ def create_request(
             carrier_account_number=payload.carrier_account_number,
             billing_name=payload.billing_name,
             billing_address=payload.billing_address,
+            authorization_evidence_url=payload.authorization_evidence_url,
+            target_completion_date=payload.target_completion_date,
         )
     except service.PortingRequestConflictError as e:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e

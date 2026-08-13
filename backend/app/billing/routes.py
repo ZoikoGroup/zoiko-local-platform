@@ -4,20 +4,19 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.orm import Session
 
 from app.billing import service
+from app.billing.models import BillingActionRequestStatus, BillingActionType
 from app.billing.schemas import (
+    BillingActionRequestResponse,
     ChangePlanRequest,
     CreatePriceCatalogEntryRequest,
-    CreditNoteResponse,
-    DebitNoteResponse,
     IssueCreditNoteRequest,
     IssueDebitNoteRequest,
     PlanResponse,
     PriceCatalogEntryResponse,
     RefundPaymentRequest,
-    RefundResponse,
+    RejectBillingActionRequest,
     ResolveReconciliationExceptionRequest,
     RunBillingCycleRequest,
-    RunBillingCycleResponse,
     SimulatePaymentEventRequest,
     SubscriptionResponse,
     UsageSummaryResponse,
@@ -30,6 +29,7 @@ from app.core.database import get_db
 from app.core.deps import get_current_staff, get_current_user, require_admin, require_capability
 from app.integrations.billing import zoikonex as zoikonex_adapter
 from app.numbering.identity.models import User
+from app.ops.service import KillSwitchTrippedError
 from app.staff.models import PlatformStaff
 
 router = APIRouter(prefix="/billing", tags=["billing"])
@@ -265,76 +265,126 @@ def resolve_zoikonex_reconciliation_exception(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
 
 
-@router.post("/zoikonex/run-billing-cycle", response_model=RunBillingCycleResponse)
-def run_billing_cycle(
+@router.post("/zoikonex/run-billing-cycle/request", response_model=BillingActionRequestResponse, status_code=201)
+def request_run_billing_cycle(
     payload: RunBillingCycleRequest,
     db: Session = Depends(get_db),
     staff: PlatformStaff = Depends(require_capability("billing.run_billing_cycle")),
 ):
-    """SUPER_ADMIN only - drives a real rating -> invoice -> payment cycle
+    """SUPER_ADMIN only - stages a real rating -> invoice -> payment cycle
     against ZoikoNex for one account, priced from PriceCatalogEntry (see
     that model's docstring - may still be a placeholder, not a real
-    decided price). Same segregation-of-duties bar as simulate_payment_event
-    above, since this creates real ZoikoNex invoices and payment intents,
-    even when the amount is a placeholder."""
+    decided price), for a *different* staff member to approve via POST
+    /billing/actions/{id}/approve - see BillingActionRequest's docstring
+    for why this is no longer a single-staff action."""
+    return service.request_billing_action(
+        db, action_type=BillingActionType.RUN_BILLING_CYCLE,
+        payload=payload.model_dump(), requested_by=staff.id,
+    )
+
+
+@router.post("/zoikonex/credit-notes/request", response_model=BillingActionRequestResponse, status_code=201)
+def request_issue_credit_note(
+    payload: IssueCreditNoteRequest,
+    db: Session = Depends(get_db),
+    staff: PlatformStaff = Depends(require_capability("billing.issue_credit_note")),
+):
+    """SUPER_ADMIN only - stages a correction to an over-billed ISSUED
+    invoice for a different staff member to approve."""
+    return service.request_billing_action(
+        db, action_type=BillingActionType.CREDIT_NOTE,
+        payload=payload.model_dump(), requested_by=staff.id,
+    )
+
+
+@router.post("/zoikonex/debit-notes/request", response_model=BillingActionRequestResponse, status_code=201)
+def request_issue_debit_note(
+    payload: IssueDebitNoteRequest,
+    db: Session = Depends(get_db),
+    staff: PlatformStaff = Depends(require_capability("billing.issue_debit_note")),
+):
+    """SUPER_ADMIN only - stages a correction to an under-billed ISSUED
+    invoice for a different staff member to approve."""
+    return service.request_billing_action(
+        db, action_type=BillingActionType.DEBIT_NOTE,
+        payload=payload.model_dump(), requested_by=staff.id,
+    )
+
+
+@router.post("/zoikonex/refunds/request", response_model=BillingActionRequestResponse, status_code=201)
+def request_refund_payment(
+    payload: RefundPaymentRequest,
+    db: Session = Depends(get_db),
+    staff: PlatformStaff = Depends(require_capability("billing.refund_payment")),
+):
+    """SUPER_ADMIN only - stages a refund of a CAPTURED ZoikoNex payment
+    for a different staff member to approve. Currently always fails on
+    approval against a real ZoikoNex-side error (capture itself is broken
+    there - see app.integrations.billing.zoikonex's docstring), not a bug
+    here - see refund_zoikonex_payment's docstring."""
+    return service.request_billing_action(
+        db, action_type=BillingActionType.REFUND,
+        payload=payload.model_dump(), requested_by=staff.id,
+    )
+
+
+@router.get("/actions", response_model=list[BillingActionRequestResponse])
+def list_billing_actions(
+    request_status: str | None = None,
+    db: Session = Depends(get_db),
+    _staff: PlatformStaff = Depends(get_current_staff),
+):
+    """Any staff role can view the queue (diagnostic, same posture as other
+    review-queue list endpoints in this codebase); approving/rejecting one
+    is the sensitive action, gated below."""
+    status_filter = BillingActionRequestStatus(request_status) if request_status else None
+    return service.list_billing_action_requests(db, status=status_filter)
+
+
+@router.post("/actions/{action_id}/approve", response_model=BillingActionRequestResponse)
+def approve_billing_action(
+    action_id: str,
+    db: Session = Depends(get_db),
+    staff: PlatformStaff = Depends(require_capability("billing.approve_billing_action")),
+):
+    """SUPER_ADMIN only, AND must be a different staff member than
+    whoever requested the action (see approve_billing_action's docstring
+    in the service layer) - the actual maker-checker enforcement. Executes
+    the real ZoikoNex call using the exact payload that was staged."""
     try:
-        return service.run_billing_cycle(db, payload.account_id, actor=staff.id)
+        return service.approve_billing_action(db, action_id, actor=staff.id)
+    except service.BillingActionRequestNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
+    except service.BillingActionAlreadyResolvedError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e
+    except service.SelfApprovalNotAllowedError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e)) from e
     except service.NonCommercialAccountError as e:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e)) from e
     except service.ZoikoNexBillingCycleError as e:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(e)) from e
     except zoikonex_adapter.ZoikoNexError as e:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(e)) from e
+    except KillSwitchTrippedError as e:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e)) from e
+    except service.TestAccountRestrictedError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e)) from e
 
 
-@router.post("/zoikonex/credit-notes", response_model=CreditNoteResponse)
-def issue_credit_note(
-    payload: IssueCreditNoteRequest,
+@router.post("/actions/{action_id}/reject", response_model=BillingActionRequestResponse)
+def reject_billing_action(
+    action_id: str,
+    payload: RejectBillingActionRequest,
     db: Session = Depends(get_db),
-    staff: PlatformStaff = Depends(require_capability("billing.issue_credit_note")),
+    staff: PlatformStaff = Depends(require_capability("billing.approve_billing_action")),
 ):
-    """SUPER_ADMIN only - corrects an over-billed ISSUED invoice. Same
-    segregation-of-duties bar as run_billing_cycle - a real, money-adjacent
-    ZoikoNex write."""
+    """Same dual-control bar as approve - a different staff member must
+    review it, even to reject."""
     try:
-        return service.issue_invoice_credit_note(
-            db, payload.account_id, payload.invoice_id,
-            amount_minor_units=payload.amount_minor_units, reason=payload.reason, actor=staff.id,
-        )
-    except zoikonex_adapter.ZoikoNexError as e:
-        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(e)) from e
-
-
-@router.post("/zoikonex/debit-notes", response_model=DebitNoteResponse)
-def issue_debit_note(
-    payload: IssueDebitNoteRequest,
-    db: Session = Depends(get_db),
-    staff: PlatformStaff = Depends(require_capability("billing.issue_debit_note")),
-):
-    """SUPER_ADMIN only - corrects an under-billed ISSUED invoice."""
-    try:
-        return service.issue_invoice_debit_note(
-            db, payload.account_id, payload.invoice_id,
-            amount_minor_units=payload.amount_minor_units, reason=payload.reason, actor=staff.id,
-        )
-    except zoikonex_adapter.ZoikoNexError as e:
-        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(e)) from e
-
-
-@router.post("/zoikonex/refunds", response_model=RefundResponse)
-def refund_payment(
-    payload: RefundPaymentRequest,
-    db: Session = Depends(get_db),
-    staff: PlatformStaff = Depends(require_capability("billing.refund_payment")),
-):
-    """SUPER_ADMIN only - refunds a CAPTURED ZoikoNex payment. Currently
-    always fails against a real ZoikoNex-side error (capture itself is
-    broken there - see app.integrations.billing.zoikonex's docstring), not
-    a bug in this endpoint - see refund_zoikonex_payment's docstring."""
-    try:
-        return service.refund_zoikonex_payment(
-            db, payload.account_id, payload.payment_intent_id,
-            amount_minor_units=payload.amount_minor_units, reason=payload.reason, actor=staff.id,
-        )
-    except zoikonex_adapter.ZoikoNexError as e:
-        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(e)) from e
+        return service.reject_billing_action(db, action_id, actor=staff.id, reason=payload.reason)
+    except service.BillingActionRequestNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
+    except service.BillingActionAlreadyResolvedError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e
+    except service.SelfApprovalNotAllowedError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e)) from e

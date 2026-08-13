@@ -1,7 +1,7 @@
 import enum
-from datetime import datetime
+from datetime import date, datetime
 
-from sqlalchemy import DateTime, Enum, ForeignKey, String, Text, func
+from sqlalchemy import Date, DateTime, Enum, ForeignKey, String, Text, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -43,6 +43,18 @@ class PortingRequest(Base):
     carrier_account_number: Mapped[str] = mapped_column(String(100), nullable=False)
     billing_name: Mapped[str] = mapped_column(String(255), nullable=False)
     billing_address: Mapped[str] = mapped_column(Text, nullable=False)
+    # Commercial Billing Operating Standard doc §I1 - "port_case stores
+    # authorization... evidence." An object-storage reference (see
+    # app.integrations.storage - reused, not a new upload pipeline) to a
+    # customer-supplied LOA-equivalent document. Optional: this codebase's
+    # port-in is still a staff-mediated manual hand-off (see this class's
+    # own docstring above), so submission isn't blocked on it, but staff
+    # reviewing the request can now see it was actually provided.
+    authorization_evidence_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    # §I1 "target date" - customer-requested completion date, recorded but
+    # not enforced against a real carrier (there's no real port-out
+    # automation to enforce it against - see this class's docstring).
+    target_completion_date: Mapped[date | None] = mapped_column(Date, nullable=True)
     status: Mapped[PortingRequestStatus] = mapped_column(
         Enum(PortingRequestStatus, name="porting_request_status_enum"),
         nullable=False,

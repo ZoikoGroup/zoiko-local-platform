@@ -185,3 +185,22 @@ class ZoikoNexReconciliationExceptionResponse(BaseModel):
 
 class ResolveReconciliationExceptionRequest(BaseModel):
     reason: str
+
+
+class BillingActionRequestResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    action_type: str
+    payload: dict
+    requested_by: str
+    status: str
+    approved_by: str | None
+    rejection_reason: str | None
+    result: dict | None
+    resolved_at: datetime | None
+    created_at: datetime
+
+
+class RejectBillingActionRequest(BaseModel):
+    reason: str | None = None

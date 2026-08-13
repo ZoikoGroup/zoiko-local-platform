@@ -1,9 +1,11 @@
 import time
+from datetime import datetime, timezone
 
 import sqlalchemy as sa
 from sqlalchemy.orm import Session
 from twilio.request_validator import RequestValidator
 
+from app.audit.service import log_event
 from app.core.config import settings
 from app.integrations.billing import stripe_checkout
 from app.integrations.embeddings import cohere as cohere_embeddings
@@ -19,7 +21,7 @@ from app.notifications.service import (
     notify_incident_update,
     notify_status_subscription_confirmed,
 )
-from app.ops.models import Incident, IncidentStatus, StatusSubscription, SyntheticCheckRun
+from app.ops.models import Incident, IncidentStatus, KillSwitchScope, PlatformKillSwitch, StatusSubscription, SyntheticCheckRun
 
 # Maps a provider-status entry name to the (circuit_state accessor,
 # failover_enabled setting) of the category it belongs to - only providers
@@ -316,3 +318,52 @@ def unsubscribe_from_status(db: Session, account_id: str) -> None:
 
 def get_status_subscription(db: Session, account_id: str) -> StatusSubscription | None:
     return db.query(StatusSubscription).filter(StatusSubscription.account_id == account_id).first()
+
+
+class KillSwitchTrippedError(Exception):
+    """Raised by assert_kill_switch_not_active - a staff member has
+    manually halted new activity in this scope (Commercial Billing
+    Operating Standard doc §32.1)."""
+
+
+def list_kill_switches(db: Session) -> list[PlatformKillSwitch]:
+    return db.query(PlatformKillSwitch).order_by(PlatformKillSwitch.scope.asc()).all()
+
+
+def set_kill_switch(
+    db: Session, scope: KillSwitchScope, is_active: bool, *, actor: str, reason: str | None = None
+) -> PlatformKillSwitch:
+    """Upserts the one row for this scope - see PlatformKillSwitch's
+    docstring for why this is an upsert, not an appended history row."""
+    switch = db.query(PlatformKillSwitch).filter(PlatformKillSwitch.scope == scope).first()
+    now = datetime.now(timezone.utc)
+    if switch is None:
+        switch = PlatformKillSwitch(scope=scope)
+        db.add(switch)
+    switch.is_active = is_active
+    switch.reason = reason
+    if is_active:
+        switch.activated_by = actor
+        switch.activated_at = now
+        switch.deactivated_at = None
+    else:
+        switch.deactivated_at = now
+    db.commit()
+    db.refresh(switch)
+    log_event(
+        db, actor=actor, action="ops.kill_switch_activated" if is_active else "ops.kill_switch_deactivated",
+        target=f"kill_switch:{scope.value}", after={"reason": reason},
+    )
+    return switch
+
+
+def assert_kill_switch_not_active(db: Session, scope: KillSwitchScope) -> None:
+    """Call at the start of any action this scope is meant to halt (number
+    provisioning, outbound calling, AI processing, payments/billing) -
+    raises before any side effect if a staff member has tripped it."""
+    switch = db.query(PlatformKillSwitch).filter(PlatformKillSwitch.scope == scope).first()
+    if switch is not None and switch.is_active:
+        raise KillSwitchTrippedError(
+            f"{scope.value} is currently halted by an active kill switch"
+            + (f": {switch.reason}" if switch.reason else "")
+        )

@@ -1,11 +1,14 @@
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import sqlalchemy as sa
 from sqlalchemy.orm import Session
 
 from app.audit.service import log_event
 from app.billing.models import (
+    BillingActionRequest,
+    BillingActionRequestStatus,
+    BillingActionType,
     CatalogEntryStatus,
     Plan,
     PriceCatalogEntry,
@@ -28,6 +31,8 @@ from app.notifications.service import (
     notify_service_restored,
     notify_trial_started,
 )
+from app.ops.models import KillSwitchScope
+from app.ops.service import assert_kill_switch_not_active
 
 DEFAULT_PLAN_CODE = "free_trial"
 _PERIOD_LENGTH = timedelta(days=30)
@@ -426,6 +431,25 @@ class BillingSuspendedError(Exception):
     calling, video, new purchases, and AI features may pause after dunning
     thresholds. Deliberately never raised for inbound calls or existing
     number ownership - see assert_billing_not_suspended's docstring."""
+
+
+class TestAccountRestrictedError(Exception):
+    """Raised when an account flagged is_test attempts a real-money
+    ZoikoNex action (Commercial Billing Operating Standard doc §14/§T) -
+    see app.numbering.identity.models.Account.is_test's docstring. A
+    separate class from app.numbering.numbers.service's identically-named
+    error (same concept, but importing across that pair would be
+    circular - numbering already imports this module)."""
+
+
+def _assert_not_test_account(db: Session, account_id: str) -> None:
+    from app.numbering.identity.models import Account
+
+    account = db.query(Account).filter(Account.id == account_id).first()
+    if account is not None and account.is_test:
+        raise TestAccountRestrictedError(
+            f"Account {account_id} is flagged is_test and cannot be billed for real"
+        )
 
 
 _PAYMENT_EVENT_TYPES = {"payment_failed", "payment_retry", "payment_restored"}
@@ -976,6 +1000,12 @@ def run_billing_cycle(db: Session, account_id: str, *, actor: str) -> dict:
     a live ZoikoNex charge, and an account meant to be billed through a
     bundle/partner/legacy path must never ALSO get charged directly here.
     """
+    # Commercial Billing Operating Standard doc §32.1 - checked before any
+    # ZoikoNex call, whether this is invoked directly or via
+    # approve_billing_action's staged execution.
+    assert_kill_switch_not_active(db, KillSwitchScope.PAYMENTS_BILLING)
+    _assert_not_test_account(db, account_id)
+
     sub = get_or_create_subscription(db, account_id)
     plan = get_plan(db, sub.plan_code)
     catalog_entry = get_active_price_catalog_entry(db, plan.plan_code)
@@ -1115,6 +1145,8 @@ def issue_invoice_credit_note(
     keys, a fresh UUID here since a real operator issuing two separate
     credit notes against the same invoice for two different reasons is a
     legitimate scenario, not a retry."""
+    assert_kill_switch_not_active(db, KillSwitchScope.PAYMENTS_BILLING)
+    _assert_not_test_account(db, account_id)
     result = zoikonex_adapter.create_credit_note(
         invoice_id, reason_code="CUSTOMER_REQUEST", amount_minor_units=amount_minor_units,
         reason_description=reason, idempotency_key=str(uuid.uuid4()),
@@ -1139,6 +1171,8 @@ def issue_invoice_debit_note(
 ) -> dict:
     """Corrects an under-billed ISSUED invoice - see
     issue_invoice_credit_note's docstring for the same rationale."""
+    assert_kill_switch_not_active(db, KillSwitchScope.PAYMENTS_BILLING)
+    _assert_not_test_account(db, account_id)
     result = zoikonex_adapter.create_debit_note(
         invoice_id, reason_code="UNDERBILLED", amount_minor_units=amount_minor_units,
         idempotency_key=str(uuid.uuid4()),
@@ -1168,6 +1202,8 @@ def refund_zoikonex_payment(
     against any payment intent in this environment correctly fails with
     ZoikoNexError (409 STATE_CONFLICT, "illegal payment state transition")
     rather than succeeding - confirmed live, not a bug in this function."""
+    assert_kill_switch_not_active(db, KillSwitchScope.PAYMENTS_BILLING)
+    _assert_not_test_account(db, account_id)
     result = zoikonex_adapter.create_refund(
         payment_intent_id, refund_amount_minor_units=amount_minor_units,
         reason_code="CUSTOMER_REQUEST", idempotency_key=str(uuid.uuid4()),
@@ -1226,3 +1262,130 @@ def get_usage_summary(db: Session, account_id: str) -> dict:
             {"resource": "ai_summaries", "used": int(ai_summaries_used), "limit": plan.monthly_ai_summaries},
         ],
     }
+
+
+class BillingActionRequestNotFoundError(Exception):
+    """Raised when acting on a billing_action_requests row that doesn't exist."""
+
+
+class BillingActionAlreadyResolvedError(Exception):
+    """Raised when approving/rejecting a request that isn't PENDING anymore."""
+
+
+class SelfApprovalNotAllowedError(Exception):
+    """Commercial Billing Operating Standard doc §26 - "Approver... cannot
+    self-approve where policy applies." Raised when the staff member
+    approving a BillingActionRequest is the same one who requested it."""
+
+
+def request_billing_action(
+    db: Session, *, action_type: BillingActionType, payload: dict, requested_by: str
+) -> BillingActionRequest:
+    """Stages a credit note / debit note / refund / run-billing-cycle
+    action instead of executing it immediately - see BillingActionRequest's
+    docstring. Does not touch ZoikoNex at all; only approve_billing_action
+    (by a *different* staff member) does."""
+    request = BillingActionRequest(
+        action_type=action_type, payload=payload, requested_by=requested_by,
+    )
+    db.add(request)
+    db.commit()
+    db.refresh(request)
+    log_event(
+        db, actor=requested_by, action="billing.action_requested",
+        target=f"billing_action_request:{request.id}",
+        after={"action_type": action_type.value, "payload": payload},
+    )
+    return request
+
+
+def list_billing_action_requests(
+    db: Session, *, status: BillingActionRequestStatus | None = None
+) -> list[BillingActionRequest]:
+    query = db.query(BillingActionRequest)
+    if status is not None:
+        query = query.filter(BillingActionRequest.status == status)
+    return query.order_by(BillingActionRequest.created_at.desc()).all()
+
+
+def _execute_billing_action(db: Session, request: BillingActionRequest, *, actor: str) -> dict:
+    """Replays the staged payload through the real service function for
+    request.action_type - the approver authorizes exactly what was
+    requested (see BillingActionRequest.payload's docstring), never a
+    re-typed summary of it."""
+    payload = request.payload
+    if request.action_type == BillingActionType.RUN_BILLING_CYCLE:
+        return run_billing_cycle(db, payload["account_id"], actor=actor)
+    if request.action_type == BillingActionType.CREDIT_NOTE:
+        return issue_invoice_credit_note(
+            db, payload["account_id"], payload["invoice_id"],
+            amount_minor_units=payload["amount_minor_units"], reason=payload["reason"], actor=actor,
+        )
+    if request.action_type == BillingActionType.DEBIT_NOTE:
+        return issue_invoice_debit_note(
+            db, payload["account_id"], payload["invoice_id"],
+            amount_minor_units=payload["amount_minor_units"], reason=payload["reason"], actor=actor,
+        )
+    if request.action_type == BillingActionType.REFUND:
+        return refund_zoikonex_payment(
+            db, payload["account_id"], payload["payment_intent_id"],
+            amount_minor_units=payload["amount_minor_units"], reason=payload["reason"], actor=actor,
+        )
+    raise ValueError(f"Unhandled BillingActionType: {request.action_type}")  # pragma: no cover - exhaustive above
+
+
+def approve_billing_action(db: Session, request_id: str, *, actor: str) -> BillingActionRequest:
+    request = db.query(BillingActionRequest).filter(BillingActionRequest.id == request_id).with_for_update().first()
+    if request is None:
+        raise BillingActionRequestNotFoundError(f"Billing action request {request_id} not found")
+    if request.status != BillingActionRequestStatus.PENDING:
+        raise BillingActionAlreadyResolvedError(f"Billing action request {request_id} is already {request.status.value}")
+    if actor == request.requested_by:
+        raise SelfApprovalNotAllowedError(
+            "The staff member who requested this action cannot also approve it - a different staff "
+            "member must approve"
+        )
+
+    # Execute first, mark EXECUTED only once the real ZoikoNex call actually
+    # succeeds - an exception from _execute_billing_action propagates and
+    # this request stays PENDING (not silently marked done) for retry.
+    result = _execute_billing_action(db, request, actor=actor)
+
+    request.status = BillingActionRequestStatus.EXECUTED
+    request.approved_by = actor
+    request.result = result
+    request.resolved_at = datetime.now(timezone.utc)
+    db.commit()
+    db.refresh(request)
+    log_event(
+        db, actor=actor, action="billing.action_approved",
+        target=f"billing_action_request:{request.id}",
+        after={"action_type": request.action_type.value, "result": result},
+    )
+    return request
+
+
+def reject_billing_action(db: Session, request_id: str, *, actor: str, reason: str | None = None) -> BillingActionRequest:
+    request = db.query(BillingActionRequest).filter(BillingActionRequest.id == request_id).with_for_update().first()
+    if request is None:
+        raise BillingActionRequestNotFoundError(f"Billing action request {request_id} not found")
+    if request.status != BillingActionRequestStatus.PENDING:
+        raise BillingActionAlreadyResolvedError(f"Billing action request {request_id} is already {request.status.value}")
+    if actor == request.requested_by:
+        raise SelfApprovalNotAllowedError(
+            "The staff member who requested this action cannot also reject it - a different staff "
+            "member must review it"
+        )
+
+    request.status = BillingActionRequestStatus.REJECTED
+    request.approved_by = actor
+    request.rejection_reason = reason
+    request.resolved_at = datetime.now(timezone.utc)
+    db.commit()
+    db.refresh(request)
+    log_event(
+        db, actor=actor, action="billing.action_rejected",
+        target=f"billing_action_request:{request.id}",
+        after={"action_type": request.action_type.value, "reason": reason},
+    )
+    return request

@@ -47,13 +47,30 @@ def grant_consent(
 
     if consent_type == ConsentType.EMERGENCY_CALLING_ACKNOWLEDGED:
         from app.numbering.identity.models import User, UserRole
+        from app.numbering.numbers.models import SupportedCountry
 
         owner = db.query(User).filter(User.account_id == account_id, User.role == UserRole.OWNER).first()
         if owner is not None:
             resource_summary = "your account" if jurisdiction == GLOBAL_JURISDICTION else f"numbers in {jurisdiction}"
+            # Commercial Billing Operating Standard doc §10/§34 - the
+            # disclosure text must reflect this specific market's verified
+            # capability, not one generic sentence for every country. A
+            # GLOBAL grant (no single country known yet) keeps the
+            # conservative "not guaranteed" wording.
+            country = (
+                db.query(SupportedCountry).filter(SupportedCountry.code == jurisdiction).first()
+                if jurisdiction != GLOBAL_JURISDICTION
+                else None
+            )
+            if country is not None and country.emergency_calling_supported:
+                capability_status = "acknowledged - available where technically supported, not guaranteed"
+            elif country is not None:
+                capability_status = f"acknowledged - NOT currently supported in {jurisdiction}; do not rely on this service for emergency calls there"
+            else:
+                capability_status = "acknowledged - available where technically supported, not guaranteed"
             notify_emergency_calling_notice(
                 db, account_id=account_id, account_email=owner.email, resource_summary=resource_summary,
-                capability_status="acknowledged - available where technically supported, not guaranteed",
+                capability_status=capability_status,
             )
 
     return record

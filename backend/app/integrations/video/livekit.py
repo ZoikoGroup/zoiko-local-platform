@@ -56,7 +56,11 @@ async def health_check() -> dict:
         return {"configured": True, "ok": False, "detail": str(e)}
 
 
-async def create_room(room_name: str) -> dict:
+async def create_room(room_name: str, max_participants: int = MAX_PARTICIPANTS) -> dict:
+    """max_participants defaults to the platform-wide ceiling but should
+    normally be the caller's actual billing-plan limit (see
+    media.service.create_video_session) - a "larger meetings" plan and a
+    Phase 1 starter plan shouldn't get the same room capacity."""
     async def _primary() -> dict:
         # _client() itself raises (a plain ValueError, not TwirpError) when
         # LIVEKIT_URL/KEY/SECRET aren't configured - guarded separately so
@@ -70,7 +74,7 @@ async def create_room(room_name: str) -> dict:
         try:
             with trace_provider_call("livekit", "create_room"):
                 room = await client.room.create_room(
-                    livekit_api.CreateRoomRequest(name=room_name, max_participants=MAX_PARTICIPANTS)
+                    livekit_api.CreateRoomRequest(name=room_name, max_participants=max_participants)
                 )
         except livekit_api.TwirpError as e:
             raise VideoError(str(e)) from e
@@ -78,7 +82,9 @@ async def create_room(room_name: str) -> dict:
             await client.aclose()
         return {"name": room.name, "sid": room.sid}
 
-    secondary_fn = (lambda: secondary.create_room(room_name)) if settings.video_failover_enabled else None
+    secondary_fn = (
+        (lambda: secondary.create_room(room_name, max_participants)) if settings.video_failover_enabled else None
+    )
     return await with_failover_async(_breaker, _primary, secondary_fn, VideoError)
 
 

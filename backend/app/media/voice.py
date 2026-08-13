@@ -18,6 +18,7 @@ from app.billing.service import BillingSuspendedError
 from app.core.database import get_db
 from app.core.deps import get_current_user, require_writer
 from app.integrations.telecom import twilio as telecom
+from app.ops.service import KillSwitchTrippedError
 from app.integrations.telecom.twilio import TelecomError
 from app.media import service as media_service
 from app.media.models import CallDirection
@@ -252,6 +253,8 @@ async def outbound_call(
         raise HTTPException(status_code=429, detail=str(e)) from e
     except risk_service.SpendLimitExceededError as e:
         raise HTTPException(status_code=429, detail=str(e)) from e
+    except KillSwitchTrippedError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
     except TelecomError as e:
         raise HTTPException(status_code=502, detail=str(e)) from e
 

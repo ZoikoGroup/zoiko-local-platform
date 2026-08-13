@@ -117,12 +117,14 @@ class SupportedCountryResponse(BaseModel):
 
     code: str
     name: str
+    emergency_calling_supported: bool
 
 
 class UpsertSupportedCountryRequest(BaseModel):
     code: str
     name: str
     sort_order: int = 0
+    emergency_calling_supported: bool = False
 
 
 class NumberEligibilityRuleResponse(BaseModel):
