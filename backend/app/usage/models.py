@@ -1,6 +1,7 @@
+import enum
 from datetime import datetime
 
-from sqlalchemy import DateTime, ForeignKey, Integer, Numeric, String, func
+from sqlalchemy import DateTime, Enum, ForeignKey, Integer, Numeric, String, Text, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -91,3 +92,69 @@ class UsageEvent(Base):
     rated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     idempotency_key: Mapped[str] = mapped_column(String(255), unique=True, nullable=False, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class UsageDisputeStatus(str, enum.Enum):
+    OPEN = "open"
+    INVESTIGATING = "investigating"
+    RESOLVED_ADJUSTED = "resolved_adjusted"
+    RESOLVED_DENIED = "resolved_denied"
+
+
+class UsageDispute(Base):
+    """Commercial Billing Operating Standard doc §L1/E6 - "billing
+    corrections have no structured, append-only audit trail" was the gap:
+    before this, a customer disputing a charge had nowhere to raise it and
+    staff had no record of the conversation, only whatever ad hoc note
+    (if any) ended up in a support ticket outside this codebase. One
+    dispute per usage_event_id isn't enforced (a customer could
+    conceivably raise a second one after a denial), but resolving one
+    requires it be OPEN/INVESTIGATING first - see resolve_usage_dispute."""
+
+    __tablename__ = "usage_disputes"
+
+    id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=new_uuid)
+    account_id: Mapped[str] = mapped_column(
+        UUID(as_uuid=False), ForeignKey("accounts.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    usage_event_id: Mapped[str] = mapped_column(
+        UUID(as_uuid=False), ForeignKey("usage_events.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[UsageDisputeStatus] = mapped_column(
+        Enum(UsageDisputeStatus, name="usage_dispute_status_enum"), nullable=False, default=UsageDisputeStatus.OPEN
+    )
+    raised_by: Mapped[str] = mapped_column(String(100), nullable=False)
+    resolved_by: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    resolution_notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class UsageAdjustment(Base):
+    """Append-only correction ledger - the actual mechanism §L1/E6 asks
+    for. app.usage.service.create_usage_adjustment is the ONLY code path
+    allowed to change UsageEvent.estimated_cost_cents after creation, and
+    it always writes one of these rows in the same transaction - the
+    value is never bare-UPDATEd elsewhere. Rows here are never edited or
+    deleted once created (a further correction is a NEW row, same Class A
+    discipline as PriceCatalogEntry/ZoikoNex PriceRule), so the full
+    history of every change to a usage event's billed cost is always
+    reconstructable. dispute_id is nullable - staff can proactively
+    correct a metering bug without a customer having raised a dispute
+    first."""
+
+    __tablename__ = "usage_adjustments"
+
+    id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=new_uuid)
+    usage_event_id: Mapped[str] = mapped_column(
+        UUID(as_uuid=False), ForeignKey("usage_events.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    dispute_id: Mapped[str | None] = mapped_column(
+        UUID(as_uuid=False), ForeignKey("usage_disputes.id", ondelete="SET NULL"), nullable=True
+    )
+    previous_estimated_cost_cents: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    new_estimated_cost_cents: Mapped[int] = mapped_column(Integer, nullable=False)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    actor: Mapped[str] = mapped_column(String(100), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
