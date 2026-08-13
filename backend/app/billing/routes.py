@@ -8,6 +8,7 @@ from app.billing.models import BillingActionRequestStatus, BillingActionType
 from app.billing.schemas import (
     ApprovePriceCatalogEntryRequest,
     BillingActionRequestResponse,
+    CancelSubscriptionRequest,
     ChangePlanRequest,
     CreatePriceCatalogEntryRequest,
     IssueCreditNoteRequest,
@@ -122,6 +123,22 @@ def change_plan(
         return service.change_plan(db, current_user.account_id, payload.plan_code, actor=current_user.id)
     except service.PlanNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
+
+
+@router.post("/subscription/cancel", response_model=SubscriptionResponse)
+def cancel_subscription(
+    payload: CancelSubscriptionRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin),
+):
+    """Owner/Admin only, matching change_plan above - the account's own
+    decision about its own subscription, not one of the 4 staff maker-
+    checker money-moving actions elsewhere in this file. Immediate, not
+    "at period end" - see service.cancel_subscription's docstring."""
+    try:
+        return service.cancel_subscription(db, current_user.account_id, actor=current_user.id, reason=payload.reason)
+    except service.SubscriptionAlreadyCanceledError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e
 
 
 @router.get("/usage-summary", response_model=UsageSummaryResponse)

@@ -228,6 +228,123 @@ def test_usage_summary_route_requires_auth(client):
     assert response.status_code == 401
 
 
+# --- Cancellation ---
+
+
+def test_cancel_subscription_sets_canceled_status_and_timestamp(db_session):
+    account = Account(name="Cancel Sub Co", account_type=AccountType.INDIVIDUAL)
+    db_session.add(account)
+    db_session.flush()
+    service.change_plan(db_session, account.id, "business", actor="test-actor")
+
+    sub = service.cancel_subscription(db_session, account.id, actor="test-actor", reason="too expensive")
+    assert sub.status == SubscriptionStatus.CANCELED
+    assert sub.canceled_at is not None
+
+
+def test_cancel_subscription_rejects_a_second_cancellation(db_session):
+    account = Account(name="Double Cancel Co", account_type=AccountType.INDIVIDUAL)
+    db_session.add(account)
+    db_session.flush()
+    service.cancel_subscription(db_session, account.id, actor="test-actor")
+
+    try:
+        service.cancel_subscription(db_session, account.id, actor="test-actor")
+        assert False, "expected SubscriptionAlreadyCanceledError"
+    except service.SubscriptionAlreadyCanceledError:
+        pass
+
+
+def test_assert_billing_not_suspended_blocks_a_canceled_subscription_immediately(db_session):
+    """No grace period, unlike PAST_DUE - cancellation is voluntary, so
+    there's nothing to wait out."""
+    account = Account(name="Canceled Blocks Co", account_type=AccountType.INDIVIDUAL)
+    db_session.add(account)
+    db_session.flush()
+    service.cancel_subscription(db_session, account.id, actor="test-actor")
+
+    try:
+        service.assert_billing_not_suspended(db_session, account.id)
+        assert False, "expected BillingSuspendedError"
+    except service.BillingSuspendedError:
+        pass
+
+
+def test_run_billing_cycle_skips_a_canceled_subscription_instead_of_billing_it(db_session, monkeypatch):
+    from app.numbering.identity.models import AccountBillingClassification, AccountBillingSource
+
+    account = Account(
+        name="No Bill After Cancel Co", account_type=AccountType.BUSINESS,
+        billing_classification=AccountBillingClassification.COMMERCIAL_STANDALONE,
+        billing_source=AccountBillingSource.DIRECT_ZOIKO_LOCAL,
+    )
+    db_session.add(account)
+    db_session.flush()
+    service.change_plan(db_session, account.id, "business", actor="test-actor")
+    service.cancel_subscription(db_session, account.id, actor="test-actor")
+
+    result = service.run_billing_cycle(db_session, account.id, actor="test-actor")
+    assert result == {"billed": False, "reason": "subscription is canceled"}
+
+
+def test_cancel_subscription_route_requires_admin(client):
+    owner_token = _signup_and_login(client, "cancelsubowner@example.com", account_type="business")
+    owner_headers = {"Authorization": f"Bearer {owner_token}"}
+    client.post(
+        "/team/members",
+        json={"email": "cancelsubmember@example.com", "password": "supersecret123", "role": "member"},
+        headers=owner_headers,
+    )
+    member_token = client.post(
+        "/auth/login", json={"email": "cancelsubmember@example.com", "password": "supersecret123"}
+    ).json()["access_token"]
+
+    response = client.post(
+        "/billing/subscription/cancel", json={}, headers={"Authorization": f"Bearer {member_token}"}
+    )
+    assert response.status_code == 403
+
+
+def test_cancel_subscription_route_succeeds_for_owner(client):
+    token = _signup_and_login(client, "cancelsubowner2@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    response = client.post("/billing/subscription/cancel", json={"reason": "no longer needed"}, headers=headers)
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "canceled"
+    assert response.json()["canceled_at"] is not None
+
+
+def test_cancel_subscription_route_rejects_a_second_cancellation(client):
+    token = _signup_and_login(client, "cancelsubowner3@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    client.post("/billing/subscription/cancel", json={}, headers=headers)
+
+    response = client.post("/billing/subscription/cancel", json={}, headers=headers)
+    assert response.status_code == 409
+
+
+def test_canceled_account_is_blocked_from_outbound_calling(client, monkeypatch):
+    from app.integrations.telecom import twilio as telecom
+
+    _stub_buy_number(monkeypatch)
+    monkeypatch.setattr(telecom, "place_call", lambda **kwargs: {"sid": "CA_fake", "status": "queued"})
+
+    token = _signup_and_login(client, "canceledoutbound@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    purchase = _reserve_and_purchase(client, headers, "+15550019001")
+    assert purchase.status_code == 200, purchase.text
+
+    client.post("/billing/subscription/cancel", json={}, headers=headers)
+
+    response = client.post(
+        "/media/voice/outbound",
+        json={"to": "+15550001234", "from_number": "+15550019001", "message": "test"},
+        headers=headers,
+    )
+    assert response.status_code == 402
+
+
 def test_usage_summary_route_returns_zeroed_resources_for_a_fresh_account(client):
     token = _signup_and_login(client, "billingusagefresh@example.com")
     response = client.get("/billing/usage-summary", headers={"Authorization": f"Bearer {token}"})

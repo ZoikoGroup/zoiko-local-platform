@@ -636,8 +636,18 @@ def assert_billing_not_suspended(db: Session, account_id: str) -> None:
     """Gates outbound calling, video room creation, number purchases, and AI
     summary generation - deliberately NOT called for inbound calls or
     anything that would strand an existing number, per the graceful-
-    degradation policy's explicit carve-out (Architecture doc §9)."""
+    degradation policy's explicit carve-out (Architecture doc §9).
+
+    CANCELED blocks immediately, no grace period - unlike PAST_DUE (an
+    involuntary payment failure the account didn't choose), cancellation is
+    a voluntary "stop billing/using me" decision, so there's nothing to
+    wait out."""
     sub = get_or_create_subscription(db, account_id)
+    if sub.status == SubscriptionStatus.CANCELED:
+        raise BillingSuspendedError(
+            "This account's subscription has been canceled - resubscribe (change plan) to resume "
+            "outbound calling, video, purchases, and AI features."
+        )
     if sub.status != SubscriptionStatus.PAST_DUE or sub.grace_period_ends_at is None:
         return
     now = _db_now(db)
@@ -646,6 +656,44 @@ def assert_billing_not_suspended(db: Session, account_id: str) -> None:
             "This account's payment is past due and its grace period has ended - "
             "resolve billing to resume outbound calling, video, purchases, and AI features."
         )
+
+
+class SubscriptionAlreadyCanceledError(Exception):
+    """Raised by cancel_subscription when the subscription is already
+    CANCELED - idempotency guard, not a retryable error."""
+
+
+def cancel_subscription(db: Session, account_id: str, *, actor: str, reason: str | None = None) -> Subscription:
+    """Customer self-service cancellation (Owner/Admin, same authorization
+    bar as change_plan above) - deliberately NOT one of the 4 staff maker-
+    checker money-moving actions elsewhere in this file, since this is the
+    account's own decision about its own subscription, not a staff-
+    initiated action against someone else's money.
+
+    Immediate, not "at period end" - no business decision has been made
+    to support a deferred cancellation, and pretending to support one
+    without actually deferring anything would be the "invented precision"
+    P0-1 already exists to avoid elsewhere. Stops future billing cycles
+    (see run_billing_cycle's early-return) and blocks outbound calling/
+    video/purchases/AI (see assert_billing_not_suspended) immediately.
+    Does NOT touch any owned phone numbers - those already have their own
+    per-number cancel path (POST /numbers/{e164}/cancel); cascading this
+    into a bulk number release is a separate product decision, not made
+    here."""
+    sub = get_or_create_subscription(db, account_id)
+    if sub.status == SubscriptionStatus.CANCELED:
+        raise SubscriptionAlreadyCanceledError(f"Subscription for account {account_id} is already canceled")
+
+    sub.status = SubscriptionStatus.CANCELED
+    sub.canceled_at = _db_now(db)
+    db.commit()
+    db.refresh(sub)
+    sync_subscription_to_zoikonex(db, sub)
+    log_event(
+        db, actor=actor, action="billing.subscription_canceled", target=f"subscription:{sub.id}",
+        after={"reason": reason},
+    )
+    return sub
 
 
 def list_zoikonex_sync_events(db: Session, *, account_id: str | None = None, limit: int = 200) -> list[ZoikoNexSyncEvent]:
@@ -1083,6 +1131,12 @@ def run_billing_cycle(db: Session, account_id: str, *, actor: str) -> dict:
     _assert_not_test_account(db, account_id)
 
     sub = get_or_create_subscription(db, account_id)
+    if sub.status == SubscriptionStatus.CANCELED:
+        # Not assert_billing_not_suspended - that also blocks PAST_DUE,
+        # which must stay billable here so a delinquent account can still
+        # be re-billed to attempt collection. CANCELED is the only status
+        # with nothing left to ever bill again.
+        return {"billed": False, "reason": "subscription is canceled"}
     plan = get_plan(db, sub.plan_code)
     catalog_entry = get_active_price_catalog_entry(db, plan.plan_code)
 

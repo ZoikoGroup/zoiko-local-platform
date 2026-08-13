@@ -187,6 +187,12 @@ class Subscription(Base):
     # are gated once this passes (see app.billing.service.
     # assert_billing_not_suspended) - NULL means "no grace period in effect."
     grace_period_ends_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Set once, the first time cancel_subscription runs (see that
+    # function's docstring) - NULL for every status except CANCELED.
+    # Distinct from grace_period_ends_at above: that's an involuntary
+    # PAST_DUE clock; this is a voluntary, immediate cancellation with no
+    # grace period of its own.
+    canceled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 

@@ -63,10 +63,15 @@ class SubscriptionResponse(BaseModel):
     current_period_end: datetime
     zoikonex_ref: str | None
     grace_period_ends_at: datetime | None
+    canceled_at: datetime | None
 
 
 class ChangePlanRequest(BaseModel):
     plan_code: str
+
+
+class CancelSubscriptionRequest(BaseModel):
+    reason: str | None = None
 
 
 class UsageResourceSummary(BaseModel):
