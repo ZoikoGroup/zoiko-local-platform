@@ -13,6 +13,24 @@ def new_uuid() -> str:
     return str(uuid.uuid4())
 
 
+class MarketActivationState(str, enum.Enum):
+    """Production Readiness & Go-Live Decision Standard §6.2/Table 17-18 -
+    "NO GLOBAL SWITCH... each market must move through a controlled
+    activation registry. 'Provider has numbers there' and 'Zoiko intends
+    to operate there' are not sufficient activation criteria." Replaces
+    the previous all-or-nothing gate (a country either has a
+    SupportedCountry row and is fully sellable, or doesn't exist at all)
+    with the doc's exact 5-state vocabulary. Default-deny per Annex B
+    ("Market availability is policy-controlled and default-deny") - see
+    this column's server_default."""
+
+    CLOSED = "closed"
+    INTERNAL_TEST = "internal_test"
+    CONTROLLED_BETA = "controlled_beta"
+    PAID_OPEN = "paid_open"
+    SUSPENDED = "suspended"
+
+
 class SupportedCountry(Base):
     """Zoiko Local's curated launch-country list (Architecture doc's
     "6-8 priority countries", not "whatever Twilio happens to expose").
@@ -21,7 +39,19 @@ class SupportedCountry(Base):
     list as a P0 launch blocker, the same rule it applies to plan names
     and prices (see app.usage.models.CallingRate for the pricing side of
     the same discipline). Staff-managed via PUT /staff/countries
-    (SUPER_ADMIN only, same bar as calling-rate changes)."""
+    (SUPER_ADMIN only, same bar as calling-rate changes).
+
+    activation_state (added for the Market Activation Registry - see
+    MarketActivationState's docstring) is enforced today only at the
+    CLOSED/SUSPENDED boundary (app.numbering.numbers.service.
+    _assert_supported_country raises for either) - the genuinely hard
+    "no" cases the doc is most emphatic about. INTERNAL_TEST/
+    CONTROLLED_BETA/PAID_OPEN are tracked and staff-visible but not yet
+    behaviorally distinguished from each other: this codebase has no
+    invited-tester/entitlement infrastructure to tell "staff-only" from
+    "invited beta customer" from "any customer" apart at the request
+    layer yet. Not fabricating that distinction rather than pretending it
+    exists - see set_market_activation_state's docstring."""
 
     __tablename__ = "supported_countries"
 
@@ -37,6 +67,20 @@ class SupportedCountry(Base):
     # disclosure-accuracy flag, not a claim of real E911 capability; flip it
     # only once real emergency-routing evidence for that country exists.
     emergency_calling_supported: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    activation_state: Mapped[MarketActivationState] = mapped_column(
+        Enum(MarketActivationState, name="market_activation_state_enum"),
+        nullable=False, default=MarketActivationState.CLOSED, server_default=MarketActivationState.CLOSED.name,
+    )
+    # Free-text pointer to whatever legal/tax/telecom review evidence
+    # exists for this state (a ticket, decision-record ID, or summary) -
+    # not a structured "minimum market file" (Table 6.3 lists ~10 separate
+    # legal/tax/telecom/privacy determinations) since this codebase has no
+    # real content for any of those yet and fabricating empty structured
+    # fields for them would look like more compliance work has happened
+    # than actually has.
+    activation_notes: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    activation_changed_by: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    activation_changed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 

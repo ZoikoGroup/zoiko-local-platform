@@ -118,6 +118,10 @@ class SupportedCountryResponse(BaseModel):
     code: str
     name: str
     emergency_calling_supported: bool
+    activation_state: str
+    activation_notes: str | None = None
+    activation_changed_by: str | None = None
+    activation_changed_at: datetime | None = None
 
 
 class UpsertSupportedCountryRequest(BaseModel):
@@ -125,6 +129,11 @@ class UpsertSupportedCountryRequest(BaseModel):
     name: str
     sort_order: int = 0
     emergency_calling_supported: bool = False
+
+
+class SetMarketActivationStateRequest(BaseModel):
+    state: str
+    notes: str | None = None
 
 
 class NumberEligibilityRuleResponse(BaseModel):
