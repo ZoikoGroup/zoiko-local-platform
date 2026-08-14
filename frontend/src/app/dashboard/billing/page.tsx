@@ -7,10 +7,13 @@ import {
   listPlans,
   getSubscription,
   changeSubscriptionPlan,
+  cancelSubscription,
+  getPriceCatalogEntry,
   getUsageSummary,
   ApiError,
   type UsageEvent,
   type Plan,
+  type PriceCatalogEntry,
   type Subscription,
   type UsageSummary,
 } from "@/lib/api";
@@ -30,6 +33,22 @@ const RESOURCE_LABELS: Record<string, string> = {
   video_minutes: "Video minutes",
   ai_summaries: "AI summaries",
 };
+
+function formatPrice(entry: PriceCatalogEntry | null | undefined): string {
+  // is_placeholder, not just null, must gate this - confirmed live that
+  // get_active_price_catalog_entry's own fallback ("nothing activated yet,
+  // use the most recently created entry regardless of status") can still
+  // return an old fake test-placeholder row (e.g. Enterprise's leftover
+  // $199.99 test price) even when a plan has no real decided price. A
+  // placeholder is never a real price anywhere else in this codebase -
+  // the customer-facing display must hold to that same rule.
+  if (!entry || entry.is_placeholder) return "Custom";
+  const amount = (entry.amount_minor_units / 100).toLocaleString(undefined, {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  });
+  return `${entry.currency_code} ${amount}/mo`;
+}
 
 function UsageBar({ resource }: { resource: { resource: string; used: number; limit: number } }) {
   const pct = resource.limit > 0 ? Math.min(100, Math.round((resource.used / resource.limit) * 100)) : 0;
@@ -56,10 +75,14 @@ export default function BillingPage() {
   const [subscription, setSubscription] = useState<Subscription | null>(null);
   const [usageSummary, setUsageSummary] = useState<UsageSummary | null>(null);
   const [plans, setPlans] = useState<Plan[]>([]);
+  const [prices, setPrices] = useState<Record<string, PriceCatalogEntry | null>>({});
   const [summaryLoading, setSummaryLoading] = useState(true);
   const [summaryError, setSummaryError] = useState<string | null>(null);
   const [changingPlan, setChangingPlan] = useState<string | null>(null);
   const [planError, setPlanError] = useState<string | null>(null);
+  const [canceling, setCanceling] = useState(false);
+  const [cancelError, setCancelError] = useState<string | null>(null);
+  const [confirmingCancel, setConfirmingCancel] = useState(false);
 
   const [events, setEvents] = useState<UsageEvent[]>([]);
   const [logLoading, setLogLoading] = useState(true);
@@ -81,6 +104,19 @@ export default function BillingPage() {
   useEffect(() => {
     loadPlanAndUsage();
   }, [loadPlanAndUsage]);
+
+  useEffect(() => {
+    if (!token || plans.length === 0) return;
+    Promise.all(
+      plans.map((plan) =>
+        getPriceCatalogEntry(token, plan.plan_code)
+          .then((entry) => [plan.plan_code, entry] as const)
+          .catch(() => [plan.plan_code, null] as const)
+      )
+    ).then((entries) => {
+      setPrices(Object.fromEntries(entries));
+    });
+  }, [token, plans]);
 
   useEffect(() => {
     if (!token) return;
@@ -118,13 +154,27 @@ export default function BillingPage() {
     }
   }
 
+  async function handleCancelSubscription() {
+    if (!token) return;
+    setCanceling(true);
+    setCancelError(null);
+    try {
+      await cancelSubscription(token);
+      await loadPlanAndUsage();
+      setConfirmingCancel(false);
+    } catch (err) {
+      setCancelError(err instanceof ApiError ? err.message : "Couldn't cancel subscription.");
+    } finally {
+      setCanceling(false);
+    }
+  }
+
   return (
     <div className="max-w-3xl mx-auto space-y-6">
       <div>
         <h2 className="text-xl font-semibold text-slate-900">Billing &amp; Usage</h2>
         <p className="text-sm text-slate-500">
-          Plan limits and metered usage on your account. No payment is processed here yet — billing
-          integration is still being connected.
+          Plan limits, pricing and metered usage on your account.
         </p>
       </div>
 
@@ -158,6 +208,15 @@ export default function BillingPage() {
           </p>
         )}
 
+        {subscription?.status === "canceled" && (
+          <p className="text-sm text-red-700 bg-red-50 border border-red-200 rounded-lg px-3 py-2">
+            This subscription was canceled{" "}
+            {subscription.canceled_at ? `on ${new Date(subscription.canceled_at).toLocaleDateString()}` : ""}.
+            Outbound calling, video, new number purchases, and AI features are paused. Choose a plan below to
+            resume.
+          </p>
+        )}
+
         {usageSummary && subscription && (
           <>
             <div className="flex items-baseline justify-between">
@@ -169,6 +228,11 @@ export default function BillingPage() {
                     : `Current period renews ${new Date(usageSummary.current_period_end).toLocaleDateString()}`}
                 </div>
               </div>
+              {prices[usageSummary.plan_code] !== undefined && (
+                <div className="text-lg font-semibold text-slate-900">
+                  {formatPrice(prices[usageSummary.plan_code])}
+                </div>
+              )}
             </div>
 
             <div className="space-y-3 pt-1">
@@ -177,6 +241,45 @@ export default function BillingPage() {
               ))}
             </div>
           </>
+        )}
+
+        {isAdmin && subscription && subscription.status !== "canceled" && (
+          <div className="border-t border-slate-100 pt-4">
+            {cancelError && (
+              <p className="text-sm text-red-600 bg-red-50 rounded-lg px-3 py-2 mb-2">{cancelError}</p>
+            )}
+            {!confirmingCancel ? (
+              <button
+                onClick={() => setConfirmingCancel(true)}
+                className="text-xs font-medium text-red-600 hover:text-red-700"
+              >
+                Cancel subscription
+              </button>
+            ) : (
+              <div className="rounded-lg border border-red-200 bg-red-50 p-3 space-y-2">
+                <p className="text-sm text-red-800">
+                  This takes effect immediately - outbound calling, video, new number purchases, and AI
+                  features will stop. This can&apos;t be undone from here.
+                </p>
+                <div className="flex gap-2">
+                  <button
+                    onClick={handleCancelSubscription}
+                    disabled={canceling}
+                    className="text-xs font-medium rounded-lg px-3 py-1.5 bg-red-600 hover:bg-red-700 disabled:opacity-60 text-white"
+                  >
+                    {canceling ? "Canceling..." : "Yes, cancel subscription"}
+                  </button>
+                  <button
+                    onClick={() => setConfirmingCancel(false)}
+                    disabled={canceling}
+                    className="text-xs font-medium rounded-lg px-3 py-1.5 border border-slate-300 text-slate-700 hover:bg-slate-50"
+                  >
+                    Keep subscription
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
         )}
       </div>
 
@@ -201,6 +304,9 @@ export default function BillingPage() {
                       Current
                     </span>
                   )}
+                </div>
+                <div className="text-sm font-semibold text-slate-800">
+                  {formatPrice(prices[plan.plan_code])}
                 </div>
                 <ul className="text-xs text-slate-500 space-y-0.5">
                   <li>{plan.max_numbers.toLocaleString()} numbers</li>

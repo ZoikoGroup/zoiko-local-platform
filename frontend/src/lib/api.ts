@@ -1328,6 +1328,29 @@ export type Subscription = {
   current_period_end: string;
   zoikonex_ref: string | null;
   grace_period_ends_at: string | null;
+  canceled_at: string | null;
+};
+
+// Mirrors backend PriceCatalogEntryResponse. null means no price has ever
+// been set for this plan (e.g. Enterprise, which is sales-led/custom per
+// the Global Plans, Pricing & Commercial Launch Standard - never show a
+// dollar amount for it, show "Custom" instead).
+export type PriceCatalogEntry = {
+  id: string;
+  plan_code: string;
+  catalog_version: string;
+  amount_minor_units: number;
+  currency_code: string;
+  status: string;
+  is_placeholder: boolean;
+  price_book_version: string | null;
+  market: string;
+  effective_from: string | null;
+  effective_to: string | null;
+  approval_evidence: string | null;
+  approved_by: string | null;
+  approved_at: string | null;
+  created_at: string;
 };
 
 export type UsageResourceSummary = {
@@ -1363,6 +1386,22 @@ export function changeSubscriptionPlan(token: string, planCode: string): Promise
     method: "PUT",
     headers: { Authorization: `Bearer ${token}` },
     body: JSON.stringify({ plan_code: planCode }),
+  });
+}
+
+export function cancelSubscription(token: string, reason?: string): Promise<Subscription> {
+  return request<Subscription>("/billing/subscription/cancel", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ reason: reason ?? null }),
+  });
+}
+
+// null means this plan has no price on file yet (only expected for
+// Enterprise, which is sales-led/custom).
+export function getPriceCatalogEntry(token: string, planCode: string): Promise<PriceCatalogEntry | null> {
+  return request<PriceCatalogEntry | null>(`/billing/price-catalog/${planCode}`, {
+    headers: { Authorization: `Bearer ${token}` },
   });
 }
 
