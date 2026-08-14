@@ -800,6 +800,69 @@ def test_create_checkout_session_returns_stripe_hosted_url(client, monkeypatch):
     body = response.json()
     assert body["id"] == "cs_test_123"
     assert body["url"] == "https://checkout.stripe.com/c/pay/cs_test_123"
+    assert body["included"] is False
+    assert body["number"] is None
+
+
+def test_checkout_session_is_free_for_the_first_number_on_a_paid_plan(client, db_session, monkeypatch):
+    """Global Plans, Pricing & Commercial Launch Standard doc: the first
+    standard local number is included with a paid plan - a starter-plan
+    account's very first checkout must skip Stripe entirely and come back
+    already ACTIVE."""
+    from app.billing import service as billing_service
+
+    _stub_buy_number(monkeypatch)
+    stripe_called = []
+    monkeypatch.setattr(
+        "app.numbering.numbers.service.stripe_checkout.create_checkout_session",
+        lambda **kwargs: stripe_called.append(kwargs) or {"id": "cs_should_not_be_called", "url": "https://x"},
+    )
+
+    token = _signup_and_login(client, "checkoutincluded@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    account_id = client.get("/auth/me", headers=headers).json()["account_id"]
+    billing_service.change_plan(db_session, account_id, "starter", actor="test-actor")
+    _reserve(client, headers, "+15550013006")
+
+    response = client.post("/numbers/+15550013006/checkout-session", headers=headers)
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["included"] is True
+    assert body["id"] is None
+    assert body["url"] is None
+    assert body["number"]["e164"] == "+15550013006"
+    assert body["number"]["status"] == "active"
+    assert stripe_called == []
+
+
+def test_checkout_session_charges_for_a_second_number_even_on_a_paid_plan(client, db_session, monkeypatch):
+    """Only the account's FIRST number is included - a second number on the
+    same paid plan must still go through Stripe like before."""
+    from app.billing import service as billing_service
+
+    _stub_buy_number(monkeypatch)
+    monkeypatch.setattr("app.core.config.settings.stripe_payments_secret_key", "rk_test_fake")
+    monkeypatch.setattr(
+        "app.numbering.numbers.service.stripe_checkout.create_checkout_session",
+        lambda **kwargs: {"id": "cs_test_second", "url": "https://checkout.stripe.com/c/pay/cs_test_second"},
+    )
+
+    token = _signup_and_login(client, "checkoutsecondnumber@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    account_id = client.get("/auth/me", headers=headers).json()["account_id"]
+    billing_service.change_plan(db_session, account_id, "starter", actor="test-actor")
+
+    _reserve(client, headers, "+15550013007")
+    first = client.post("/numbers/+15550013007/checkout-session", headers=headers)
+    assert first.json()["included"] is True
+
+    _reserve(client, headers, "+15550013008")
+    second = client.post("/numbers/+15550013008/checkout-session", headers=headers)
+    assert second.status_code == 200, second.text
+    body = second.json()
+    assert body["included"] is False
+    assert body["id"] == "cs_test_second"
+    assert body["url"] == "https://checkout.stripe.com/c/pay/cs_test_second"
 
 
 def test_non_commercial_account_cannot_create_a_checkout_session(client, db_session, monkeypatch):

@@ -65,11 +65,6 @@ class PurchaseNumberRequest(BaseModel):
     e164: str
 
 
-class CheckoutSessionResponse(BaseModel):
-    id: str
-    url: str
-
-
 class AssignNumberRequest(BaseModel):
     user_id: str | None = None  # None unassigns the number
 
@@ -110,6 +105,21 @@ class PhoneNumberResponse(BaseModel):
         if self.status == "reserved" and self.reserved_until is not None and self.reserved_until < datetime.now(timezone.utc):
             self.status = "expired"
         return self
+
+
+class CheckoutSessionResponse(BaseModel):
+    """id/url are set for a real Stripe Checkout (a paid number). included=True
+    is the Global Plans, Pricing & Commercial Launch Standard doc's "first
+    standard local number is included with each paid user" path - no Stripe
+    session is created at all, the number is purchased/provisioned
+    immediately, and `number` carries the now-ACTIVE (or COMPLIANCE_PENDING,
+    if a KYC case opened) row so the frontend has something to show instead
+    of a redirect URL that doesn't exist."""
+
+    id: str | None = None
+    url: str | None = None
+    included: bool = False
+    number: PhoneNumberResponse | None = None
 
 
 class SupportedCountryResponse(BaseModel):

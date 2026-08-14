@@ -839,9 +839,17 @@ export function purchaseNumber(token: string, e164: string): Promise<MyPhoneNumb
 // number only actually activates once Stripe confirms payment via the
 // backend's webhook - see app.numbering.numbers.service.
 // complete_number_purchase_from_checkout.
+//
+// included=true is the Global Plans, Pricing & Commercial Launch Standard
+// doc's "first number is included with a paid plan" path - id/url are null
+// (no Stripe session was created), and `number` is already ACTIVE (or
+// COMPLIANCE_PENDING) since the backend purchased it immediately instead
+// of waiting on a payment webhook.
 export type CheckoutSession = {
-  id: string;
-  url: string;
+  id: string | null;
+  url: string | null;
+  included: boolean;
+  number: MyPhoneNumber | null;
 };
 
 export function createNumberCheckoutSession(token: string, e164: string): Promise<CheckoutSession> {

@@ -169,7 +169,7 @@ export default function NumbersPage() {
   // not this redirect, so this just reflects that outcome to the customer
   // and refreshes the list to pick up the (by-then-likely-already-active)
   // number.
-  const [checkoutResult, setCheckoutResult] = useState<"success" | "cancelled" | null>(null);
+  const [checkoutResult, setCheckoutResult] = useState<"success" | "cancelled" | "included" | null>(null);
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     const checkout = params.get("checkout");
@@ -298,12 +298,22 @@ export default function NumbersPage() {
     setPurchaseError(null);
     try {
       await acknowledgeEmergencyCallingLimitation(token);
+      const session = await createNumberCheckoutSession(token, reservedNumber.e164);
+      if (session.included) {
+        // First number included with a paid plan - the backend already
+        // purchased/provisioned it, no Stripe involved. Reflect that
+        // immediately instead of redirecting to a payment page that was
+        // never created.
+        await loadMyNumbers();
+        setCheckoutResult("included");
+        handleStartOver();
+        return;
+      }
       // Real Stripe Checkout (test mode) - redirects to Stripe's own
       // hosted payment page. The number only actually activates once
       // Stripe confirms payment via the backend's webhook; this tab
       // navigates away, so nothing more happens here on success.
-      const session = await createNumberCheckoutSession(token, reservedNumber.e164);
-      window.location.href = session.url;
+      window.location.href = session.url as string;
     } catch (err) {
       if (err instanceof ApiError && err.status === 403) {
         setPurchaseError(
@@ -522,6 +532,11 @@ export default function NumbersPage() {
         <p className="text-sm text-emerald-800 bg-emerald-50 border border-emerald-200 rounded-lg px-3 py-2">
           Payment received — your number will show as active below shortly (test mode, no real charge was
           made).
+        </p>
+      )}
+      {checkoutResult === "included" && (
+        <p className="text-sm text-emerald-800 bg-emerald-50 border border-emerald-200 rounded-lg px-3 py-2">
+          Your first number is included with your plan — no payment needed. It&apos;s active below.
         </p>
       )}
       {checkoutResult === "cancelled" && (
@@ -994,10 +1009,14 @@ export default function NumbersPage() {
           </div>
           <div className="flex justify-between text-sm">
             <span className="text-slate-500">Purchase price</span>
-            <span className="text-slate-800">$1.00 (test mode — no real charge)</span>
+            <span className="text-slate-800">
+              Your first number is included free with a paid plan — additional numbers are a
+              small monthly charge (test mode — no real charge either way).
+            </span>
           </div>
           <p className="text-xs text-slate-400">
-            You&apos;ll be redirected to Stripe&apos;s secure payment page to complete this purchase.
+            If this number isn&apos;t included, you&apos;ll be redirected to Stripe&apos;s secure payment page to
+            complete the purchase.
           </p>
 
           <div className="bg-amber-50 border border-amber-200 rounded-lg p-3 space-y-2">
@@ -1028,7 +1047,7 @@ export default function NumbersPage() {
             disabled={purchaseBusy || !emergencyAcknowledged}
             className="bg-indigo-600 hover:bg-indigo-700 disabled:opacity-60 text-white text-sm font-medium rounded-lg px-4 py-2"
           >
-            {purchaseBusy ? "Redirecting to payment..." : "Proceed to Payment"}
+            {purchaseBusy ? "Processing..." : "Get This Number"}
           </button>
         </div>
       )}

@@ -712,7 +712,15 @@ def create_number_purchase_checkout_session(db: Session, account_id: str, e164: 
     checkout below) re-checks the same gate as defense-in-depth against the
     case's status changing in the gap between session creation and webhook
     delivery, then performs the actual provisioning. Returns {id, url} -
-    the customer is redirected to url."""
+    the customer is redirected to url.
+
+    Global Plans, Pricing & Commercial Launch Standard doc: the account's
+    first number is included with a paid plan, not charged. When
+    billing_service.is_first_number_included says so, this skips Stripe
+    entirely and calls purchase_number directly - same eligibility gate,
+    same provisioning path, just no charge/redirect. See that function's
+    docstring for why this doesn't yet implement the doc's recurring
+    "$4.99/month" price for additional numbers."""
     _assert_commercial_account(db, account_id)
     # Commercial Billing Operating Standard doc §14/§T stopgap - see
     # Account.is_test's docstring. Overlaps with _assert_commercial_account
@@ -735,6 +743,14 @@ def create_number_purchase_checkout_session(db: Session, account_id: str, e164: 
 
     _assert_purchase_eligible(db, account_id, number, e164=e164)
 
+    if billing_service.is_first_number_included(db, account_id, exclude_number_id=number.id):
+        log_event(
+            db, actor_id=account_id, action="number.included_purchase",
+            target_type="phone_number", target_id=number.id, metadata={"e164": e164},
+        )
+        included_number = purchase_number(db, account_id, e164)
+        return {"id": None, "url": None, "included": True, "number": included_number}
+
     session = stripe_checkout.create_checkout_session(
         e164=e164,
         amount_cents=NUMBER_PURCHASE_PRICE_CENTS,
@@ -747,7 +763,7 @@ def create_number_purchase_checkout_session(db: Session, account_id: str, e164: 
         db, actor_id=account_id, action="number.checkout_session_created",
         target_type="phone_number", target_id=number.id, metadata={"e164": e164, "session_id": session["id"]},
     )
-    return session
+    return {"id": session["id"], "url": session["url"], "included": False, "number": None}
 
 
 def complete_number_purchase_from_checkout(
