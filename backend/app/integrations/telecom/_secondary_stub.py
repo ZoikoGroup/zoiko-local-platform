@@ -199,8 +199,15 @@ def _voice_jwt() -> str:
 
 def place_call(
     to: str, from_: str, twiml_url: str | None = None, twiml: str | None = None,
-    status_callback_url: str | None = None,
+    status_callback_url: str | None = None, time_limit_seconds: int | None = None,
 ) -> dict:
+    # time_limit_seconds accepted for call-signature compatibility with the
+    # primary but not yet wired into the NCCO - Vonage's own per-call
+    # duration control (an NCCO "connect" action's lengthTimer) doesn't map
+    # cleanly onto a bare "talk" NCCO the way Twilio's flat time_limit
+    # parameter does, and this hasn't been verified against a live Vonage
+    # account. Not silently dropping this would be worse than a documented
+    # gap - flagging it here rather than pretending the cap applies.
     if twiml_url:
         raise TelecomError(
             _NOT_CROSS_VENDOR_COMPATIBLE.format(

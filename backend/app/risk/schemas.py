@@ -2,6 +2,7 @@ from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict
 
+from app.ops.models import KillSwitchScope
 from app.risk.models import AccountRiskState, FraudCaseStatus, RiskSignalType
 
 
@@ -47,6 +48,24 @@ class SetAccountRiskStateRequest(BaseModel):
     # Mandatory, same "every override has actor, reason, timestamp and
     # evidence" posture as SetMarketActivationStatusRequest.reason.
     reason: str
+
+
+class AccountKillSwitchResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    account_id: str
+    scope: KillSwitchScope
+    is_active: bool
+    reason: str | None
+    activated_by: str | None
+    activated_at: datetime | None
+    deactivated_at: datetime | None
+    created_at: datetime
+
+
+class SetAccountKillSwitchRequest(BaseModel):
+    reason: str | None = None
 
 
 class FraudRuleResponse(BaseModel):

@@ -9,7 +9,9 @@ from app.media.models import TERMINAL_CALL_STATUSES, CallDirection, CallRecord
 from app.notifications.service import notify_account_suspended_for_risk, notify_account_warning
 from app.numbering.identity.models import Account
 from app.numbering.numbers.service import suspend_numbers_for_account_by_system
+from app.ops.models import KillSwitchScope
 from app.risk.models import (
+    AccountKillSwitch,
     AccountRiskState,
     BlockedDestination,
     DeviceFingerprintSighting,
@@ -97,6 +99,22 @@ MAX_CONCURRENT_CALLS_BY_RISK_STATE = {
     AccountRiskState.SUSPENDED_FRAUD: 0,
 }
 
+# Production Readiness Standard Table 15 "Usage ceilings" - lifetime (not
+# rolling-window) cap, independent of MAX_SPEND_CENTS_PER_WINDOW above (which
+# only looks at the trailing SPEND_WINDOW_HOURS). Only enforced while an
+# account is still in a TRIAL_* tier (see assert_cumulative_trial_usage_ok) -
+# a PAID_NORMAL account has already stepped up past this ceiling entirely.
+# Same "conservative first pass, not a tuned production value" caveat as
+# every other threshold in this module.
+MAX_TRIAL_LIFETIME_SPEND_CENTS = 2000  # $20.00
+
+# Twilio Calls.create's own time_limit parameter (seconds) - hangs up the
+# call automatically once reached, a real hard cap enforced by Twilio itself
+# rather than a check that only runs before the call starts. Only applied to
+# TRIAL_* accounts; a TRIAL_VERIFIED/PAID_NORMAL account gets no cap (None)
+# from get_call_time_limit_for_account.
+MAX_TRIAL_CALL_DURATION_SECONDS = 600  # 10 minutes
+
 # Inbound fraud/spam signal (Roadmap "AI-driven fraud/spam signals"): a real
 # customer calls one business; a robocall/spam campaign dials the same
 # number out to many businesses in a short window. Platform-wide (not
@@ -137,6 +155,19 @@ class ConcurrentCallLimitExceededError(Exception):
     """Raised when an account already has as many outbound calls in flight
     as its current AccountRiskState tier allows - see
     MAX_CONCURRENT_CALLS_BY_RISK_STATE."""
+
+
+class CumulativeTrialUsageExceededError(Exception):
+    """Raised when a still-trial account's all-time rated usage exceeds
+    MAX_TRIAL_LIFETIME_SPEND_CENTS - distinct from the rolling-window
+    SpendLimitExceededError above."""
+
+
+class AccountKillSwitchTrippedError(Exception):
+    """Raised by assert_account_kill_switch_not_active - staff have halted
+    this one account's activity in this scope without suspending the whole
+    account (Production Readiness Standard Table 15's "Tenant" kill-switch
+    scope)."""
 
 
 class DestinationRuleConflictError(Exception):
@@ -326,9 +357,7 @@ def assert_spend_limit_ok(db: Session, account_id: str) -> None:
     """Commercial Billing Operating Standard doc's "real-time fraud/toll-
     abuse spend controls" - sums UsageEvent.estimated_cost_cents (the same
     rated figures app.usage.service.record_usage_event already writes)
-    over the trailing window, independent of call count or destination.
-    Anil's anilupdated branch didn't build this leg of the fraud model -
-    kept from the merge's other side."""
+    over the trailing window, independent of call count or destination."""
     from sqlalchemy import func as sa_func
 
     from app.usage.models import UsageEvent
@@ -351,6 +380,98 @@ def assert_spend_limit_ok(db: Session, account_id: str) -> None:
         raise SpendLimitExceededError(
             f"Outbound call spend limit exceeded: {total_cents}c in the last {SPEND_WINDOW_HOURS}h "
             f"(limit {MAX_SPEND_CENTS_PER_WINDOW}c)"
+        )
+
+
+def assert_cumulative_trial_usage_ok(db: Session, account_id: str) -> None:
+    """Production Readiness Standard Table 15 "Usage ceilings: ...
+    cumulative trial usage." Only applies while the account is still in a
+    TRIAL_* risk_state - once it's genuinely PAID_NORMAL (or under active
+    review/suspension) this lifetime cap no longer makes sense to check."""
+    from sqlalchemy import func as sa_func
+
+    from app.usage.models import UsageEvent
+
+    account = db.query(Account).filter(Account.id == account_id).first()
+    if account is None or account.risk_state not in (AccountRiskState.TRIAL_LOW, AccountRiskState.TRIAL_VERIFIED):
+        return
+
+    total_cents = (
+        db.query(sa_func.coalesce(sa_func.sum(UsageEvent.estimated_cost_cents), 0))
+        .filter(UsageEvent.account_id == account_id, UsageEvent.estimated_cost_cents.isnot(None))
+        .scalar()
+    )
+    if total_cents > MAX_TRIAL_LIFETIME_SPEND_CENTS:
+        record_risk_signal(
+            db, account_id=account_id, signal_type=RiskSignalType.SPEND_LIMIT_EXCEEDED,
+            detail=f"lifetime trial usage {total_cents}c exceeds cap {MAX_TRIAL_LIFETIME_SPEND_CENTS}c",
+        )
+        raise CumulativeTrialUsageExceededError(
+            f"Trial usage limit reached: {total_cents}c all-time (limit {MAX_TRIAL_LIFETIME_SPEND_CENTS}c) - "
+            f"upgrade to a paid plan to continue"
+        )
+
+
+def get_call_time_limit_for_account(db: Session, account_id: str) -> int | None:
+    """Hard per-call duration cap (Twilio Calls.create's time_limit) for
+    still-trial accounts - None (no cap) once verified/paid. Enforced by
+    Twilio hanging up the call server-side, not a pre-call check, since
+    duration isn't known until the call is already in progress."""
+    account = db.query(Account).filter(Account.id == account_id).first()
+    if account is not None and account.risk_state in (AccountRiskState.TRIAL_VERIFIED, AccountRiskState.PAID_NORMAL):
+        return None
+    return MAX_TRIAL_CALL_DURATION_SECONDS
+
+
+def set_account_kill_switch(
+    db: Session, account_id: str, scope: KillSwitchScope, is_active: bool, *, actor: str, reason: str | None = None
+) -> AccountKillSwitch:
+    """Staff-only (ops.manage_kill_switches - same capability as the
+    platform-wide switch). Upserts the one row for this account+scope -
+    same shape/rationale as app.ops.service.set_kill_switch."""
+    switch = (
+        db.query(AccountKillSwitch)
+        .filter(AccountKillSwitch.account_id == account_id, AccountKillSwitch.scope == scope)
+        .first()
+    )
+    now = datetime.now(timezone.utc)
+    if switch is None:
+        switch = AccountKillSwitch(account_id=account_id, scope=scope)
+        db.add(switch)
+    switch.is_active = is_active
+    switch.reason = reason
+    if is_active:
+        switch.activated_by = actor
+        switch.activated_at = now
+        switch.deactivated_at = None
+    else:
+        switch.deactivated_at = now
+    db.commit()
+    db.refresh(switch)
+    log_event(
+        db, actor=actor, action="risk.account_kill_switch_activated" if is_active else "risk.account_kill_switch_deactivated",
+        target=f"account:{account_id}", after={"scope": scope.value, "reason": reason},
+    )
+    return switch
+
+
+def list_account_kill_switches(db: Session, account_id: str) -> list[AccountKillSwitch]:
+    return db.query(AccountKillSwitch).filter(AccountKillSwitch.account_id == account_id).order_by(AccountKillSwitch.scope).all()
+
+
+def assert_account_kill_switch_not_active(db: Session, account_id: str, scope: KillSwitchScope) -> None:
+    """Call alongside (not instead of) app.ops.service.
+    assert_kill_switch_not_active - that one halts the whole platform for
+    this scope; this one halts just this one account, without suspending
+    it outright (Production Readiness Standard Table 15's "Tenant" scope)."""
+    switch = (
+        db.query(AccountKillSwitch)
+        .filter(AccountKillSwitch.account_id == account_id, AccountKillSwitch.scope == scope)
+        .first()
+    )
+    if switch is not None and switch.is_active:
+        raise AccountKillSwitchTrippedError(
+            f"{scope.value} is currently halted for this account" + (f": {switch.reason}" if switch.reason else "")
         )
 
 
@@ -591,13 +712,15 @@ def _transition_risk_state(db: Session, account_id: str, new_state: AccountRiskS
 
 
 def _compute_baseline_risk_state(db: Session, account_id: str) -> AccountRiskState:
-    """What tier an account belongs at on the merits alone - KYC/purchase
-    history - ignoring any REVIEW_REQUIRED/SUSPENDED_FRAUD overlay a fraud
-    signal may have added on top. Used to decide what to restore an account
-    to once a human clears it (resolve_fraud_case) or reinstates its
-    numbers (restore_risk_state_after_reinstatement), not during normal
-    step-up (see step_up_risk_state_after_kyc_approval/_after_purchase,
-    which only ever move an account forward one tier at a time)."""
+    """What tier an account belongs at on the merits alone - KYC/purchase/
+    subscription history - ignoring any REVIEW_REQUIRED/SUSPENDED_FRAUD
+    overlay a fraud signal may have added on top. Used to decide what to
+    restore an account to once a human clears it (resolve_fraud_case) or
+    reinstates its numbers (restore_risk_state_after_reinstatement), not
+    during normal step-up (see step_up_risk_state_after_kyc_approval/
+    _after_purchase, which only ever move an account forward one tier at a
+    time)."""
+    from app.billing.service import get_or_create_subscription
     from app.compliance.models import ComplianceCase, ComplianceCaseStatus
     from app.numbering.numbers.models import PhoneNumber, PhoneNumberStatus
 
@@ -607,7 +730,11 @@ def _compute_baseline_risk_state(db: Session, account_id: str) -> AccountRiskSta
         .first()
         is not None
     )
-    if has_active_number:
+    # A real paid subscription plan is just as strong a "genuine paying
+    # customer" signal as an active number - either one alone is enough to
+    # earn PAID_NORMAL.
+    subscription = get_or_create_subscription(db, account_id)
+    if has_active_number or subscription.plan_code != "free_trial":
         return AccountRiskState.PAID_NORMAL
 
     has_kyc_approval = (
@@ -616,7 +743,19 @@ def _compute_baseline_risk_state(db: Session, account_id: str) -> AccountRiskSta
         .first()
         is not None
     )
-    if has_kyc_approval:
+    # A number the account has purchased before (even one since suspended
+    # or cancelled) is the same "has done a real transaction" evidence as a
+    # currently-active one, for the narrower TRIAL_VERIFIED tier.
+    has_purchased_before = (
+        db.query(PhoneNumber)
+        .filter(
+            PhoneNumber.account_id == account_id,
+            PhoneNumber.status.in_([PhoneNumberStatus.ACTIVE, PhoneNumberStatus.SUSPENDED, PhoneNumberStatus.CANCELLED]),
+        )
+        .first()
+        is not None
+    )
+    if has_kyc_approval or has_purchased_before:
         return AccountRiskState.TRIAL_VERIFIED
 
     return AccountRiskState.TRIAL_LOW

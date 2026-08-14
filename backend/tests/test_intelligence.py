@@ -677,3 +677,134 @@ def test_edit_summary_requires_auth(client, db_session):
 
     response = client.patch(f"/intelligence/summaries/{record.id}", json={"summary": "x"})
     assert response.status_code == 401
+
+
+# --- AIJob retry lineage / failure observability ---
+
+
+def test_successful_summarize_creates_a_succeeded_ai_job(client, db_session):
+    from app.intelligence.models import AIJob, AIJobStatus, SummarySourceType
+
+    token, account_id = _signup_and_login(client, "aijobsuccess1@example.com", "AI Job Success Co")
+    voicemail = _make_voicemail(db_session, account_id, "+15550005556")
+    client.post(
+        "/compliance/consent", json={"consent_type": "ai_processing"}, headers={"Authorization": f"Bearer {token}"},
+    )
+
+    from unittest.mock import patch as _patch
+    with _patch("app.intelligence.service.download_recording", lambda url: b"fake-audio-bytes"), \
+         _patch("app.intelligence.service.transcribe_audio", lambda audio_bytes: "Test voicemail content."):
+        response = client.post(
+            f"/intelligence/voicemails/{voicemail.id}/summarize", headers={"Authorization": f"Bearer {token}"},
+        )
+    assert response.status_code == 201
+    summary_id = response.json()["id"]
+
+    job = (
+        db_session.query(AIJob)
+        .filter(AIJob.source_type == SummarySourceType.VOICEMAIL, AIJob.source_id == voicemail.id)
+        .first()
+    )
+    assert job is not None
+    assert job.status == AIJobStatus.SUCCEEDED
+    assert job.attempt_count == 1
+    assert job.last_error is None
+    assert job.conversation_summary_id == summary_id
+
+
+def test_failed_transcription_records_a_failed_ai_job_and_still_raises(client, db_session, monkeypatch):
+    from app.intelligence.models import AIJob, AIJobStatus, SummarySourceType
+
+    token, account_id = _signup_and_login(client, "aijobfail1@example.com", "AI Job Fail Co")
+    voicemail = _make_voicemail(db_session, account_id, "+15550005557")
+    client.post(
+        "/compliance/consent", json={"consent_type": "ai_processing"}, headers={"Authorization": f"Bearer {token}"},
+    )
+
+    def _boom(url):
+        raise RuntimeError("simulated storage failure")
+
+    monkeypatch.setattr("app.intelligence.service.download_recording", _boom)
+
+    with pytest.raises(RuntimeError, match="simulated storage failure"):
+        client.post(f"/intelligence/voicemails/{voicemail.id}/summarize", headers={"Authorization": f"Bearer {token}"})
+
+    job = (
+        db_session.query(AIJob)
+        .filter(AIJob.source_type == SummarySourceType.VOICEMAIL, AIJob.source_id == voicemail.id)
+        .first()
+    )
+    assert job is not None
+    assert job.status == AIJobStatus.FAILED
+    assert job.attempt_count == 1
+    assert "simulated storage failure" in job.last_error
+    assert job.conversation_summary_id is None
+
+
+def test_retry_after_failure_increments_the_same_job_and_can_succeed(client, db_session, monkeypatch):
+    from app.intelligence.models import AIJob, AIJobStatus, SummarySourceType
+
+    token, account_id = _signup_and_login(client, "aijobretry1@example.com", "AI Job Retry Co")
+    voicemail = _make_voicemail(db_session, account_id, "+15550005558")
+    client.post(
+        "/compliance/consent", json={"consent_type": "ai_processing"}, headers={"Authorization": f"Bearer {token}"},
+    )
+
+    def _boom(url):
+        raise RuntimeError("transient failure")
+
+    monkeypatch.setattr("app.intelligence.service.download_recording", _boom)
+    with pytest.raises(RuntimeError):
+        client.post(f"/intelligence/voicemails/{voicemail.id}/summarize", headers={"Authorization": f"Bearer {token}"})
+
+    monkeypatch.setattr("app.intelligence.service.download_recording", lambda url: b"fake-audio-bytes")
+    monkeypatch.setattr("app.intelligence.service.transcribe_audio", lambda audio_bytes: "Recovered on retry.")
+    second = client.post(
+        f"/intelligence/voicemails/{voicemail.id}/summarize", headers={"Authorization": f"Bearer {token}"},
+    )
+    assert second.status_code == 201
+
+    jobs = (
+        db_session.query(AIJob)
+        .filter(AIJob.source_type == SummarySourceType.VOICEMAIL, AIJob.source_id == voicemail.id)
+        .all()
+    )
+    assert len(jobs) == 1  # same row updated in place, not a new one per attempt
+    assert jobs[0].attempt_count == 2
+    assert jobs[0].status == AIJobStatus.SUCCEEDED
+    assert jobs[0].last_error is None
+    assert jobs[0].conversation_summary_id is not None
+
+
+def test_staff_can_list_ai_jobs_filtered_by_status(client, db_session, monkeypatch):
+    from app.staff import service as staff_service
+    from app.staff.models import PlatformStaffRole
+
+    token, account_id = _signup_and_login(client, "aijobstafflist1@example.com", "AI Job Staff List Co")
+    voicemail = _make_voicemail(db_session, account_id, "+15550005559")
+    client.post(
+        "/compliance/consent", json={"consent_type": "ai_processing"}, headers={"Authorization": f"Bearer {token}"},
+    )
+
+    def _boom(url):
+        raise RuntimeError("simulated failure for staff listing test")
+
+    monkeypatch.setattr("app.intelligence.service.download_recording", _boom)
+    with pytest.raises(RuntimeError):
+        client.post(f"/intelligence/voicemails/{voicemail.id}/summarize", headers={"Authorization": f"Bearer {token}"})
+
+    staff_service.create_staff(
+        db_session, email="aijobstaff1@zoikolocal.com", password="staffpass123", role=PlatformStaffRole.SUPPORT
+    )
+    staff_token = client.post(
+        "/staff/login", json={"email": "aijobstaff1@zoikolocal.com", "password": "staffpass123"}
+    ).json()["access_token"]
+
+    response = client.get(
+        "/intelligence/jobs", params={"job_status": "failed"}, headers={"Authorization": f"Bearer {staff_token}"},
+    )
+    assert response.status_code == 200
+    matching = [j for j in response.json() if j["source_id"] == voicemail.id]
+    assert len(matching) == 1
+    assert matching[0]["status"] == "failed"
+    assert "simulated failure for staff listing test" in matching[0]["last_error"]

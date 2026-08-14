@@ -222,11 +222,17 @@ def test_create_price_catalog_entry_rejects_a_duplicate_version(db_session):
 def test_get_active_price_catalog_entry_returns_the_most_recently_created(db_session):
     from datetime import datetime, timedelta, timezone
 
+    # "enterprise" deliberately (not "starter") - the Zoiko Local Global
+    # Plans, Pricing & Commercial Launch Standard (2026-08-14) gave starter/
+    # business/pro/scale a real ACTIVE entry each, which would otherwise win
+    # get_active_price_catalog_entry's own ACTIVE-first lookup and mask the
+    # "nothing activated yet, fall back to most recent" path this test is
+    # isolating. Enterprise stays unseeded/custom per that same doc.
     service.create_price_catalog_entry(
-        db_session, plan_code="starter", catalog_version="test-v-old", amount_minor_units=1000, actor="test-actor"
+        db_session, plan_code="enterprise", catalog_version="test-v-old", amount_minor_units=1000, actor="test-actor"
     )
     newest = service.create_price_catalog_entry(
-        db_session, plan_code="starter", catalog_version="test-v-new", amount_minor_units=2000, actor="test-actor"
+        db_session, plan_code="enterprise", catalog_version="test-v-new", amount_minor_units=2000, actor="test-actor"
     )
     # Postgres's now() is frozen to this test's enclosing transaction (see
     # _db_now's docstring) - both rows above got the SAME created_at, so
@@ -235,7 +241,7 @@ def test_get_active_price_catalog_entry_returns_the_most_recently_created(db_ses
     newest.created_at = datetime.now(timezone.utc) + timedelta(seconds=1)
     db_session.commit()
 
-    active = service.get_active_price_catalog_entry(db_session, "starter")
+    active = service.get_active_price_catalog_entry(db_session, "enterprise")
     assert active.id == newest.id
 
 
@@ -245,7 +251,7 @@ def test_cannot_approve_a_placeholder_catalog_entry(db_session):
         is_placeholder=True, actor="test-actor",
     )
     try:
-        service.approve_price_catalog_entry(db_session, entry.id, actor="test-actor")
+        service.approve_price_catalog_entry(db_session, entry.id, actor="test-actor", approval_evidence="FIN-9999")
         assert False, "expected CannotApprovePlaceholderError"
     except service.CannotApprovePlaceholderError:
         pass
@@ -258,17 +264,64 @@ def test_can_approve_a_real_catalog_entry(db_session):
         db_session, plan_code="starter", catalog_version="test-v-real", amount_minor_units=1000,
         is_placeholder=False, actor="test-actor",
     )
-    approved = service.approve_price_catalog_entry(db_session, entry.id, actor="test-actor")
+    approved = service.approve_price_catalog_entry(
+        db_session, entry.id, actor="test-actor", approval_evidence="FIN-1234"
+    )
     assert approved.status == CatalogEntryStatus.APPROVED
+    assert approved.approval_evidence == "FIN-1234"
     assert approved.approved_by == "test-actor"
     assert approved.approved_at is not None
 
 
+def test_activate_price_catalog_entry_retires_the_previous_active_one(db_session):
+    from app.billing.models import CatalogEntryStatus
+
+    first = service.create_price_catalog_entry(
+        db_session, plan_code="starter", catalog_version="test-v-active-1", amount_minor_units=1000,
+        is_placeholder=False, actor="test-actor",
+    )
+    service.approve_price_catalog_entry(db_session, first.id, actor="test-actor", approval_evidence="FIN-0001")
+    activated_first = service.activate_price_catalog_entry(db_session, first.id, actor="test-actor")
+    assert activated_first.status == CatalogEntryStatus.ACTIVE
+    assert activated_first.effective_from is not None
+
+    second = service.create_price_catalog_entry(
+        db_session, plan_code="starter", catalog_version="test-v-active-2", amount_minor_units=1500,
+        is_placeholder=False, actor="test-actor",
+    )
+    service.approve_price_catalog_entry(db_session, second.id, actor="test-actor", approval_evidence="FIN-0002")
+    activated_second = service.activate_price_catalog_entry(db_session, second.id, actor="test-actor")
+
+    db_session.refresh(first)
+    assert first.status == CatalogEntryStatus.RETIRED
+    assert activated_second.status == CatalogEntryStatus.ACTIVE
+
+    current = service.get_active_price_catalog_entry(db_session, "starter")
+    assert current.id == second.id
+
+
+def test_cannot_activate_an_entry_that_isnt_approved(db_session):
+    entry = service.create_price_catalog_entry(
+        db_session, plan_code="starter", catalog_version="test-v-not-approved", amount_minor_units=1000,
+        is_placeholder=False, actor="test-actor",
+    )
+    try:
+        service.activate_price_catalog_entry(db_session, entry.id, actor="test-actor")
+        assert False, "expected CannotActivateEntryError"
+    except service.CannotActivateEntryError:
+        pass
+
+
 def test_run_billing_cycle_refuses_a_placeholder_price_outside_development(db_session, monkeypatch):
     """The whole point of P0-1: a placeholder must never silently become a
-    real charge just because someone deployed to a non-dev environment."""
+    real charge just because someone deployed to a non-dev environment.
+    Uses "enterprise" specifically - it's the one seeded plan with no
+    price-book-engine PROPOSED baseline entry (Table 4: "Enterprise
+    custom" has no fixed figure to seed), so its most-recently-created
+    catalog entry is still the original dev-only is_placeholder=True row
+    rather than the versioned baseline seeded for starter/business."""
     monkeypatch.setattr(service.settings, "environment", "production")
-    account, _sub = _synced_paid_subscription(db_session, "Billing Cycle Placeholder Guard Co")
+    account, _sub = _synced_paid_subscription(db_session, "Billing Cycle Placeholder Guard Co", plan_code="enterprise")
 
     try:
         service.run_billing_cycle(db_session, account.id, actor="test-actor")

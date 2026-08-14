@@ -55,10 +55,18 @@ class NumberConflictError(Exception):
     account already holds it, or the caller's own reservation lapsed."""
 
 
-class TestAccountRestrictedError(Exception):
-    """Raised when an account flagged is_test attempts a real-money action
-    (Commercial Billing Operating Standard doc §14/§T) - see Account.
-    is_test's docstring."""
+class ReservationExpiredError(NumberConflictError):
+    """Raised specifically when the account's OWN reservation on this
+    number lapsed (RESERVATION_TTL_MINUTES) - a subclass of
+    NumberConflictError so anything already catching that broadly still
+    catches this, but distinct enough that complete_number_purchase_from_
+    checkout can tell it apart from "already fulfilled/duplicate webhook."
+    Confirmed live (Commercial Billing Operating Standard acceptance test,
+    2026-08-13): before this existed, a real Stripe payment that completed
+    after the reservation had already expired was silently kept with no
+    number delivered and no refund issued, because this case raised the
+    same NumberConflictError as the harmless "already fulfilled" case and
+    complete_number_purchase_from_checkout couldn't distinguish them."""
 
 
 class NonCommercialAccountError(Exception):
@@ -78,6 +86,14 @@ def _assert_commercial_account(db: Session, account_id: str) -> None:
         raise NonCommercialAccountError(
             f"Account billing_classification {classification!r} cannot create a live charge"
         )
+
+
+class TestAccountRestrictedError(Exception):
+    """Raised when an account flagged is_test attempts a real-money action
+    (Commercial Billing Operating Standard doc §14/§T) - see Account.
+    is_test's docstring. Overlaps with NonCommercialAccountError above (see
+    Account.is_test's merge-time docstring on the two fields) - both are
+    checked, not consolidated, in this merge."""
 
 
 class UnsupportedCountryError(Exception):
@@ -145,8 +161,8 @@ def remove_supported_country(db: Session, code: str) -> None:
 
 
 def _assert_supported_country(db: Session, country: str) -> None:
-    exists = db.query(SupportedCountry).filter(SupportedCountry.code == country).first() is not None
-    if not exists:
+    row = db.query(SupportedCountry).filter(SupportedCountry.code == country).first()
+    if row is None:
         raise UnsupportedCountryError(f"{country!r} is not on Zoiko Local's supported country list yet")
 
 
@@ -626,6 +642,12 @@ def purchase_number(db: Session, account_id: str, e164: str) -> PhoneNumber:
     # anything else so a tripped switch blocks new provisioning without
     # touching this number's existing reservation/eligibility state.
     assert_kill_switch_not_active(db, KillSwitchScope.NUMBER_PROVISIONING)
+    # Deferred import - see reactivate_numbers_for_account_by_staff's
+    # comment on why (app.risk.service imports this module already).
+    # Production Readiness Standard Table 15's "Tenant" kill-switch scope.
+    from app.risk.service import assert_account_kill_switch_not_active
+
+    assert_account_kill_switch_not_active(db, account_id, KillSwitchScope.NUMBER_PROVISIONING)
 
     now = datetime.now(timezone.utc)
     number = db.query(PhoneNumber).filter(PhoneNumber.e164 == e164).with_for_update().first()
@@ -637,7 +659,7 @@ def purchase_number(db: Session, account_id: str, e164: str) -> PhoneNumber:
     if number.status == PhoneNumberStatus.RESERVED and (
         number.reserved_until is not None and number.reserved_until < now
     ):
-        raise NumberConflictError(f"Reservation for {e164} expired — reserve it again before purchasing")
+        raise ReservationExpiredError(f"Reservation for {e164} expired — reserve it again before purchasing")
 
     _assert_purchase_eligible(db, account_id, number, e164=e164)
 
@@ -730,7 +752,9 @@ def create_number_purchase_checkout_session(db: Session, account_id: str, e164: 
     delivery, then performs the actual provisioning. Returns {id, url} -
     the customer is redirected to url."""
     # Commercial Billing Operating Standard doc §14/§T stopgap - see
-    # Account.is_test's docstring. Checked before ever reaching Stripe.
+    # Account.is_test's docstring. Overlaps with _assert_commercial_account
+    # above (see TestAccountRestrictedError's docstring) - both are
+    # checked, not consolidated, in this merge.
     account = db.query(Account).filter(Account.id == account_id).first()
     if account is not None and account.is_test:
         raise TestAccountRestrictedError(f"Account {account_id} is flagged is_test and cannot create a live checkout session")
@@ -745,7 +769,7 @@ def create_number_purchase_checkout_session(db: Session, account_id: str, e164: 
     if number.status == PhoneNumberStatus.RESERVED and (
         number.reserved_until is not None and number.reserved_until < now
     ):
-        raise NumberConflictError(f"Reservation for {e164} expired — reserve it again before checkout")
+        raise ReservationExpiredError(f"Reservation for {e164} expired — reserve it again before checkout")
 
     _assert_purchase_eligible(db, account_id, number, e164=e164)
 
@@ -773,26 +797,38 @@ def complete_number_purchase_from_checkout(
     error) for every known way purchase_number can fail to actually reach
     ACTIVE after a successful payment:
 
-    - NumberConflictError: the number is no longer purchasable (already
-      bought, or the webhook was retried after already succeeding once) -
-      idempotency against Stripe's at-least-once webhook delivery. Not
-      refunded - this path means the number was already (or is being)
-      fulfilled, or a duplicate delivery of an already-handled event.
+    - NumberConflictError (NOT the ReservationExpiredError subclass below):
+      the number is no longer purchasable because it's already bought, or
+      the webhook was retried after already succeeding once - idempotency
+      against Stripe's at-least-once webhook delivery. Not refunded - this
+      path means the number was already (or is being) fulfilled, or a
+      duplicate delivery of an already-handled event.
     - ComplianceRequiredError / NumberEligibilityRequiredError:
       purchase_number already persisted the number into COMPLIANCE_PENDING
       and (for the KYC case) sent its own customer notification - correct
       behavior, nothing further for this handler to do. Not refunded - the
       customer still gets the number once the relevant case clears, this
       isn't a failure.
-    - NumberQuotaExceededError / BillingSuspendedError /
-      EmergencyDisclosureRequiredError / TelecomError: genuine post-
-      payment fulfillment failures - the customer paid and won't be
-      getting a number for it. Automatically refunded via Stripe (if
-      payment_intent_id is available) so no real launch would leave a
-      collected-but-unfulfilled payment sitting uncorrected.
+    - ReservationExpiredError / NumberQuotaExceededError /
+      BillingSuspendedError / EmergencyDisclosureRequiredError /
+      TelecomError: genuine post-payment fulfillment failures - the
+      customer paid and won't be getting a number for it. Automatically
+      refunded via Stripe (if payment_intent_id is available) so no real
+      launch would leave a collected-but-unfulfilled payment sitting
+      uncorrected. ReservationExpiredError was folded into the no-refund
+      NumberConflictError bucket until a live acceptance test (2026-08-13)
+      caught it silently keeping a real completed payment - see that
+      exception's own docstring.
     """
     try:
         return purchase_number(db, account_id, e164)
+    except ReservationExpiredError:
+        if payment_intent_id:
+            try:
+                stripe_checkout.refund_payment(payment_intent_id)
+            except stripe_checkout.PaymentError:
+                pass
+        return None
     except (NumberConflictError, ComplianceRequiredError, NumberEligibilityRequiredError):
         return None
     except (

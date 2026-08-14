@@ -45,6 +45,20 @@ jobs:
 
       - run: pip install -r requirements.txt
 
+      # Production Readiness Standard §A10 "dependency/security scanning" -
+      # informational for now (continue-on-error), not a hard gate: a real
+      # 2026-08-13 pip-audit run against this exact requirements.txt found
+      # unfixed findings in starlette/fastapi (would need a major-version
+      # bump, not yet verified against this app's 270+ routes) and ecdsa
+      # (no fixed version exists upstream at all - a known, maintainer-
+      # acknowledged pure-Python timing-side-channel issue). Failing the
+      # build on those today would just make CI permanently red with
+      # nothing actionable to do about it in the same PR. Safe patch/minor
+      # bumps already applied this pass: python-dotenv, python-jose,
+      # python-multipart. See docs/runbooks/dependency-scanning.md.
+      - run: pip install pip-audit && pip-audit -r requirements.txt
+        continue-on-error: true
+
       - run: alembic upgrade head
 
       - run: alembic check
@@ -71,6 +85,14 @@ jobs:
           cache-dependency-path: frontend/package-lock.json
 
       - run: npm ci
+
+      # Same informational (continue-on-error) posture as the backend's
+      # pip-audit step - see that step's comment. Current known findings
+      # are all transitive through `next` and only fixable via a major
+      # Next.js version bump outside this pass's scope - see
+      # docs/runbooks/dependency-scanning.md.
+      - run: npm audit --production
+        continue-on-error: true
 
       - run: npm run lint
 

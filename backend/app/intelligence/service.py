@@ -15,7 +15,7 @@ from app.integrations.storage.s3 import download_object
 from app.integrations.telecom.twilio import download_recording
 from app.integrations.transcription.groq import MODEL_VERSION as TRANSCRIPTION_MODEL_VERSION
 from app.integrations.transcription.groq import transcribe_audio
-from app.intelligence.models import ConversationSummary, SummarySourceType
+from app.intelligence.models import AIJob, AIJobStatus, ConversationSummary, SummarySourceType
 from app.media.models import CallDirection, CallRecord, ReceptionistUrgency, Voicemail, VideoSession
 from app.notifications.service import notify_call_summary_available, notify_voicemail_transcription_ready
 from app.numbering.identity.models import User, UserRole
@@ -162,6 +162,37 @@ def _analyze_and_store(
     return record
 
 
+def _run_ai_job(
+    db: Session, *, account_id: str, source_type: SummarySourceType, source_id: str, work_fn,
+) -> ConversationSummary:
+    """Retry lineage/failure observability wrapper (see AIJob's docstring) -
+    one row per (source_type, source_id), updated in place across attempts
+    rather than a new row each time, so a job's own history shows every
+    attempt. Re-raises whatever work_fn raises after recording the
+    failure - this changes nothing about caller-visible behavior/error
+    responses, it only adds a persisted trail alongside them."""
+    job = db.query(AIJob).filter(AIJob.source_type == source_type, AIJob.source_id == source_id).first()
+    if job is None:
+        job = AIJob(account_id=account_id, source_type=source_type, source_id=source_id, attempt_count=0, status=AIJobStatus.RUNNING)
+        db.add(job)
+    job.attempt_count += 1
+    job.status = AIJobStatus.RUNNING
+    job.last_error = None
+    db.commit()
+
+    try:
+        result = work_fn()
+    except Exception as e:
+        job.status = AIJobStatus.FAILED
+        job.last_error = str(e)[:2000]
+        db.commit()
+        raise
+    job.status = AIJobStatus.SUCCEEDED
+    job.conversation_summary_id = result.id
+    db.commit()
+    return result
+
+
 def _assert_can_access_number(db: Session, user: User, phone_number_id: str | None) -> None:
     """A Member may only summarize calls/voicemail on a number assigned to
     them - same assignment boundary as direct number management."""
@@ -191,12 +222,12 @@ def summarize_voicemail(db: Session, user: User, voicemail_id: str) -> Conversat
     jurisdiction = _phone_number_country(db, voicemail.phone_number_id)
     _require_consent(db, user.account_id, "voicemails", jurisdiction)
 
-    summary = _analyze_and_store(
-        db,
-        account_id=user.account_id,
-        source_type=SummarySourceType.VOICEMAIL,
-        source_id=voicemail.id,
-        transcript=_download_and_transcribe(voicemail.recording_url),
+    summary = _run_ai_job(
+        db, account_id=user.account_id, source_type=SummarySourceType.VOICEMAIL, source_id=voicemail.id,
+        work_fn=lambda: _analyze_and_store(
+            db, account_id=user.account_id, source_type=SummarySourceType.VOICEMAIL, source_id=voicemail.id,
+            transcript=_download_and_transcribe(voicemail.recording_url),
+        ),
     )
     notify_voicemail_transcription_ready(db, account_id=user.account_id, account_email=user.email)
     return summary
@@ -215,12 +246,12 @@ def summarize_call(db: Session, user: User, call_id: str) -> ConversationSummary
     jurisdiction = _phone_number_country(db, call.phone_number_id)
     _require_consent(db, user.account_id, "calls", jurisdiction)
 
-    summary = _analyze_and_store(
-        db,
-        account_id=user.account_id,
-        source_type=SummarySourceType.CALL,
-        source_id=call.id,
-        transcript=_download_and_transcribe(call.recording_url),
+    summary = _run_ai_job(
+        db, account_id=user.account_id, source_type=SummarySourceType.CALL, source_id=call.id,
+        work_fn=lambda: _analyze_and_store(
+            db, account_id=user.account_id, source_type=SummarySourceType.CALL, source_id=call.id,
+            transcript=_download_and_transcribe(call.recording_url),
+        ),
     )
     counterparty = call.to_number if call.direction == CallDirection.OUTBOUND else call.from_number
     notify_call_summary_available(db, account_id=user.account_id, account_email=user.email, counterparty=counterparty)
@@ -243,12 +274,12 @@ def summarize_video_session(db: Session, user: User, room_name: str) -> Conversa
 
     _require_consent(db, user.account_id, "video calls", GLOBAL_JURISDICTION)
 
-    return _analyze_and_store(
-        db,
-        account_id=user.account_id,
-        source_type=SummarySourceType.VIDEO,
-        source_id=session.id,
-        transcript=_download_and_transcribe_video(session.room_name),
+    return _run_ai_job(
+        db, account_id=user.account_id, source_type=SummarySourceType.VIDEO, source_id=session.id,
+        work_fn=lambda: _analyze_and_store(
+            db, account_id=user.account_id, source_type=SummarySourceType.VIDEO, source_id=session.id,
+            transcript=_download_and_transcribe_video(session.room_name),
+        ),
     )
 
 
@@ -380,3 +411,13 @@ def search_account_summaries(db: Session, user: User, search_query: str) -> list
         .limit(_SEMANTIC_RESULT_LIMIT)
         .all()
     )
+
+
+def list_ai_jobs(db: Session, status_filter: AIJobStatus | None = None) -> list[AIJob]:
+    """Staff-only failure-observability view (AIJob's docstring) - any
+    staff role can view, same diagnostic posture as /ops/traces and the
+    risk score view."""
+    query = db.query(AIJob)
+    if status_filter is not None:
+        query = query.filter(AIJob.status == status_filter)
+    return query.order_by(AIJob.updated_at.desc()).all()

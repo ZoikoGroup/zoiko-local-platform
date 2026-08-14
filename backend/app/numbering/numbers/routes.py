@@ -8,6 +8,7 @@ from app.integrations.billing import stripe_checkout
 from app.integrations.telecom.twilio import TelecomError
 from app.numbering.identity.models import User
 from app.ops.service import KillSwitchTrippedError
+from app.risk.service import AccountKillSwitchTrippedError
 from app.numbering.numbers import service
 from app.numbering.numbers.schemas import (
     AssignNumberRequest,
@@ -108,6 +109,8 @@ def purchase_number(
     except TelecomError as e:
         raise HTTPException(status_code=502, detail=str(e)) from e
     except KillSwitchTrippedError as e:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e)) from e
+    except AccountKillSwitchTrippedError as e:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e)) from e
 
 

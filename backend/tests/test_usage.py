@@ -170,6 +170,208 @@ def test_non_super_admin_staff_cannot_update_calling_rates(client, db_session):
     assert response.status_code == 403
 
 
+# --- Usage disputes / adjustments (append-only billing correction trail) ---
+
+
+def test_owner_can_open_a_dispute_on_their_own_usage_event(client, db_session, monkeypatch):
+    token = _signup_and_login(client, "disputeopen1@example.com")
+    account_id = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"}).json()["account_id"]
+    _place_outbound_call(client, db_session, monkeypatch, token, account_id, "+15550004444", "+15559990010", "CAdispute1")
+    callback_url = "http://testserver/media/voice/status-callback"
+    callback_params = {"CallSid": "CAdispute1", "CallStatus": "completed", "CallDuration": "600"}
+    signature = _twilio_signature(callback_url, callback_params)
+    client.post("/media/voice/status-callback", data=callback_params, headers={"X-Twilio-Signature": signature})
+
+    headers = {"Authorization": f"Bearer {token}"}
+    usage_event_id = client.get("/usage", headers=headers).json()[0]["id"]
+
+    response = client.post(
+        "/usage/disputes", json={"usage_event_id": usage_event_id, "reason": "I was never on this call"},
+        headers=headers,
+    )
+    assert response.status_code == 201
+    body = response.json()
+    assert body["status"] == "open"
+    assert body["usage_event_id"] == usage_event_id
+
+    own_list = client.get("/usage/disputes", headers=headers).json()
+    assert len(own_list) == 1
+    assert own_list[0]["id"] == body["id"]
+
+
+def test_cannot_dispute_a_usage_event_belonging_to_another_account(client, db_session, monkeypatch):
+    token1 = _signup_and_login(client, "disputeother1@example.com")
+    account_id1 = client.get("/auth/me", headers={"Authorization": f"Bearer {token1}"}).json()["account_id"]
+    _place_outbound_call(client, db_session, monkeypatch, token1, account_id1, "+15550005555", "+15559990011", "CAdispute2")
+    callback_url = "http://testserver/media/voice/status-callback"
+    callback_params = {"CallSid": "CAdispute2", "CallStatus": "completed", "CallDuration": "60"}
+    signature = _twilio_signature(callback_url, callback_params)
+    client.post("/media/voice/status-callback", data=callback_params, headers={"X-Twilio-Signature": signature})
+    usage_event_id = client.get("/usage", headers={"Authorization": f"Bearer {token1}"}).json()[0]["id"]
+
+    token2 = _signup_and_login(client, "disputeother2@example.com")
+    response = client.post(
+        "/usage/disputes", json={"usage_event_id": usage_event_id, "reason": "not mine"},
+        headers={"Authorization": f"Bearer {token2}"},
+    )
+    assert response.status_code == 404
+
+
+def test_staff_resolves_dispute_with_adjustment_and_updates_the_usage_event(client, db_session, monkeypatch):
+    from app.staff import service as staff_service
+    from app.staff.models import PlatformStaffRole
+
+    token = _signup_and_login(client, "disputeadjust1@example.com")
+    account_id = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"}).json()["account_id"]
+    _place_outbound_call(client, db_session, monkeypatch, token, account_id, "+15550006666", "+15559990012", "CAdispute3")
+    callback_url = "http://testserver/media/voice/status-callback"
+    callback_params = {"CallSid": "CAdispute3", "CallStatus": "completed", "CallDuration": "600"}
+    signature = _twilio_signature(callback_url, callback_params)
+    client.post("/media/voice/status-callback", data=callback_params, headers={"X-Twilio-Signature": signature})
+
+    headers = {"Authorization": f"Bearer {token}"}
+    original_event = client.get("/usage", headers=headers).json()[0]
+    usage_event_id = original_event["id"]
+    original_cost = original_event["estimated_cost_cents"]
+    assert original_cost > 0
+
+    dispute_id = client.post(
+        "/usage/disputes", json={"usage_event_id": usage_event_id, "reason": "call dropped after 10 seconds"},
+        headers=headers,
+    ).json()["id"]
+
+    staff_service.create_staff(
+        db_session, email="disputestaff1@zoikolocal.com", password="staffpass123", role=PlatformStaffRole.SUPER_ADMIN
+    )
+    staff_token = client.post(
+        "/staff/login", json={"email": "disputestaff1@zoikolocal.com", "password": "staffpass123"}
+    ).json()["access_token"]
+    staff_headers = {"Authorization": f"Bearer {staff_token}"}
+
+    resolve_response = client.post(
+        f"/usage/disputes/{dispute_id}/resolve",
+        json={"status": "resolved_adjusted", "notes": "confirmed dropped call, adjusted to 10s pricing", "new_estimated_cost_cents": 1},
+        headers=staff_headers,
+    )
+    assert resolve_response.status_code == 200
+    assert resolve_response.json()["status"] == "resolved_adjusted"
+
+    updated_event = client.get("/usage", headers=headers).json()[0]
+    assert updated_event["estimated_cost_cents"] == 1
+    assert updated_event["estimated_cost_cents"] != original_cost
+
+    from app.usage.models import UsageAdjustment
+    adjustment = db_session.query(UsageAdjustment).filter(UsageAdjustment.usage_event_id == usage_event_id).first()
+    assert adjustment is not None
+    assert adjustment.previous_estimated_cost_cents == original_cost
+    assert adjustment.new_estimated_cost_cents == 1
+    assert adjustment.dispute_id == dispute_id
+
+
+def test_staff_can_deny_a_dispute_without_touching_the_usage_event(client, db_session, monkeypatch):
+    from app.staff import service as staff_service
+    from app.staff.models import PlatformStaffRole
+
+    token = _signup_and_login(client, "disputedeny1@example.com")
+    account_id = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"}).json()["account_id"]
+    _place_outbound_call(client, db_session, monkeypatch, token, account_id, "+15550007777", "+15559990013", "CAdispute4")
+    callback_url = "http://testserver/media/voice/status-callback"
+    callback_params = {"CallSid": "CAdispute4", "CallStatus": "completed", "CallDuration": "60"}
+    signature = _twilio_signature(callback_url, callback_params)
+    client.post("/media/voice/status-callback", data=callback_params, headers={"X-Twilio-Signature": signature})
+
+    headers = {"Authorization": f"Bearer {token}"}
+    original_cost = client.get("/usage", headers=headers).json()[0]["estimated_cost_cents"]
+    usage_event_id = client.get("/usage", headers=headers).json()[0]["id"]
+    dispute_id = client.post(
+        "/usage/disputes", json={"usage_event_id": usage_event_id, "reason": "disagree with the rate"},
+        headers=headers,
+    ).json()["id"]
+
+    staff_service.create_staff(
+        db_session, email="disputestaff2@zoikolocal.com", password="staffpass123", role=PlatformStaffRole.SUPER_ADMIN
+    )
+    staff_token = client.post(
+        "/staff/login", json={"email": "disputestaff2@zoikolocal.com", "password": "staffpass123"}
+    ).json()["access_token"]
+
+    resolve_response = client.post(
+        f"/usage/disputes/{dispute_id}/resolve",
+        json={"status": "resolved_denied", "notes": "rate card is correct"},
+        headers={"Authorization": f"Bearer {staff_token}"},
+    )
+    assert resolve_response.status_code == 200
+    assert resolve_response.json()["status"] == "resolved_denied"
+
+    unchanged_cost = client.get("/usage", headers=headers).json()[0]["estimated_cost_cents"]
+    assert unchanged_cost == original_cost
+
+
+def test_non_super_admin_staff_cannot_resolve_a_dispute(client, db_session, monkeypatch):
+    from app.staff import service as staff_service
+    from app.staff.models import PlatformStaffRole
+
+    token = _signup_and_login(client, "disputenonadmin1@example.com")
+    account_id = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"}).json()["account_id"]
+    _place_outbound_call(client, db_session, monkeypatch, token, account_id, "+15550008888", "+15559990014", "CAdispute5")
+    callback_url = "http://testserver/media/voice/status-callback"
+    callback_params = {"CallSid": "CAdispute5", "CallStatus": "completed", "CallDuration": "60"}
+    signature = _twilio_signature(callback_url, callback_params)
+    client.post("/media/voice/status-callback", data=callback_params, headers={"X-Twilio-Signature": signature})
+
+    headers = {"Authorization": f"Bearer {token}"}
+    usage_event_id = client.get("/usage", headers=headers).json()[0]["id"]
+    dispute_id = client.post(
+        "/usage/disputes", json={"usage_event_id": usage_event_id, "reason": "test"}, headers=headers,
+    ).json()["id"]
+
+    staff_service.create_staff(
+        db_session, email="disputestaff3@zoikolocal.com", password="staffpass123", role=PlatformStaffRole.SUPPORT
+    )
+    staff_token = client.post(
+        "/staff/login", json={"email": "disputestaff3@zoikolocal.com", "password": "staffpass123"}
+    ).json()["access_token"]
+
+    response = client.post(
+        f"/usage/disputes/{dispute_id}/resolve", json={"status": "resolved_denied"},
+        headers={"Authorization": f"Bearer {staff_token}"},
+    )
+    assert response.status_code == 403
+
+
+def test_cannot_resolve_an_already_resolved_dispute(client, db_session, monkeypatch):
+    from app.staff import service as staff_service
+    from app.staff.models import PlatformStaffRole
+
+    token = _signup_and_login(client, "disputetwice1@example.com")
+    account_id = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"}).json()["account_id"]
+    _place_outbound_call(client, db_session, monkeypatch, token, account_id, "+15550009999", "+15559990015", "CAdispute6")
+    callback_url = "http://testserver/media/voice/status-callback"
+    callback_params = {"CallSid": "CAdispute6", "CallStatus": "completed", "CallDuration": "60"}
+    signature = _twilio_signature(callback_url, callback_params)
+    client.post("/media/voice/status-callback", data=callback_params, headers={"X-Twilio-Signature": signature})
+
+    headers = {"Authorization": f"Bearer {token}"}
+    usage_event_id = client.get("/usage", headers=headers).json()[0]["id"]
+    dispute_id = client.post(
+        "/usage/disputes", json={"usage_event_id": usage_event_id, "reason": "test"}, headers=headers,
+    ).json()["id"]
+
+    staff_service.create_staff(
+        db_session, email="disputestaff4@zoikolocal.com", password="staffpass123", role=PlatformStaffRole.SUPER_ADMIN
+    )
+    staff_token = client.post(
+        "/staff/login", json={"email": "disputestaff4@zoikolocal.com", "password": "staffpass123"}
+    ).json()["access_token"]
+    staff_headers = {"Authorization": f"Bearer {staff_token}"}
+
+    client.post(f"/usage/disputes/{dispute_id}/resolve", json={"status": "resolved_denied"}, headers=staff_headers)
+    second_attempt = client.post(
+        f"/usage/disputes/{dispute_id}/resolve", json={"status": "resolved_denied"}, headers=staff_headers,
+    )
+    assert second_attempt.status_code == 409
+
+
 def test_usage_requires_admin(client):
     owner_token = _signup_and_login(client, "usagememberowner@example.com")
     owner_headers = {"Authorization": f"Bearer {owner_token}"}

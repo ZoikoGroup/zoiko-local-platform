@@ -78,3 +78,47 @@ fly secrets set DB_POOL_SIZE=15 DB_MAX_OVERFLOW=15
 Nothing needs to be manually replayed — `pool_pre_ping=True` means the
 engine discards stale connections and reconnects automatically once the DB
 is reachable again. No app restart needed for a transient DB blip.
+
+## Backup & restore (self-hosted/local Postgres)
+
+Production Readiness & Go-Live Decision Standard's reliability gate (A11)
+asks for "backups and restore test," not just "a backup runs somewhere" -
+this section covers the self-hosted docker-compose Postgres this repo
+actually runs today (local dev, and any self-hosted deployment target).
+**Neon** (the intended production target per this doc's own opening line)
+has its own managed backup/point-in-time-restore and branching mechanism -
+use that directly once a real Neon project is provisioned; the scripts
+below are for the docker-compose instance specifically.
+
+`scripts/backup_db.sh [output_dir]` - runs `pg_dump` inside the running
+`zoiko_local-postgres-1` container (via `docker exec`, so no client tools
+need to be installed on the host) and writes a timestamped custom-format
+dump to `output_dir` (default `./backups`).
+
+`scripts/restore_db.sh <backup_file> <target_db_name>` - restores a dump
+into `target_db_name`, creating it first if needed. **Always requires an
+explicit target name** - it will never restore over the live database by
+default, specifically so a restore can't become its own incident. To
+verify a backup is actually good without touching real data, restore it
+into a disposable name (e.g. `zoiko_local_restore_test`) and drop that
+database once you've checked it.
+
+**Actually tested end to end** (2026-08-13, not just written and assumed
+to work): backed up the live local dev database, restored it into a
+scratch `zoiko_local_restore_test` database, confirmed matching row
+counts across several tables (`accounts`, `phone_numbers`, `plans`), then
+dropped the scratch database. Real finding from that test run: this
+container's host has a newer glibc collation version than the database
+was initialized under, which makes plain `createdb` fail outright
+("template database template1 has a collation version mismatch") -
+`restore_db.sh` works around this by creating the target from
+`template0` instead of the (broken) default `template1`. If you ever see
+that same collation warning elsewhere against this container, this is
+why, and the same `--template=template0` workaround applies.
+
+```bash
+./scripts/backup_db.sh ./backups
+./scripts/restore_db.sh ./backups/zoiko_local_20260813T160702Z.dump zoiko_local_restore_test
+# verify row counts / spot-check data against the real DB, then:
+docker exec zoiko_local-postgres-1 dropdb -U zoiko zoiko_local_restore_test
+```

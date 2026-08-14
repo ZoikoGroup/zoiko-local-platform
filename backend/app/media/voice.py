@@ -255,6 +255,12 @@ async def outbound_call(
         raise HTTPException(status_code=429, detail=str(e)) from e
     except risk_service.SpendLimitExceededError as e:
         raise HTTPException(status_code=429, detail=str(e)) from e
+    except risk_service.ConcurrencyLimitExceededError as e:
+        raise HTTPException(status_code=429, detail=str(e)) from e
+    except risk_service.CumulativeTrialUsageExceededError as e:
+        raise HTTPException(status_code=402, detail=str(e)) from e
+    except risk_service.AccountKillSwitchTrippedError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
     except KillSwitchTrippedError as e:
         raise HTTPException(status_code=503, detail=str(e)) from e
     except TelecomError as e:

@@ -241,11 +241,17 @@ def buy_number(phone_number: str) -> dict:
 
 def place_call(
     to: str, from_: str, twiml_url: str | None = None, twiml: str | None = None,
-    status_callback_url: str | None = None,
+    status_callback_url: str | None = None, time_limit_seconds: int | None = None,
 ) -> dict:
     """`from_` must be a Twilio number owned on this account. Confirmed live:
     Twilio rejects with a 400 ("not yet verified for your account") if `from_`
     isn't an owned/verified number — see docs/stage3-twilio-calling-notes.md.
+
+    time_limit_seconds maps straight to Twilio's own Calls.create time_limit
+    parameter - a real server-side hard cap (Twilio hangs up the call itself
+    once reached), not a client-side check. Production Readiness Standard
+    Table 15's "Usage ceilings: hard limits on... call duration" - see
+    app.risk.service.get_call_time_limit_for_account for who gets a cap.
     """
     if not twiml_url and not twiml:
         raise ValueError("Provide either twiml_url or twiml")
@@ -259,6 +265,8 @@ def place_call(
         kwargs["status_callback"] = status_callback_url
         kwargs["status_callback_event"] = ["completed"]
         kwargs["status_callback_method"] = "POST"
+    if time_limit_seconds is not None:
+        kwargs["time_limit"] = time_limit_seconds
 
     def _primary() -> dict:
         try:
@@ -269,7 +277,7 @@ def place_call(
         return {"sid": call.sid, "status": call.status, "to": call.to, "from": call.from_}
 
     secondary_fn = (
-        (lambda: secondary.place_call(to, from_, twiml_url, twiml, status_callback_url))
+        (lambda: secondary.place_call(to, from_, twiml_url, twiml, status_callback_url, time_limit_seconds))
         if settings.telecom_failover_enabled else None
     )
     return with_failover(_breaker, _primary, secondary_fn, TelecomError)

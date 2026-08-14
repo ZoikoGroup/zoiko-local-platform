@@ -26,6 +26,11 @@ class PriceCatalogEntryResponse(BaseModel):
     currency_code: str
     status: str
     is_placeholder: bool
+    price_book_version: str | None
+    market: str
+    effective_from: datetime | None
+    effective_to: datetime | None
+    approval_evidence: str | None
     approved_by: str | None
     approved_at: datetime | None
     created_at: datetime
@@ -37,6 +42,14 @@ class CreatePriceCatalogEntryRequest(BaseModel):
     amount_minor_units: int
     currency_code: str = "USD"
     is_placeholder: bool = True
+    price_book_version: str | None = None
+    market: str = "GLOBAL"
+    effective_from: datetime | None = None
+    effective_to: datetime | None = None
+
+
+class ApprovePriceCatalogEntryRequest(BaseModel):
+    approval_evidence: str
 
 
 class SubscriptionResponse(BaseModel):
@@ -50,10 +63,15 @@ class SubscriptionResponse(BaseModel):
     current_period_end: datetime
     zoikonex_ref: str | None
     grace_period_ends_at: datetime | None
+    canceled_at: datetime | None
 
 
 class ChangePlanRequest(BaseModel):
     plan_code: str
+
+
+class CancelSubscriptionRequest(BaseModel):
+    reason: str | None = None
 
 
 class UsageResourceSummary(BaseModel):

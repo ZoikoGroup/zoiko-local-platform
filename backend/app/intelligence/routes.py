@@ -9,14 +9,16 @@ from sqlalchemy.orm import Session
 
 from app.billing.service import BillingSuspendedError
 from app.core.database import get_db
-from app.core.deps import get_current_user, require_writer
+from app.core.deps import get_current_staff, get_current_user, require_writer
 from app.integrations.llm.groq import LLMError
 from app.integrations.storage.s3 import StorageError
 from app.integrations.telecom.twilio import TelecomError
 from app.integrations.transcription.groq import TranscriptionError
 from app.intelligence import service
+from app.intelligence.models import AIJobStatus
 from app.numbering.identity.models import User
 from app.ops.service import KillSwitchTrippedError
+from app.staff.models import PlatformStaff
 
 router = APIRouter(prefix="/intelligence", tags=["intelligence"])
 
@@ -145,3 +147,25 @@ def search_summaries(
         return []
     records = service.search_account_summaries(db, current_user, q)
     return [_summary_response(r) for r in records]
+
+
+@router.get("/jobs")
+def list_ai_jobs(
+    job_status: AIJobStatus | None = None,
+    db: Session = Depends(get_db),
+    _staff: PlatformStaff = Depends(get_current_staff),
+):
+    """Staff-only retry-lineage/failure-observability view (AIJob's
+    docstring) - answers "why did this recording never get a summary"
+    without grepping raw logs. Any staff role can view (diagnostic, same
+    posture as /ops/traces)."""
+    jobs = service.list_ai_jobs(db, job_status)
+    return [
+        {
+            "id": j.id, "account_id": j.account_id, "source_type": j.source_type.value, "source_id": j.source_id,
+            "status": j.status.value, "attempt_count": j.attempt_count, "last_error": j.last_error,
+            "conversation_summary_id": j.conversation_summary_id,
+            "created_at": j.created_at, "updated_at": j.updated_at,
+        }
+        for j in jobs
+    ]

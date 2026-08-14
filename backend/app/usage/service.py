@@ -1,9 +1,19 @@
+from datetime import datetime, timezone
+
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.audit.service import log_event
 from app.billing.service import sync_usage_event_to_zoikonex
 from app.events.service import publish_usage_rated
-from app.usage.models import DEFAULT_RATE_COUNTRY, CallingRate, UsageEvent
+from app.usage.models import (
+    DEFAULT_RATE_COUNTRY,
+    CallingRate,
+    UsageAdjustment,
+    UsageDispute,
+    UsageDisputeStatus,
+    UsageEvent,
+)
 
 # Commercial Billing Operating Standard doc §E1/§30 - bumped only when the
 # rounding/minimum-increment/disposition-billability rule below actually
@@ -126,3 +136,127 @@ def list_account_usage(db: Session, account_id: str) -> list[UsageEvent]:
         .order_by(UsageEvent.created_at.desc())
         .all()
     )
+
+
+class UsageEventNotFoundError(Exception):
+    """Raised when a usage_event_id doesn't exist (or doesn't belong to
+    the account raising a dispute against it)."""
+
+
+class UsageDisputeNotFoundError(Exception):
+    """Raised when a usage_dispute_id doesn't exist."""
+
+
+class UsageDisputeAlreadyResolvedError(Exception):
+    """Raised when trying to resolve a dispute that's already
+    RESOLVED_ADJUSTED or RESOLVED_DENIED."""
+
+
+class InvalidUsageDisputeResolutionError(Exception):
+    """Raised for a resolution status other than RESOLVED_ADJUSTED/
+    RESOLVED_DENIED, or an ADJUSTED resolution missing the new cost."""
+
+
+def open_usage_dispute(db: Session, *, account_id: str, usage_event_id: str, reason: str, raised_by: str) -> UsageDispute:
+    """Commercial Billing Operating Standard doc §L1/E6 - the customer-
+    facing half of the append-only billing-correction trail (see
+    UsageDispute's docstring). Any account member can raise one against a
+    usage event on their own account; resolving it is staff-only (see
+    resolve_usage_dispute)."""
+    event = db.query(UsageEvent).filter(UsageEvent.id == usage_event_id, UsageEvent.account_id == account_id).first()
+    if event is None:
+        raise UsageEventNotFoundError(f"No such usage event {usage_event_id!r} on this account")
+    dispute = UsageDispute(account_id=account_id, usage_event_id=usage_event_id, reason=reason, raised_by=raised_by)
+    db.add(dispute)
+    db.commit()
+    db.refresh(dispute)
+    log_event(
+        db, actor=raised_by, action="usage.dispute_opened", target=f"usage_dispute:{dispute.id}",
+        after={"usage_event_id": usage_event_id, "reason": reason},
+    )
+    return dispute
+
+
+def list_account_usage_disputes(db: Session, account_id: str) -> list[UsageDispute]:
+    return db.query(UsageDispute).filter(UsageDispute.account_id == account_id).order_by(UsageDispute.created_at.desc()).all()
+
+
+def list_usage_disputes(db: Session, status_filter: UsageDisputeStatus | None = None) -> list[UsageDispute]:
+    """Staff-only queue view - any staff role can view (diagnostic, same
+    posture as the fraud-case queue); resolving one is the sensitive
+    action, gated at the route."""
+    query = db.query(UsageDispute)
+    if status_filter is not None:
+        query = query.filter(UsageDispute.status == status_filter)
+    return query.order_by(UsageDispute.created_at.desc()).all()
+
+
+def create_usage_adjustment(
+    db: Session, usage_event_id: str, *, new_estimated_cost_cents: int, reason: str, actor: str,
+    dispute_id: str | None = None,
+) -> UsageAdjustment:
+    """The ONLY code path allowed to change UsageEvent.estimated_cost_cents
+    after creation - see UsageAdjustment's docstring on why this must
+    never happen as a bare UPDATE elsewhere. Staff-only, gated at the
+    route (billing.resolve_usage_dispute - same capability whether or not
+    a formal dispute exists, since the sensitivity is "changing a billed
+    amount," not "responding to a customer complaint")."""
+    event = db.query(UsageEvent).filter(UsageEvent.id == usage_event_id).first()
+    if event is None:
+        raise UsageEventNotFoundError(f"No such usage event {usage_event_id!r}")
+    adjustment = UsageAdjustment(
+        usage_event_id=usage_event_id, dispute_id=dispute_id,
+        previous_estimated_cost_cents=event.estimated_cost_cents,
+        new_estimated_cost_cents=new_estimated_cost_cents, reason=reason, actor=actor,
+    )
+    event.estimated_cost_cents = new_estimated_cost_cents
+    db.add(adjustment)
+    db.commit()
+    db.refresh(adjustment)
+    log_event(
+        db, actor=actor, action="usage.adjustment_created", target=f"usage_event:{usage_event_id}",
+        before={"estimated_cost_cents": adjustment.previous_estimated_cost_cents},
+        after={"estimated_cost_cents": new_estimated_cost_cents, "reason": reason, "dispute_id": dispute_id},
+    )
+    return adjustment
+
+
+def resolve_usage_dispute(
+    db: Session, dispute_id: str, *, actor: str, status: UsageDisputeStatus, notes: str | None = None,
+    new_estimated_cost_cents: int | None = None,
+) -> UsageDispute:
+    """Staff-only. status must be RESOLVED_ADJUSTED or RESOLVED_DENIED -
+    OPEN/INVESTIGATING aren't resolutions, they're the dispute's own
+    starting/in-progress states. RESOLVED_ADJUSTED atomically creates the
+    UsageAdjustment ledger row (see create_usage_adjustment) in the same
+    call, rather than requiring the caller to remember to make two
+    separate requests."""
+    if status not in (UsageDisputeStatus.RESOLVED_ADJUSTED, UsageDisputeStatus.RESOLVED_DENIED):
+        raise InvalidUsageDisputeResolutionError(
+            "A dispute can only be resolved as 'resolved_adjusted' or 'resolved_denied'"
+        )
+    dispute = db.query(UsageDispute).filter(UsageDispute.id == dispute_id).first()
+    if dispute is None:
+        raise UsageDisputeNotFoundError(f"No such usage dispute {dispute_id!r}")
+    if dispute.status in (UsageDisputeStatus.RESOLVED_ADJUSTED, UsageDisputeStatus.RESOLVED_DENIED):
+        raise UsageDisputeAlreadyResolvedError(f"Dispute {dispute_id} is already {dispute.status.value}")
+
+    if status == UsageDisputeStatus.RESOLVED_ADJUSTED:
+        if new_estimated_cost_cents is None:
+            raise InvalidUsageDisputeResolutionError("new_estimated_cost_cents is required to resolve as resolved_adjusted")
+        create_usage_adjustment(
+            db, dispute.usage_event_id, new_estimated_cost_cents=new_estimated_cost_cents,
+            reason=notes or f"Usage dispute {dispute_id} resolved with adjustment", actor=actor, dispute_id=dispute_id,
+        )
+
+    dispute.status = status
+    dispute.resolved_by = actor
+    dispute.resolution_notes = notes
+    dispute.resolved_at = datetime.now(timezone.utc)
+    db.commit()
+    db.refresh(dispute)
+    log_event(
+        db, actor=actor, action="usage.dispute_resolved", target=f"usage_dispute:{dispute.id}",
+        after={"status": status.value, "notes": notes},
+    )
+    return dispute

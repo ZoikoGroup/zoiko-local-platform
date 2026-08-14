@@ -66,7 +66,7 @@ _COUNTRY_NUMBERS = [
 def test_geographic_dispersion_allowed_below_threshold(client, db_session, monkeypatch):
     monkeypatch.setattr(
         "app.media.service.telecom.place_call",
-        lambda **kwargs: {"sid": "CAgeo1", "status": "queued", "to": kwargs["to"], "from": kwargs["from_"]},
+        lambda **kwargs: {"sid": "CAgeo1", "status": "completed", "to": kwargs["to"], "from": kwargs["from_"]},
     )
     from app.risk.service import GEOGRAPHIC_DISPERSION_COUNTRY_THRESHOLD
 
@@ -84,7 +84,7 @@ def test_geographic_dispersion_allowed_below_threshold(client, db_session, monke
 def test_geographic_dispersion_blocks_at_threshold(client, db_session, monkeypatch):
     monkeypatch.setattr(
         "app.media.service.telecom.place_call",
-        lambda **kwargs: {"sid": "CAgeo2", "status": "queued", "to": kwargs["to"], "from": kwargs["from_"]},
+        lambda **kwargs: {"sid": "CAgeo2", "status": "completed", "to": kwargs["to"], "from": kwargs["from_"]},
     )
     from app.risk.service import GEOGRAPHIC_DISPERSION_COUNTRY_THRESHOLD
 
@@ -107,7 +107,7 @@ def test_geographic_dispersion_blocks_at_threshold(client, db_session, monkeypat
 def test_geographic_dispersion_signal_is_recorded(client, db_session, monkeypatch):
     monkeypatch.setattr(
         "app.media.service.telecom.place_call",
-        lambda **kwargs: {"sid": "CAgeo3", "status": "queued", "to": kwargs["to"], "from": kwargs["from_"]},
+        lambda **kwargs: {"sid": "CAgeo3", "status": "completed", "to": kwargs["to"], "from": kwargs["from_"]},
     )
     from app.risk.models import RiskSignal, RiskSignalType
     from app.risk.service import GEOGRAPHIC_DISPERSION_COUNTRY_THRESHOLD
@@ -375,3 +375,216 @@ def test_resolving_as_open_is_rejected(client, db_session):
         headers={"Authorization": f"Bearer {staff_token}"},
     )
     assert response.status_code == 409
+
+
+# --- Trial/fraud control plane (Production Readiness Standard §5.3/Table 15-16) ---
+
+
+def test_new_account_starts_trial_low(client, db_session):
+    from app.numbering.identity.models import Account
+
+    token = _signup_and_login(client, "riskstatenew1@example.com")
+    account_id = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"}).json()["account_id"]
+    account = db_session.query(Account).filter(Account.id == account_id).first()
+    assert account.risk_state.value == "trial_low"
+
+
+def test_review_threshold_sets_risk_state_to_review_required(client, db_session):
+    from app.numbering.identity.models import Account
+    from app.risk.models import BlockedDestination, RiskSignalType
+    from app.risk.service import record_risk_signal
+
+    db_session.add(BlockedDestination(prefix="+1910", reason="test prefix"))
+    db_session.commit()
+
+    token = _signup_and_login(client, "riskstatereview1@example.com")
+    account_id = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"}).json()["account_id"]
+
+    record_risk_signal(db_session, account_id=account_id, signal_type=RiskSignalType.BLOCKED_DESTINATION_ATTEMPT, detail="t1")
+    record_risk_signal(db_session, account_id=account_id, signal_type=RiskSignalType.BLOCKED_DESTINATION_ATTEMPT, detail="t2")
+
+    account = db_session.query(Account).filter(Account.id == account_id).first()
+    assert account.risk_state.value == "review_required"
+
+
+def test_auto_suspend_sets_risk_state_to_suspended_fraud(client, db_session):
+    from app.numbering.identity.models import Account
+    from app.risk.models import BlockedDestination, RiskSignalType
+    from app.risk.service import record_risk_signal
+
+    db_session.add(BlockedDestination(prefix="+1911", reason="test prefix"))
+    db_session.commit()
+
+    token = _signup_and_login(client, "riskstatesuspend1@example.com")
+    account_id = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"}).json()["account_id"]
+
+    for i in range(3):
+        record_risk_signal(db_session, account_id=account_id, signal_type=RiskSignalType.BLOCKED_DESTINATION_ATTEMPT, detail=f"t{i}")
+
+    account = db_session.query(Account).filter(Account.id == account_id).first()
+    assert account.risk_state.value == "suspended_fraud"
+
+
+def test_resolve_cleared_restores_baseline_risk_state(client, db_session):
+    from app.numbering.identity.models import Account
+    from app.risk.models import BlockedDestination, RiskSignalType
+    from app.risk.service import record_risk_signal
+    from app.staff.models import PlatformStaffRole
+
+    db_session.add(BlockedDestination(prefix="+1912", reason="test prefix"))
+    db_session.commit()
+
+    token = _signup_and_login(client, "riskstateclear1@example.com")
+    account_id = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"}).json()["account_id"]
+
+    record_risk_signal(db_session, account_id=account_id, signal_type=RiskSignalType.BLOCKED_DESTINATION_ATTEMPT, detail="t1")
+    record_risk_signal(db_session, account_id=account_id, signal_type=RiskSignalType.BLOCKED_DESTINATION_ATTEMPT, detail="t2")
+
+    account = db_session.query(Account).filter(Account.id == account_id).first()
+    assert account.risk_state.value == "review_required"
+
+    staff_token = _create_staff_and_login(client, db_session, "riskstateclearstaff1@zoikolocal.com", PlatformStaffRole.SUPER_ADMIN)
+    cases = client.get("/risk/fraud-cases", headers={"Authorization": f"Bearer {staff_token}"}).json()
+    case_id = next(c["id"] for c in cases if c["account_id"] == account_id)
+    client.post(
+        f"/risk/fraud-cases/{case_id}/resolve", json={"status": "cleared"},
+        headers={"Authorization": f"Bearer {staff_token}"},
+    )
+
+    db_session.refresh(account)
+    assert account.risk_state.value == "trial_low"
+
+
+def test_reinstate_restores_risk_state_from_suspended_fraud(client, db_session):
+    from app.numbering.identity.models import Account
+    from app.risk.models import BlockedDestination, RiskSignalType
+    from app.risk.service import record_risk_signal
+    from app.staff.models import PlatformStaffRole
+
+    db_session.add(BlockedDestination(prefix="+1913", reason="test prefix"))
+    db_session.commit()
+
+    token = _signup_and_login(client, "riskstatereinstate1@example.com")
+    account_id = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"}).json()["account_id"]
+
+    for i in range(3):
+        record_risk_signal(db_session, account_id=account_id, signal_type=RiskSignalType.BLOCKED_DESTINATION_ATTEMPT, detail=f"t{i}")
+
+    account = db_session.query(Account).filter(Account.id == account_id).first()
+    assert account.risk_state.value == "suspended_fraud"
+
+    staff_token = _create_staff_and_login(
+        client, db_session, "riskstatereinstatestaff1@zoikolocal.com", PlatformStaffRole.COMPLIANCE_OFFICER
+    )
+    reinstate = client.post(
+        f"/risk/accounts/{account_id}/reinstate", json={"reason": "false positive"},
+        headers={"Authorization": f"Bearer {staff_token}"},
+    )
+    assert reinstate.status_code == 200
+
+    db_session.refresh(account)
+    assert account.risk_state.value == "trial_low"
+
+
+def test_paid_plan_sets_baseline_risk_state_to_paid_normal(client, db_session):
+    from app.numbering.identity.models import Account
+
+    token = _signup_and_login(client, "riskstatepaid1@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    account_id = client.get("/auth/me", headers=headers).json()["account_id"]
+
+    response = client.put("/billing/subscription/plan", json={"plan_code": "starter"}, headers=headers)
+    assert response.status_code == 200
+
+    from app.risk.service import recompute_risk_state
+
+    recompute_risk_state(db_session, account_id)
+    account = db_session.query(Account).filter(Account.id == account_id).first()
+    assert account.risk_state.value == "paid_normal"
+
+
+def test_concurrency_limit_blocks_extra_simultaneous_calls(client, db_session, monkeypatch):
+    call_count = {"n": 0}
+
+    def _fake_place_call(**kwargs):
+        call_count["n"] += 1
+        return {"sid": f"CA_fake_{call_count['n']}", "status": "in-progress", "to": kwargs["to"], "from": kwargs["from_"]}
+
+    monkeypatch.setattr("app.media.service.telecom.place_call", _fake_place_call)
+
+    token = _signup_and_login(client, "concurrencylimit1@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    account_id = client.get("/auth/me", headers=headers).json()["account_id"]
+    _active_number(db_session, account_id, "+15550070030")
+
+    # MAX_CONCURRENT_CALLS_TRIAL is 3 - the first 3 (each left "in-progress",
+    # matching the fake response above, so they count as still live) succeed,
+    # the 4th must be blocked.
+    for i in range(3):
+        response = _place_call(client, headers, f"+1416555000{i}", "+15550070030")
+        assert response.status_code == 200, response.text
+
+    fourth = _place_call(client, headers, "+14165550009", "+15550070030")
+    assert fourth.status_code == 429
+
+
+def test_cumulative_trial_usage_blocks_after_lifetime_cap(client, db_session):
+    from app.usage.service import record_usage_event
+
+    token = _signup_and_login(client, "trialcap1@example.com")
+    account_id = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"}).json()["account_id"]
+
+    # MAX_TRIAL_LIFETIME_SPEND_CENTS is 2000 ($20) - record enough rated
+    # call_seconds usage to exceed it, then confirm the guard trips.
+    record_usage_event(
+        db_session, account_id=account_id, event_type="call_seconds", quantity=100000, unit="seconds",
+        country_band=None, idempotency_key="trialcap-usage-1",
+    )
+    from app.usage.models import UsageEvent
+
+    event = db_session.query(UsageEvent).filter(UsageEvent.idempotency_key == "trialcap-usage-1").first()
+    event.estimated_cost_cents = 2500
+    db_session.commit()
+
+    from app.risk.service import CumulativeTrialUsageExceededError, assert_cumulative_trial_usage_ok
+
+    try:
+        assert_cumulative_trial_usage_ok(db_session, account_id)
+        assert False, "expected CumulativeTrialUsageExceededError"
+    except CumulativeTrialUsageExceededError:
+        pass
+
+
+def test_account_kill_switch_blocks_outbound_calling_for_one_account(client, db_session, monkeypatch):
+    monkeypatch.setattr(
+        "app.media.service.telecom.place_call",
+        lambda **kwargs: {"sid": "CA_fake", "status": "queued", "to": kwargs["to"], "from": kwargs["from_"]},
+    )
+
+    token = _signup_and_login(client, "accountkillswitch1@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    account_id = client.get("/auth/me", headers=headers).json()["account_id"]
+    _active_number(db_session, account_id, "+15550070040")
+
+    from app.staff.models import PlatformStaffRole
+    staff_token = _create_staff_and_login(client, db_session, "accountkillswitchstaff1@zoikolocal.com", PlatformStaffRole.SUPER_ADMIN)
+
+    activate = client.post(
+        f"/risk/accounts/{account_id}/kill-switches/outbound_calling/activate",
+        json={"reason": "test lockdown"}, headers={"Authorization": f"Bearer {staff_token}"},
+    )
+    assert activate.status_code == 200
+    assert activate.json()["is_active"] is True
+
+    blocked = _place_call(client, headers, "+14165550099", "+15550070040")
+    assert blocked.status_code == 503
+
+    deactivate = client.post(
+        f"/risk/accounts/{account_id}/kill-switches/outbound_calling/deactivate",
+        headers={"Authorization": f"Bearer {staff_token}"},
+    )
+    assert deactivate.status_code == 200
+    assert deactivate.json()["is_active"] is False
+
+    allowed = _place_call(client, headers, "+14165550098", "+15550070040")
+    assert allowed.status_code == 200

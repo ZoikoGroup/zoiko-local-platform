@@ -4,9 +4,11 @@ from sqlalchemy.orm import Session
 from app.core.database import get_db
 from app.core.deps import get_current_staff, require_capability
 from app.numbering.numbers.service import reactivate_numbers_for_account_by_staff
+from app.ops.models import KillSwitchScope
 from app.risk import service
 from app.risk.models import FraudCaseStatus, RiskSignalType
 from app.risk.schemas import (
+    AccountKillSwitchResponse,
     AccountReinstateRequest,
     AccountRiskSummaryResponse,
     BlockedDestinationCreate,
@@ -15,6 +17,7 @@ from app.risk.schemas import (
     FraudCaseResponse,
     FraudRuleResponse,
     FraudRuleUpsertRequest,
+    SetAccountKillSwitchRequest,
     SetAccountRiskStateRequest,
 )
 from app.staff.models import PlatformStaff
@@ -95,6 +98,42 @@ def reinstate_account_numbers(
     human review - reactivates every SUSPENDED number on the account."""
     numbers = reactivate_numbers_for_account_by_staff(db, account_id, staff_id=staff.id, reason=payload.reason)
     return {"reactivated": [n.e164 for n in numbers]}
+
+
+@router.get("/accounts/{account_id}/kill-switches", response_model=list[AccountKillSwitchResponse])
+def list_account_kill_switches(
+    account_id: str,
+    db: Session = Depends(get_db),
+    _staff: PlatformStaff = Depends(get_current_staff),
+):
+    """Production Readiness Standard Table 15's "Tenant" kill-switch scope -
+    diagnostic view, same posture as the platform-wide kill-switch list."""
+    return service.list_account_kill_switches(db, account_id)
+
+
+@router.post("/accounts/{account_id}/kill-switches/{scope}/activate", response_model=AccountKillSwitchResponse)
+def activate_account_kill_switch(
+    account_id: str,
+    scope: KillSwitchScope,
+    payload: SetAccountKillSwitchRequest,
+    db: Session = Depends(get_db),
+    staff: PlatformStaff = Depends(require_capability("ops.manage_kill_switches")),
+):
+    """SUPER_ADMIN only - halts new activity in this scope for ONE account,
+    without suspending it outright. Same capability as the platform-wide
+    switch (app.ops.routes.activate_kill_switch)."""
+    return service.set_account_kill_switch(db, account_id, scope, True, actor=staff.id, reason=payload.reason)
+
+
+@router.post("/accounts/{account_id}/kill-switches/{scope}/deactivate", response_model=AccountKillSwitchResponse)
+def deactivate_account_kill_switch(
+    account_id: str,
+    scope: KillSwitchScope,
+    db: Session = Depends(get_db),
+    staff: PlatformStaff = Depends(require_capability("ops.manage_kill_switches")),
+):
+    """SUPER_ADMIN only."""
+    return service.set_account_kill_switch(db, account_id, scope, False, actor=staff.id)
 
 
 @router.get("/fraud-rules", response_model=list[FraudRuleResponse])

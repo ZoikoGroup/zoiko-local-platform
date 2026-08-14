@@ -1,12 +1,13 @@
 import enum
 from datetime import datetime
 
-from sqlalchemy import DateTime, Enum, ForeignKey, String, func
+from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, String, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import Base
 from app.core.ids import new_uuid
+from app.ops.models import KillSwitchScope
 
 
 class BlockedDestination(Base):
@@ -170,6 +171,37 @@ class DeviceFingerprintSighting(Base):
         UUID(as_uuid=False), ForeignKey("accounts.id", ondelete="CASCADE"), nullable=False, index=True
     )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+
+
+class AccountKillSwitch(Base):
+    """Production Readiness Standard Table 15 - "Kill switches: Tenant,
+    provider subaccount, destination, country, product feature and
+    platform-wide emergency disable controls." PlatformKillSwitch (app.
+    ops.models) already covers platform-wide; BlockedDestination already
+    covers destination/country (a prefix block IS a per-destination kill
+    switch). This table is the missing "Tenant" scope - halting one
+    specific account's outbound calling/number provisioning/AI processing/
+    payments without suspending the whole account outright (a step below
+    suspend_numbers_for_account_by_system). Same upsert-by-(account,scope)
+    shape as PlatformKillSwitch, for the same reason (exactly one current
+    state per account+scope, full history via audit_event)."""
+
+    __tablename__ = "account_kill_switches"
+    __table_args__ = (
+        UniqueConstraint("account_id", "scope", name="uq_account_kill_switch_account_scope"),
+    )
+
+    id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=new_uuid)
+    account_id: Mapped[str] = mapped_column(
+        UUID(as_uuid=False), ForeignKey("accounts.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    scope: Mapped[KillSwitchScope] = mapped_column(Enum(KillSwitchScope, name="kill_switch_scope_enum"), nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    reason: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    activated_by: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    activated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    deactivated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
 class FraudCase(Base):
