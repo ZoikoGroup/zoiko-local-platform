@@ -35,10 +35,23 @@ def create_access_token(subject: str, scope: str = "customer", expire_minutes: i
 
 
 def decode_access_token(token: str) -> dict | None:
+    """Tries the current jwt_secret_key first, then jwt_secret_key_previous
+    if set - the actual mechanism that makes secret rotation possible
+    without forcibly logging out everyone with a still-valid token the
+    moment the key changes (tokens live up to ACCESS_TOKEN_EXPIRE_MINUTES -
+    24h - so a naive single-key swap would invalidate a full day of active
+    sessions at once). See docs/runbooks/secrets-rotation.md for the
+    actual rotation procedure this supports."""
     try:
         return jwt.decode(token, settings.jwt_secret_key, algorithms=[ALGORITHM])
     except JWTError:
-        return None
+        pass
+    if settings.jwt_secret_key_previous:
+        try:
+            return jwt.decode(token, settings.jwt_secret_key_previous, algorithms=[ALGORITHM])
+        except JWTError:
+            pass
+    return None
 
 
 def password_fingerprint(hashed_password: str) -> str:

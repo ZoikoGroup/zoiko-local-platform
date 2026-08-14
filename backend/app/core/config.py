@@ -32,6 +32,14 @@ class Settings(BaseSettings):
     # if a specific Neon plan's real limit is known.
     db_connection_budget_warning_threshold: int = 100
     jwt_secret_key: str = PLACEHOLDER_JWT_SECRET_KEY
+    # Production Readiness Standard §A10 "secrets rotation" - set this to
+    # the OLD value of jwt_secret_key during a rotation window so tokens
+    # already issued (up to ACCESS_TOKEN_EXPIRE_MINUTES old) keep verifying
+    # while jwt_secret_key itself is rotated to a new value - see
+    # app.core.security.decode_access_token and docs/runbooks/
+    # secrets-rotation.md for the actual rotation procedure. Empty (the
+    # default) means no rotation in progress - only jwt_secret_key is valid.
+    jwt_secret_key_previous: str = ""
     environment: str = "development"
     # Comma-separated allowed CORS origins - the deployed frontend's real
     # origin(s) in production, localhost for dev. A literal "*" is rejected in
