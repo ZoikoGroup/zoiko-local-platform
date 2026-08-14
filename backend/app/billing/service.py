@@ -436,6 +436,14 @@ def change_plan(db: Session, account_id: str, plan_code: str, *, actor: str) -> 
         before={"plan_code": before_plan}, after={"plan_code": sub.plan_code},
     )
 
+    # Production Readiness Standard doc's "trial-abuse step-up model" - a
+    # real paid plan is just as strong a "genuine paying customer" signal
+    # as a completed number purchase (see app.risk.service.
+    # _compute_baseline_risk_state), so it earns the same step-up.
+    from app.risk.service import step_up_risk_state_after_plan_upgrade
+
+    step_up_risk_state_after_plan_upgrade(db, account_id, plan.plan_code)
+
     from app.numbering.identity.models import Account, User, UserRole
 
     owner = db.query(User).filter(User.account_id == account_id, User.role == UserRole.OWNER).first()

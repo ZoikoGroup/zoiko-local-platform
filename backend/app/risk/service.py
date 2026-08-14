@@ -787,6 +787,23 @@ def step_up_risk_state_after_purchase(db: Session, account_id: str) -> None:
     )
 
 
+def step_up_risk_state_after_plan_upgrade(db: Session, account_id: str, plan_code: str) -> None:
+    """Called from app.billing.service.change_plan - moving onto any real
+    paid plan (anything but "free_trial") is just as strong a "genuine
+    paying customer" signal as a completed number purchase (see
+    _compute_baseline_risk_state), so it earns the same PAID_NORMAL step-up
+    rather than waiting for a number purchase that may never happen (e.g.
+    an account that only uses AI/video features). A no-op for free_trial
+    or for an account already PAID_NORMAL or under REVIEW_REQUIRED/
+    SUSPENDED_FRAUD (see _transition_risk_state)."""
+    if plan_code == "free_trial":
+        return
+    _transition_risk_state(
+        db, account_id, AccountRiskState.PAID_NORMAL,
+        actor="system:risk_engine", reason=f"upgraded to paid plan {plan_code!r}",
+    )
+
+
 def restore_risk_state_after_reinstatement(db: Session, account_id: str, *, actor: str) -> None:
     """Called from app.numbering.numbers.service.
     reactivate_numbers_for_account_by_staff - staff reactivating a

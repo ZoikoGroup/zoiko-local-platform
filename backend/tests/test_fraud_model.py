@@ -496,9 +496,6 @@ def test_paid_plan_sets_baseline_risk_state_to_paid_normal(client, db_session):
     response = client.put("/billing/subscription/plan", json={"plan_code": "starter"}, headers=headers)
     assert response.status_code == 200
 
-    from app.risk.service import recompute_risk_state
-
-    recompute_risk_state(db_session, account_id)
     account = db_session.query(Account).filter(Account.id == account_id).first()
     assert account.risk_state.value == "paid_normal"
 

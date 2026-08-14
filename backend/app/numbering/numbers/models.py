@@ -39,19 +39,7 @@ class SupportedCountry(Base):
     list as a P0 launch blocker, the same rule it applies to plan names
     and prices (see app.usage.models.CallingRate for the pricing side of
     the same discipline). Staff-managed via PUT /staff/countries
-    (SUPER_ADMIN only, same bar as calling-rate changes).
-
-    activation_state (added for the Market Activation Registry - see
-    MarketActivationState's docstring) is enforced today only at the
-    CLOSED/SUSPENDED boundary (app.numbering.numbers.service.
-    _assert_supported_country raises for either) - the genuinely hard
-    "no" cases the doc is most emphatic about. INTERNAL_TEST/
-    CONTROLLED_BETA/PAID_OPEN are tracked and staff-visible but not yet
-    behaviorally distinguished from each other: this codebase has no
-    invited-tester/entitlement infrastructure to tell "staff-only" from
-    "invited beta customer" from "any customer" apart at the request
-    layer yet. Not fabricating that distinction rather than pretending it
-    exists - see set_market_activation_state's docstring."""
+    (SUPER_ADMIN only, same bar as calling-rate changes)."""
 
     __tablename__ = "supported_countries"
 

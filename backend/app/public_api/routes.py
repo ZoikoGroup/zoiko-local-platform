@@ -143,8 +143,6 @@ def place_call(
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(e)) from e
     except risk_service.SpendLimitExceededError as e:
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(e)) from e
-    except risk_service.ConcurrencyLimitExceededError as e:
-        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(e)) from e
     except risk_service.CumulativeTrialUsageExceededError as e:
         raise HTTPException(status_code=status.HTTP_402_PAYMENT_REQUIRED, detail=str(e)) from e
     except risk_service.AccountKillSwitchTrippedError as e:
