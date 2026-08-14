@@ -1,11 +1,11 @@
 "use client";
 
 import { useEffect, useState, useCallback } from "react";
-import { COUNTRIES } from "@/lib/sampleNumbers";
 import {
   getComplianceRules,
   openComplianceCase,
   listMyNumbers,
+  listSupportedCountries,
   searchNumbers,
   reserveNumber,
   createNumberCheckoutSession,
@@ -26,6 +26,7 @@ import {
   type ComplianceRule,
   type MyPhoneNumber,
   type NumberSearchResult,
+  type SupportedCountry,
   type TeamMember,
   type PortingRequest,
   type IVROption,
@@ -101,6 +102,9 @@ export default function NumbersPage() {
   const [ivrError, setIvrError] = useState<string | null>(null);
   const [ivrExisting, setIvrExisting] = useState<IVROption[]>([]);
 
+  const [countries, setCountries] = useState<SupportedCountry[]>([]);
+  const [countriesError, setCountriesError] = useState<string | null>(null);
+
   const [step, setStep] = useState<Step>("search");
   const [countryCode, setCountryCode] = useState("US");
   const [areaCode, setAreaCode] = useState("");
@@ -143,6 +147,22 @@ export default function NumbersPage() {
   useEffect(() => {
     loadMyNumbers();
   }, [loadMyNumbers]);
+
+  useEffect(() => {
+    if (!token) return;
+    listSupportedCountries(token)
+      .then((data) => {
+        setCountries(data);
+        setCountriesError(null);
+        // Only override the "US" initial default if US genuinely isn't
+        // supported - avoids resetting a user's in-progress selection on
+        // every re-render.
+        setCountryCode((current) =>
+          data.some((c) => c.code === current) ? current : (data[0]?.code ?? current)
+        );
+      })
+      .catch(() => setCountriesError("Couldn't load the list of supported countries."));
+  }, [token]);
 
   // Stripe redirects the browser back here after Checkout (success or
   // cancel) - the number itself only activates via the backend's webhook,
@@ -488,7 +508,7 @@ export default function NumbersPage() {
     }
   }
 
-  const country = COUNTRIES.find((c) => c.code === countryCode);
+  const country = countries.find((c) => c.code === countryCode);
 
   return (
     <div className="max-w-2xl mx-auto space-y-6">
@@ -828,9 +848,9 @@ export default function NumbersPage() {
               onChange={(e) => setCountryCode(e.target.value)}
               className="rounded-lg border border-slate-300 px-3 py-2 text-sm"
             >
-              {COUNTRIES.map((c) => (
+              {countries.map((c) => (
                 <option key={c.code} value={c.code}>
-                  {c.name} ({c.dial})
+                  {c.name} ({c.code})
                 </option>
               ))}
             </select>
@@ -850,6 +870,9 @@ export default function NumbersPage() {
             </button>
           </div>
 
+          {countriesError && (
+            <p className="text-sm text-red-600 bg-red-50 rounded-lg px-3 py-2">{countriesError}</p>
+          )}
           {searchError && <p className="text-sm text-red-600 bg-red-50 rounded-lg px-3 py-2">{searchError}</p>}
           {reserveError && <p className="text-sm text-red-600 bg-red-50 rounded-lg px-3 py-2">{reserveError}</p>}
 
@@ -1089,7 +1112,7 @@ export default function NumbersPage() {
                   onChange={(e) => setPortingForm({ ...portingForm, country: e.target.value })}
                   className="w-full rounded-lg border border-slate-300 px-3 py-1.5 text-sm"
                 >
-                  {COUNTRIES.map((c) => (
+                  {countries.map((c) => (
                     <option key={c.code} value={c.code}>
                       {c.name}
                     </option>

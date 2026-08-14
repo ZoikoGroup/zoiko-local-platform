@@ -750,6 +750,28 @@ export function getPublicStatus(): Promise<PublicStatus> {
 
 // --- Numbers ---
 
+// Mirrors backend SupportedCountryResponse - the real, live launch-market
+// list. Confirmed live (2026-08-14) that the frontend previously used a
+// hardcoded, stale country list (src/lib/sampleNumbers.ts) that offered 5
+// countries the backend doesn't actually support (Nigeria, South Africa,
+// Ghana, Kenya, Mexico - searching any of them fails with a real "not on
+// Zoiko Local's supported country list yet" error) while hiding 4 the
+// backend does support (Australia, Germany, France, India). Fetching this
+// for real means the dropdown can never drift out of sync with the
+// backend again.
+export type SupportedCountry = {
+  code: string;
+  name: string;
+  emergency_calling_supported: boolean;
+  activation_state: string;
+};
+
+export function listSupportedCountries(token: string): Promise<SupportedCountry[]> {
+  return request<SupportedCountry[]>("/numbers/countries", {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
 export type MyPhoneNumber = {
   id: string;
   e164: string;
