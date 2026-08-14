@@ -1000,13 +1000,22 @@ export default function NumbersPage() {
             <p className="text-sm text-red-600 bg-red-50 rounded-lg px-3 py-2">{purchaseError}</p>
           )}
 
-          <button
-            onClick={handlePurchase}
-            disabled={purchaseBusy || !emergencyAcknowledged}
-            className="bg-indigo-600 hover:bg-indigo-700 disabled:opacity-60 text-white text-sm font-medium rounded-lg px-4 py-2"
-          >
-            {purchaseBusy ? "Redirecting to payment..." : "Proceed to Payment"}
-          </button>
+          <div className="flex items-center gap-3">
+            <button
+              onClick={handlePurchase}
+              disabled={purchaseBusy || !emergencyAcknowledged}
+              className="bg-indigo-600 hover:bg-indigo-700 disabled:opacity-60 text-white text-sm font-medium rounded-lg px-4 py-2"
+            >
+              {purchaseBusy ? "Redirecting to payment..." : "Proceed to Payment"}
+            </button>
+            <button
+              onClick={handleStartOver}
+              disabled={purchaseBusy}
+              className="text-sm font-medium text-slate-600 hover:text-slate-900 disabled:opacity-60"
+            >
+              Start over
+            </button>
+          </div>
         </div>
       )}
 

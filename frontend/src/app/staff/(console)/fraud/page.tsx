@@ -393,8 +393,11 @@ function BlockedDestinationsSection({
   const [loading, setLoading] = useState(true);
 
   const load = useCallback(() => {
-    setLoading(true);
-    return listBlockedDestinations(token)
+    return Promise.resolve()
+      .then(() => {
+        setLoading(true);
+        return listBlockedDestinations(token);
+      })
       .then((data) => {
         setDestinations(data);
         onError(null);

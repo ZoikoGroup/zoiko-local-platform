@@ -23,6 +23,25 @@ declare global {
 
 const CLIENT_ID = process.env.NEXT_PUBLIC_GOOGLE_CLIENT_ID;
 
+// Module-level, not component state: google.accounts.id.initialize() is
+// meant to be called exactly once per page lifetime (per Google's own
+// docs) - window.google persists across Next.js client-side navigation
+// even though this component unmounts/remounts on every visit to a page
+// that renders it (e.g. leaving /login and coming back), so component
+// state alone would re-initialize on every mount. renderButton() is the
+// part that must still run per mount, since each mount has a fresh
+// container DOM node to render into.
+//
+// The one-time initialize() call registers ITS OWN callback closure,
+// which would otherwise permanently capture whichever component instance
+// mounted first (e.g. /login) - breaking /signup's GoogleSignInButton,
+// since the two pages pass different onCredential handlers. Routing the
+// callback through this module-level indirection instead, kept in sync
+// with whichever instance is CURRENTLY mounted, decouples "initialize
+// once" from "deliver the credential to whoever's showing the button now."
+let gsiInitialized = false;
+let activeCredentialHandler: ((credential: string) => void) | null = null;
+
 export default function GoogleSignInButton({
   onCredential,
 }: {
@@ -37,12 +56,18 @@ export default function GoogleSignInButton({
     () => typeof window !== "undefined" && !!window.google?.accounts?.id
   );
   // onCredential is re-created on every render of the parent (login/signup
-  // pages don't memoize it) - kept in a ref so the init effect below only
-  // depends on scriptLoaded, not on a prop that changes every keystroke.
-  const onCredentialRef = useRef(onCredential);
+  // pages don't memoize it) - synced into the module-level indirection
+  // (see its docstring above) on every render, and cleared on unmount so
+  // a stale handler from a page the user has since navigated away from
+  // never fires.
   useEffect(() => {
-    onCredentialRef.current = onCredential;
-  });
+    activeCredentialHandler = onCredential;
+    return () => {
+      if (activeCredentialHandler === onCredential) {
+        activeCredentialHandler = null;
+      }
+    };
+  }, [onCredential]);
 
   useEffect(() => {
     if (!CLIENT_ID || scriptLoaded) return;
@@ -68,10 +93,13 @@ export default function GoogleSignInButton({
   useEffect(() => {
     if (!scriptLoaded || !CLIENT_ID || !containerRef.current || !window.google) return;
 
-    window.google.accounts.id.initialize({
-      client_id: CLIENT_ID,
-      callback: (response) => onCredentialRef.current(response.credential),
-    });
+    if (!gsiInitialized) {
+      window.google.accounts.id.initialize({
+        client_id: CLIENT_ID,
+        callback: (response) => activeCredentialHandler?.(response.credential),
+      });
+      gsiInitialized = true;
+    }
 
     window.google.accounts.id.renderButton(containerRef.current, {
       theme: "outline",

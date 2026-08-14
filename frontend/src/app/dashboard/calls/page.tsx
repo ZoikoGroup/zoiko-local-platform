@@ -14,7 +14,6 @@ import {
   type MyPhoneNumber,
   type CallLogEntry,
   type VoicemailEntry,
-  type ConversationSummary,
   type Contact,
 } from "@/lib/api";
 import { getToken } from "@/lib/auth";
