@@ -16,6 +16,7 @@ from app.events.service import (
     publish_video_room_ended,
     publish_voicemail_created,
 )
+from app.integrations.cache.redis import cache_delete, cache_get, cache_set
 from app.integrations.llm.groq import LLMError
 from app.integrations.storage.s3 import StorageError, generate_presigned_url
 from app.integrations.telecom import twilio as telecom
@@ -155,6 +156,7 @@ def record_call(
     db.add(call)
     db.commit()
     db.refresh(call)
+    _invalidate_calls_cache(account_id)
     log_event(
         db,
         actor_id=account_id,
@@ -282,6 +284,7 @@ def update_call_status(db: Session, provider_call_sid: str, status: str, duratio
     call.duration = duration
     db.commit()
     db.refresh(call)
+    _invalidate_calls_cache(call.account_id)
     log_event(
         db, actor_id=call.account_id, action="call.status_updated",
         target_type="call_record", target_id=call.id, metadata={"status": status, "duration": duration},
@@ -329,6 +332,7 @@ def record_call_recording(db: Session, provider_call_sid: str, recording_url: st
         call.duration = duration
     db.commit()
     db.refresh(call)
+    _invalidate_calls_cache(call.account_id)
     log_event(
         db, actor_id=call.account_id, action="call.recorded",
         target_type="call_record", target_id=call.id, metadata={"duration": duration},
@@ -336,14 +340,100 @@ def record_call_recording(db: Session, provider_call_sid: str, recording_url: st
     return call
 
 
+def _calls_cache_key(account_id: str, limit: int) -> str:
+    return f"calls:list:{account_id}:{limit}"
+
+
+# Short TTL, invalidated on record_call/update_call_status/
+# record_call_recording (see their call sites) plus the two staff/retention
+# write paths (billing.service's wholesale-cost capture, retention.service's
+# recording purge). Only ever caches the Owner/Admin (unfiltered) view -
+# a Member's view additionally filters by assigned_number_ids BEFORE the
+# limit is applied (see the docstring below), so serving it from an
+# unfiltered cached page could silently return fewer/different rows than
+# a live query would; Members fall through to a direct query every time
+# instead, same as before this cache existed.
+_CALLS_CACHE_TTL_SECONDS = 15
+
+
+def _serialize_call(c: CallRecord) -> dict:
+    return {
+        "id": c.id,
+        "account_id": c.account_id,
+        "phone_number_id": c.phone_number_id,
+        "direction": c.direction.value,
+        "from_number": c.from_number,
+        "to_number": c.to_number,
+        "provider_call_sid": c.provider_call_sid,
+        "status": c.status,
+        "duration": c.duration,
+        "recording_url": c.recording_url,
+        "is_suspected_spam": c.is_suspected_spam,
+        "wholesale_cost_cents": c.wholesale_cost_cents,
+        "wholesale_currency": c.wholesale_currency,
+        "created_at": c.created_at.isoformat() if c.created_at else None,
+    }
+
+
+def _deserialize_call(data: dict) -> CallRecord:
+    return CallRecord(
+        id=data["id"],
+        account_id=data["account_id"],
+        phone_number_id=data["phone_number_id"],
+        direction=CallDirection(data["direction"]),
+        from_number=data["from_number"],
+        to_number=data["to_number"],
+        provider_call_sid=data["provider_call_sid"],
+        status=data["status"],
+        duration=data["duration"],
+        recording_url=data["recording_url"],
+        is_suspected_spam=data["is_suspected_spam"],
+        wholesale_cost_cents=data["wholesale_cost_cents"],
+        wholesale_currency=data["wholesale_currency"],
+        created_at=datetime.fromisoformat(data["created_at"]) if data["created_at"] else None,
+    )
+
+
+def _invalidate_calls_cache(account_id: str | None) -> None:
+    """Best-effort - only clears the default limit=20 entry (the dashboard's
+    own request shape), same pragmatic scope as everywhere else in this
+    pass. A staff/API caller using a non-default limit rides out the TTL
+    instead of an exact invalidation - there's no registry of "every limit
+    anyone has ever cached" to sweep here without adding real complexity
+    for a rarely-used parameter."""
+    if account_id:
+        cache_delete(_calls_cache_key(account_id, 20))
+
+
 def list_account_calls(db: Session, user: User, limit: int = 20) -> list[CallRecord]:
     """Owner/Admin see every call on the account. A plain Member only sees
     calls on numbers assigned to them - mirrors list_account_numbers."""
-    query = db.query(CallRecord).filter(CallRecord.account_id == user.account_id)
     ids = assigned_number_ids(db, user)
     if ids is not None:
-        query = query.filter(CallRecord.phone_number_id.in_(ids))
-    return query.order_by(CallRecord.created_at.desc()).limit(limit).all()
+        # Member view - filtering must happen BEFORE the limit is applied,
+        # so this always queries live rather than risking a cached
+        # Owner/Admin page that was limited/filtered in the wrong order.
+        return (
+            db.query(CallRecord)
+            .filter(CallRecord.account_id == user.account_id, CallRecord.phone_number_id.in_(ids))
+            .order_by(CallRecord.created_at.desc())
+            .limit(limit)
+            .all()
+        )
+
+    cache_key = _calls_cache_key(user.account_id, limit)
+    cached = cache_get(cache_key)
+    if cached is not None:
+        return [_deserialize_call(row) for row in cached]
+    calls = (
+        db.query(CallRecord)
+        .filter(CallRecord.account_id == user.account_id)
+        .order_by(CallRecord.created_at.desc())
+        .limit(limit)
+        .all()
+    )
+    cache_set(cache_key, [_serialize_call(c) for c in calls], ttl_seconds=_CALLS_CACHE_TTL_SECONDS)
+    return calls
 
 
 def assert_can_access_call(db: Session, user: User, call_sid: str) -> None:
@@ -380,6 +470,7 @@ def record_voicemail(
     db.add(voicemail)
     db.commit()
     db.refresh(voicemail)
+    _invalidate_voicemails_cache(account_id)
     log_event(
         db, actor_id=account_id, action="voicemail.created",
         target_type="voicemail", target_id=voicemail.id, metadata={"from": from_number},
@@ -397,14 +488,69 @@ def record_voicemail(
     return voicemail
 
 
+def _voicemails_cache_key(account_id: str) -> str:
+    return f"voicemails:list:{account_id}"
+
+
+# Only ever caches the Owner/Admin (unfiltered) view, same reasoning as
+# list_account_calls - a Member's phone_number_id filter must run before
+# any row count/ordering decision a cache could otherwise get wrong.
+_VOICEMAILS_CACHE_TTL_SECONDS = 15
+
+
+def _serialize_voicemail(v: Voicemail) -> dict:
+    return {
+        "id": v.id,
+        "phone_number_id": v.phone_number_id,
+        "account_id": v.account_id,
+        "from_number": v.from_number,
+        "recording_url": v.recording_url,
+        "duration": v.duration,
+        "created_at": v.created_at.isoformat() if v.created_at else None,
+    }
+
+
+def _deserialize_voicemail(data: dict) -> Voicemail:
+    return Voicemail(
+        id=data["id"],
+        phone_number_id=data["phone_number_id"],
+        account_id=data["account_id"],
+        from_number=data["from_number"],
+        recording_url=data["recording_url"],
+        duration=data["duration"],
+        created_at=datetime.fromisoformat(data["created_at"]) if data["created_at"] else None,
+    )
+
+
+def _invalidate_voicemails_cache(account_id: str | None) -> None:
+    if account_id:
+        cache_delete(_voicemails_cache_key(account_id))
+
+
 def list_account_voicemails(db: Session, user: User) -> list[Voicemail]:
     """Owner/Admin see every voicemail on the account. A plain Member only
     sees voicemails on numbers assigned to them."""
-    query = db.query(Voicemail).filter(Voicemail.account_id == user.account_id)
     ids = assigned_number_ids(db, user)
     if ids is not None:
-        query = query.filter(Voicemail.phone_number_id.in_(ids))
-    return query.order_by(Voicemail.created_at.desc()).all()
+        return (
+            db.query(Voicemail)
+            .filter(Voicemail.account_id == user.account_id, Voicemail.phone_number_id.in_(ids))
+            .order_by(Voicemail.created_at.desc())
+            .all()
+        )
+
+    cache_key = _voicemails_cache_key(user.account_id)
+    cached = cache_get(cache_key)
+    if cached is not None:
+        return [_deserialize_voicemail(row) for row in cached]
+    voicemails = (
+        db.query(Voicemail)
+        .filter(Voicemail.account_id == user.account_id)
+        .order_by(Voicemail.created_at.desc())
+        .all()
+    )
+    cache_set(cache_key, [_serialize_voicemail(v) for v in voicemails], ttl_seconds=_VOICEMAILS_CACHE_TTL_SECONDS)
+    return voicemails
 
 
 def _find_account_video_session(db: Session, account_id: str, room_name: str) -> VideoSession:

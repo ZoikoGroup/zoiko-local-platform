@@ -260,14 +260,19 @@ def remove_team_member(db: Session, *, account_id: str, user_id: str, actor: str
 def start_mfa_setup(db: Session, user: User) -> tuple[str, str]:
     """Generates a new pending TOTP secret (not yet enabled). Returns
     (secret, otpauth_uri) for the caller to show as text/QR code."""
+    from app.core.deps import invalidate_cached_user
+
     secret = generate_mfa_secret()
     user.mfa_secret = secret
     user.mfa_enabled = False  # any previous enabled state is cleared until re-confirmed
     db.commit()
+    invalidate_cached_user(user.id)
     return secret, mfa_provisioning_uri(secret, user.email)
 
 
 def enable_mfa(db: Session, user: User, code: str, actor: str) -> None:
+    from app.core.deps import invalidate_cached_user
+
     if not user.mfa_secret:
         raise ValueError("Call /auth/mfa/setup first")
     if not verify_totp_code(user.mfa_secret, code):
@@ -275,11 +280,14 @@ def enable_mfa(db: Session, user: User, code: str, actor: str) -> None:
 
     user.mfa_enabled = True
     db.commit()
+    invalidate_cached_user(user.id)
     log_event(db, actor=actor, action="mfa.enabled", target=f"user:{user.id}")
     notify_mfa_enabled(db, account_id=user.account_id, user_email=user.email)
 
 
 def disable_mfa(db: Session, user: User, code: str, actor: str) -> None:
+    from app.core.deps import invalidate_cached_user
+
     if not user.mfa_enabled or not user.mfa_secret:
         raise ValueError("MFA is not enabled")
     if not verify_totp_code(user.mfa_secret, code):
@@ -288,15 +296,19 @@ def disable_mfa(db: Session, user: User, code: str, actor: str) -> None:
     user.mfa_secret = None
     user.mfa_enabled = False
     db.commit()
+    invalidate_cached_user(user.id)
     log_event(db, actor=actor, action="mfa.disabled", target=f"user:{user.id}")
     notify_mfa_disabled(db, account_id=user.account_id, user_email=user.email)
 
 
 def set_phone_number(db: Session, user: User, phone_number: str | None) -> User:
+    from app.core.deps import invalidate_cached_user
+
     before = user.phone_number
     user.phone_number = phone_number
     db.commit()
     db.refresh(user)
+    invalidate_cached_user(user.id)
     log_event(
         db, actor=user.id, action="user.phone_number_updated", target=f"user:{user.id}",
         before={"phone_number": before}, after={"phone_number": phone_number},

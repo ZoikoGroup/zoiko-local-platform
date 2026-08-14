@@ -12,6 +12,7 @@ from datetime import datetime, timedelta
 from sqlalchemy.orm import Session
 
 from app.audit.service import log_event
+from app.integrations.cache.redis import cache_delete, cache_get, cache_set
 from app.integrations.telecom import twilio as telecom
 from app.numbering.identity.models import User
 from app.queues.models import (
@@ -77,18 +78,44 @@ def _to_response(db: Session, queue: CallQueue) -> dict:
     }
 
 
+def _queues_cache_key(account_id: str) -> str:
+    return f"queues:list:{account_id}"
+
+
+_QUEUES_CACHE_TTL_SECONDS = 30
+
+
+def _serialize_queue_response(q: dict) -> dict:
+    return {**q, "created_at": q["created_at"].isoformat() if q["created_at"] else None}
+
+
+def _deserialize_queue_response(data: dict) -> dict:
+    return {**data, "created_at": datetime.fromisoformat(data["created_at"]) if data["created_at"] else None}
+
+
+def _invalidate_queues_cache(account_id: str) -> None:
+    cache_delete(_queues_cache_key(account_id))
+
+
 def create_queue(db: Session, account_id: str, name: str, max_wait_seconds: int, wrap_up_seconds: int, actor_id: str) -> dict:
     queue = CallQueue(account_id=account_id, name=name, max_wait_seconds=max_wait_seconds, wrap_up_seconds=wrap_up_seconds)
     db.add(queue)
     db.commit()
+    _invalidate_queues_cache(account_id)
     log_event(db, actor_id=account_id, action="queue.created", target_type="call_queue", target_id=queue.id,
                metadata={"name": name})
     return _to_response(db, queue)
 
 
 def list_queues(db: Session, account_id: str) -> list[dict]:
+    cache_key = _queues_cache_key(account_id)
+    cached = cache_get(cache_key)
+    if cached is not None:
+        return [_deserialize_queue_response(row) for row in cached]
     queues = db.query(CallQueue).filter(CallQueue.account_id == account_id).order_by(CallQueue.created_at.desc()).all()
-    return [_to_response(db, q) for q in queues]
+    responses = [_to_response(db, q) for q in queues]
+    cache_set(cache_key, [_serialize_queue_response(r) for r in responses], ttl_seconds=_QUEUES_CACHE_TTL_SECONDS)
+    return responses
 
 
 def get_queue_detail(db: Session, account_id: str, queue_id: str) -> dict:
@@ -105,6 +132,7 @@ def update_queue(db: Session, account_id: str, queue_id: str, name: str | None, 
     if wrap_up_seconds is not None:
         queue.wrap_up_seconds = wrap_up_seconds
     db.commit()
+    _invalidate_queues_cache(account_id)
     return _to_response(db, queue)
 
 
@@ -117,6 +145,7 @@ def add_member(db: Session, account_id: str, queue_id: str, user_id: str) -> dic
     if exists is None:
         db.add(QueueMember(queue_id=queue_id, user_id=user_id))
         db.commit()
+        _invalidate_queues_cache(account_id)
     return _to_response(db, queue)
 
 
@@ -124,6 +153,7 @@ def remove_member(db: Session, account_id: str, queue_id: str, user_id: str) -> 
     queue = _get_queue(db, account_id, queue_id)
     db.query(QueueMember).filter(QueueMember.queue_id == queue_id, QueueMember.user_id == user_id).delete()
     db.commit()
+    _invalidate_queues_cache(account_id)
     return _to_response(db, queue)
 
 

@@ -87,6 +87,10 @@ def _purge_voicemails(db: Session, now: datetime) -> tuple[int, int]:
             continue
         vm.recording_url = PURGED_MARKER
         db.commit()
+        if vm.account_id:
+            from app.media.service import _invalidate_voicemails_cache
+
+            _invalidate_voicemails_cache(vm.account_id)
         log_event(
             db, actor_id=vm.account_id, action="retention.voicemail_purged",
             target_type="voicemail", target_id=vm.id, metadata={"retention_days": retention_days},
@@ -117,6 +121,13 @@ def _purge_call_recordings(db: Session, now: datetime) -> tuple[int, int]:
             continue
         call.recording_url = PURGED_MARKER
         db.commit()
+        if call.account_id:
+            # Deferred import - app.media.service imports this module
+            # (for PURGED_MARKER), so a module-level import here would be
+            # circular.
+            from app.media.service import _invalidate_calls_cache
+
+            _invalidate_calls_cache(call.account_id)
         log_event(
             db, actor_id=call.account_id, action="retention.call_recording_purged",
             target_type="call_record", target_id=call.id, metadata={"retention_days": retention_days},

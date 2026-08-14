@@ -1,14 +1,75 @@
+from datetime import datetime
+
 from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import APIKeyHeader, OAuth2PasswordBearer
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.core.security import decode_access_token
+from app.integrations.cache.redis import cache_delete, cache_get, cache_set
 from app.numbering.identity.models import User, UserRole
-from app.staff.models import PlatformStaff, StaffCapabilityGrant
+from app.staff.models import PlatformStaff, PlatformStaffRole, StaffCapabilityGrant
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
 api_key_header = APIKeyHeader(name="Authorization", auto_error=False)
+
+# get_current_user/get_current_staff run on nearly every authenticated
+# request in the app (require_admin/require_writer/require_capability all
+# build on top of one or the other) - caching the identity lookup here is
+# the single highest-leverage place to cut request latency, since it's
+# multiplied across almost every page a logged-in user or staff member
+# loads. Short TTL: a role/email/MFA change takes up to this long to
+# reach an already-issued session's cached copy - acceptable staleness
+# for a first pass, same "conservative, not tuned" posture as every other
+# threshold in this codebase. Confirmed safe to return a plain
+# reconstructed (session-detached) object for these two: nothing anywhere
+# in this codebase touches a relationship or mutates-then-commits
+# current_user/staff directly - every call site only reads plain columns
+# (account_id, id, role, email, ...).
+_AUTH_CACHE_TTL_SECONDS = 30
+
+
+def _user_cache_key(user_id: str) -> str:
+    return f"auth:user:{user_id}"
+
+
+def _staff_cache_key(staff_id: str) -> str:
+    return f"auth:staff:{staff_id}"
+
+
+def _serialize_user(user: User) -> dict:
+    return {
+        "id": user.id,
+        "account_id": user.account_id,
+        "email": user.email,
+        "phone_number": user.phone_number,
+        "hashed_password": user.hashed_password,
+        "role": user.role.value,
+        "mfa_secret": user.mfa_secret,
+        "mfa_enabled": user.mfa_enabled,
+        "created_at": user.created_at.isoformat() if user.created_at else None,
+    }
+
+
+def _deserialize_user(data: dict) -> User:
+    return User(
+        id=data["id"],
+        account_id=data["account_id"],
+        email=data["email"],
+        phone_number=data["phone_number"],
+        hashed_password=data["hashed_password"],
+        role=UserRole(data["role"]),
+        mfa_secret=data["mfa_secret"],
+        mfa_enabled=data["mfa_enabled"],
+        created_at=datetime.fromisoformat(data["created_at"]) if data["created_at"] else None,
+    )
+
+
+def invalidate_cached_user(user_id: str) -> None:
+    """Called after a mutation whose result current_user callers should
+    see right away rather than waiting out the TTL (e.g. MFA toggled) -
+    see app.numbering.identity.service's enable_mfa/disable_mfa."""
+    cache_delete(_user_cache_key(user_id))
 
 
 def get_current_user(
@@ -26,9 +87,15 @@ def get_current_user(
     if payload is None or payload.get("scope") != "customer":
         raise credentials_error
 
-    user = db.query(User).filter(User.id == payload.get("sub")).first()
-    if user is None:
-        raise credentials_error
+    user_id = payload.get("sub")
+    cached = cache_get(_user_cache_key(user_id))
+    if cached is not None:
+        user = _deserialize_user(cached)
+    else:
+        user = db.query(User).filter(User.id == user_id).first()
+        if user is None:
+            raise credentials_error
+        cache_set(_user_cache_key(user_id), _serialize_user(user), ttl_seconds=_AUTH_CACHE_TTL_SECONDS)
 
     # For app.core.error_logging.ErrorLoggingMiddleware - lets a 5xx logged
     # to error_events be traced back to the account/user that hit it,
@@ -64,6 +131,28 @@ def require_writer(current_user: User = Depends(get_current_user)) -> User:
     return current_user
 
 
+def _serialize_staff(staff: PlatformStaff) -> dict:
+    return {
+        "id": staff.id,
+        "email": staff.email,
+        "hashed_password": staff.hashed_password,
+        "role": staff.role.value,
+        "is_active": staff.is_active,
+        "created_at": staff.created_at.isoformat() if staff.created_at else None,
+    }
+
+
+def _deserialize_staff(data: dict) -> PlatformStaff:
+    return PlatformStaff(
+        id=data["id"],
+        email=data["email"],
+        hashed_password=data["hashed_password"],
+        role=PlatformStaffRole(data["role"]),
+        is_active=data["is_active"],
+        created_at=datetime.fromisoformat(data["created_at"]) if data["created_at"] else None,
+    )
+
+
 def get_current_staff(request: Request, token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
     """A logged-in Zoiko platform staff member. Rejects customer tokens -
     no customer, including an account Owner, can act as staff."""
@@ -77,9 +166,18 @@ def get_current_staff(request: Request, token: str = Depends(oauth2_scheme), db:
     if payload is None or payload.get("scope") != "staff":
         raise credentials_error
 
-    staff = db.query(PlatformStaff).filter(PlatformStaff.id == payload.get("sub")).first()
-    if staff is None or not staff.is_active:
-        raise credentials_error
+    staff_id = payload.get("sub")
+    cached = cache_get(_staff_cache_key(staff_id))
+    if cached is not None:
+        staff = _deserialize_staff(cached)
+    else:
+        staff = db.query(PlatformStaff).filter(PlatformStaff.id == staff_id).first()
+        if staff is None or not staff.is_active:
+            raise credentials_error
+        # Only ever caches an ACTIVE staff row - a deactivated account is
+        # re-checked against the database on every request, never cached
+        # as still-active for the TTL window.
+        cache_set(_staff_cache_key(staff_id), _serialize_staff(staff), ttl_seconds=_AUTH_CACHE_TTL_SECONDS)
 
     # See get_current_user's identical note - staff has no account_id.
     request.state.user_id = staff.id

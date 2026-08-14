@@ -12,6 +12,7 @@ from app.consent.service import has_active_consent
 from app.core.config import settings
 from app.events.service import publish_number_activated, publish_number_reserved, publish_number_suspended
 from app.integrations.billing import stripe_checkout
+from app.integrations.cache.redis import cache_delete, cache_get, cache_set
 from app.integrations.telecom import twilio as telecom
 from app.ops.models import KillSwitchScope
 from app.ops.service import assert_kill_switch_not_active
@@ -125,8 +126,54 @@ class MarketNotActivatedError(Exception):
     is_test gate for now (see _assert_market_activated's docstring)."""
 
 
+_SUPPORTED_COUNTRIES_CACHE_KEY = "numbers:supported_countries"
+# Moderate TTL, backed by explicit invalidation on every mutator below
+# (upsert_supported_country/remove_supported_country/
+# set_market_activation_status) - the TTL is just the safety net for a
+# write path this list somehow isn't invalidated against, not the primary
+# staleness control. Called on every /numbers/search page load.
+_SUPPORTED_COUNTRIES_CACHE_TTL_SECONDS = 60
+
+
+def _serialize_supported_country(country: SupportedCountry) -> dict:
+    return {
+        "id": country.id,
+        "code": country.code,
+        "name": country.name,
+        "sort_order": country.sort_order,
+        "emergency_calling_supported": country.emergency_calling_supported,
+        "market_status": country.market_status.value,
+        "created_at": country.created_at.isoformat() if country.created_at else None,
+    }
+
+
+def _deserialize_supported_country(data: dict) -> SupportedCountry:
+    return SupportedCountry(
+        id=data["id"],
+        code=data["code"],
+        name=data["name"],
+        sort_order=data["sort_order"],
+        emergency_calling_supported=data["emergency_calling_supported"],
+        market_status=MarketActivationStatus(data["market_status"]),
+        created_at=datetime.fromisoformat(data["created_at"]) if data["created_at"] else None,
+    )
+
+
+def _invalidate_supported_countries_cache() -> None:
+    cache_delete(_SUPPORTED_COUNTRIES_CACHE_KEY)
+
+
 def list_supported_countries(db: Session) -> list[SupportedCountry]:
-    return db.query(SupportedCountry).order_by(SupportedCountry.sort_order, SupportedCountry.code).all()
+    cached = cache_get(_SUPPORTED_COUNTRIES_CACHE_KEY)
+    if cached is not None:
+        return [_deserialize_supported_country(row) for row in cached]
+    countries = db.query(SupportedCountry).order_by(SupportedCountry.sort_order, SupportedCountry.code).all()
+    cache_set(
+        _SUPPORTED_COUNTRIES_CACHE_KEY,
+        [_serialize_supported_country(c) for c in countries],
+        ttl_seconds=_SUPPORTED_COUNTRIES_CACHE_TTL_SECONDS,
+    )
+    return countries
 
 
 def upsert_supported_country(
@@ -152,12 +199,14 @@ def upsert_supported_country(
         country.emergency_calling_supported = emergency_calling_supported
     db.commit()
     db.refresh(country)
+    _invalidate_supported_countries_cache()
     return country
 
 
 def remove_supported_country(db: Session, code: str) -> None:
     db.query(SupportedCountry).filter(SupportedCountry.code == code).delete()
     db.commit()
+    _invalidate_supported_countries_cache()
 
 
 def _assert_supported_country(db: Session, country: str) -> None:
@@ -205,6 +254,7 @@ def set_market_activation_status(
     country.market_status = status
     db.commit()
     db.refresh(country)
+    _invalidate_supported_countries_cache()
     log_event(
         db, actor=actor, action="market.activation_status_changed",
         target=f"supported_country:{code}", reason=reason,
@@ -483,6 +533,12 @@ def reserve_number(db: Session, account_id: str, e164: str, country: str, number
     _assert_market_activated(db, country, account_id)
     now = datetime.now(timezone.utc)
     number = db.query(PhoneNumber).filter(PhoneNumber.e164 == e164).with_for_update().first()
+    # Captured before any mutation below - a re-reservation of an expired/
+    # released row (the final `else` branch) reassigns account_id, which
+    # would otherwise leave a stale entry in the PREVIOUS account's cached
+    # list (this number vanishing from account_id but never invalidated
+    # there).
+    previous_account_id = number.account_id if number is not None else None
 
     if number is None:
         number = PhoneNumber(
@@ -526,6 +582,9 @@ def reserve_number(db: Session, account_id: str, e164: str, country: str, number
         raise NumberConflictError(f"{e164} was just reserved by another account") from e
 
     db.refresh(number)
+    _invalidate_numbers_cache(account_id)
+    if previous_account_id is not None and previous_account_id != account_id:
+        _invalidate_numbers_cache(previous_account_id)
     log_event(
         db,
         actor_id=account_id,
@@ -597,6 +656,7 @@ def _assert_purchase_eligible(db: Session, account_id: str, number: PhoneNumber,
         # purchase_number can be retried from here once the case is approved.
         number.status = PhoneNumberStatus.COMPLIANCE_PENDING
         db.commit()
+        _invalidate_numbers_cache(account_id)
         log_event(
             db, actor_id=account_id, action="number.compliance_pending",
             target_type="phone_number", target_id=number.id,
@@ -626,6 +686,7 @@ def _assert_purchase_eligible(db: Session, account_id: str, number: PhoneNumber,
         if case.status != NumberEligibilityCaseStatus.APPROVED:
             number.status = PhoneNumberStatus.COMPLIANCE_PENDING
             db.commit()
+            _invalidate_numbers_cache(account_id)
             log_event(
                 db, actor_id=account_id, action="number.eligibility_pending",
                 target_type="phone_number", target_id=number.id,
@@ -691,6 +752,7 @@ def purchase_number(db: Session, account_id: str, e164: str) -> PhoneNumber:
         number.status = PhoneNumberStatus.RESERVED
         number.provisioning_started_at = None
         db.commit()
+        _invalidate_numbers_cache(account_id)
         log_event(
             db, actor_id=account_id, action="number.purchase_failed",
             target_type="phone_number", target_id=number.id, metadata={"e164": e164},
@@ -710,6 +772,7 @@ def purchase_number(db: Session, account_id: str, e164: str) -> PhoneNumber:
     number.next_renewal_at = now + timedelta(days=RENEWAL_PERIOD_DAYS)
     db.commit()
     db.refresh(number)
+    _invalidate_numbers_cache(account_id)
     log_event(
         db, actor_id=account_id, action="number.activated",
         target_type="phone_number", target_id=number.id, metadata={"e164": e164, "provider_sid": bought["sid"]},
@@ -910,6 +973,7 @@ def retry_provisioning(db: Session, staff_id: str, number_id: str) -> PhoneNumbe
         number.status = PhoneNumberStatus.RESERVED
         number.provisioning_started_at = None
         db.commit()
+        _invalidate_numbers_cache(number.account_id)
         log_event(
             db, actor_id=staff_id, action="number.purchase_failed",
             target_type="phone_number", target_id=number.id, metadata={"e164": number.e164, "retried_by_staff": True},
@@ -923,6 +987,7 @@ def retry_provisioning(db: Session, staff_id: str, number_id: str) -> PhoneNumbe
     number.next_renewal_at = datetime.now(timezone.utc) + timedelta(days=RENEWAL_PERIOD_DAYS)
     db.commit()
     db.refresh(number)
+    _invalidate_numbers_cache(number.account_id)
     log_event(
         db, actor_id=staff_id, action="number.activated",
         target_type="phone_number", target_id=number.id,
@@ -953,6 +1018,7 @@ def release_stuck_provisioning(db: Session, staff_id: str, number_id: str) -> Ph
     number.provisioning_started_at = None
     db.commit()
     db.refresh(number)
+    _invalidate_numbers_cache(number.account_id)
     log_event(
         db, actor_id=staff_id, action="number.provisioning_released",
         target_type="phone_number", target_id=number.id, metadata={"e164": number.e164},
@@ -1016,6 +1082,7 @@ def mark_number_renewed(db: Session, staff_id: str, number_id: str) -> PhoneNumb
     number.next_renewal_at = now + timedelta(days=RENEWAL_PERIOD_DAYS)
     db.commit()
     db.refresh(number)
+    _invalidate_numbers_cache(number.account_id)
     log_event(
         db, actor_id=staff_id, action="number.renewed",
         target_type="phone_number", target_id=number.id,
@@ -1033,6 +1100,7 @@ def suspend_number(db: Session, user: User, e164: str, reason: str | None = None
     number.status = PhoneNumberStatus.SUSPENDED
     db.commit()
     db.refresh(number)
+    _invalidate_numbers_cache(user.account_id)
     log_event(
         db, actor_id=user.id, action="number.suspended",
         target_type="phone_number", target_id=number.id, metadata={"e164": e164, "reason": reason},
@@ -1065,6 +1133,8 @@ def suspend_numbers_for_account_by_system(db: Session, account_id: str, *, reaso
     for number in numbers:
         number.status = PhoneNumberStatus.SUSPENDED
     db.commit()
+    if numbers:
+        _invalidate_numbers_cache(account_id)
 
     for number in numbers:
         db.refresh(number)
@@ -1103,6 +1173,8 @@ def reactivate_numbers_for_account_by_staff(
     for number in numbers:
         number.status = PhoneNumberStatus.ACTIVE
     db.commit()
+    if numbers:
+        _invalidate_numbers_cache(account_id)
 
     owner = db.query(User).filter(User.account_id == account_id, User.role == UserRole.OWNER).first()
     account = db.query(Account).filter(Account.id == account_id).first()
@@ -1148,6 +1220,7 @@ def cancel_number(db: Session, user: User, e164: str) -> PhoneNumber:
     number.cancelled_at = datetime.now(timezone.utc)
     db.commit()
     db.refresh(number)
+    _invalidate_numbers_cache(user.account_id)
     log_event(
         db, actor_id=user.id, action="number.cancelled",
         target_type="phone_number", target_id=number.id, metadata={"e164": e164},
@@ -1208,6 +1281,7 @@ def configure_routing(
     number.sms_enabled = sms_enabled
     db.commit()
     db.refresh(number)
+    _invalidate_numbers_cache(user.account_id)
     log_event(
         db, actor_id=user.id, action="number.routing_configured",
         target_type="phone_number", target_id=number.id,
@@ -1303,6 +1377,7 @@ def set_ivr_menu(
     ]
     db.add_all(rows)
     db.commit()
+    _invalidate_numbers_cache(user.account_id)
 
     log_event(
         db, actor_id=user.account_id, action="number.ivr_menu_updated",
@@ -1333,6 +1408,7 @@ def clear_ivr_menu(db: Session, user: User, e164: str) -> None:
     number.ivr_greeting = None
     db.query(IVROption).filter(IVROption.phone_number_id == number.id).delete()
     db.commit()
+    _invalidate_numbers_cache(user.account_id)
 
     log_event(
         db, actor_id=user.account_id, action="number.ivr_menu_cleared",
@@ -1362,14 +1438,107 @@ def sync_webhook(db: Session, user: User, e164: str) -> PhoneNumber:
     return number
 
 
+def _numbers_cache_key(account_id: str) -> str:
+    return f"numbers:list:{account_id}"
+
+
+# Short TTL as a safety net, but this list is actively invalidated at
+# every write site that changes a PhoneNumber row for the account (see
+# _invalidate_numbers_cache's call sites below) - the dashboard already
+# refetches this list immediately after every action a customer takes
+# (purchase/suspend/cancel/assign/routing/...), so a cache that only
+# expired on a timer without invalidation would show a customer stale
+# state right after their own action, which is worse than no cache at all.
+_NUMBERS_CACHE_TTL_SECONDS = 30
+
+
+def _serialize_phone_number(n: PhoneNumber) -> dict:
+    return {
+        "id": n.id,
+        "e164": n.e164,
+        "country": n.country,
+        "provider": n.provider,
+        "provider_sid": n.provider_sid,
+        "status": n.status.value,
+        "account_id": n.account_id,
+        "reserved_until": n.reserved_until.isoformat() if n.reserved_until else None,
+        "number_type": n.number_type,
+        "cancelled_at": n.cancelled_at.isoformat() if n.cancelled_at else None,
+        "provisioning_started_at": n.provisioning_started_at.isoformat() if n.provisioning_started_at else None,
+        "assigned_user_id": n.assigned_user_id,
+        "forwarding_number": n.forwarding_number,
+        "business_hours_start": n.business_hours_start.isoformat() if n.business_hours_start else None,
+        "business_hours_end": n.business_hours_end.isoformat() if n.business_hours_end else None,
+        "business_hours_timezone": n.business_hours_timezone,
+        "ai_receptionist_enabled": n.ai_receptionist_enabled,
+        "escalation_user_id": n.escalation_user_id,
+        "ivr_greeting": n.ivr_greeting,
+        "next_renewal_at": n.next_renewal_at.isoformat() if n.next_renewal_at else None,
+        "call_flow_id": n.call_flow_id,
+        "whatsapp_enabled": n.whatsapp_enabled,
+        "sms_enabled": n.sms_enabled,
+        "created_at": n.created_at.isoformat() if n.created_at else None,
+    }
+
+
+def _deserialize_phone_number(data: dict) -> PhoneNumber:
+    from datetime import time as time_cls
+
+    return PhoneNumber(
+        id=data["id"],
+        e164=data["e164"],
+        country=data["country"],
+        provider=data["provider"],
+        provider_sid=data["provider_sid"],
+        status=PhoneNumberStatus(data["status"]),
+        account_id=data["account_id"],
+        reserved_until=datetime.fromisoformat(data["reserved_until"]) if data["reserved_until"] else None,
+        number_type=data["number_type"],
+        cancelled_at=datetime.fromisoformat(data["cancelled_at"]) if data["cancelled_at"] else None,
+        provisioning_started_at=(
+            datetime.fromisoformat(data["provisioning_started_at"]) if data["provisioning_started_at"] else None
+        ),
+        assigned_user_id=data["assigned_user_id"],
+        forwarding_number=data["forwarding_number"],
+        business_hours_start=time_cls.fromisoformat(data["business_hours_start"]) if data["business_hours_start"] else None,
+        business_hours_end=time_cls.fromisoformat(data["business_hours_end"]) if data["business_hours_end"] else None,
+        business_hours_timezone=data["business_hours_timezone"],
+        ai_receptionist_enabled=data["ai_receptionist_enabled"],
+        escalation_user_id=data["escalation_user_id"],
+        ivr_greeting=data["ivr_greeting"],
+        next_renewal_at=datetime.fromisoformat(data["next_renewal_at"]) if data["next_renewal_at"] else None,
+        call_flow_id=data["call_flow_id"],
+        whatsapp_enabled=data["whatsapp_enabled"],
+        sms_enabled=data["sms_enabled"],
+        created_at=datetime.fromisoformat(data["created_at"]) if data["created_at"] else None,
+    )
+
+
+def _invalidate_numbers_cache(account_id: str) -> None:
+    cache_delete(_numbers_cache_key(account_id))
+
+
+def _list_account_numbers_uncached(db: Session, account_id: str) -> list[PhoneNumber]:
+    return db.query(PhoneNumber).filter(PhoneNumber.account_id == account_id).all()
+
+
 def list_account_numbers(db: Session, account_id: str, *, user: User) -> list[PhoneNumber]:
     """Owner/Admin see every number on the account. A plain Member only sees
     numbers assigned to them - unassigned numbers aren't theirs to manage
-    yet, they haven't been handed anything."""
-    query = db.query(PhoneNumber).filter(PhoneNumber.account_id == account_id)
+    yet, they haven't been handed anything. Cached account-wide (the
+    unfiltered, Owner/Admin view) so every member of the same account
+    shares one cache entry; the Member filter is applied in Python after
+    the cache lookup rather than being baked into the cache key."""
+    cache_key = _numbers_cache_key(account_id)
+    cached = cache_get(cache_key)
+    if cached is not None:
+        numbers = [_deserialize_phone_number(row) for row in cached]
+    else:
+        numbers = _list_account_numbers_uncached(db, account_id)
+        cache_set(cache_key, [_serialize_phone_number(n) for n in numbers], ttl_seconds=_NUMBERS_CACHE_TTL_SECONDS)
     if user.role == UserRole.MEMBER:
-        query = query.filter(PhoneNumber.assigned_user_id == user.id)
-    return query.all()
+        numbers = [n for n in numbers if n.assigned_user_id == user.id]
+    return numbers
 
 
 def assigned_number_ids(db: Session, user: User) -> list[str] | None:
@@ -1401,6 +1570,7 @@ def assign_number(db: Session, *, account_id: str, e164: str, user_id: str | Non
     number.assigned_user_id = user_id
     db.commit()
     db.refresh(number)
+    _invalidate_numbers_cache(account_id)
 
     log_event(
         db, actor=actor, action="number.assigned",

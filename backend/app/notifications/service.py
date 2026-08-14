@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 from app.audit.service import log_event
 from app.core.config import settings
 from app.events.service import publish_notification_sent
+from app.integrations.cache.redis import cache_delete, cache_get, cache_set
 from app.integrations.notifications.email import EmailError, send_email
 from app.integrations.notifications.webpush import PushError, PushSubscriptionExpiredError, send_push
 from app.integrations.telecom.twilio import TelecomError, send_sms
@@ -494,13 +495,75 @@ def send_sms_notification(
     return delivery
 
 
+def _notifications_cache_key(account_id: str) -> str:
+    return f"notifications:list:{account_id}"
+
+
+# Short TTL, deliberately NOT invalidated on every send_notification call
+# site (there are ~40 of them across the whole codebase - see
+# send_notification's own docstring) - that would mean touching every
+# domain module that ever sends a notification, for a feature the
+# dashboard bell already polls periodically rather than needing to be
+# instant. A new notification appearing up to this many seconds late is
+# an acceptable tradeoff for cutting the DB round-trip on every poll;
+# mark_notification_read/mark_all_notifications_read below DO invalidate
+# immediately, since those are single, easily-owned write paths and a
+# user expects their own "mark read" click to stick right away.
+_NOTIFICATIONS_CACHE_TTL_SECONDS = 8
+
+
+def _serialize_notification(n: NotificationDelivery) -> dict:
+    return {
+        "id": n.id,
+        "account_id": n.account_id,
+        "event_name": n.event_name,
+        "channel": n.channel.value,
+        "recipient_email": n.recipient_email,
+        "recipient_phone": n.recipient_phone,
+        "push_subscription_id": n.push_subscription_id,
+        "subject": n.subject,
+        "status": n.status.value,
+        "error": n.error,
+        "provider_message_id": n.provider_message_id,
+        "created_at": n.created_at.isoformat() if n.created_at else None,
+        "read_at": n.read_at.isoformat() if n.read_at else None,
+    }
+
+
+def _deserialize_notification(data: dict) -> NotificationDelivery:
+    return NotificationDelivery(
+        id=data["id"],
+        account_id=data["account_id"],
+        event_name=data["event_name"],
+        channel=NotificationChannel(data["channel"]),
+        recipient_email=data["recipient_email"],
+        recipient_phone=data["recipient_phone"],
+        push_subscription_id=data["push_subscription_id"],
+        subject=data["subject"],
+        status=NotificationDeliveryStatus(data["status"]),
+        error=data["error"],
+        provider_message_id=data["provider_message_id"],
+        created_at=datetime.fromisoformat(data["created_at"]) if data["created_at"] else None,
+        read_at=datetime.fromisoformat(data["read_at"]) if data["read_at"] else None,
+    )
+
+
 def list_account_notifications(db: Session, account_id: str) -> list[NotificationDelivery]:
-    return (
+    cache_key = _notifications_cache_key(account_id)
+    cached = cache_get(cache_key)
+    if cached is not None:
+        return [_deserialize_notification(row) for row in cached]
+    deliveries = (
         db.query(NotificationDelivery)
         .filter(NotificationDelivery.account_id == account_id)
         .order_by(NotificationDelivery.created_at.desc())
         .all()
     )
+    cache_set(
+        cache_key, [_serialize_notification(d) for d in deliveries],
+        ttl_seconds=_NOTIFICATIONS_CACHE_TTL_SECONDS,
+    )
+    return deliveries
 
 
 class NotificationAuthorizationError(Exception):
@@ -515,6 +578,7 @@ def mark_notification_read(db: Session, account_id: str, notification_id: str) -
         delivery.read_at = datetime.now(timezone.utc)
         db.commit()
         db.refresh(delivery)
+        cache_delete(_notifications_cache_key(account_id))
         log_event(
             db, actor_id=account_id, action="notification.read",
             target_type="notification_delivery", target_id=delivery.id,
@@ -531,6 +595,7 @@ def mark_all_notifications_read(db: Session, account_id: str) -> int:
     db.commit()
 
     if result:
+        cache_delete(_notifications_cache_key(account_id))
         log_event(
             db, actor_id=account_id, action="notification.read_all",
             target_type="account", target_id=account_id, metadata={"count": result},

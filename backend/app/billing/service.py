@@ -22,6 +22,7 @@ from app.billing.models import (
 )
 from app.core.config import settings
 from app.integrations.billing import zoikonex as zoikonex_adapter
+from app.integrations.cache.redis import cache_get, cache_set
 from app.integrations.telecom import twilio as telecom
 from app.notifications.service import (
     notify_payment_failed,
@@ -77,8 +78,62 @@ class SeatQuotaExceededError(Exception):
     plan's max_team_seats."""
 
 
+_PLANS_CACHE_KEY = "billing:plans"
+# Long TTL, no invalidation needed - Plan rows are only ever seeded via
+# migration (see Plan's docstring), never mutated by any runtime service
+# function, so there's no write path this cache could ever go stale
+# against. list_plans is called on nearly every /dashboard/billing page
+# load (see PlanResponse's schema, which doesn't even expose the
+# zoikonex_* fields register_plan_in_catalog does mutate at runtime, so
+# caching those too here is harmless for that response shape).
+_PLANS_CACHE_TTL_SECONDS = 300
+
+
+def _serialize_plan(plan: Plan) -> dict:
+    return {
+        "plan_code": plan.plan_code,
+        "name": plan.name,
+        "max_numbers": plan.max_numbers,
+        "max_team_seats": plan.max_team_seats,
+        "monthly_voice_minutes": plan.monthly_voice_minutes,
+        "monthly_video_minutes": plan.monthly_video_minutes,
+        "max_video_participants": plan.max_video_participants,
+        "monthly_ai_summaries": plan.monthly_ai_summaries,
+        "trial_days": plan.trial_days,
+        "sort_order": plan.sort_order,
+        "zoikonex_product_id": plan.zoikonex_product_id,
+        "zoikonex_offer_id": plan.zoikonex_offer_id,
+        "zoikonex_price_rule_id": plan.zoikonex_price_rule_id,
+        "created_at": plan.created_at.isoformat() if plan.created_at else None,
+    }
+
+
+def _deserialize_plan(data: dict) -> Plan:
+    return Plan(
+        plan_code=data["plan_code"],
+        name=data["name"],
+        max_numbers=data["max_numbers"],
+        max_team_seats=data["max_team_seats"],
+        monthly_voice_minutes=data["monthly_voice_minutes"],
+        monthly_video_minutes=data["monthly_video_minutes"],
+        max_video_participants=data["max_video_participants"],
+        monthly_ai_summaries=data["monthly_ai_summaries"],
+        trial_days=data["trial_days"],
+        sort_order=data["sort_order"],
+        zoikonex_product_id=data["zoikonex_product_id"],
+        zoikonex_offer_id=data["zoikonex_offer_id"],
+        zoikonex_price_rule_id=data["zoikonex_price_rule_id"],
+        created_at=datetime.fromisoformat(data["created_at"]) if data["created_at"] else None,
+    )
+
+
 def list_plans(db: Session) -> list[Plan]:
-    return db.query(Plan).order_by(Plan.sort_order).all()
+    cached = cache_get(_PLANS_CACHE_KEY)
+    if cached is not None:
+        return [_deserialize_plan(row) for row in cached]
+    plans = db.query(Plan).order_by(Plan.sort_order).all()
+    cache_set(_PLANS_CACHE_KEY, [_serialize_plan(p) for p in plans], ttl_seconds=_PLANS_CACHE_TTL_SECONDS)
+    return plans
 
 
 def get_plan(db: Session, plan_code: str) -> Plan:
@@ -939,6 +994,13 @@ def capture_wholesale_call_cost(db: Session, *, limit: int = 50) -> dict:
         call.wholesale_currency = price_unit.upper()
         db.commit()
         db.refresh(call)
+        if call.account_id:
+            # Deferred import - app.media.service imports this module
+            # (billing_service.assert_billing_not_suspended), so a
+            # module-level import here would be circular.
+            from app.media.service import _invalidate_calls_cache
+
+            _invalidate_calls_cache(call.account_id)
         log_event(
             db, actor="system:wholesale_cost_capture", action="call.wholesale_cost_captured",
             target=f"call_record:{call.id}", account_id=call.account_id,

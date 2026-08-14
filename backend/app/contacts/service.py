@@ -1,3 +1,5 @@
+from datetime import datetime
+
 import sqlalchemy as sa
 from sqlalchemy.orm import Session
 
@@ -5,6 +7,7 @@ from app.audit.service import log_event
 from app.contacts.models import Contact
 from app.contacts.schemas import ContactHistoryEntry
 from app.crm.service import sync_contact_to_crm
+from app.integrations.cache.redis import cache_delete, cache_get, cache_set
 from app.media.models import CallRecord, ReceptionistCall, Voicemail
 from app.numbering.identity.models import User
 from app.numbering.numbers.service import assigned_number_ids
@@ -14,8 +17,47 @@ class ContactNotFoundError(Exception):
     """Raised when a contact_id doesn't exist or belongs to a different account."""
 
 
+def _contacts_cache_key(account_id: str) -> str:
+    return f"contacts:list:{account_id}"
+
+
+_CONTACTS_CACHE_TTL_SECONDS = 30
+
+
+def _serialize_contact(c: Contact) -> dict:
+    return {
+        "id": c.id,
+        "account_id": c.account_id,
+        "name": c.name,
+        "phone_number": c.phone_number,
+        "email": c.email,
+        "notes": c.notes,
+        "created_by_user_id": c.created_by_user_id,
+        "created_at": c.created_at.isoformat() if c.created_at else None,
+    }
+
+
+def _deserialize_contact(data: dict) -> Contact:
+    return Contact(
+        id=data["id"],
+        account_id=data["account_id"],
+        name=data["name"],
+        phone_number=data["phone_number"],
+        email=data["email"],
+        notes=data["notes"],
+        created_by_user_id=data["created_by_user_id"],
+        created_at=datetime.fromisoformat(data["created_at"]) if data["created_at"] else None,
+    )
+
+
 def list_contacts(db: Session, account_id: str) -> list[Contact]:
-    return db.query(Contact).filter(Contact.account_id == account_id).order_by(Contact.name.asc()).all()
+    cache_key = _contacts_cache_key(account_id)
+    cached = cache_get(cache_key)
+    if cached is not None:
+        return [_deserialize_contact(row) for row in cached]
+    contacts = db.query(Contact).filter(Contact.account_id == account_id).order_by(Contact.name.asc()).all()
+    cache_set(cache_key, [_serialize_contact(c) for c in contacts], ttl_seconds=_CONTACTS_CACHE_TTL_SECONDS)
+    return contacts
 
 
 def get_contact(db: Session, account_id: str, contact_id: str) -> Contact:
@@ -41,6 +83,7 @@ def create_contact(
     db.add(contact)
     db.commit()
     db.refresh(contact)
+    cache_delete(_contacts_cache_key(account_id))
     log_event(
         db, actor=user_id or "public_api", action="contacts.created", target=f"contact:{contact.id}",
         after={"name": name, "phone_number": phone_number},
@@ -61,6 +104,7 @@ def update_contact(
     contact.notes = notes
     db.commit()
     db.refresh(contact)
+    cache_delete(_contacts_cache_key(account_id))
     log_event(
         db, actor=user_id, action="contacts.updated", target=f"contact:{contact.id}",
         before=before, after={"name": name, "phone_number": phone_number},
@@ -74,6 +118,7 @@ def delete_contact(db: Session, *, account_id: str, user_id: str, contact_id: st
     before = {"name": contact.name, "phone_number": contact.phone_number}
     db.delete(contact)
     db.commit()
+    cache_delete(_contacts_cache_key(account_id))
     log_event(db, actor=user_id, action="contacts.deleted", target=f"contact:{contact_id}", before=before)
 
 
