@@ -222,11 +222,17 @@ def test_create_price_catalog_entry_rejects_a_duplicate_version(db_session):
 def test_get_active_price_catalog_entry_returns_the_most_recently_created(db_session):
     from datetime import datetime, timedelta, timezone
 
+    # "enterprise" deliberately (not "starter") - the Zoiko Local Global
+    # Plans, Pricing & Commercial Launch Standard (2026-08-14) gave starter/
+    # business/pro/scale a real ACTIVE entry each, which would otherwise win
+    # get_active_price_catalog_entry's own ACTIVE-first lookup and mask the
+    # "nothing activated yet, fall back to most recent" path this test is
+    # isolating. Enterprise stays unseeded/custom per that same doc.
     service.create_price_catalog_entry(
-        db_session, plan_code="starter", catalog_version="test-v-old", amount_minor_units=1000, actor="test-actor"
+        db_session, plan_code="enterprise", catalog_version="test-v-old", amount_minor_units=1000, actor="test-actor"
     )
     newest = service.create_price_catalog_entry(
-        db_session, plan_code="starter", catalog_version="test-v-new", amount_minor_units=2000, actor="test-actor"
+        db_session, plan_code="enterprise", catalog_version="test-v-new", amount_minor_units=2000, actor="test-actor"
     )
     # Postgres's now() is frozen to this test's enclosing transaction (see
     # _db_now's docstring) - both rows above got the SAME created_at, so
@@ -235,7 +241,7 @@ def test_get_active_price_catalog_entry_returns_the_most_recently_created(db_ses
     newest.created_at = datetime.now(timezone.utc) + timedelta(seconds=1)
     db_session.commit()
 
-    active = service.get_active_price_catalog_entry(db_session, "starter")
+    active = service.get_active_price_catalog_entry(db_session, "enterprise")
     assert active.id == newest.id
 
 

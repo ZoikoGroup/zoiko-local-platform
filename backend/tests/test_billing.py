@@ -168,12 +168,16 @@ def test_get_plans_requires_auth(client):
     assert response.status_code == 401
 
 
-def test_get_plans_returns_all_four_seeded_plans(client):
+def test_get_plans_returns_all_six_seeded_plans(client):
+    """Pro and Scale added per the Zoiko Local Global Plans, Pricing &
+    Commercial Launch Standard (2026-08-14) - a real 5-tier public
+    architecture (Starter/Business/Pro/Scale/Enterprise) plus the
+    pre-existing free_trial plan."""
     token = _signup_and_login(client, "billingplans1@example.com")
     response = client.get("/billing/plans", headers={"Authorization": f"Bearer {token}"})
     assert response.status_code == 200
     codes = {p["plan_code"] for p in response.json()}
-    assert codes == {"free_trial", "starter", "business", "enterprise"}
+    assert codes == {"free_trial", "starter", "business", "pro", "scale", "enterprise"}
 
 
 def test_get_subscription_returns_default_free_trial(client):
