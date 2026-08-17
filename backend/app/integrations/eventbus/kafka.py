@@ -44,13 +44,39 @@ def health_check() -> dict:
 
 
 def publish(topic: str, key: str | None, payload: dict) -> None:
+    """Fire-and-forget: hands the message to kafka-python's background
+    sender thread and returns without waiting for the broker's ack.
+    Confirmed live (found via a real backend test run): the previous
+    `future.get(timeout=10)` blocked the calling request/transaction for
+    up to 10 real seconds on every single publish - a degraded-but-not-
+    down broker wouldn't just risk failing the transaction (already
+    handled below), it could make the transaction itself slow enough to
+    trip an unrelated timeout elsewhere (e.g. the request's own DB
+    connection checkout), which contradicts this module's whole
+    "best-effort, never impacts the underlying business transaction"
+    design intent - "never fails it" isn't the same guarantee as "never
+    slows it down by seconds." Delivery failures are still logged (via
+    the future's errback), just asynchronously - by the time this
+    returns, only failures that happen before the message is even
+    handed to the producer (e.g. the broker being unreachable at send()
+    call time, which can still raise synchronously) surface as
+    EventBusError to the caller. This means events/service.py's
+    _publish_failures counter under-counts true async delivery failures
+    (it only sees the synchronous ones) - a known, accepted gap rather
+    than threading a callback back through this Provider Gateway's
+    signature, which would ripple into every test double that mocks
+    this function (see test_events.py's own monkeypatched fake, which
+    only accepts topic/key/payload)."""
     if not settings.kafka_bootstrap_servers:
         logger.info("EVENT (no Kafka broker configured) topic=%s key=%s payload=%r", topic, key, payload)
         return
 
+    def _log_delivery_failure(exc: Exception) -> None:
+        logger.warning("Kafka publish failed for topic %r (async): %s", topic, exc)
+
     try:
         future = _get_producer().send(topic, key=key, value=payload)
-        future.get(timeout=10)
+        future.add_errback(_log_delivery_failure)
     except KafkaError as e:
         raise EventBusError(f"Kafka publish failed for topic {topic!r}: {e}") from e
 

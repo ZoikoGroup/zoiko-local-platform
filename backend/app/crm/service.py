@@ -7,6 +7,7 @@ from app.audit.service import log_event
 from app.core.crypto import decrypt_secret, encrypt_secret
 from app.core.security import create_access_token, decode_access_token
 from app.crm.models import CrmConnection, CrmProvider, CrmSyncEvent, CrmSyncEventType
+from app.events.service import publish_crm_connected, publish_crm_disconnected
 from app.integrations.crm import hubspot as hubspot_adapter
 from app.integrations.crm import mock as crm_adapter
 from app.integrations.crm import pipedrive as pipedrive_adapter
@@ -96,6 +97,7 @@ def connect_crm(db: Session, *, account_id: str, provider: str, actor: str) -> C
         db, actor=actor, action="crm_connection.connected", target=f"crm_connection:{connection.id}",
         after={"provider": provider_enum.value},
     )
+    publish_crm_connected(account_id, provider=provider_enum.value)
 
     from app.numbering.identity.models import Account, User, UserRole
 
@@ -122,6 +124,7 @@ def disconnect_crm(db: Session, *, account_id: str, actor: str) -> None:
     db.commit()
 
     log_event(db, actor=actor, action="crm_connection.disconnected", target=f"crm_connection:{connection.id}")
+    publish_crm_disconnected(account_id, provider=connection.provider.value)
 
     from app.numbering.identity.models import Account, User, UserRole
 
@@ -172,6 +175,7 @@ def complete_hubspot_oauth(db: Session, *, code: str, state: str) -> CrmConnecti
         db, actor="hubspot_oauth_callback", action="crm_connection.connected",
         target=f"crm_connection:{connection.id}", after={"provider": "hubspot", "real": True},
     )
+    publish_crm_connected(account_id, provider="hubspot")
 
     from app.numbering.identity.models import Account, User, UserRole
 
@@ -242,6 +246,7 @@ def complete_salesforce_oauth(db: Session, *, code: str, state: str) -> CrmConne
         db, actor="salesforce_oauth_callback", action="crm_connection.connected",
         target=f"crm_connection:{connection.id}", after={"provider": "salesforce", "real": True},
     )
+    publish_crm_connected(account_id, provider="salesforce")
 
     from app.numbering.identity.models import Account, User, UserRole
 
@@ -310,6 +315,7 @@ def complete_pipedrive_oauth(db: Session, *, code: str, state: str) -> CrmConnec
         db, actor="pipedrive_oauth_callback", action="crm_connection.connected",
         target=f"crm_connection:{connection.id}", after={"provider": "pipedrive", "real": True},
     )
+    publish_crm_connected(account_id, provider="pipedrive")
 
     from app.numbering.identity.models import Account, User, UserRole
 

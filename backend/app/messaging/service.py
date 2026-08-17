@@ -13,6 +13,8 @@ from datetime import datetime
 from sqlalchemy.orm import Session
 
 from app.audit.service import log_event
+from app.events.service import publish_message_received, publish_message_sent
+from app.integrations.cache.redis import cache_delete, cache_get, cache_set
 from app.integrations.telecom import twilio as telecom
 from app.messaging.models import Conversation, Message, MessageDirection, MessageStatus, MessagingChannel
 from app.notifications.service import notify_recipient_opted_out
@@ -100,8 +102,11 @@ def send_message(
     db.add(message)
     conversation.last_message_at = datetime.utcnow()
     db.commit()
+    _invalidate_conversations_cache(account_id)
+    _invalidate_messages_cache(conversation.id)
     log_event(db, actor_id=actor_id, action=f"messaging.{channel.value}.sent", target_type="messaging_conversation",
                target_id=conversation.id, metadata={"to": to, "message_id": message.id})
+    publish_message_sent(account_id, message_id=message.id, conversation_id=conversation.id, channel=channel.value)
     return message
 
 
@@ -141,8 +146,11 @@ def _record_inbound(
     db.add(message)
     conversation.last_message_at = datetime.utcnow()
     db.commit()
+    _invalidate_conversations_cache(number.account_id)
+    _invalidate_messages_cache(conversation.id)
     log_event(db, actor_id=number.account_id, action=f"messaging.{channel.value}.received", target_type="messaging_conversation",
                target_id=conversation.id, metadata={"from": from_number})
+    publish_message_received(number.account_id, message_id=message.id, conversation_id=conversation.id, channel=channel.value)
     return message
 
 
@@ -168,15 +176,100 @@ def update_message_status(db: Session, provider_message_sid: str, status: str) -
     except ValueError:
         return
     db.commit()
+    _invalidate_messages_cache(message.conversation_id)
+
+
+def _conversations_cache_key(account_id: str) -> str:
+    return f"conversations:list:{account_id}"
+
+
+# Same short-TTL, invalidate-on-write pattern as media.service's calls/
+# voicemails/video-sessions caches - invalidated at both write paths that
+# change a field this list reflects (last_message_at on every message,
+# opted_out/opted_out_at on an inbound STOP/START).
+_CONVERSATIONS_CACHE_TTL_SECONDS = 15
+
+
+def _serialize_conversation(c: Conversation) -> dict:
+    return {
+        "id": c.id,
+        "account_id": c.account_id,
+        "phone_number_id": c.phone_number_id,
+        "customer_number": c.customer_number,
+        "channel": c.channel.value,
+        "opted_out": c.opted_out,
+        "opted_out_at": c.opted_out_at.isoformat() if c.opted_out_at else None,
+        "last_message_at": c.last_message_at.isoformat() if c.last_message_at else None,
+        "created_at": c.created_at.isoformat() if c.created_at else None,
+    }
+
+
+def _deserialize_conversation(data: dict) -> Conversation:
+    return Conversation(
+        id=data["id"],
+        account_id=data["account_id"],
+        phone_number_id=data["phone_number_id"],
+        customer_number=data["customer_number"],
+        channel=MessagingChannel(data["channel"]),
+        opted_out=data["opted_out"],
+        opted_out_at=datetime.fromisoformat(data["opted_out_at"]) if data["opted_out_at"] else None,
+        last_message_at=datetime.fromisoformat(data["last_message_at"]) if data["last_message_at"] else None,
+        created_at=datetime.fromisoformat(data["created_at"]) if data["created_at"] else None,
+    )
+
+
+def _invalidate_conversations_cache(account_id: str) -> None:
+    cache_delete(_conversations_cache_key(account_id))
 
 
 def list_conversations(db: Session, account_id: str) -> list[Conversation]:
-    return (
+    cache_key = _conversations_cache_key(account_id)
+    cached = cache_get(cache_key)
+    if cached is not None:
+        return [_deserialize_conversation(row) for row in cached]
+    conversations = (
         db.query(Conversation)
         .filter(Conversation.account_id == account_id)
         .order_by(Conversation.last_message_at.desc())
         .all()
     )
+    cache_set(cache_key, [_serialize_conversation(c) for c in conversations], ttl_seconds=_CONVERSATIONS_CACHE_TTL_SECONDS)
+    return conversations
+
+
+def _messages_cache_key(conversation_id: str) -> str:
+    return f"messages:list:{conversation_id}"
+
+
+_MESSAGES_CACHE_TTL_SECONDS = 15
+
+
+def _serialize_message(m: Message) -> dict:
+    return {
+        "id": m.id,
+        "conversation_id": m.conversation_id,
+        "direction": m.direction.value,
+        "body": m.body,
+        "provider_message_sid": m.provider_message_sid,
+        "status": m.status.value,
+        "created_at": m.created_at.isoformat() if m.created_at else None,
+    }
+
+
+def _deserialize_message(data: dict) -> Message:
+    return Message(
+        id=data["id"],
+        conversation_id=data["conversation_id"],
+        direction=MessageDirection(data["direction"]),
+        body=data["body"],
+        provider_message_sid=data["provider_message_sid"],
+        status=MessageStatus(data["status"]),
+        created_at=datetime.fromisoformat(data["created_at"]) if data["created_at"] else None,
+    )
+
+
+def _invalidate_messages_cache(conversation_id: str) -> None:
+    cache_delete(_messages_cache_key(conversation_id))
 
 
 def list_messages(db: Session, account_id: str, conversation_id: str) -> list[Message]:
@@ -187,4 +280,11 @@ def list_messages(db: Session, account_id: str, conversation_id: str) -> list[Me
     )
     if conversation is None:
         raise ConversationNotFoundError(conversation_id)
-    return db.query(Message).filter(Message.conversation_id == conversation_id).order_by(Message.created_at.asc()).all()
+
+    cache_key = _messages_cache_key(conversation_id)
+    cached = cache_get(cache_key)
+    if cached is not None:
+        return [_deserialize_message(row) for row in cached]
+    messages = db.query(Message).filter(Message.conversation_id == conversation_id).order_by(Message.created_at.asc()).all()
+    cache_set(cache_key, [_serialize_message(m) for m in messages], ttl_seconds=_MESSAGES_CACHE_TTL_SECONDS)
+    return messages

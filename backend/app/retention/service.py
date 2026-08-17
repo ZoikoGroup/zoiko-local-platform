@@ -3,6 +3,8 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy.orm import Session
 
 from app.audit.service import log_event
+from app.events.service import publish_retention_policy_set, publish_retention_recording_purged
+from app.integrations.cache.redis import cache_delete, cache_get, cache_set
 from app.integrations.storage.s3 import StorageError, delete_object
 from app.integrations.telecom import twilio as telecom
 from app.integrations.telecom.twilio import TelecomError
@@ -60,14 +62,36 @@ def set_retention_policy(
         target=f"retention_policy:{policy.id}",
         after={"artifact_type": artifact_type.value, "retention_days": retention_days},
     )
+    publish_retention_policy_set(account_id, artifact_type=artifact_type.value, retention_days=retention_days)
     return policy
+
+
+def _retention_policies_cache_key(account_id: str) -> str:
+    return f"retention_policies:list:{account_id}"
+
+
+# Real N+1 cost, same shape as routing.list_flows: get_retention_days runs
+# up to 2 queries (account override, global fallback) PER artifact type, so
+# a straight call here is up to 2 * len(ArtifactType) queries for what's
+# conceptually a single small settings view.
+_RETENTION_POLICIES_CACHE_TTL_SECONDS = 30
+
+
+def _invalidate_retention_policies_cache(account_id: str) -> None:
+    cache_delete(_retention_policies_cache_key(account_id))
 
 
 def list_retention_policies(db: Session, account_id: str) -> dict[str, int]:
     """Returns the EFFECTIVE retention (account override, else global
     default, else the hardcoded fallback) for every artifact type - so a
     customer always sees a real number, never a gap."""
-    return {t.value: get_retention_days(db, account_id, t) for t in ArtifactType}
+    cache_key = _retention_policies_cache_key(account_id)
+    cached = cache_get(cache_key)
+    if cached is not None:
+        return cached
+    result = {t.value: get_retention_days(db, account_id, t) for t in ArtifactType}
+    cache_set(cache_key, result, ttl_seconds=_RETENTION_POLICIES_CACHE_TTL_SECONDS)
+    return result
 
 
 def _purge_voicemails(db: Session, now: datetime) -> tuple[int, int]:
@@ -95,6 +119,7 @@ def _purge_voicemails(db: Session, now: datetime) -> tuple[int, int]:
             db, actor_id=vm.account_id, action="retention.voicemail_purged",
             target_type="voicemail", target_id=vm.id, metadata={"retention_days": retention_days},
         )
+        publish_retention_recording_purged(vm.account_id, artifact_type="voicemail", target_id=vm.id)
         purged += 1
     return purged, failed
 
@@ -132,6 +157,7 @@ def _purge_call_recordings(db: Session, now: datetime) -> tuple[int, int]:
             db, actor_id=call.account_id, action="retention.call_recording_purged",
             target_type="call_record", target_id=call.id, metadata={"retention_days": retention_days},
         )
+        publish_retention_recording_purged(call.account_id, artifact_type="call_recording", target_id=call.id)
         purged += 1
     return purged, failed
 
@@ -158,6 +184,7 @@ def _purge_video_recordings(db: Session, now: datetime) -> tuple[int, int]:
             db, actor_id=session.account_id, action="retention.video_recording_purged",
             target_type="video_session", target_id=session.id, metadata={"retention_days": retention_days},
         )
+        publish_retention_recording_purged(session.account_id, artifact_type="video_recording", target_id=session.id)
         purged += 1
     return purged, failed
 

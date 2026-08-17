@@ -6,6 +6,8 @@ from sqlalchemy.orm import Session
 
 from app.apikeys.models import ApiKey
 from app.audit.service import log_event
+from app.events.service import publish_api_key_created, publish_api_key_revoked
+from app.integrations.cache.redis import cache_delete, cache_get, cache_set
 from app.notifications.service import notify_api_client_created
 
 _MAX_KEYS_PER_ACCOUNT = 10
@@ -40,7 +42,9 @@ def create_api_key(db: Session, *, account_id: str, label: str, actor: str) -> t
     db.commit()
     db.refresh(key)
 
+    _invalidate_api_keys_cache(account_id)
     log_event(db, actor=actor, action="api_key.created", target=f"api_key:{key.id}", after={"label": label})
+    publish_api_key_created(account_id, key_id=key.id, label=label)
 
     from app.numbering.identity.models import User, UserRole
 
@@ -55,8 +59,54 @@ def create_api_key(db: Session, *, account_id: str, label: str, actor: str) -> t
     return key, raw_key
 
 
+def _api_keys_cache_key(account_id: str) -> str:
+    return f"api_keys:list:{account_id}"
+
+
+# Capped at _MAX_KEYS_PER_ACCOUNT (10) rows and a rarely-visited page, so
+# the perf win is small - included anyway to close out the same gap
+# consistently across every account-scoped list in the app.
+_API_KEYS_CACHE_TTL_SECONDS = 30
+
+
+def _serialize_api_key(k: ApiKey) -> dict:
+    return {
+        "id": k.id,
+        "account_id": k.account_id,
+        "label": k.label,
+        "key_prefix": k.key_prefix,
+        "key_hash": k.key_hash,
+        "last_used_at": k.last_used_at.isoformat() if k.last_used_at else None,
+        "revoked_at": k.revoked_at.isoformat() if k.revoked_at else None,
+        "created_at": k.created_at.isoformat() if k.created_at else None,
+    }
+
+
+def _deserialize_api_key(data: dict) -> ApiKey:
+    return ApiKey(
+        id=data["id"],
+        account_id=data["account_id"],
+        label=data["label"],
+        key_prefix=data["key_prefix"],
+        key_hash=data["key_hash"],
+        last_used_at=datetime.fromisoformat(data["last_used_at"]) if data["last_used_at"] else None,
+        revoked_at=datetime.fromisoformat(data["revoked_at"]) if data["revoked_at"] else None,
+        created_at=datetime.fromisoformat(data["created_at"]) if data["created_at"] else None,
+    )
+
+
+def _invalidate_api_keys_cache(account_id: str) -> None:
+    cache_delete(_api_keys_cache_key(account_id))
+
+
 def list_api_keys(db: Session, account_id: str) -> list[ApiKey]:
-    return db.query(ApiKey).filter(ApiKey.account_id == account_id).order_by(ApiKey.created_at.desc()).all()
+    cache_key = _api_keys_cache_key(account_id)
+    cached = cache_get(cache_key)
+    if cached is not None:
+        return [_deserialize_api_key(row) for row in cached]
+    keys = db.query(ApiKey).filter(ApiKey.account_id == account_id).order_by(ApiKey.created_at.desc()).all()
+    cache_set(cache_key, [_serialize_api_key(k) for k in keys], ttl_seconds=_API_KEYS_CACHE_TTL_SECONDS)
+    return keys
 
 
 def revoke_api_key(db: Session, *, account_id: str, key_id: str, actor: str) -> None:
@@ -66,7 +116,9 @@ def revoke_api_key(db: Session, *, account_id: str, key_id: str, actor: str) -> 
 
     key.revoked_at = datetime.now(timezone.utc)
     db.commit()
+    _invalidate_api_keys_cache(account_id)
     log_event(db, actor=actor, action="api_key.revoked", target=f"api_key:{key_id}")
+    publish_api_key_revoked(account_id, key_id=key_id)
 
 
 def authenticate_api_key(db: Session, raw_key: str) -> ApiKey | None:

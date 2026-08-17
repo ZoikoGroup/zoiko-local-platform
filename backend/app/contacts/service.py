@@ -7,6 +7,7 @@ from app.audit.service import log_event
 from app.contacts.models import Contact
 from app.contacts.schemas import ContactHistoryEntry
 from app.crm.service import sync_contact_to_crm
+from app.events.service import publish_contact_created, publish_contact_deleted, publish_contact_updated
 from app.integrations.cache.redis import cache_delete, cache_get, cache_set
 from app.media.models import CallRecord, ReceptionistCall, Voicemail
 from app.numbering.identity.models import User
@@ -88,6 +89,7 @@ def create_contact(
         db, actor=user_id or "public_api", action="contacts.created", target=f"contact:{contact.id}",
         after={"name": name, "phone_number": phone_number},
     )
+    publish_contact_created(account_id, contact_id=contact.id, name=name)
     sync_contact_to_crm(db, account_id=account_id, contact_id=contact.id, name=name, phone_number=phone_number)
     return contact
 
@@ -109,6 +111,7 @@ def update_contact(
         db, actor=user_id, action="contacts.updated", target=f"contact:{contact.id}",
         before=before, after={"name": name, "phone_number": phone_number},
     )
+    publish_contact_updated(account_id, contact_id=contact.id)
     sync_contact_to_crm(db, account_id=account_id, contact_id=contact.id, name=name, phone_number=phone_number)
     return contact
 
@@ -120,6 +123,7 @@ def delete_contact(db: Session, *, account_id: str, user_id: str, contact_id: st
     db.commit()
     cache_delete(_contacts_cache_key(account_id))
     log_event(db, actor=user_id, action="contacts.deleted", target=f"contact:{contact_id}", before=before)
+    publish_contact_deleted(account_id, contact_id=contact_id)
 
 
 def get_contact_history(db: Session, user: User, contact: Contact) -> list[ContactHistoryEntry]:

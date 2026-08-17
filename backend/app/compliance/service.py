@@ -10,6 +10,7 @@ from app.events.service import (
     publish_compliance_case_rejected,
     publish_compliance_case_required,
 )
+from app.integrations.cache.redis import cache_delete, cache_get, cache_set
 from app.integrations.kyc import stripe_identity
 from app.integrations.storage import s3 as storage
 from app.notifications.service import (
@@ -96,6 +97,7 @@ def open_compliance_case(
     db.add(case)
     db.commit()
     db.refresh(case)
+    _invalidate_cases_cache(account_id)
 
     log_event(
         db,
@@ -110,13 +112,65 @@ def open_compliance_case(
     return case
 
 
+def _cases_cache_key(account_id: str) -> str:
+    return f"compliance_cases:list:{account_id}"
+
+
+# Small per-account row counts (typically a handful of cases at most) mean
+# the perf win here is modest, but the write-site count is small too (only
+# 5 real mutators - open/submit_document/approve/reject/start_kyc_
+# verification), so it costs little to close the same gap the higher-
+# traffic lists already closed.
+_CASES_CACHE_TTL_SECONDS = 30
+
+
+def _serialize_case(c: ComplianceCase) -> dict:
+    return {
+        "id": c.id,
+        "account_id": c.account_id,
+        "number_id": c.number_id,
+        "jurisdiction": c.jurisdiction,
+        "requirement_type": c.requirement_type,
+        "status": c.status.value,
+        "documents": c.documents,
+        "expires_at": c.expires_at.isoformat() if c.expires_at else None,
+        "created_at": c.created_at.isoformat() if c.created_at else None,
+        "kyc_inquiry_id": c.kyc_inquiry_id,
+    }
+
+
+def _deserialize_case(data: dict) -> ComplianceCase:
+    return ComplianceCase(
+        id=data["id"],
+        account_id=data["account_id"],
+        number_id=data["number_id"],
+        jurisdiction=data["jurisdiction"],
+        requirement_type=data["requirement_type"],
+        status=ComplianceCaseStatus(data["status"]),
+        documents=data["documents"],
+        expires_at=datetime.fromisoformat(data["expires_at"]) if data["expires_at"] else None,
+        created_at=datetime.fromisoformat(data["created_at"]) if data["created_at"] else None,
+        kyc_inquiry_id=data["kyc_inquiry_id"],
+    )
+
+
+def _invalidate_cases_cache(account_id: str) -> None:
+    cache_delete(_cases_cache_key(account_id))
+
+
 def list_cases_for_account(db: Session, account_id: str) -> list[ComplianceCase]:
-    return (
+    cache_key = _cases_cache_key(account_id)
+    cached = cache_get(cache_key)
+    if cached is not None:
+        return [_deserialize_case(row) for row in cached]
+    cases = (
         db.query(ComplianceCase)
         .filter(ComplianceCase.account_id == account_id)
         .order_by(ComplianceCase.created_at.desc())
         .all()
     )
+    cache_set(cache_key, [_serialize_case(c) for c in cases], ttl_seconds=_CASES_CACHE_TTL_SECONDS)
+    return cases
 
 
 def list_all_cases(db: Session, status: str | None = None) -> list[dict]:
@@ -209,6 +263,7 @@ def submit_document(
     case.documents = [*case.documents, new_doc]  # reassign, not .append() - JSON columns need a new object to detect the change
     db.commit()
     db.refresh(case)
+    _invalidate_cases_cache(case.account_id)
 
     log_event(
         db,
@@ -246,6 +301,7 @@ def approve_case(db: Session, case: ComplianceCase, *, actor: str) -> Compliance
     case.status = ComplianceCaseStatus.APPROVED
     db.commit()
     db.refresh(case)
+    _invalidate_cases_cache(case.account_id)
 
     log_event(
         db,
@@ -284,6 +340,7 @@ def reject_case(db: Session, case: ComplianceCase, *, actor: str, reason: str | 
     case.status = ComplianceCaseStatus.REJECTED
     db.commit()
     db.refresh(case)
+    _invalidate_cases_cache(case.account_id)
 
     log_event(
         db,
@@ -344,6 +401,7 @@ def start_kyc_verification(db: Session, case: ComplianceCase, *, actor: str) -> 
         # new attempt is still pending a fresh decision.
         case.status = ComplianceCaseStatus.PENDING
     db.commit()
+    _invalidate_cases_cache(case.account_id)
 
     log_event(
         db,

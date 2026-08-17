@@ -7,6 +7,7 @@ from twilio.request_validator import RequestValidator
 
 from app.audit.service import log_event
 from app.core.config import settings
+from app.events.service import publish_incident_declared, publish_incident_resolved, publish_kill_switch_changed
 from app.integrations.billing import stripe_checkout
 from app.integrations.embeddings import cohere as cohere_embeddings
 from app.integrations.kyc import stripe_identity
@@ -228,6 +229,7 @@ def create_incident(db: Session, *, title: str, affected_service: str, impact_su
     db.add(incident)
     db.commit()
     db.refresh(incident)
+    publish_incident_declared(incident_id=incident.id, title=title, affected_service=affected_service)
     for user in _list_active_subscribers(db):
         notify_incident_declared(
             db, account_id=user.account_id, account_email=user.email,
@@ -281,6 +283,7 @@ def resolve_incident(db: Session, incident_id: str) -> Incident:
     incident.resolved_at = sa.func.now()
     db.commit()
     db.refresh(incident)
+    publish_incident_resolved(incident_id=incident.id)
     duration = incident.resolved_at - incident.started_at
     for user in _list_active_subscribers(db):
         notify_incident_resolved(
@@ -354,6 +357,7 @@ def set_kill_switch(
         db, actor=actor, action="ops.kill_switch_activated" if is_active else "ops.kill_switch_deactivated",
         target=f"kill_switch:{scope.value}", after={"reason": reason},
     )
+    publish_kill_switch_changed(scope=scope.value, is_active=is_active, actor=actor)
     return switch
 
 

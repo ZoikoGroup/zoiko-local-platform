@@ -8,6 +8,7 @@ from app.billing import service as billing_service
 from app.consent.models import GLOBAL_JURISDICTION, ConsentType
 from app.consent.service import has_active_consent
 from app.events.service import publish_ai_summary_completed, publish_transcript_completed
+from app.integrations.cache.redis import cache_delete, cache_get, cache_set
 from app.integrations.embeddings.cohere import EmbeddingError, generate_embedding
 from app.integrations.llm.groq import MODEL_VERSION as LLM_MODEL_VERSION
 from app.integrations.llm.groq import extract_conversation_summary, extract_receptionist_qualification
@@ -133,6 +134,7 @@ def _analyze_and_store(
     db.add(record)
     db.commit()
     db.refresh(record)
+    _invalidate_summaries_cache(account_id)
     log_event(
         db, actor_id=account_id, action="intelligence.summary_created",
         target_type="conversation_summary", target_id=record.id,
@@ -313,6 +315,7 @@ def edit_summary(db: Session, user: User, summary_id: str, new_summary: str) -> 
     summary.edited_by_user_id = user.id
     db.commit()
     db.refresh(summary)
+    _invalidate_summaries_cache(summary.account_id)
 
     log_event(
         db, actor=user.id, action="intelligence.summary_edited",
@@ -375,8 +378,79 @@ def _account_summaries_query(db: Session, user: User):
     return query
 
 
+def _summaries_cache_key(account_id: str) -> str:
+    return f"summaries:list:{account_id}"
+
+
+# Same "only cache the unfiltered Owner/Admin view" pattern as media.service's
+# calls/voicemails/video-sessions caches - a Member's role-filtered view
+# always queries live (see list_account_summaries below), since serving it
+# from an unfiltered cached page could return rows the Member shouldn't see.
+# The embedding vector is deliberately excluded from the cached payload -
+# _summary_response (the only consumer of this list) never reads it, and
+# caching a float array per row for semantic search (a separate, uncached
+# query path - see search_account_summaries) would be pure waste.
+_SUMMARIES_CACHE_TTL_SECONDS = 20
+
+
+def _serialize_summary(s: ConversationSummary) -> dict:
+    return {
+        "id": s.id,
+        "account_id": s.account_id,
+        "source_type": s.source_type.value,
+        "source_id": s.source_id,
+        "transcript": s.transcript,
+        "summary": s.summary,
+        "language": s.language,
+        "urgency": s.urgency.value if s.urgency else None,
+        "action_items": s.action_items,
+        "suggested_follow_up": s.suggested_follow_up,
+        "model_version": s.model_version,
+        "created_at": s.created_at.isoformat() if s.created_at else None,
+        "original_summary": s.original_summary,
+        "edited_at": s.edited_at.isoformat() if s.edited_at else None,
+        "edited_by_user_id": s.edited_by_user_id,
+    }
+
+
+def _deserialize_summary(data: dict) -> ConversationSummary:
+    return ConversationSummary(
+        id=data["id"],
+        account_id=data["account_id"],
+        source_type=SummarySourceType(data["source_type"]),
+        source_id=data["source_id"],
+        transcript=data["transcript"],
+        summary=data["summary"],
+        language=data["language"],
+        urgency=ReceptionistUrgency(data["urgency"]) if data["urgency"] else None,
+        action_items=data["action_items"],
+        suggested_follow_up=data["suggested_follow_up"],
+        model_version=data["model_version"],
+        created_at=datetime.fromisoformat(data["created_at"]) if data["created_at"] else None,
+        original_summary=data["original_summary"],
+        edited_at=datetime.fromisoformat(data["edited_at"]) if data["edited_at"] else None,
+        edited_by_user_id=data["edited_by_user_id"],
+    )
+
+
+def _invalidate_summaries_cache(account_id: str | None) -> None:
+    if account_id:
+        cache_delete(_summaries_cache_key(account_id))
+
+
 def list_account_summaries(db: Session, user: User) -> list[ConversationSummary]:
-    return _account_summaries_query(db, user).order_by(ConversationSummary.created_at.desc()).all()
+    ids = assigned_number_ids(db, user)
+    if ids is not None:
+        # Member view - always queries live, same reason as list_account_calls.
+        return _account_summaries_query(db, user).order_by(ConversationSummary.created_at.desc()).all()
+
+    cache_key = _summaries_cache_key(user.account_id)
+    cached = cache_get(cache_key)
+    if cached is not None:
+        return [_deserialize_summary(row) for row in cached]
+    summaries = _account_summaries_query(db, user).order_by(ConversationSummary.created_at.desc()).all()
+    cache_set(cache_key, [_serialize_summary(s) for s in summaries], ttl_seconds=_SUMMARIES_CACHE_TTL_SECONDS)
+    return summaries
 
 
 # Cosine distance cutoff below which a result counts as a real semantic

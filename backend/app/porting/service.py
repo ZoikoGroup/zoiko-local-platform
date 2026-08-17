@@ -4,6 +4,13 @@ from datetime import date
 from sqlalchemy.orm import Session
 
 from app.audit.service import log_event
+from app.events.service import (
+    publish_porting_request_approved,
+    publish_porting_request_canceled,
+    publish_porting_request_completed,
+    publish_porting_request_rejected,
+    publish_porting_request_submitted,
+)
 from app.notifications.service import (
     notify_porting_request_approved,
     notify_porting_request_canceled,
@@ -80,6 +87,7 @@ def submit_porting_request(
         db, actor=requested_by_user_id, action="porting.request_submitted",
         target=f"porting_request:{request.id}", after={"phone_number": phone_number, "country": request.country},
     )
+    publish_porting_request_submitted(account_id, request_id=request.id, phone_number=phone_number, country=request.country)
 
     owner_email = _account_owner_email(db, account_id)
     if owner_email:
@@ -162,6 +170,7 @@ def cancel_porting_request(db: Session, request: PortingRequest, *, account_id: 
         db, actor=actor, action="porting.request_canceled",
         target=f"porting_request:{request.id}", before={"status": before_status}, after={"status": request.status},
     )
+    publish_porting_request_canceled(account_id, request_id=request.id)
 
     owner_email = _account_owner_email(db, account_id)
     if owner_email:
@@ -191,6 +200,7 @@ def approve_porting_request(db: Session, request: PortingRequest, *, actor: str)
         db, actor=actor, action="porting.request_approved",
         target=f"porting_request:{request.id}", after={"status": request.status},
     )
+    publish_porting_request_approved(request.account_id, request_id=request.id)
 
     owner_email = _account_owner_email(db, request.account_id)
     if owner_email:
@@ -217,6 +227,7 @@ def reject_porting_request(
         db, actor=actor, action="porting.request_rejected",
         target=f"porting_request:{request.id}", reason=reason, after={"status": request.status},
     )
+    publish_porting_request_rejected(request.account_id, request_id=request.id, reason=reason)
 
     owner_email = _account_owner_email(db, request.account_id)
     if owner_email:
@@ -266,6 +277,7 @@ def complete_porting_request(
         target=f"porting_request:{request.id}",
         after={"status": request.status, "phone_number_id": number.id},
     )
+    publish_porting_request_completed(request.account_id, request_id=request.id, phone_number_id=number.id)
 
     owner_email = _account_owner_email(db, request.account_id)
     if owner_email:

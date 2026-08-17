@@ -3,6 +3,7 @@ from sqlalchemy.orm import Session
 
 from app.audit.service import log_event
 from app.core.security import hash_password, verify_password
+from app.events.service import publish_account_billing_classification_updated
 from app.numbering.identity.models import Account, User, UserRole
 from app.numbering.numbers.models import PhoneNumber
 from app.numbering.numbers.service import list_due_renewals as _list_due_renewals
@@ -126,6 +127,9 @@ def update_account_billing_classification(
         db, actor=actor, action="account.billing_classification_updated", target=f"account:{account.id}",
         before=before,
         after={"billing_classification": billing_classification.value, "billing_source": billing_source.value},
+    )
+    publish_account_billing_classification_updated(
+        account_id, billing_classification=billing_classification.value, billing_source=billing_source.value,
     )
     return account
 

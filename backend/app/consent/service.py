@@ -4,6 +4,7 @@ from sqlalchemy.orm import Session
 
 from app.audit.service import log_event
 from app.consent.models import GLOBAL_JURISDICTION, ConsentRecord, ConsentType
+from app.events.service import publish_consent_granted, publish_consent_revoked
 from app.notifications.service import notify_emergency_calling_notice
 
 
@@ -44,6 +45,7 @@ def grant_consent(
         target_type="consent_record", target_id=record.id,
         metadata={"consent_type": consent_type.value, "jurisdiction": jurisdiction},
     )
+    publish_consent_granted(account_id, consent_type=consent_type.value, jurisdiction=jurisdiction)
 
     if consent_type == ConsentType.EMERGENCY_CALLING_ACKNOWLEDGED:
         from app.numbering.identity.models import User, UserRole
@@ -94,6 +96,7 @@ def revoke_consent(
         target_type="consent_record", target_id=record.id,
         metadata={"consent_type": consent_type.value, "jurisdiction": jurisdiction},
     )
+    publish_consent_revoked(account_id, consent_type=consent_type.value, jurisdiction=jurisdiction)
     return record
 
 

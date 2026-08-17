@@ -19,6 +19,8 @@ from zoneinfo import ZoneInfo
 from sqlalchemy.orm import Session
 
 from app.audit.service import log_event
+from app.events.service import publish_call_flow_published, publish_call_flow_rolled_back
+from app.integrations.cache.redis import cache_delete, cache_get, cache_set
 from app.notifications.service import notify_call_flow_published, notify_call_flow_rolled_back
 from app.numbering.identity.models import User, UserRole
 from app.numbering.numbers.models import PhoneNumber
@@ -121,12 +123,35 @@ def create_flow(db: Session, account_id: str, name: str, actor_id: str) -> CallF
     )
     db.add(draft)
     db.commit()
+    _invalidate_flows_cache(account_id)
     log_event(db, actor_id=account_id, action="call_flow.created", target_type="call_flow", target_id=flow.id,
                metadata={"name": name})
     return flow
 
 
+def _flows_cache_key(account_id: str) -> str:
+    return f"call_flows:list:{account_id}"
+
+
+# Real N+1 query cost, unlike a plain single-table list: list_flows runs two
+# extra queries PER flow (live version, assigned numbers), so this is a
+# genuine perf win, not just the usual "avoid one requery" case. Invalidated
+# at every write site that changes a field this response actually reflects -
+# create_flow (id/name/created_at), publish_flow/rollback_flow (live_version),
+# assign_to_number (assigned_numbers). save_draft is deliberately excluded -
+# draft node content never appears in this list's output.
+_FLOWS_CACHE_TTL_SECONDS = 30
+
+
+def _invalidate_flows_cache(account_id: str) -> None:
+    cache_delete(_flows_cache_key(account_id))
+
+
 def list_flows(db: Session, account_id: str) -> list[dict]:
+    cache_key = _flows_cache_key(account_id)
+    cached = cache_get(cache_key)
+    if cached is not None:
+        return cached
     flows = db.query(CallFlow).filter(CallFlow.account_id == account_id).order_by(CallFlow.created_at.desc()).all()
     results = []
     for flow in flows:
@@ -140,12 +165,13 @@ def list_flows(db: Session, account_id: str) -> list[dict]:
             {
                 "id": flow.id,
                 "name": flow.name,
-                "created_at": flow.created_at,
+                "created_at": flow.created_at.isoformat() if flow.created_at else None,
                 "has_draft": True,
                 "live_version": live.version if live else None,
                 "assigned_numbers": [row[0] for row in assigned],
             }
         )
+    cache_set(cache_key, results, ttl_seconds=_FLOWS_CACHE_TTL_SECONDS)
     return results
 
 
@@ -321,8 +347,10 @@ def publish_flow(db: Session, account_id: str, call_flow_id: str, actor_id: str)
     db.add(new_draft)
     db.commit()
 
+    _invalidate_flows_cache(account_id)
     log_event(db, actor_id=account_id, action="call_flow.published", target_type="call_flow", target_id=flow.id,
                metadata={"version": published_version.version})
+    publish_call_flow_published(account_id, call_flow_id=flow.id, version=published_version.version)
 
     numbers = db.query(PhoneNumber).filter(PhoneNumber.call_flow_id == flow.id).all()
     owner = db.query(User).filter(User.account_id == account_id, User.role == UserRole.OWNER).first()
@@ -369,8 +397,12 @@ def rollback_flow(db: Session, account_id: str, call_flow_id: str, target_versio
     db.add(rolled_back)
     db.commit()
 
+    _invalidate_flows_cache(account_id)
     log_event(db, actor_id=account_id, action="call_flow.rolled_back", target_type="call_flow", target_id=flow.id,
                metadata={"restored_version": target_version, "new_version": rolled_back.version})
+    publish_call_flow_rolled_back(
+        account_id, call_flow_id=flow.id, restored_version=target_version, new_version=rolled_back.version,
+    )
 
     owner = db.query(User).filter(User.account_id == account_id, User.role == UserRole.OWNER).first()
     if owner is not None:
@@ -389,6 +421,7 @@ def assign_to_number(db: Session, account_id: str, call_flow_id: str | None, pho
         _get_flow(db, account_id, call_flow_id)  # raises CallFlowNotFoundError if not this account's
     number.call_flow_id = call_flow_id
     db.commit()
+    _invalidate_flows_cache(account_id)
     log_event(db, actor_id=account_id, action="call_flow.assigned", target_type="phone_number", target_id=number.id,
                metadata={"call_flow_id": call_flow_id})
     return number

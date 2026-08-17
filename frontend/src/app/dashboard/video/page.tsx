@@ -95,6 +95,12 @@ export default function VideoPage() {
   const remoteContainerRef = useRef<HTMLDivElement>(null);
   const attachedElements = useRef<Map<string, HTMLMediaElement>>(new Map());
   const participantTiles = useRef<Map<string, HTMLDivElement>>(new Map());
+  // Mirrors of state read inside long-lived room.on(...) handlers/cleanups
+  // registered once at connect/mount time - reading the state variable
+  // directly there would close over whatever value existed at that moment
+  // and never see later updates (same reason chatOpenRef exists below).
+  const lobbyVideoStreamRef = useRef<MediaStream | null>(null);
+  const connectionQualityRef = useRef<"excellent" | "good" | "poor" | null>(null);
 
   function getOrCreateTile(identity: string, name: string): HTMLDivElement {
     const existing = participantTiles.current.get(identity);
@@ -139,9 +145,17 @@ export default function VideoPage() {
   }, [loadRooms]);
 
   useEffect(() => {
+    lobbyVideoStreamRef.current = lobbyVideoStream;
+  }, [lobbyVideoStream]);
+
+  useEffect(() => {
+    connectionQualityRef.current = connectionQuality;
+  }, [connectionQuality]);
+
+  useEffect(() => {
     return () => {
       roomRef.current?.disconnect();
-      lobbyVideoStream?.getTracks().forEach((t) => t.stop());
+      lobbyVideoStreamRef.current?.getTracks().forEach((t) => t.stop());
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -396,7 +410,7 @@ export default function VideoPage() {
         });
       });
       room.on(RoomEvent.Reconnected, () => {
-        reportCallQuality(token, targetRoomName as string, connectionQuality ?? "good", true).catch(() => {});
+        reportCallQuality(token, targetRoomName as string, connectionQualityRef.current ?? "good", true).catch(() => {});
       });
       room.on(RoomEvent.Disconnected, () => {
         setCallState("idle");

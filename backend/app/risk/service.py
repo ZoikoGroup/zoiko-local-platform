@@ -5,6 +5,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.audit.service import log_event
+from app.events.service import publish_account_auto_suspended, publish_account_kill_switch_changed, publish_fraud_case_opened, publish_fraud_case_resolved, publish_risk_signal_recorded
 from app.media.models import TERMINAL_CALL_STATUSES, CallDirection, CallRecord
 from app.notifications.service import notify_account_suspended_for_risk, notify_account_warning
 from app.numbering.identity.models import Account
@@ -211,6 +212,7 @@ def record_risk_signal(db: Session, *, account_id: str, signal_type: RiskSignalT
         db, actor="system:risk_engine", action=f"risk.{signal_type.value}",
         target=f"account:{account_id}", after={"detail": detail},
     )
+    publish_risk_signal_recorded(account_id, signal_type=signal_type.value, detail=detail)
     if maybe_auto_suspend_for_risk(db, account_id):
         _auto_resolve_open_case_for_suspended_account(db, account_id)
     else:
@@ -452,6 +454,7 @@ def set_account_kill_switch(
         db, actor=actor, action="risk.account_kill_switch_activated" if is_active else "risk.account_kill_switch_deactivated",
         target=f"account:{account_id}", after={"scope": scope.value, "reason": reason},
     )
+    publish_account_kill_switch_changed(account_id, scope=scope.value, is_active=is_active, actor=actor)
     return switch
 
 
@@ -549,6 +552,7 @@ def maybe_auto_suspend_for_risk(db: Session, account_id: str) -> bool:
             target=f"account:{account_id}",
             after={"score": score, "numbers_suspended": [n.e164 for n in suspended]},
         )
+        publish_account_auto_suspended(account_id, score=score, numbers_suspended=[n.e164 for n in suspended])
         owner = _get_account_owner(db, account_id)
         if owner is not None:
             notify_account_suspended_for_risk(
@@ -585,6 +589,7 @@ def open_fraud_case_if_needed(db: Session, account_id: str) -> FraudCase | None:
         db, actor="system:risk_engine", action="risk.fraud_case_opened",
         target=f"account:{account_id}", after={"case_id": case.id, "score": score},
     )
+    publish_fraud_case_opened(account_id, case_id=case.id, score=score)
     _transition_risk_state(
         db, account_id, AccountRiskState.REVIEW_REQUIRED, actor="system:risk_engine",
         reason=f"fraud case {case.id} opened - risk score {score}/{MAX_RISK_SCORE}",
@@ -649,6 +654,7 @@ def resolve_fraud_case(
         db, actor=actor, action="risk.fraud_case_resolved",
         target=f"fraud_case:{case.id}", after={"status": status.value, "notes": notes},
     )
+    publish_fraud_case_resolved(case.account_id, case_id=case.id, status=status.value, notes=notes)
     if status == FraudCaseStatus.CLEARED:
         # Human reviewer found nothing - release the account back to
         # whatever tier it would be at on the merits (KYC/purchase history),

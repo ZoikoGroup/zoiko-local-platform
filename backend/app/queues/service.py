@@ -12,6 +12,7 @@ from datetime import datetime, timedelta
 from sqlalchemy.orm import Session
 
 from app.audit.service import log_event
+from app.events.service import publish_agent_presence_changed, publish_queue_created
 from app.integrations.cache.redis import cache_delete, cache_get, cache_set
 from app.integrations.telecom import twilio as telecom
 from app.numbering.identity.models import User
@@ -104,6 +105,7 @@ def create_queue(db: Session, account_id: str, name: str, max_wait_seconds: int,
     _invalidate_queues_cache(account_id)
     log_event(db, actor_id=account_id, action="queue.created", target_type="call_queue", target_id=queue.id,
                metadata={"name": name})
+    publish_queue_created(account_id, queue_id=queue.id, name=name)
     return _to_response(db, queue)
 
 
@@ -197,6 +199,9 @@ def set_presence(db: Session, user_id: str, status: str) -> AgentPresence:
     presence.changed_at = datetime.utcnow()
     presence.wrap_up_until = None
     db.commit()
+    agent = db.query(User).filter(User.id == user_id).first()
+    if agent is not None:
+        publish_agent_presence_changed(agent.account_id, user_id=user_id, status=status)
     return presence
 
 

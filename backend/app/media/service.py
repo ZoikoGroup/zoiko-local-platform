@@ -587,6 +587,7 @@ async def create_video_session(
     db.add(session)
     db.commit()
     db.refresh(session)
+    _invalidate_video_sessions_cache(account_id)
     log_event(
         db, actor_id=account_id, action="video.session.started",
         target_type="video_session", target_id=session.id,
@@ -617,6 +618,7 @@ async def end_video_session(db: Session, user: User, room_name: str) -> VideoSes
     session.ended_at = datetime.now(timezone.utc)
     db.commit()
     db.refresh(session)
+    _invalidate_video_sessions_cache(user.account_id)
     log_event(
         db, actor_id=user.account_id, action="video.session.ended",
         target_type="video_session", target_id=session.id, metadata={"room_name": room_name},
@@ -659,6 +661,7 @@ async def start_video_recording(db: Session, user: User, room_name: str) -> Vide
     session.recording_url = None
     db.commit()
     db.refresh(session)
+    _invalidate_video_sessions_cache(user.account_id)
     log_event(
         db, actor_id=user.account_id, action="video.recording_started",
         target_type="video_session", target_id=session.id, metadata={"room_name": room_name},
@@ -758,6 +761,7 @@ def request_guest_join(db: Session, room_name: str, display_name: str) -> VideoW
     db.add(waiting_guest)
     db.commit()
     db.refresh(waiting_guest)
+    _invalidate_waiting_guests_cache(session.id)
     log_event(
         db, actor_id=session.account_id, action="video.guest_join_requested",
         target_type="video_session", target_id=session.id,
@@ -807,8 +811,59 @@ def _assert_can_manage_video_session(db: Session, user: User, room_name: str) ->
     return session
 
 
+def _waiting_guests_cache_key(video_session_id: str) -> str:
+    return f"waiting_guests:list:{video_session_id}"
+
+
+# Short TTL, same "don't chase every write site" posture as notifications.
+# service's list cache: the host's browser polls this every 3 seconds for
+# the whole duration of a call (see the video page's waiting-room poll), so
+# this is actually a higher-frequency read than anything else cached in this
+# codebase. Still invalidated at request_guest_join/admit_waiting_guest/
+# deny_waiting_guest below - unlike notifications' ~40 send call sites,
+# there are only 3 write sites here, cheap to cover directly - but NOT
+# re-checked against _expire_if_stale's lazy, read-triggered time-based
+# expiry, which a cache can't preemptively invalidate against. A guest who
+# timed out may still show as pending for up to this TTL; admit/deny both
+# re-check staleness live via _get_waiting_guest_for_host regardless of
+# what this cached list showed, so that bounded staleness window is
+# cosmetic only, never a correctness issue for the actual admit/deny action.
+_WAITING_GUESTS_CACHE_TTL_SECONDS = 5
+
+
+def _serialize_waiting_guest(g: VideoWaitingGuest) -> dict:
+    return {
+        "id": g.id,
+        "video_session_id": g.video_session_id,
+        "display_name": g.display_name,
+        "guest_identity": g.guest_identity,
+        "status": g.status.value,
+        "created_at": g.created_at.isoformat() if g.created_at else None,
+    }
+
+
+def _deserialize_waiting_guest(data: dict) -> VideoWaitingGuest:
+    return VideoWaitingGuest(
+        id=data["id"],
+        video_session_id=data["video_session_id"],
+        display_name=data["display_name"],
+        guest_identity=data["guest_identity"],
+        status=VideoWaitingGuestStatus(data["status"]),
+        created_at=datetime.fromisoformat(data["created_at"]) if data["created_at"] else None,
+    )
+
+
+def _invalidate_waiting_guests_cache(video_session_id: str) -> None:
+    cache_delete(_waiting_guests_cache_key(video_session_id))
+
+
 def list_waiting_guests(db: Session, user: User, room_name: str) -> list[VideoWaitingGuest]:
     session = _assert_can_manage_video_session(db, user, room_name)
+    cache_key = _waiting_guests_cache_key(session.id)
+    cached = cache_get(cache_key)
+    if cached is not None:
+        return [_deserialize_waiting_guest(row) for row in cached]
+
     candidates = (
         db.query(VideoWaitingGuest)
         .filter(
@@ -822,7 +877,9 @@ def list_waiting_guests(db: Session, user: User, room_name: str) -> list[VideoWa
     # list shouldn't see (or be able to admit) a request the guest may have
     # long since given up on.
     still_pending = [_expire_if_stale(db, g) for g in candidates]
-    return [g for g in still_pending if g.status == VideoWaitingGuestStatus.PENDING]
+    result = [g for g in still_pending if g.status == VideoWaitingGuestStatus.PENDING]
+    cache_set(cache_key, [_serialize_waiting_guest(g) for g in result], ttl_seconds=_WAITING_GUESTS_CACHE_TTL_SECONDS)
+    return result
 
 
 def _get_waiting_guest_for_host(db: Session, user: User, room_name: str, waiting_id: str) -> VideoWaitingGuest:
@@ -845,6 +902,7 @@ def admit_waiting_guest(db: Session, user: User, room_name: str, waiting_id: str
         )
     waiting_guest.status = VideoWaitingGuestStatus.ADMITTED
     db.commit()
+    _invalidate_waiting_guests_cache(waiting_guest.video_session_id)
     log_event(
         db, actor_id=user.id, action="video.guest_admitted",
         target_type="video_session", target_id=waiting_guest.video_session_id,
@@ -860,6 +918,7 @@ def deny_waiting_guest(db: Session, user: User, room_name: str, waiting_id: str)
         )
     waiting_guest.status = VideoWaitingGuestStatus.DENIED
     db.commit()
+    _invalidate_waiting_guests_cache(waiting_guest.video_session_id)
     log_event(
         db, actor_id=user.id, action="video.guest_denied",
         target_type="video_session", target_id=waiting_guest.video_session_id,
@@ -867,13 +926,72 @@ def deny_waiting_guest(db: Session, user: User, room_name: str, waiting_id: str)
     )
 
 
+def _video_sessions_cache_key(account_id: str) -> str:
+    return f"video_sessions:list:{account_id}"
+
+
+# Same short-TTL, invalidate-on-write pattern as _CALLS_CACHE_TTL_SECONDS/
+# _VOICEMAILS_CACHE_TTL_SECONDS above - the video Call History page (GET
+# /media/video/rooms) refetches this list after every join/end/record/
+# summarize action, same "highest-traffic dashboard endpoint" justification.
+# Invalidated at every VideoSession field mutation that list_account_video_
+# sessions' serialized output actually reflects: create_video_session,
+# end_video_session, start_video_recording, handle_video_webhook_event's
+# room_finished transition, and _handle_egress_ended (attaches recording_url,
+# which is what makes "Play recording"/"Summarize with AI" appear).
+_VIDEO_SESSIONS_CACHE_TTL_SECONDS = 15
+
+
+def _serialize_video_session(s: VideoSession) -> dict:
+    return {
+        "id": s.id,
+        "account_id": s.account_id,
+        "host_user_id": s.host_user_id,
+        "room_name": s.room_name,
+        "status": s.status.value,
+        "started_at": s.started_at.isoformat() if s.started_at else None,
+        "ended_at": s.ended_at.isoformat() if s.ended_at else None,
+        "confidential": s.confidential,
+        "recording_egress_id": s.recording_egress_id,
+        "recording_url": s.recording_url,
+        "created_at": s.created_at.isoformat() if s.created_at else None,
+    }
+
+
+def _deserialize_video_session(data: dict) -> VideoSession:
+    return VideoSession(
+        id=data["id"],
+        account_id=data["account_id"],
+        host_user_id=data["host_user_id"],
+        room_name=data["room_name"],
+        status=VideoSessionStatus(data["status"]),
+        started_at=datetime.fromisoformat(data["started_at"]) if data["started_at"] else None,
+        ended_at=datetime.fromisoformat(data["ended_at"]) if data["ended_at"] else None,
+        confidential=data["confidential"],
+        recording_egress_id=data["recording_egress_id"],
+        recording_url=data["recording_url"],
+        created_at=datetime.fromisoformat(data["created_at"]) if data["created_at"] else None,
+    )
+
+
+def _invalidate_video_sessions_cache(account_id: str | None) -> None:
+    if account_id:
+        cache_delete(_video_sessions_cache_key(account_id))
+
+
 def list_account_video_sessions(db: Session, account_id: str) -> list[VideoSession]:
-    return (
+    cache_key = _video_sessions_cache_key(account_id)
+    cached = cache_get(cache_key)
+    if cached is not None:
+        return [_deserialize_video_session(row) for row in cached]
+    sessions = (
         db.query(VideoSession)
         .filter(VideoSession.account_id == account_id)
         .order_by(VideoSession.created_at.desc())
         .all()
     )
+    cache_set(cache_key, [_serialize_video_session(s) for s in sessions], ttl_seconds=_VIDEO_SESSIONS_CACHE_TTL_SECONDS)
+    return sessions
 
 
 def get_account_video_usage_minutes(db: Session, account_id: str) -> float:
@@ -903,6 +1021,7 @@ def handle_video_webhook_event(db: Session, event) -> None:
             session.status = VideoSessionStatus.ENDED
             session.ended_at = now
             db.commit()
+            _invalidate_video_sessions_cache(session.account_id)
             log_event(
                 db, actor_id=session.account_id, action="video.session.ended",
                 target_type="video_session", target_id=session.id,
@@ -1077,6 +1196,7 @@ def _handle_egress_ended(db: Session, event) -> None:
     if location:
         session.recording_url = location
         db.commit()
+        _invalidate_video_sessions_cache(session.account_id)
         log_event(
             db, actor_id=session.account_id, action="video.recording_completed",
             target_type="video_session", target_id=session.id,
@@ -1137,6 +1257,7 @@ def capture_receptionist_call(
     db.add(call)
     db.commit()
     db.refresh(call)
+    _invalidate_receptionist_calls_cache(owner.account_id)
     log_event(
         db, actor_id=owner.account_id, action="receptionist.call_captured",
         target_type="receptionist_call", target_id=call.id,
@@ -1151,6 +1272,7 @@ def mark_receptionist_call_escalated(db: Session, receptionist_call_id: str, esc
         return
     call.escalated = True
     db.commit()
+    _invalidate_receptionist_calls_cache(call.account_id)
     # Roadmap §7 Evidence: "escalation path" - who this specific urgent call
     # was routed to, not just that some escalation happened.
     log_event(
@@ -1188,6 +1310,7 @@ def route_receptionist_call(
     call.assigned_user_id = assigned_user_id
     db.commit()
     db.refresh(call)
+    _invalidate_receptionist_calls_cache(call.account_id)
     log_event(
         db, actor_id=user.id, action="receptionist.call_routed",
         target_type="receptionist_call", target_id=call.id,
@@ -1224,6 +1347,7 @@ def edit_receptionist_call_summary(
     call.edited_by_user_id = user.id
     db.commit()
     db.refresh(call)
+    _invalidate_receptionist_calls_cache(call.account_id)
     log_event(
         db, actor_id=user.id, action="receptionist.call_summary_edited",
         target_type="receptionist_call", target_id=call.id, metadata={"edited": True},
@@ -1234,8 +1358,79 @@ def edit_receptionist_call_summary(
 def list_account_receptionist_calls(db: Session, user: User) -> list[ReceptionistCall]:
     """Owner/Admin see every receptionist call on the account. A plain Member
     only sees calls on numbers assigned to them."""
-    query = db.query(ReceptionistCall).filter(ReceptionistCall.account_id == user.account_id)
     ids = assigned_number_ids(db, user)
+    query = db.query(ReceptionistCall).filter(ReceptionistCall.account_id == user.account_id)
     if ids is not None:
-        query = query.filter(ReceptionistCall.phone_number_id.in_(ids))
-    return query.order_by(ReceptionistCall.created_at.desc()).all()
+        # Member view - always queries live, same reason as list_account_calls.
+        return query.filter(ReceptionistCall.phone_number_id.in_(ids)).order_by(ReceptionistCall.created_at.desc()).all()
+
+    cache_key = _receptionist_calls_cache_key(user.account_id)
+    cached = cache_get(cache_key)
+    if cached is not None:
+        return [_deserialize_receptionist_call(row) for row in cached]
+    calls = query.order_by(ReceptionistCall.created_at.desc()).all()
+    cache_set(cache_key, [_serialize_receptionist_call(c) for c in calls], ttl_seconds=_RECEPTIONIST_CALLS_CACHE_TTL_SECONDS)
+    return calls
+
+
+def _receptionist_calls_cache_key(account_id: str) -> str:
+    return f"receptionist_calls:list:{account_id}"
+
+
+_RECEPTIONIST_CALLS_CACHE_TTL_SECONDS = 15
+
+
+def _serialize_receptionist_call(c: ReceptionistCall) -> dict:
+    return {
+        "id": c.id,
+        "account_id": c.account_id,
+        "phone_number_id": c.phone_number_id,
+        "call_sid": c.call_sid,
+        "caller_number": c.caller_number,
+        "raw_transcript": c.raw_transcript,
+        "caller_name": c.caller_name,
+        "caller_company": c.caller_company,
+        "reason": c.reason,
+        "summary": c.summary,
+        "urgency": c.urgency.value if c.urgency else None,
+        "escalated": c.escalated,
+        "assigned_user_id": c.assigned_user_id,
+        "guardrail_flags": c.guardrail_flags,
+        "original_summary": c.original_summary,
+        "edited_at": c.edited_at.isoformat() if c.edited_at else None,
+        "edited_by_user_id": c.edited_by_user_id,
+        "model_version": c.model_version,
+        "is_likely_spam": c.is_likely_spam,
+        "spam_reason": c.spam_reason,
+        "created_at": c.created_at.isoformat() if c.created_at else None,
+    }
+
+
+def _deserialize_receptionist_call(data: dict) -> ReceptionistCall:
+    return ReceptionistCall(
+        id=data["id"],
+        account_id=data["account_id"],
+        phone_number_id=data["phone_number_id"],
+        call_sid=data["call_sid"],
+        caller_number=data["caller_number"],
+        raw_transcript=data["raw_transcript"],
+        caller_name=data["caller_name"],
+        caller_company=data["caller_company"],
+        reason=data["reason"],
+        summary=data["summary"],
+        urgency=ReceptionistUrgency(data["urgency"]) if data["urgency"] else None,
+        escalated=data["escalated"],
+        assigned_user_id=data["assigned_user_id"],
+        guardrail_flags=data["guardrail_flags"],
+        original_summary=data["original_summary"],
+        edited_at=datetime.fromisoformat(data["edited_at"]) if data["edited_at"] else None,
+        edited_by_user_id=data["edited_by_user_id"],
+        model_version=data["model_version"],
+        is_likely_spam=data["is_likely_spam"],
+        spam_reason=data["spam_reason"],
+        created_at=datetime.fromisoformat(data["created_at"]) if data["created_at"] else None,
+    )
+
+
+def _invalidate_receptionist_calls_cache(account_id: str) -> None:
+    cache_delete(_receptionist_calls_cache_key(account_id))

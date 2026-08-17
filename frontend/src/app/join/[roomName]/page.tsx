@@ -55,11 +55,20 @@ export default function GuestJoinPage() {
   const pendingJoinRef = useRef<{ camera: boolean; mic: boolean } | null>(null);
   const chatEndRef = useRef<HTMLDivElement>(null);
   const chatOpenRef = useRef(false);
+  // Mirror of lobbyVideoStream for the unmount cleanup below, which is
+  // registered once at mount time - reading the state variable directly
+  // there would close over its initial `null` value forever (same reason
+  // chatOpenRef exists).
+  const lobbyVideoStreamRef = useRef<MediaStream | null>(null);
+
+  useEffect(() => {
+    lobbyVideoStreamRef.current = lobbyVideoStream;
+  }, [lobbyVideoStream]);
 
   useEffect(() => {
     return () => {
       roomRef.current?.disconnect();
-      lobbyVideoStream?.getTracks().forEach((t) => t.stop());
+      lobbyVideoStreamRef.current?.getTracks().forEach((t) => t.stop());
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);

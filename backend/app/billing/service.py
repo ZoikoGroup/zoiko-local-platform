@@ -21,6 +21,7 @@ from app.billing.models import (
     ZoikoNexSyncEventType,
 )
 from app.core.config import settings
+from app.events.service import publish_subscription_canceled, publish_subscription_payment_event, publish_subscription_plan_changed
 from app.integrations.billing import zoikonex as zoikonex_adapter
 from app.integrations.cache.redis import cache_get, cache_set
 from app.integrations.telecom import twilio as telecom
@@ -490,6 +491,9 @@ def change_plan(db: Session, account_id: str, plan_code: str, *, actor: str) -> 
         db, actor=actor, action="subscription.plan_changed", target=f"subscription:{sub.id}",
         before={"plan_code": before_plan}, after={"plan_code": sub.plan_code},
     )
+    publish_subscription_plan_changed(
+        account_id, subscription_id=sub.id, previous_plan=before_plan, new_plan=sub.plan_code,
+    )
 
     # Production Readiness Standard doc's "trial-abuse step-up model" - a
     # real paid plan is just as strong a "genuine paying customer" signal
@@ -684,6 +688,9 @@ def _apply_zoikonex_payment_event(
         db, actor=actor, action=action, target=f"subscription:{sub.id}",
         before={"status": before_status.value}, after={"status": sub.status.value, "event_type": event_type},
     )
+    publish_subscription_payment_event(
+        account_id, subscription_id=sub.id, event_type=event_type, status=sub.status.value,
+    )
 
     from app.numbering.identity.models import User, UserRole
 
@@ -799,6 +806,7 @@ def cancel_subscription(db: Session, account_id: str, *, actor: str, reason: str
         db, actor=actor, action="billing.subscription_canceled", target=f"subscription:{sub.id}",
         after={"reason": reason},
     )
+    publish_subscription_canceled(account_id, subscription_id=sub.id, reason=reason)
     return sub
 
 
