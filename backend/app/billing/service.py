@@ -544,6 +544,47 @@ def assert_number_quota_available(db: Session, account_id: str, *, exclude_numbe
         )
 
 
+def is_first_number_included(db: Session, account_id: str, *, exclude_number_id: str | None = None) -> bool:
+    """Global Plans, Pricing & Commercial Launch Standard doc: "First
+    standard local number: Included with each paid user in eligible
+    markets... Additional standard local number: From $4.99/month."
+
+    Phase-1 reading of "included with each paid user": the account's very
+    first number is free, not literally one free number per seat - there is
+    no existing per-seat number-consumption ledger in this codebase (seats
+    are gated by a simple headroom count in assert_seat_quota_available, not
+    individually-tracked entitlements), and the doc gives no metering rule
+    for how a multi-seat free allowance would be issued or decremented. This
+    is the same kind of engineering-judgment call already made for Pro/
+    Scale's entitlement numbers (see the plan-tier migration).
+
+    Free-trial accounts don't qualify - "paid user" is the doc's own
+    wording - nor does a canceled subscription. The recurring "$4.99/month
+    additional number" charge from the doc is NOT implemented here: this
+    codebase only has one-time Stripe Checkout for numbers today, and
+    turning that into real recurring per-number billing (subscription
+    items, proration, invoice lines) is a distinct, larger change than
+    "is the first number free" - out of scope for this fix."""
+    from app.numbering.numbers.models import PhoneNumber, PhoneNumberStatus
+
+    sub = get_or_create_subscription(db, account_id)
+    if sub.plan_code == DEFAULT_PLAN_CODE or sub.status == SubscriptionStatus.CANCELED:
+        return False
+    query = db.query(PhoneNumber).filter(
+        PhoneNumber.account_id == account_id,
+        PhoneNumber.status.in_([
+            PhoneNumberStatus.PURCHASE_PENDING,
+            PhoneNumberStatus.COMPLIANCE_PENDING,
+            PhoneNumberStatus.PROVISIONING,
+            PhoneNumberStatus.ACTIVE,
+            PhoneNumberStatus.SUSPENDED,
+        ]),
+    )
+    if exclude_number_id is not None:
+        query = query.filter(PhoneNumber.id != exclude_number_id)
+    return query.count() == 0
+
+
 def assert_seat_quota_available(db: Session, account_id: str) -> None:
     from app.numbering.identity.models import User
 

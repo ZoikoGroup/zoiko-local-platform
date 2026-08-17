@@ -8,6 +8,9 @@ exception note). No Account/Number model linkage, no audit logging, no
 entitlement checks — that gets added once Stage 1/2 land properly.
 """
 
+import json
+import re
+
 import httpx
 from twilio.base.exceptions import TwilioException, TwilioRestException
 from twilio.request_validator import RequestValidator
@@ -31,6 +34,30 @@ class TelecomError(Exception):
     """Raised instead of letting TwilioRestException escape this module —
     callers elsewhere in the app should never need to know or catch a
     vendor-specific exception type (Provider Gateway rule)."""
+
+
+def _clean_twilio_error_message(e: TwilioException) -> str:
+    """Confirmed live: a Twilio trial-account restriction on
+    AvailablePhoneNumbers reached the customer as the literal raw Python
+    exception dump - "('Unable to fetch page', HTTP 401
+    {"code":20003,"message":"This feature is not available on a Trial
+    account...","more_info":"...","status":401})" - because the SDK
+    raises the bare TwilioException base class (not the TwilioRestException
+    subclass with a clean parsed .msg) for failures during a paginated
+    list fetch. Extracts Twilio's own "message" field from the embedded
+    JSON where possible, instead of leaking that raw dump to the frontend."""
+    if isinstance(e, TwilioRestException) and e.msg:
+        return e.msg
+    raw = str(e)
+    match = re.search(r"\{.*\}", raw)
+    if match:
+        try:
+            message = json.loads(match.group(0)).get("message")
+            if message:
+                return message
+        except (json.JSONDecodeError, AttributeError):
+            pass
+    return raw
 
 
 # Imported after TelecomError is defined - _secondary_stub imports it back
@@ -66,7 +93,7 @@ def send_sms(to: str, body: str) -> dict:
             with trace_provider_call("twilio", "send_sms"):
                 message = _client().messages.create(to=to, from_=settings.twilio_trial_number, body=body)
         except TwilioException as e:
-            raise TelecomError(str(e)) from e
+            raise TelecomError(_clean_twilio_error_message(e)) from e
         return {"sid": message.sid, "status": message.status}
 
     secondary_fn = (lambda: secondary.send_sms(to, body)) if settings.telecom_failover_enabled else None
@@ -89,7 +116,7 @@ def send_whatsapp_message(to: str, from_number: str, body: str) -> dict:
                     to=f"whatsapp:{to}", from_=f"whatsapp:{from_number}", body=body
                 )
         except TwilioException as e:
-            raise TelecomError(str(e)) from e
+            raise TelecomError(_clean_twilio_error_message(e)) from e
         return {"sid": message.sid, "status": message.status}
 
     return with_failover(_breaker, _primary, None, TelecomError)
@@ -107,7 +134,7 @@ def send_customer_sms(to: str, from_number: str, body: str) -> dict:
             with trace_provider_call("twilio", "send_customer_sms"):
                 message = _client().messages.create(to=to, from_=from_number, body=body)
         except TwilioException as e:
-            raise TelecomError(str(e)) from e
+            raise TelecomError(_clean_twilio_error_message(e)) from e
         return {"sid": message.sid, "status": message.status}
 
     return with_failover(_breaker, _primary, None, TelecomError)
@@ -137,7 +164,7 @@ def search_available_numbers(country: str, number_type: str = "local", area_code
             # than the TwilioRestException subclass this 404 check expects.
             if isinstance(e, TwilioRestException) and e.status == 404:
                 raise TelecomError(f"Twilio has no {number_type} numbering coverage for country '{country}'") from e
-            raise TelecomError(str(e)) from e
+            raise TelecomError(_clean_twilio_error_message(e)) from e
 
         return [
             {
@@ -163,7 +190,7 @@ def list_owned_numbers() -> list[dict]:
             with trace_provider_call("twilio", "list_owned_numbers"):
                 numbers = _client().incoming_phone_numbers.list()
         except TwilioException as e:
-            raise TelecomError(str(e)) from e
+            raise TelecomError(_clean_twilio_error_message(e)) from e
         return [{"sid": n.sid, "phone_number": n.phone_number, "capabilities": n.capabilities} for n in numbers]
 
     secondary_fn = secondary.list_owned_numbers if settings.telecom_failover_enabled else None
@@ -186,7 +213,7 @@ def set_voice_webhook(phone_number_sid: str, public_base_url: str) -> None:
                     status_callback_method="POST",
                 )
         except TwilioException as e:
-            raise TelecomError(str(e)) from e
+            raise TelecomError(_clean_twilio_error_message(e)) from e
 
     secondary_fn = (
         (lambda: secondary.set_voice_webhook(phone_number_sid, public_base_url))
@@ -204,7 +231,7 @@ def release_number(phone_number_sid: str) -> None:
             with trace_provider_call("twilio", "release_number"):
                 _client().incoming_phone_numbers(phone_number_sid).delete()
         except TwilioException as e:
-            raise TelecomError(str(e)) from e
+            raise TelecomError(_clean_twilio_error_message(e)) from e
 
     secondary_fn = (lambda: secondary.release_number(phone_number_sid)) if settings.telecom_failover_enabled else None
     with_failover(_breaker, _primary, secondary_fn, TelecomError)
@@ -232,7 +259,7 @@ def buy_number(phone_number: str) -> dict:
             with trace_provider_call("twilio", "buy_number"):
                 number = _client().incoming_phone_numbers.create(**kwargs)
         except TwilioException as e:
-            raise TelecomError(str(e)) from e
+            raise TelecomError(_clean_twilio_error_message(e)) from e
         return {"sid": number.sid, "phone_number": number.phone_number, "capabilities": number.capabilities}
 
     secondary_fn = (lambda: secondary.buy_number(phone_number)) if settings.telecom_failover_enabled else None
@@ -273,7 +300,7 @@ def place_call(
             with trace_provider_call("twilio", "place_call"):
                 call = _client().calls.create(**kwargs)
         except TwilioException as e:
-            raise TelecomError(str(e)) from e
+            raise TelecomError(_clean_twilio_error_message(e)) from e
         return {"sid": call.sid, "status": call.status, "to": call.to, "from": call.from_}
 
     secondary_fn = (
@@ -296,7 +323,7 @@ def get_call(call_sid: str) -> dict:
             with trace_provider_call("twilio", "get_call"):
                 call = _client().calls(call_sid).fetch()
         except TwilioException as e:
-            raise TelecomError(str(e)) from e
+            raise TelecomError(_clean_twilio_error_message(e)) from e
         return {
             "sid": call.sid, "status": call.status, "to": call.to, "from": call.from_, "duration": call.duration,
             "price": call.price, "price_unit": call.price_unit,
@@ -315,7 +342,7 @@ def list_calls(limit: int = 20) -> list[dict]:
             with trace_provider_call("twilio", "list_calls"):
                 calls = _client().calls.list(limit=limit)
         except TwilioException as e:
-            raise TelecomError(str(e)) from e
+            raise TelecomError(_clean_twilio_error_message(e)) from e
         return [{"sid": c.sid, "status": c.status, "to": c.to, "from": c.from_} for c in calls]
 
     secondary_fn = (lambda: secondary.list_calls(limit)) if settings.telecom_failover_enabled else None
@@ -548,7 +575,7 @@ def delete_recording(recording_sid: str) -> None:
             with trace_provider_call("twilio", "delete_recording"):
                 _client().recordings(recording_sid).delete()
         except TwilioException as e:
-            raise TelecomError(str(e)) from e
+            raise TelecomError(_clean_twilio_error_message(e)) from e
 
     secondary_fn = (
         (lambda: secondary.delete_recording(recording_sid)) if settings.telecom_failover_enabled else None

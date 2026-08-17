@@ -46,8 +46,16 @@ def list_plans(db: Session = Depends(get_db), _current_user: User = Depends(get_
 
 @router.get("/price-catalog/{plan_code}", response_model=PriceCatalogEntryResponse | None)
 def get_price_catalog_entry(
-    plan_code: str, db: Session = Depends(get_db), _staff: PlatformStaff = Depends(get_current_staff),
+    plan_code: str, db: Session = Depends(get_db), _current_user: User = Depends(get_current_user),
 ):
+    """Customer-facing (not staff-only, unlike every other /price-catalog
+    route below) - any authenticated customer choosing a plan needs to see
+    what it costs. Was staff-only until an acceptance-test-style UI sweep
+    (2026-08-14) found the dashboard billing page had no price display at
+    all - a customer couldn't see what any plan cost, partly because this
+    was the only endpoint that could tell them and it 403'd for their own
+    account's login. Nothing frontend or staff-side called this route
+    before this change, so nothing depends on the old staff-only gate."""
     return service.get_active_price_catalog_entry(db, plan_code)
 
 

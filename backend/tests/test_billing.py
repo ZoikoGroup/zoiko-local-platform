@@ -219,6 +219,20 @@ def test_change_plan_route_succeeds_for_owner(client):
     assert response.json()["plan_code"] == "starter"
 
 
+def test_price_catalog_route_is_customer_facing_not_staff_only(client):
+    """A real customer must be able to see what a plan costs before
+    choosing it - confirmed missing (403'd for a real customer login) by
+    a UI-gap sweep on 2026-08-14; this route used to require staff auth."""
+    token = _signup_and_login(client, "pricecatalogcustomer@example.com")
+    response = client.get("/billing/price-catalog/starter", headers={"Authorization": f"Bearer {token}"})
+    assert response.status_code == 200, response.text
+
+
+def test_price_catalog_route_requires_some_authentication(client):
+    response = client.get("/billing/price-catalog/starter")
+    assert response.status_code == 401
+
+
 def test_change_plan_route_rejects_unknown_plan(client):
     token = _signup_and_login(client, "billingplanunknown@example.com")
     response = client.put(
