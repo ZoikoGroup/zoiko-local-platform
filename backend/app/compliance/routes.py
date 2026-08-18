@@ -8,7 +8,8 @@ from app.compliance.schemas import (
     ComplianceCaseResponse,
     ComplianceCaseStaffResponse,
     ComplianceRuleResponse,
-    DocumentDownloadUrl, 
+    ComplianceRuleUpsertRequest,
+    DocumentDownloadUrl,
     KYCVerificationStart,
 )
 from app.core.database import get_db
@@ -31,6 +32,29 @@ def _get_case_or_404(db: Session, case_id: str):
 @router.get("/rules", response_model=list[ComplianceRuleResponse])
 def list_rules(country: str, db: Session = Depends(get_db)):
     return service.get_active_rules(db, country)
+
+
+@router.get("/staff/rules", response_model=list[ComplianceRuleResponse])
+def list_all_rules(
+    db: Session = Depends(get_db),
+    _staff: PlatformStaff = Depends(get_current_staff),
+):
+    """Any staff role can view what's configured (diagnostic, same posture
+    as risk's fraud-rules list) - adding or changing a rule is the
+    sensitive action, gated below."""
+    return service.list_all_rules(db)
+
+
+@router.put("/staff/rules", response_model=ComplianceRuleResponse)
+def upsert_rule(
+    payload: ComplianceRuleUpsertRequest,
+    db: Session = Depends(get_db),
+    staff: PlatformStaff = Depends(require_capability("compliance.manage_rules")),
+):
+    return service.upsert_compliance_rule(
+        db, country=payload.country, requirement_type=payload.requirement_type,
+        required_documents=payload.required_documents, is_active=payload.is_active, actor=staff.id,
+    )
 
   
 @router.post("/cases", response_model=ComplianceCaseResponse, status_code=201)

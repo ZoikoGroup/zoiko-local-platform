@@ -19,7 +19,7 @@ def circuit_state() -> str:
 
 _CHAT_COMPLETIONS_URL = "https://api.groq.com/openai/v1/chat/completions"
 _MODELS_URL = "https://api.groq.com/openai/v1/models"
-_MODEL = "llama-3.1-8b-instant"
+_MODEL = "openai/gpt-oss-20b"
 MODEL_VERSION = f"groq/{_MODEL}"
 
 

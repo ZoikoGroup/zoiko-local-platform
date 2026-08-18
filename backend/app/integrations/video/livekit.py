@@ -35,6 +35,19 @@ MAX_PARTICIPANTS = 50
 
 
 def _client() -> livekit_api.LiveKitAPI:
+    # Explicit check, not left to the SDK's own validation - LiveKitAPI's
+    # constructor does `url = url or os.getenv("LIVEKIT_URL")` internally,
+    # silently falling back to the raw OS environment variable whenever a
+    # falsy value is passed in. That means an intentionally-unset
+    # settings.livekit_url (e.g. this test/config path) would still get a
+    # working client built from whatever's in the process environment,
+    # never actually raising - confirmed live, this is exactly what let a
+    # "LiveKit not configured" scenario silently create a real room instead
+    # of failing cleanly. Checking here, before ever calling the SDK,
+    # makes this app's own settings object authoritative regardless of
+    # what's sitting in os.environ.
+    if not (settings.livekit_url and settings.livekit_api_key and settings.livekit_api_secret):
+        raise ValueError("LiveKit is not configured (LIVEKIT_URL/LIVEKIT_API_KEY/LIVEKIT_API_SECRET)")
     return livekit_api.LiveKitAPI(
         settings.livekit_url, settings.livekit_api_key, settings.livekit_api_secret
     )

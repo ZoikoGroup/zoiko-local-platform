@@ -514,15 +514,18 @@ def test_concurrency_limit_blocks_extra_simultaneous_calls(client, db_session, m
     account_id = client.get("/auth/me", headers=headers).json()["account_id"]
     _active_number(db_session, account_id, "+15550070030")
 
-    # MAX_CONCURRENT_CALLS_TRIAL is 3 - the first 3 (each left "in-progress",
-    # matching the fake response above, so they count as still live) succeed,
-    # the 4th must be blocked.
-    for i in range(3):
-        response = _place_call(client, headers, f"+1416555000{i}", "+15550070030")
-        assert response.status_code == 200, response.text
+    # MAX_CONCURRENT_CALLS_BY_RISK_STATE[TRIAL_LOW] is 1 (app/risk/service.py)
+    # - the first call (left "in-progress", matching the fake response
+    # above, so it counts as still live) succeeds, the second must be
+    # blocked. Same tier/limit test_risk.py's
+    # test_concurrent_call_limit_blocks_a_second_in_flight_call_for_a_trial_account
+    # covers - kept here too since it's this suite's own fraud-model
+    # regression check for the same code path.
+    first = _place_call(client, headers, "+14165550000", "+15550070030")
+    assert first.status_code == 200, first.text
 
-    fourth = _place_call(client, headers, "+14165550009", "+15550070030")
-    assert fourth.status_code == 429
+    second = _place_call(client, headers, "+14165550009", "+15550070030")
+    assert second.status_code == 429
 
 
 def test_cumulative_trial_usage_blocks_after_lifetime_cap(client, db_session):

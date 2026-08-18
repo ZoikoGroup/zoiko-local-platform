@@ -149,7 +149,7 @@ def test_summarize_call_returns_a_clean_502_when_groq_summarization_fails(client
 
 
 def test_summarize_call_falls_back_when_groq_returns_a_null_summary(client, db_session, monkeypatch):
-    """Confirmed live against the real Groq API: llama-3.1-8b-instant
+    """Confirmed live against the real Groq API: the configured model
     sometimes returns an explicit `"summary": null` for a very short/low-
     content transcript (e.g. "Hai, Helo, this is Renky.") even though the
     prompt never lists null as valid for that field. conversation_summaries

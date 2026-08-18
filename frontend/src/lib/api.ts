@@ -355,6 +355,14 @@ export function unsubscribeFromPush(token: string, endpoint: string): Promise<vo
   });
 }
 
+// Public half of the backend's VAPID keypair - safe to expose client-side
+// (that's the whole point of the VAPID public/private split). Blank when
+// no keypair is configured yet, same "not configured" posture the rest of
+// the Provider Gateway follows.
+export function getVapidPublicKey(): string {
+  return process.env.NEXT_PUBLIC_VAPID_PUBLIC_KEY ?? "";
+}
+
 export type NotificationPreferences = {
   transactional_enabled: boolean;
   sms_enabled: boolean;
@@ -607,6 +615,141 @@ export function listProviderTraces(
 
 export function getProviderTraceSummary(staffToken: string, hours: number = 24): Promise<ProviderLatencySummary[]> {
   return request<ProviderLatencySummary[]>(`/ops/traces/summary?hours=${hours}`, {
+    headers: { Authorization: `Bearer ${staffToken}` },
+  });
+}
+
+// --- Self-hosted error monitoring (staff-only) ---
+
+export type ErrorEvent = {
+  id: string;
+  request_id: string;
+  method: string;
+  path: string;
+  status_code: number;
+  exception_type: string | null;
+  exception_message: string | null;
+  account_id: string | null;
+  user_id: string | null;
+  created_at: string;
+};
+
+export type ErrorEventDetail = ErrorEvent & {
+  traceback: string | null;
+};
+
+export type ErrorCountSummary = {
+  exception_type: string | null;
+  path: string;
+  status_code: number;
+  count: number;
+};
+
+export function listErrors(staffToken: string, limit: number = 100): Promise<ErrorEvent[]> {
+  return request<ErrorEvent[]>(`/ops/errors?limit=${limit}`, {
+    headers: { Authorization: `Bearer ${staffToken}` },
+  });
+}
+
+export function getErrorSummary(staffToken: string, hours: number = 24): Promise<ErrorCountSummary[]> {
+  return request<ErrorCountSummary[]>(`/ops/errors/summary?hours=${hours}`, {
+    headers: { Authorization: `Bearer ${staffToken}` },
+  });
+}
+
+export function getErrorDetail(staffToken: string, errorId: string): Promise<ErrorEventDetail> {
+  return request<ErrorEventDetail>(`/ops/errors/${errorId}`, {
+    headers: { Authorization: `Bearer ${staffToken}` },
+  });
+}
+
+// --- Incidents (public status page + staff management) ---
+
+export type IncidentStatus = "investigating" | "monitoring" | "resolved";
+
+export type Incident = {
+  id: string;
+  title: string;
+  affected_service: string;
+  status: IncidentStatus;
+  impact_summary: string;
+  mitigation_summary: string | null;
+  started_at: string;
+  resolved_at: string | null;
+};
+
+export function listIncidents(limit: number = 50): Promise<Incident[]> {
+  return request<Incident[]>(`/ops/incidents?limit=${limit}`);
+}
+
+export function createIncident(
+  staffToken: string,
+  input: { title: string; affected_service: string; impact_summary: string }
+): Promise<Incident> {
+  return request<Incident>("/ops/incidents", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${staffToken}` },
+    body: JSON.stringify(input),
+  });
+}
+
+export function updateIncident(
+  staffToken: string,
+  incidentId: string,
+  input: { status: IncidentStatus; impact_summary?: string; mitigation_summary?: string }
+): Promise<Incident> {
+  return request<Incident>(`/ops/incidents/${incidentId}`, {
+    method: "PUT",
+    headers: { Authorization: `Bearer ${staffToken}` },
+    body: JSON.stringify(input),
+  });
+}
+
+export function resolveIncident(staffToken: string, incidentId: string): Promise<Incident> {
+  return request<Incident>(`/ops/incidents/${incidentId}/resolve`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${staffToken}` },
+  });
+}
+
+// --- Synthetic checks (staff-only) ---
+
+export type SyntheticCheckRun = {
+  id: string;
+  check_name: string;
+  success: boolean;
+  duration_ms: number;
+  detail: string | null;
+  created_at: string;
+};
+
+export type SyntheticCheckSummary = {
+  overall_healthy: boolean;
+  checks: SyntheticCheckRun[];
+};
+
+export function runSyntheticChecks(staffToken: string): Promise<SyntheticCheckRun[]> {
+  return request<SyntheticCheckRun[]>("/ops/synthetic-checks/run", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${staffToken}` },
+  });
+}
+
+export function listSyntheticChecks(
+  staffToken: string,
+  filters: { checkName?: string; limit?: number } = {}
+): Promise<SyntheticCheckRun[]> {
+  const params = new URLSearchParams();
+  if (filters.checkName) params.set("check_name", filters.checkName);
+  if (filters.limit) params.set("limit", String(filters.limit));
+  const query = params.toString() ? `?${params.toString()}` : "";
+  return request<SyntheticCheckRun[]>(`/ops/synthetic-checks${query}`, {
+    headers: { Authorization: `Bearer ${staffToken}` },
+  });
+}
+
+export function getSyntheticCheckSummary(staffToken: string): Promise<SyntheticCheckSummary> {
+  return request<SyntheticCheckSummary>("/ops/synthetic-checks/summary", {
     headers: { Authorization: `Bearer ${staffToken}` },
   });
 }
@@ -1279,6 +1422,9 @@ export type ReceptionistCallEntry = {
   guardrail_flags: string[];
   is_likely_spam: boolean;
   spam_reason: string | null;
+  callback_preference: string | null;
+  callback_requested: boolean;
+  callback_window: "asap" | "today" | "tomorrow" | null;
   assigned_user_id: string | null;
   assigned_user_email: string | null;
   original_summary: string | null;

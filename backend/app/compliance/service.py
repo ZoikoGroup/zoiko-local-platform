@@ -52,6 +52,46 @@ def get_active_rules(db: Session, country: str) -> list[ComplianceRule]:
     )
 
 
+def list_all_rules(db: Session) -> list[ComplianceRule]:
+    """Staff-facing view across every country/requirement type, active or
+    not - unlike get_active_rules (single-country, active-only, used by the
+    live purchase-gating check), this is the management surface a staff
+    member needs to see what's configured before adding or deactivating a
+    rule."""
+    return db.query(ComplianceRule).order_by(ComplianceRule.country, ComplianceRule.requirement_type).all()
+
+
+def upsert_compliance_rule(
+    db: Session, *, country: str, requirement_type: str, required_documents: list[str], is_active: bool, actor: str
+) -> ComplianceRule:
+    """Staff-tunable, same "rules as data" doctrine as risk.upsert_fraud_rule
+    - deliberately NOT bulk-seeded by a migration (see a7be96c38a85's
+    docstring for why that broke the test suite): a signal/rule with no row
+    here simply never gates anything (fail-open by omission), and a real
+    deployment populates real rules deliberately through this endpoint."""
+    rule = (
+        db.query(ComplianceRule)
+        .filter(ComplianceRule.country == country.upper(), ComplianceRule.requirement_type == requirement_type)
+        .first()
+    )
+    if rule is None:
+        rule = ComplianceRule(
+            country=country.upper(), requirement_type=requirement_type,
+            required_documents=required_documents, is_active=is_active,
+        )
+        db.add(rule)
+    else:
+        rule.required_documents = required_documents
+        rule.is_active = is_active
+    db.commit()
+    db.refresh(rule)
+    log_event(
+        db, actor=actor, action="compliance.rule_updated", target=f"compliance_rule:{rule.id}",
+        after={"country": rule.country, "requirement_type": requirement_type, "is_active": is_active},
+    )
+    return rule
+
+
 def is_requirement_active(db: Session, country: str, requirement_type: str) -> bool:
     return (
         db.query(ComplianceRule)

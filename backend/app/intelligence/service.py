@@ -94,7 +94,7 @@ def _analyze_and_store(
         action_items = None
 
     # analysis.get("summary", "") is NOT enough here - Groq's smaller model
-    # (llama-3.1-8b-instant) sometimes returns an explicit `"summary": null`
+    # (openai/gpt-oss-20b) sometimes returns an explicit `"summary": null`
     # for very short/low-content transcripts (e.g. "Hai, Helo, this is
     # Renky.") even though the prompt doesn't list null as a valid value for
     # this field. `.get(key, default)` only falls back when the KEY is

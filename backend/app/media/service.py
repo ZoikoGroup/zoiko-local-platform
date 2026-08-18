@@ -25,6 +25,7 @@ from app.intelligence.guardrails import check_for_disallowed_commitments
 from app.intelligence.service import qualify_caller
 from app.notifications.service import (
     notify_high_risk_destination_blocked,
+    notify_receptionist_callback_requested,
     notify_video_guest_waiting,
     notify_voicemail_received,
 )
@@ -34,6 +35,7 @@ from app.media.models import (
     CallRecord,
     ConnectionQuality,
     ReceptionistCall,
+    ReceptionistCallbackWindow,
     ReceptionistUrgency,
     VideoParticipantSession,
     VideoSession,
@@ -1253,6 +1255,7 @@ def capture_receptionist_call(
         is_likely_spam=is_likely_spam,
         spam_reason=spam_reason,
         model_version=model_version,
+        callback_preference=qualification.get("callback_preference"),
     )
     db.add(call)
     db.commit()
@@ -1264,6 +1267,111 @@ def capture_receptionist_call(
         metadata={"urgency": urgency.value if urgency else None, "guardrail_flags": guardrail_flags, "is_likely_spam": is_likely_spam},
     )
     return call
+
+
+def get_receptionist_call(db: Session, receptionist_call_id: str) -> ReceptionistCall | None:
+    return db.query(ReceptionistCall).filter(ReceptionistCall.id == receptionist_call_id).first()
+
+
+def needs_receptionist_followup(call: ReceptionistCall) -> bool:
+    """Bounded multi-turn trigger (Roadmap §7): ask exactly one follow-up
+    question when a real qualification pass ran (model_version is only set
+    when AI-processing consent was on file AND Groq actually returned a
+    result - see capture_receptionist_call) but still got neither a name
+    nor a reason - the two fields a human receptionist would never let a
+    caller hang up without. Without a completed qualification pass (no
+    consent, or a Groq outage), asking a follow-up is pointless - the
+    follow-up's own re-qualification attempt would fail identically, so
+    this correctly falls through to closing out normally instead of
+    wasting a turn. followup_asked guards against ever asking twice for
+    the same call, even if /respond were somehow hit again for the same
+    call_sid."""
+    return (
+        call.model_version is not None
+        and call.caller_name is None
+        and call.reason is None
+        and not call.followup_asked
+    )
+
+
+def record_receptionist_followup(db: Session, call: ReceptionistCall, followup_transcript: str) -> ReceptionistCall:
+    """Merges the caller's answer to the one bounded follow-up question
+    into the same call row (never a second ReceptionistCall) - re-runs
+    qualify_caller() on the combined transcript so the LLM sees full
+    context rather than trying to heuristically slot-fill just the new
+    utterance. Same Groq-outage degrade-gracefully posture as
+    capture_receptionist_call: a failure here still finalizes the call
+    with whatever was already captured, never breaks the live response.
+    A caller who says nothing (timeout) still bounds the attempt - the
+    call finalizes with whatever the first Gather captured.
+    """
+    call.followup_asked = True
+    if not followup_transcript:
+        db.commit()
+        db.refresh(call)
+        return call
+
+    call.raw_transcript = f"{call.raw_transcript}\n{followup_transcript}"
+
+    qualification = None
+    try:
+        qualification, model_version = qualify_caller(db, call.account_id, call.raw_transcript)
+    except LLMError:
+        model_version = None
+
+    if qualification:
+        urgency_raw = qualification.get("urgency")
+        urgency = ReceptionistUrgency(urgency_raw) if urgency_raw in ("low", "medium", "high") else call.urgency
+        guardrail_flags = check_for_disallowed_commitments(qualification.get("summary"), qualification.get("reason"))
+        is_likely_spam = bool(qualification.get("is_likely_spam"))
+
+        call.caller_name = qualification.get("name") or call.caller_name
+        call.caller_company = qualification.get("company") or call.caller_company
+        call.reason = qualification.get("reason") or call.reason
+        call.summary = qualification.get("summary") or call.summary
+        call.urgency = urgency
+        call.guardrail_flags = guardrail_flags
+        call.is_likely_spam = is_likely_spam
+        call.spam_reason = qualification.get("spam_reason") if is_likely_spam else None
+        call.model_version = model_version
+        call.callback_preference = qualification.get("callback_preference") or call.callback_preference
+
+    db.commit()
+    db.refresh(call)
+    _invalidate_receptionist_calls_cache(call.account_id)
+    log_event(
+        db, actor_id=call.account_id, action="receptionist.call_followup_captured",
+        target_type="receptionist_call", target_id=call.id, metadata={},
+    )
+    return call
+
+
+def record_receptionist_callback_request(db: Session, call: ReceptionistCall, window: ReceptionistCallbackWindow | None) -> None:
+    """Self-service booking (Roadmap §7), scoped to what this platform
+    actually models: a caller-selected callback window, not a real
+    calendar slot - see ReceptionistCallbackWindow's docstring. Fires from
+    a live Twilio webhook, so the best-effort notification below must
+    never break the caller's TwiML response."""
+    call.callback_requested = True
+    call.callback_window = window
+    db.commit()
+    _invalidate_receptionist_calls_cache(call.account_id)
+    log_event(
+        db, actor_id=call.account_id, action="receptionist.callback_requested",
+        target_type="receptionist_call", target_id=call.id,
+        metadata={"callback_window": window.value if window else None},
+    )
+
+    owner = db.query(User).filter(User.account_id == call.account_id, User.role == UserRole.OWNER).first()
+    if owner is None:
+        return
+    try:
+        notify_receptionist_callback_requested(
+            db, account_id=call.account_id, account_email=owner.email,
+            caller_number=call.caller_number, callback_window=window.value if window else "unspecified",
+        )
+    except Exception:
+        pass
 
 
 def mark_receptionist_call_escalated(db: Session, receptionist_call_id: str, escalated_to_user_id: str) -> None:
@@ -1402,6 +1510,10 @@ def _serialize_receptionist_call(c: ReceptionistCall) -> dict:
         "model_version": c.model_version,
         "is_likely_spam": c.is_likely_spam,
         "spam_reason": c.spam_reason,
+        "callback_preference": c.callback_preference,
+        "followup_asked": c.followup_asked,
+        "callback_requested": c.callback_requested,
+        "callback_window": c.callback_window.value if c.callback_window else None,
         "created_at": c.created_at.isoformat() if c.created_at else None,
     }
 
@@ -1428,6 +1540,10 @@ def _deserialize_receptionist_call(data: dict) -> ReceptionistCall:
         model_version=data["model_version"],
         is_likely_spam=data["is_likely_spam"],
         spam_reason=data["spam_reason"],
+        callback_preference=data.get("callback_preference"),
+        followup_asked=data.get("followup_asked", False),
+        callback_requested=data.get("callback_requested", False),
+        callback_window=ReceptionistCallbackWindow(data["callback_window"]) if data.get("callback_window") else None,
         created_at=datetime.fromisoformat(data["created_at"]) if data["created_at"] else None,
     )
 

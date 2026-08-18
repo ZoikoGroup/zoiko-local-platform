@@ -13,6 +13,13 @@ class ComplianceRuleResponse(BaseModel):
     is_active: bool
 
 
+class ComplianceRuleUpsertRequest(BaseModel):
+    country: str
+    requirement_type: str
+    required_documents: list[str]
+    is_active: bool = True
+
+
 class ComplianceCaseCreate(BaseModel):
     jurisdiction: str
     requirement_type: str

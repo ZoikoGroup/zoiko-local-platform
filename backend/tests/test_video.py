@@ -210,15 +210,19 @@ def test_list_rooms_degrades_recording_url_to_none_on_a_genuine_s3_failure(clien
 
 
 def test_create_room_fails_cleanly_when_livekit_url_is_not_configured(client, monkeypatch):
-    """A missing LIVEKIT_URL makes the SDK's own client constructor raise a
-    plain ValueError (not a TwirpError) - must still surface as a clean 502,
-    not an unhandled 500."""
+    """A missing LIVEKIT_URL must raise a clean 502, not an unhandled 500 -
+    and not silently succeed either. _client() checks this explicitly
+    rather than trusting the SDK's own constructor: LiveKitAPI falls back
+    to os.getenv("LIVEKIT_URL") whenever a falsy url is passed, which would
+    otherwise silently resurrect the real env var's value and mask this
+    exact "not configured" scenario - confirmed live, that used to make
+    this test's monkeypatch a no-op (room creation actually succeeded)."""
     monkeypatch.setattr("app.integrations.video.livekit.settings.livekit_url", "")
     token = _signup_and_login(client, "videonolivekit@example.com")
 
     response = client.post("/media/video/rooms", headers={"Authorization": f"Bearer {token}"})
     assert response.status_code == 502
-    assert "url must be set" in response.json()["detail"]
+    assert "LiveKit is not configured" in response.json()["detail"]
 
 
 @pytest.mark.live

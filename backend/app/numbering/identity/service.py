@@ -259,9 +259,16 @@ def remove_team_member(db: Session, *, account_id: str, user_id: str, actor: str
 
 def start_mfa_setup(db: Session, user: User) -> tuple[str, str]:
     """Generates a new pending TOTP secret (not yet enabled). Returns
-    (secret, otpauth_uri) for the caller to show as text/QR code."""
+    (secret, otpauth_uri) for the caller to show as text/QR code.
+
+    `user` comes from a route's get_current_user dependency, which may
+    return a Redis-cache-deserialized instance that was never loaded
+    through `db` - mutating and committing that directly is a silent
+    no-op (the session's unit-of-work never sees the change) rather than
+    a real update. db.merge() reattaches it to this session first."""
     from app.core.deps import invalidate_cached_user
 
+    user = db.merge(user)
     secret = generate_mfa_secret()
     user.mfa_secret = secret
     user.mfa_enabled = False  # any previous enabled state is cleared until re-confirmed
@@ -271,6 +278,9 @@ def start_mfa_setup(db: Session, user: User) -> tuple[str, str]:
 
 
 def enable_mfa(db: Session, user: User, code: str, actor: str) -> None:
+    """See start_mfa_setup's docstring for why db.merge(user) is needed
+    before any mutation - `user` may be a detached, cache-deserialized
+    instance, not one loaded through this session."""
     from app.core.deps import invalidate_cached_user
 
     if not user.mfa_secret:
@@ -278,6 +288,7 @@ def enable_mfa(db: Session, user: User, code: str, actor: str) -> None:
     if not verify_totp_code(user.mfa_secret, code):
         raise ValueError("Invalid code")
 
+    user = db.merge(user)
     user.mfa_enabled = True
     db.commit()
     invalidate_cached_user(user.id)
@@ -286,6 +297,9 @@ def enable_mfa(db: Session, user: User, code: str, actor: str) -> None:
 
 
 def disable_mfa(db: Session, user: User, code: str, actor: str) -> None:
+    """See start_mfa_setup's docstring for why db.merge(user) is needed
+    before any mutation - `user` may be a detached, cache-deserialized
+    instance, not one loaded through this session."""
     from app.core.deps import invalidate_cached_user
 
     if not user.mfa_enabled or not user.mfa_secret:
@@ -293,6 +307,7 @@ def disable_mfa(db: Session, user: User, code: str, actor: str) -> None:
     if not verify_totp_code(user.mfa_secret, code):
         raise ValueError("Invalid code")
 
+    user = db.merge(user)
     user.mfa_secret = None
     user.mfa_enabled = False
     db.commit()
@@ -302,8 +317,12 @@ def disable_mfa(db: Session, user: User, code: str, actor: str) -> None:
 
 
 def set_phone_number(db: Session, user: User, phone_number: str | None) -> User:
+    """See start_mfa_setup's docstring for why db.merge(user) is needed
+    before any mutation - `user` may be a detached, cache-deserialized
+    instance, not one loaded through this session."""
     from app.core.deps import invalidate_cached_user
 
+    user = db.merge(user)
     before = user.phone_number
     user.phone_number = phone_number
     db.commit()

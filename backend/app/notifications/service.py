@@ -1025,6 +1025,19 @@ def notify_voicemail_received(
     )
 
 
+def notify_receptionist_callback_requested(
+    db: Session, *, account_id: str, account_email: str, caller_number: str, callback_window: str
+) -> None:
+    send_notification(
+        db, event_name="voice.receptionist_callback_requested", account_id=account_id, recipient_email=account_email,
+        context={
+            "user_display_name": account_email,
+            "caller_number": _mask_number(caller_number),
+            "callback_window": callback_window,
+        },
+    )
+
+
 def notify_voicemail_transcription_ready(db: Session, *, account_id: str, account_email: str) -> None:
     send_notification(
         db, event_name="voice.voicemail_transcription_ready", account_id=account_id, recipient_email=account_email,

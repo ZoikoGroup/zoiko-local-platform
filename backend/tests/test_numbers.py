@@ -1066,6 +1066,11 @@ def test_purchase_is_blocked_for_a_non_test_account_in_controlled_beta(client, d
     staff_token = _create_staff_and_login(client, db_session, "staffmarket3@zoikolocal.com")
     staff_headers = {"Authorization": f"Bearer {staff_token}"}
     _upsert_market_country(client, staff_headers, "M3")
+    # A newly-created country defaults to CLOSED (fail-closed, Market
+    # Activation Registry's "default-deny" policy - see SupportedCountry.
+    # market_status's docstring) - must be explicitly opened before it's
+    # reservable at all, distinct from the controlled_beta flip below.
+    _set_market_status(client, staff_headers, "M3", "paid_open")
 
     token = _signup_and_login(client, "marketbeta1@example.com")
     headers = {"Authorization": f"Bearer {token}"}
@@ -1088,6 +1093,11 @@ def test_purchase_succeeds_for_a_test_account_in_controlled_beta(client, db_sess
     staff_token = _create_staff_and_login(client, db_session, "staffmarket4@zoikolocal.com")
     staff_headers = {"Authorization": f"Bearer {staff_token}"}
     _upsert_market_country(client, staff_headers, "M4")
+    # A newly-created country defaults to CLOSED (fail-closed, Market
+    # Activation Registry's "default-deny" policy - see SupportedCountry.
+    # market_status's docstring) - must be explicitly opened before it's
+    # reservable at all, distinct from the controlled_beta flip below.
+    _set_market_status(client, staff_headers, "M4", "paid_open")
 
     token = _signup_and_login(client, "marketbeta2@example.com")
     headers = {"Authorization": f"Bearer {token}"}

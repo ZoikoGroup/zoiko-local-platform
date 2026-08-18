@@ -12,6 +12,7 @@ const NAV_ITEMS = [
   { href: "/staff/accounts", label: "Accounts" },
   { href: "/staff/audit", label: "Audit Log" },
   { href: "/staff/providers", label: "Provider Status" },
+  { href: "/staff/incidents", label: "Incidents & Errors" },
   { href: "/staff/billing", label: "Billing (ZoikoNex)" },
   { href: "/staff/access-matrix", label: "Access Matrix" },
 ];

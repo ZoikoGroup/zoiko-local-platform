@@ -5,11 +5,25 @@ import {
   listMyNotifications,
   getNotificationPreferences,
   updateNotificationPreferences,
+  subscribeToPush,
+  unsubscribeFromPush,
+  getVapidPublicKey,
   ApiError,
   type NotificationDelivery,
   type NotificationPreferences,
 } from "@/lib/api";
 import { getToken } from "@/lib/auth";
+
+// Standard VAPID-key decoding for PushManager.subscribe's applicationServerKey -
+// browsers require a Uint8Array, but the key is handed out as a URL-safe base64 string.
+function urlBase64ToUint8Array(base64String: string): Uint8Array {
+  const padding = "=".repeat((4 - (base64String.length % 4)) % 4);
+  const base64 = (base64String + padding).replace(/-/g, "+").replace(/_/g, "/");
+  const rawData = window.atob(base64);
+  const outputArray = new Uint8Array(rawData.length);
+  for (let i = 0; i < rawData.length; i++) outputArray[i] = rawData.charCodeAt(i);
+  return outputArray;
+}
 
 // The domains actually seeded in notification_templates today (Email
 // Communications System doc's full taxonomy has more - ROUTE/MSG/DEVICE/
@@ -39,6 +53,11 @@ export default function NotificationsPage() {
   const [quietHoursEnabled, setQuietHoursEnabled] = useState(false);
   const [quietHoursDraft, setQuietHoursDraft] = useState({ start: "22:00", end: "07:00", timezone: "UTC" });
 
+  const [pushSupported, setPushSupported] = useState(false);
+  const [pushSubscribed, setPushSubscribed] = useState(false);
+  const [pushBusy, setPushBusy] = useState(false);
+  const [pushError, setPushError] = useState<string | null>(null);
+
   useEffect(() => {
     const token = getToken();
     if (!token) return;
@@ -59,6 +78,73 @@ export default function NotificationsPage() {
       .catch(() => setPrefsError("Couldn't load notification preferences."))
       .finally(() => setPrefsLoading(false));
   }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined" || !("serviceWorker" in navigator) || !("PushManager" in window)) return;
+    Promise.resolve()
+      .then(() => {
+        setPushSupported(true);
+        return navigator.serviceWorker.register("/sw.js");
+      })
+      .then((registration) => registration.pushManager.getSubscription())
+      .then((subscription) => setPushSubscribed(subscription !== null))
+      .catch(() => {});
+  }, []);
+
+  async function handleEnablePush() {
+    const token = getToken();
+    if (!token) return;
+    setPushError(null);
+    setPushBusy(true);
+    try {
+      const vapidKey = getVapidPublicKey();
+      if (!vapidKey) {
+        setPushError("Push notifications aren't configured on this server yet.");
+        return;
+      }
+      const permission = await Notification.requestPermission();
+      if (permission !== "granted") {
+        setPushError("Browser notification permission was denied.");
+        return;
+      }
+      await navigator.serviceWorker.register("/sw.js");
+      const registration = await navigator.serviceWorker.ready;
+      const subscription = await registration.pushManager.subscribe({
+        userVisibleOnly: true,
+        applicationServerKey: urlBase64ToUint8Array(vapidKey) as BufferSource,
+      });
+      const json = subscription.toJSON();
+      if (!json.endpoint || !json.keys?.p256dh || !json.keys?.auth) {
+        throw new Error("Browser did not return a usable push subscription.");
+      }
+      await subscribeToPush(token, { endpoint: json.endpoint, p256dh: json.keys.p256dh, auth: json.keys.auth });
+      setPushSubscribed(true);
+    } catch (err) {
+      setPushError(err instanceof ApiError ? err.message : "Couldn't enable push notifications.");
+    } finally {
+      setPushBusy(false);
+    }
+  }
+
+  async function handleDisablePush() {
+    const token = getToken();
+    if (!token) return;
+    setPushError(null);
+    setPushBusy(true);
+    try {
+      const registration = await navigator.serviceWorker.ready;
+      const subscription = await registration.pushManager.getSubscription();
+      if (subscription) {
+        await unsubscribeFromPush(token, subscription.endpoint);
+        await subscription.unsubscribe();
+      }
+      setPushSubscribed(false);
+    } catch {
+      setPushError("Couldn't disable push notifications.");
+    } finally {
+      setPushBusy(false);
+    }
+  }
 
   async function handleUpdatePrefs(patch: Partial<NotificationPreferences>) {
     const token = getToken();
@@ -140,6 +226,20 @@ export default function NotificationsPage() {
                 onChange={(e) => handleUpdatePrefs({ sms_enabled: e.target.checked })}
               />
             </label>
+
+            <label className="flex items-center justify-between gap-4">
+              <span className="text-sm text-slate-700">
+                Push notifications (this browser)
+                {!pushSupported && <span className="block text-xs text-slate-400">Not supported in this browser.</span>}
+              </span>
+              <input
+                type="checkbox"
+                checked={pushSubscribed}
+                disabled={!pushSupported || pushBusy}
+                onChange={(e) => (e.target.checked ? handleEnablePush() : handleDisablePush())}
+              />
+            </label>
+            {pushError && <p className="text-xs text-red-600 bg-red-50 rounded-lg px-3 py-2">{pushError}</p>}
 
             <div className="pt-2 border-t border-slate-100">
               <label className="flex items-center justify-between gap-4">
