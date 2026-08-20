@@ -201,6 +201,60 @@ class PhoneNumber(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
+class CallerIdentityStatus(str, enum.Enum):
+    UNVERIFIED = "unverified"
+    VERIFIED = "verified"
+    RESTRICTED = "restricted"
+    EXPIRED = "expired"
+    REVOKED = "revoked"
+
+
+class CallerIdentity(Base):
+    """Commercial Billing Operating Standard doc §R6 'How is caller-ID
+    spoofing risk controlled? ... Only verified/authorized caller IDs may
+    be presented... caller_identity object records verification/
+    authorization source, allowed presentation scope and status; routing
+    rejects unauthorized combinations.' Data model line: 'verified CLI,
+    account, verification/authorization source, provider/market scope,
+    status, expiry'.
+
+    Deliberately a separate object from PhoneNumber.status: ACTIVE+owned
+    already prevents presenting a number nobody bought (see
+    place_outbound_call's ownership check), but that's an ownership
+    check, not a formal, auditable verification record with its own
+    source/scope/expiry/revocation lifecycle - this is that record.
+    Auto-created VERIFIED at the moment a number is genuinely provisioned
+    (real Twilio purchase or completed port-in, both real
+    verification/authorization sources on their own) - see
+    purchase_number/app.porting.service.complete_porting_request. Never
+    created UNVERIFIED-and-left-that-way for a number this platform
+    actually provisioned; UNVERIFIED only means "no row exists yet",
+    which assert_caller_id_authorized treats as not authorized.
+    """
+
+    __tablename__ = "caller_identities"
+
+    id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=new_uuid)
+    phone_number_id: Mapped[str] = mapped_column(
+        UUID(as_uuid=False), ForeignKey("phone_numbers.id", ondelete="CASCADE"), nullable=False, unique=True, index=True
+    )
+    account_id: Mapped[str] = mapped_column(
+        UUID(as_uuid=False), ForeignKey("accounts.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    status: Mapped[CallerIdentityStatus] = mapped_column(
+        Enum(CallerIdentityStatus, name="caller_identity_status_enum"),
+        nullable=False, default=CallerIdentityStatus.UNVERIFIED,
+    )
+    verification_source: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    # "Allowed presentation scope" (doc's phrasing) - which market/provider
+    # this verification covers. "global" until real per-market STIR/SHAKEN
+    # attestation or provider-specific scoping exists.
+    scope: Mapped[str] = mapped_column(String(50), nullable=False, default="global")
+    verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
 class IVROption(Base):
     """One keypad choice on a number's IVR menu (see PhoneNumber.ivr_greeting).
     Pressing `digit` rings `destination_number` (single dial, same overflow-

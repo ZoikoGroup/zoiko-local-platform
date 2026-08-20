@@ -25,6 +25,7 @@ from app.numbering.numbers.models import PhoneNumber
 from app.ops.models import KillSwitchScope
 from app.ops.service import assert_kill_switch_not_active
 from app.retention.service import PURGED_MARKER
+from app.risk.service import is_ai_receptionist_trial_cap_exceeded
 from app.usage import service as usage_service
 
 AI_DISCLAIMER = "AI-generated summary — may be inaccurate; not an authoritative record."
@@ -333,6 +334,11 @@ def qualify_caller(
     consent here means 'skip AI enrichment', not a hard failure.
     """
     if not has_active_consent(db, account_id, ConsentType.AI_PROCESSING, jurisdiction):
+        return None, None
+    # Pricing doc §5.3 "no unlimited AI evaluation" trial control - same
+    # skip-AI-enrichment-not-fail-the-call treatment as the consent check
+    # above.
+    if is_ai_receptionist_trial_cap_exceeded(db, account_id):
         return None, None
     return extract_receptionist_qualification(transcript), LLM_MODEL_VERSION
 

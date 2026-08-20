@@ -14,6 +14,8 @@ from app.events.service import (
     publish_call_started,
     publish_video_room_created,
     publish_video_room_ended,
+    publish_video_session_ended,
+    publish_video_session_started,
     publish_voicemail_created,
 )
 from app.integrations.cache.redis import cache_delete, cache_get, cache_set
@@ -46,7 +48,13 @@ from app.media.models import (
 )
 from app.numbering.identity.models import User, UserRole
 from app.numbering.numbers.models import PhoneNumber, PhoneNumberStatus
-from app.numbering.numbers.service import NumberConflictError, assert_number_access, assigned_number_ids
+from app.numbering.numbers.service import (
+    CallerIdNotAuthorizedError,
+    NumberConflictError,
+    assert_caller_id_authorized,
+    assert_number_access,
+    assigned_number_ids,
+)
 from app.ops.models import KillSwitchScope
 from app.ops.service import assert_kill_switch_not_active
 from app.retention.service import PURGED_MARKER
@@ -244,6 +252,10 @@ def place_outbound_call(
         assert_number_access(owner, user)
     except NumberConflictError as e:
         raise CallAuthorizationError(str(e)) from e
+    try:
+        assert_caller_id_authorized(db, owner.id)
+    except CallerIdNotAuthorizedError as e:
+        raise CallAuthorizationError(str(e)) from e
 
     return _dispatch_outbound_call(
         db, account_id=user.account_id, account_email=user.email, owner=owner, to=to, from_number=from_number,
@@ -262,6 +274,10 @@ def place_outbound_call_for_account(
     owner = find_number_owner(db, from_number)
     if owner is None or owner.account_id != account_id or owner.status != PhoneNumberStatus.ACTIVE:
         raise CallAuthorizationError(f"{from_number} is not an active number owned by your account")
+    try:
+        assert_caller_id_authorized(db, owner.id)
+    except CallerIdNotAuthorizedError as e:
+        raise CallAuthorizationError(str(e)) from e
 
     from app.numbering.identity.models import User, UserRole
 
@@ -317,6 +333,30 @@ def update_call_status(db: Session, provider_call_sid: str, status: str, duratio
             idempotency_key=f"call_seconds:{provider_call_sid}",
             disposition=status,
         )
+
+        # AI Receptionist minute metering (Pricing doc §5.3) - only for
+        # calls the receptionist actually handled. Whole-call duration, same
+        # caveat as call_seconds above: every TwiML leg, not narrowly
+        # "AI-processing time". This meters raw usage only; it does not
+        # enforce/bill the doc's included-allowance + overage rule - see
+        # billing.get_usage_summary, which reports this the same
+        # informational-only way it reports every other metered resource.
+        receptionist_call = (
+            db.query(ReceptionistCall).filter(ReceptionistCall.call_sid == provider_call_sid).first()
+        )
+        if receptionist_call is not None:
+            receptionist_call.duration_seconds = duration or 0
+            db.commit()
+            usage_service.record_usage_event(
+                db,
+                account_id=call.account_id,
+                event_type="ai_receptionist_minutes",
+                quantity=(duration or 0) / 60,
+                unit="minutes",
+                country_band=country_band,
+                idempotency_key=f"ai_receptionist_minutes:{provider_call_sid}",
+                disposition=status,
+            )
 
     return call
 
@@ -596,6 +636,7 @@ async def create_video_session(
         metadata={"room_name": room_name, "confidential": confidential},
     )
     publish_video_room_created(account_id, room_name=room_name)
+    publish_video_session_started(account_id, session_id=session.id, room_name=room_name)
     return session
 
 
@@ -626,6 +667,7 @@ async def end_video_session(db: Session, user: User, room_name: str) -> VideoSes
         target_type="video_session", target_id=session.id, metadata={"room_name": room_name},
     )
     publish_video_room_ended(user.account_id, room_name=room_name)
+    publish_video_session_ended(user.account_id, session_id=session.id, room_name=room_name)
     return session
 
 

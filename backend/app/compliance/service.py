@@ -7,6 +7,7 @@ from app.audit.service import log_event
 from app.compliance.models import ComplianceCase, ComplianceCaseStatus, ComplianceRule
 from app.events.service import (
     publish_compliance_case_approved,
+    publish_compliance_case_expired,
     publish_compliance_case_rejected,
     publish_compliance_case_required,
 )
@@ -119,6 +120,11 @@ def has_approved_case(db: Session, *, account_id: str, jurisdiction: str, requir
     )
 
 
+class NumberNotOwnedError(Exception):
+    """Raised when a case is opened against a number_id that either doesn't
+    exist or isn't owned by the account opening the case."""
+
+
 def open_compliance_case(
     db: Session,
     *,
@@ -128,6 +134,17 @@ def open_compliance_case(
     actor: str,
     number_id: str | None = None,
 ) -> ComplianceCase:
+    if number_id is not None:
+        from app.numbering.numbers.models import PhoneNumber
+
+        owned = (
+            db.query(PhoneNumber)
+            .filter(PhoneNumber.id == number_id, PhoneNumber.account_id == account_id)
+            .first()
+        )
+        if owned is None:
+            raise NumberNotOwnedError(number_id)
+
     case = ComplianceCase(
         account_id=account_id,
         number_id=number_id,
@@ -409,6 +426,48 @@ def reject_case(db: Session, case: ComplianceCase, *, actor: str, reason: str | 
         )
 
     return case
+
+
+def expire_overdue_cases(db: Session) -> dict[str, int]:
+    """Finds every PENDING case past its expires_at and transitions it to
+    EXPIRED. Called from app.ops.scheduled_reconciliation's daily run (same
+    posture as app.retention.service.purge_expired_recordings) - still
+    depends on that script actually being scheduled externally (see its own
+    docstring), this function has no timer of its own.
+
+    Only PENDING cases are in scope - an APPROVED/REJECTED case has already
+    reached a terminal human decision, and expires_at describes how long the
+    verification window stays open, not how long the decision stays valid.
+    """
+    now = datetime.now(timezone.utc)
+    overdue = (
+        db.query(ComplianceCase)
+        .filter(
+            ComplianceCase.status == ComplianceCaseStatus.PENDING,
+            ComplianceCase.expires_at.isnot(None),
+            ComplianceCase.expires_at < now,
+        )
+        .all()
+    )
+    for case in overdue:
+        case.status = ComplianceCaseStatus.EXPIRED
+        db.commit()
+        _invalidate_cases_cache(case.account_id)
+
+        log_event(
+            db,
+            actor_id=case.account_id,
+            action="compliance.case_expired",
+            target_type="compliance_case",
+            target_id=case.id,
+            before={"status": ComplianceCaseStatus.PENDING.value},
+            after={"status": case.status.value},
+        )
+        publish_compliance_case_expired(
+            case.account_id, case_id=case.id, jurisdiction=case.jurisdiction, requirement_type=case.requirement_type,
+        )
+
+    return {"expired": len(overdue)}
 
 
 class KYCAlreadyApprovedError(Exception):

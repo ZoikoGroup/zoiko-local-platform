@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException, Request, status
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
@@ -19,6 +20,7 @@ from app.numbering.numbers.models import MarketActivationStatus, NumberEligibili
 from app.numbering.numbers.service import (
     NoStuckProvisioningError,
     NotDueForRenewalError,
+    NumberConflictError,
     NumberEligibilityCaseNotFoundError,
     UnsupportedCountryError,
     approve_number_eligibility_case,
@@ -26,11 +28,13 @@ from app.numbering.numbers.service import (
     list_number_eligibility_rules,
     list_supported_countries,
     mark_number_renewed,
+    reinstate_caller_identity,
     reject_number_eligibility_case,
     release_stuck_provisioning,
     remove_number_eligibility_rule,
     remove_supported_country,
     retry_provisioning,
+    revoke_caller_identity,
     seed_market_release_registry,
     set_market_activation_status,
     upsert_number_eligibility_rule,
@@ -150,6 +154,43 @@ def release_number_provisioning(
     except NoStuckProvisioningError as e:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e
     return {"id": number.id, "e164": number.e164, "status": number.status}
+
+
+class CallerIdentityActionRequest(BaseModel):
+    reason: str | None = None
+
+
+@router.post("/numbers/{number_id}/caller-identity/revoke")
+def revoke_caller_identity_route(
+    number_id: str,
+    payload: CallerIdentityActionRequest,
+    db: Session = Depends(get_db),
+    staff: PlatformStaff = Depends(require_capability("numbers.manage_caller_identity")),
+):
+    """Fraud/abuse response (Commercial Billing Operating Standard doc §R6)
+    - blocks the number from outbound presentation without touching its
+    billing/ownership status (see CallerIdentity's docstring)."""
+    try:
+        identity = revoke_caller_identity(db, number_id, staff_id=staff.id, reason=payload.reason)
+    except NumberConflictError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
+    return {"phone_number_id": identity.phone_number_id, "status": identity.status}
+
+
+@router.post("/numbers/{number_id}/caller-identity/reinstate")
+def reinstate_caller_identity_route(
+    number_id: str,
+    payload: CallerIdentityActionRequest,
+    db: Session = Depends(get_db),
+    staff: PlatformStaff = Depends(require_capability("numbers.manage_caller_identity")),
+):
+    """Reversal of revoke - a false positive or resolved dispute shouldn't
+    need a brand new number purchase to restore calling."""
+    try:
+        identity = reinstate_caller_identity(db, number_id, staff_id=staff.id, reason=payload.reason)
+    except NumberConflictError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
+    return {"phone_number_id": identity.phone_number_id, "status": identity.status}
 
 
 @router.get("/numbers/due-for-renewal")

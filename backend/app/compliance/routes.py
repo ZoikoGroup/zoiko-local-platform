@@ -63,14 +63,17 @@ def create_case(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_admin),
 ):
-    return service.open_compliance_case(
-        db,
-        account_id=current_user.account_id,
-        jurisdiction=payload.jurisdiction,
-        requirement_type=payload.requirement_type,
-        number_id=payload.number_id,
-        actor=current_user.id,
-    )
+    try:
+        return service.open_compliance_case(
+            db,
+            account_id=current_user.account_id,
+            jurisdiction=payload.jurisdiction,
+            requirement_type=payload.requirement_type,
+            number_id=payload.number_id,
+            actor=current_user.id,
+        )
+    except service.NumberNotOwnedError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"number {e} not found on this account") from e
 
 
 @router.get("/cases/me", response_model=list[ComplianceCaseResponse])
@@ -215,3 +218,15 @@ def reject_case(
 ):
     case = _get_case_or_404(db, case_id)
     return service.reject_case(db, case, actor=staff.id, reason=payload.reason)
+
+
+@router.post("/cases/expire")
+def expire_cases(
+    db: Session = Depends(get_db),
+    _staff: PlatformStaff = Depends(get_current_staff),
+):
+    """Staff-only, manually triggered - there's no cron/scheduler in this
+    app yet (same posture as POST /retention/purge), so this is meant to be
+    called by an external scheduled task until real job infrastructure
+    exists."""
+    return service.expire_overdue_cases(db)

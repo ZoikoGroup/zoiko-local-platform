@@ -1,7 +1,7 @@
 import enum
 from datetime import datetime
 
-from sqlalchemy import DateTime, Enum, ForeignKey, Integer, String, UniqueConstraint, func
+from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, Integer, String, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -14,6 +14,13 @@ class SubscriptionStatus(str, enum.Enum):
     ACTIVE = "active"
     PAST_DUE = "past_due"
     CANCELED = "canceled"
+    # Commercial Billing Operating Standard doc §M3 - a distinct, final state
+    # from CANCELED: CANCELED still lets an Owner/Admin resubscribe via
+    # change_plan (see assert_billing_not_suspended's docstring), so on its
+    # own it behaves like an indefinite suspension, not a real termination.
+    # TERMINATED additionally deprovisions every owned number and is a
+    # one-way door - see terminate_subscription.
+    TERMINATED = "terminated"
 
 
 class Plan(Base):
@@ -46,6 +53,14 @@ class Plan(Base):
     # regardless of tier.
     max_video_participants: Mapped[int] = mapped_column(Integer, nullable=False, server_default="8")
     monthly_ai_summaries: Mapped[int] = mapped_column(Integer, nullable=False)
+    # Pricing doc §4 plan comparison table: Pro includes 50 min/account/month
+    # of AI Receptionist usage, Scale includes 150 - "account/workspace-level,
+    # not multiplied by seat count" per the doc's own footnote, which is
+    # already this column's granularity (one value per plan, not per seat).
+    # Zero for every other tier - Starter/Business only get AI Receptionist
+    # minutes by buying the separate $29/mo add-on (see
+    # AIReceptionistAddonRate, Subscription.ai_receptionist_addon_enabled).
+    ai_receptionist_minutes_included: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
     trial_days: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     sort_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     # Populated once by app.integrations.billing.zoikonex.register_plan_in_catalog
@@ -138,6 +153,44 @@ class PriceCatalogEntry(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
+class AIReceptionistAddonRate(Base):
+    """Pricing doc §5.3's `AIUsageRate` object (ai_product, included
+    quantity, overage unit rate, workspace/account scope, effective
+    period) for the one AI product that's priced today: the AI
+    Receptionist workspace add-on. Deliberately its own table rather than
+    another PriceCatalogEntry row - that table's plan_code is a real FK to
+    `plans`, and this add-on isn't a subscription tier, it's an
+    account-level toggle any plan can turn on (Subscription.
+    ai_receptionist_addon_enabled) independent of plan_code. Same Class-A
+    versioning discipline as PriceCatalogEntry: a real price change is a
+    new catalog_version row, never an edit to an existing one.
+
+    Pro/Scale get their own included-minutes allowance
+    (Plan.ai_receptionist_minutes_included) without needing this add-on at
+    all - this table's included_minutes only applies once the add-on
+    itself is purchased."""
+
+    __tablename__ = "ai_receptionist_addon_rates"
+
+    id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=new_uuid)
+    catalog_version: Mapped[str] = mapped_column(String(50), nullable=False, unique=True)
+    monthly_price_minor_units: Mapped[int] = mapped_column(Integer, nullable=False)
+    included_minutes: Mapped[int] = mapped_column(Integer, nullable=False)
+    overage_rate_minor_units_per_minute: Mapped[int] = mapped_column(Integer, nullable=False)
+    currency_code: Mapped[str] = mapped_column(String(3), nullable=False, default="USD")
+    status: Mapped[CatalogEntryStatus] = mapped_column(
+        Enum(CatalogEntryStatus, name="catalog_entry_status_enum"), nullable=False, default=CatalogEntryStatus.PROPOSED
+    )
+    is_placeholder: Mapped[bool] = mapped_column(nullable=False, default=True)
+    price_book_version: Mapped[str | None] = mapped_column(String(50), nullable=True, index=True)
+    effective_from: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    effective_to: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    approval_evidence: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    approved_by: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
 class Subscription(Base):
     """Architecture doc §7 data model: "Commercial entitlement container
     synced with ZoikoNex" - subscription_id, plan_code, status, period,
@@ -193,6 +246,17 @@ class Subscription(Base):
     # PAST_DUE clock; this is a voluntary, immediate cancellation with no
     # grace period of its own.
     canceled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Set once, the first time terminate_subscription runs - NULL for every
+    # status except TERMINATED. See SubscriptionStatus.TERMINATED's docstring
+    # for how this differs from canceled_at above.
+    terminated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Pricing doc §5.3 "$29.00 per workspace/month" AI Receptionist add-on -
+    # an account-level toggle independent of plan_code (see
+    # AIReceptionistAddonRate's docstring). Not yet wired into
+    # run_billing_cycle's actual charge computation (metering only via
+    # get_usage_summary today) - see CLAUDE.md's note on why that's a
+    # separate, larger piece of work.
+    ai_receptionist_addon_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -280,6 +344,13 @@ class ZoikoNexReconciliationRun(Base):
     # found drift," not "total open drift" (that's a live count via
     # list_zoikonex_reconciliation_exceptions(resolved=False)).
     exceptions_found: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # Production Readiness Standard's "no public production while
+    # reconciliation or recovery is uncertain" - a run_billing_cycle
+    # capture that failed with ZoikoNexCaptureFailedError (the confirmed
+    # ZoikoNex-side gRPC bug - see that error's docstring) used to just sit
+    # in a ZoikoNexSyncEvent payload with no queue entry at all. This
+    # counts how many of THIS run's new exceptions are that specific type.
+    uncaptured_payments_found: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
 
 
@@ -295,6 +366,13 @@ class ZoikoNexReconciliationExceptionType(str, enum.Enum):
     # period has already closed and been invoiced needs a human decision
     # (credit the current period vs. hold for the next one), not a guess.
     LATE_USAGE_EVENT = "late_usage_event"
+    # A run_billing_cycle capture that failed with ZoikoNexCaptureFailedError
+    # (confirmed ZoikoNex-side gRPC bug, not something this repo can fix) -
+    # "authorised but not captured" is a real, reportable outcome, not a
+    # silent one; this is what actually puts it in the operations queue
+    # instead of leaving it discoverable only by querying ZoikoNexSyncEvent
+    # payloads by hand.
+    PAYMENT_AUTHORISED_NOT_CAPTURED = "payment_authorised_not_captured"
 
 
 class ZoikoNexReconciliationException(Base):
@@ -337,6 +415,7 @@ class BillingActionType(str, enum.Enum):
     DEBIT_NOTE = "debit_note"
     REFUND = "refund"
     RUN_BILLING_CYCLE = "run_billing_cycle"
+    TERMINATE_SUBSCRIPTION = "terminate_subscription"
 
 
 class BillingActionRequestStatus(str, enum.Enum):

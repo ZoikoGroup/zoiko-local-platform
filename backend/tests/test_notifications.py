@@ -683,6 +683,219 @@ def test_security_category_email_bypasses_transactional_suppression(db_session, 
     assert len(sent) == 1
 
 
+def test_transactional_email_includes_rfc8058_unsubscribe_headers(db_session, monkeypatch):
+    from app.notifications.service import send_notification
+
+    from app.numbering.identity.models import Account, AccountType
+
+    monkeypatch.setattr("app.core.config.settings.resend_api_key", "")
+    sent = []
+    monkeypatch.setattr("app.notifications.service.send_email", lambda **kw: sent.append(kw))
+
+    account = Account(name="RFC8058 Co", account_type=AccountType.INDIVIDUAL)
+    db_session.add(account)
+    db_session.flush()
+    db_session.commit()
+
+    delivery = send_notification(
+        db_session, event_name="number.activated", account_id=account.id,
+        recipient_email="x@example.com",
+        context={
+            "e164": "+15550001111", "number_formatted": "+15550001111",
+            "organization_name": "RFC8058 Co", "user_display_name": "x@example.com",
+        },
+    )
+    assert delivery.status == "sent"
+    assert len(sent) == 1
+    headers = sent[0]["headers"]
+    assert headers["List-Unsubscribe"].startswith("<")
+    assert headers["List-Unsubscribe-Post"] == "List-Unsubscribe=One-Click"
+
+
+def test_critical_email_has_no_unsubscribe_headers(db_session, monkeypatch):
+    """CRITICAL/SECURITY templates never get an unsubscribe path at all -
+    same exemption as the transactional opt-out, not just a suppression
+    bypass - so there's no List-Unsubscribe header to send either."""
+    from app.notifications.service import send_notification
+
+    from app.numbering.identity.models import Account, AccountType
+
+    monkeypatch.setattr("app.core.config.settings.resend_api_key", "")
+    sent = []
+    monkeypatch.setattr("app.notifications.service.send_email", lambda **kw: sent.append(kw))
+
+    account = Account(name="Critical Headers Co", account_type=AccountType.INDIVIDUAL)
+    db_session.add(account)
+    db_session.flush()
+    db_session.commit()
+
+    delivery = send_notification(
+        db_session, event_name="number.suspended", account_id=account.id,
+        recipient_email="x@example.com", context={"e164": "+15550001111", "reason_line": ""},
+    )
+    assert delivery.status == "sent"
+    assert sent[0]["headers"] is None
+
+
+def test_email_is_held_during_quiet_hours(db_session, monkeypatch):
+    from datetime import time as dtime
+
+    from app.notifications.service import send_notification, update_preference
+    from app.notifications.models import NotificationTemplate, NotificationPriority
+
+    from app.numbering.identity.models import Account, AccountType
+
+    monkeypatch.setattr("app.core.config.settings.resend_api_key", "")
+    sent = []
+    monkeypatch.setattr("app.notifications.service.send_email", lambda **kw: sent.append(kw))
+
+    template = db_session.query(NotificationTemplate).filter(NotificationTemplate.key == "number.suspended").first()
+    template.priority = NotificationPriority.STANDARD
+    db_session.commit()
+
+    try:
+        account = Account(name="Quiet Hours Email Co", account_type=AccountType.INDIVIDUAL)
+        db_session.add(account)
+        db_session.flush()
+        update_preference(
+            db_session, account.id,
+            quiet_hours_start=dtime(0, 0, 0), quiet_hours_end=dtime(23, 59, 59), quiet_hours_timezone="UTC",
+        )
+
+        delivery = send_notification(
+            db_session, event_name="number.suspended", account_id=account.id,
+            recipient_email="x@example.com", context={"e164": "+15550001111", "reason_line": ""},
+        )
+        assert delivery.status == "suppressed"
+        assert "quiet hours" in delivery.error
+        assert sent == []
+    finally:
+        # This test file's db_session isn't rolled back between tests (see
+        # the identical pre-existing pattern in
+        # test_sms_is_suppressed_for_a_standard_priority_template_when_disabled) -
+        # a mutation to this shared, canonical template row must be undone
+        # here or every later test relying on number.suspended being
+        # CRITICAL breaks, regardless of what order tests actually run in.
+        template.priority = NotificationPriority.CRITICAL
+        db_session.commit()
+
+
+def test_push_is_suppressed_when_opted_out(db_session, monkeypatch):
+    from app.notifications.service import send_notification, update_preference
+    from app.notifications.models import PushSubscription
+
+    from app.core.security import hash_password
+    from app.numbering.identity.models import Account, AccountType, User, UserRole
+
+    monkeypatch.setattr("app.core.config.settings.resend_api_key", "")
+    monkeypatch.setattr("app.notifications.service.send_email", lambda **kw: None)
+    pushed = []
+    monkeypatch.setattr("app.notifications.service.send_push", lambda **kw: pushed.append(kw))
+
+    account = Account(name="Suppress Push Co", account_type=AccountType.INDIVIDUAL)
+    db_session.add(account)
+    db_session.flush()
+    user = User(
+        account_id=account.id, email="suppresspush@example.com", hashed_password=hash_password("supersecret123"),
+        role=UserRole.OWNER,
+    )
+    db_session.add(user)
+    db_session.flush()
+    db_session.add(PushSubscription(account_id=account.id, user_id=user.id, endpoint="https://push.example.com/a", p256dh="k", auth="a"))
+    db_session.commit()
+    update_preference(db_session, account.id, transactional_enabled=False)
+
+    send_notification(
+        db_session, event_name="number.activated", account_id=account.id,
+        recipient_email="x@example.com",
+        context={
+            "e164": "+15550001111", "number_formatted": "+15550001111",
+            "organization_name": "Suppress Push Co", "user_display_name": "x@example.com",
+        },
+    )
+    assert pushed == []
+
+
+def test_push_is_held_during_quiet_hours(db_session, monkeypatch):
+    from datetime import time as dtime
+
+    from app.notifications.service import send_notification, update_preference
+    from app.notifications.models import PushSubscription, NotificationTemplate, NotificationPriority
+
+    from app.core.security import hash_password
+    from app.numbering.identity.models import Account, AccountType, User, UserRole
+
+    monkeypatch.setattr("app.core.config.settings.resend_api_key", "")
+    monkeypatch.setattr("app.notifications.service.send_email", lambda **kw: None)
+    pushed = []
+    monkeypatch.setattr("app.notifications.service.send_push", lambda **kw: pushed.append(kw))
+
+    template = db_session.query(NotificationTemplate).filter(NotificationTemplate.key == "number.suspended").first()
+    template.priority = NotificationPriority.STANDARD
+    db_session.commit()
+
+    try:
+        account = Account(name="Quiet Hours Push Co", account_type=AccountType.INDIVIDUAL)
+        db_session.add(account)
+        db_session.flush()
+        user = User(
+            account_id=account.id, email="quiethourspush@example.com", hashed_password=hash_password("supersecret123"),
+            role=UserRole.OWNER,
+        )
+        db_session.add(user)
+        db_session.flush()
+        db_session.add(PushSubscription(account_id=account.id, user_id=user.id, endpoint="https://push.example.com/b", p256dh="k", auth="a"))
+        db_session.commit()
+        update_preference(
+            db_session, account.id,
+            quiet_hours_start=dtime(0, 0, 0), quiet_hours_end=dtime(23, 59, 59), quiet_hours_timezone="UTC",
+        )
+
+        send_notification(
+            db_session, event_name="number.suspended", account_id=account.id,
+            recipient_email="x@example.com", context={"e164": "+15550001111", "reason_line": ""},
+        )
+        assert pushed == []
+    finally:
+        # See test_email_is_held_during_quiet_hours's finally block - same
+        # shared-row-mutation-must-be-undone reasoning.
+        template.priority = NotificationPriority.CRITICAL
+        db_session.commit()
+
+
+def test_critical_push_bypasses_suppression(db_session, monkeypatch):
+    from app.notifications.service import send_notification, update_preference
+    from app.notifications.models import PushSubscription
+
+    from app.core.security import hash_password
+    from app.numbering.identity.models import Account, AccountType, User, UserRole
+
+    monkeypatch.setattr("app.core.config.settings.resend_api_key", "")
+    monkeypatch.setattr("app.notifications.service.send_email", lambda **kw: None)
+    pushed = []
+    monkeypatch.setattr("app.notifications.service.send_push", lambda **kw: pushed.append(kw))
+
+    account = Account(name="Critical Push Co", account_type=AccountType.INDIVIDUAL)
+    db_session.add(account)
+    db_session.flush()
+    user = User(
+        account_id=account.id, email="criticalpush@example.com", hashed_password=hash_password("supersecret123"),
+        role=UserRole.OWNER,
+    )
+    db_session.add(user)
+    db_session.flush()
+    db_session.add(PushSubscription(account_id=account.id, user_id=user.id, endpoint="https://push.example.com/c", p256dh="k", auth="a"))
+    db_session.commit()
+    update_preference(db_session, account.id, transactional_enabled=False)
+
+    # number.suspended is CRITICAL priority - bypasses the transactional opt-out for push too.
+    send_notification(
+        db_session, event_name="number.suspended", account_id=account.id,
+        recipient_email="x@example.com", context={"e164": "+15550001111", "reason_line": ""},
+    )
+    assert len(pushed) == 1
+
+
 def test_sms_is_suppressed_when_sms_disabled(db_session, monkeypatch):
     from app.notifications.service import send_sms_notification, update_preference
 
@@ -722,18 +935,28 @@ def test_sms_is_suppressed_for_a_standard_priority_template_when_disabled(db_ses
     template.priority = NotificationPriority.STANDARD
     db_session.commit()
 
-    account = Account(name="Suppress SMS Standard Co", account_type=AccountType.INDIVIDUAL)
-    db_session.add(account)
-    db_session.flush()
-    update_preference(db_session, account.id, sms_enabled=False)
+    try:
+        account = Account(name="Suppress SMS Standard Co", account_type=AccountType.INDIVIDUAL)
+        db_session.add(account)
+        db_session.flush()
+        update_preference(db_session, account.id, sms_enabled=False)
 
-    delivery = send_sms_notification(
-        db_session, event_name="number.suspended", account_id=account.id,
-        recipient_phone="+15551234567", context={"e164": "+15550001111", "reason_line": ""},
-    )
-    assert delivery.status == "suppressed"
-    assert "disabled" in delivery.error
-    assert sent == []
+        delivery = send_sms_notification(
+            db_session, event_name="number.suspended", account_id=account.id,
+            recipient_phone="+15551234567", context={"e164": "+15550001111", "reason_line": ""},
+        )
+        assert delivery.status == "suppressed"
+        assert "disabled" in delivery.error
+        assert sent == []
+    finally:
+        # This test's db_session isn't rolled back between tests - a
+        # mutation to this shared, canonical template row must be undone
+        # here or every later test relying on number.suspended being
+        # CRITICAL breaks (confirmed live: this exact gap broke
+        # test_critical_priority_email_bypasses_transactional_suppression
+        # and others until this restore was added).
+        template.priority = NotificationPriority.CRITICAL
+        db_session.commit()
 
 
 def test_sms_is_held_during_quiet_hours(db_session, monkeypatch):
@@ -751,23 +974,29 @@ def test_sms_is_held_during_quiet_hours(db_session, monkeypatch):
     template.priority = NotificationPriority.STANDARD
     db_session.commit()
 
-    account = Account(name="Quiet Hours Co", account_type=AccountType.INDIVIDUAL)
-    db_session.add(account)
-    db_session.flush()
-    # Covers virtually the entire day so this is deterministic regardless of
-    # wall-clock time when the test runs.
-    update_preference(
-        db_session, account.id,
-        quiet_hours_start=dtime(0, 0, 0), quiet_hours_end=dtime(23, 59, 59), quiet_hours_timezone="UTC",
-    )
+    try:
+        account = Account(name="Quiet Hours Co", account_type=AccountType.INDIVIDUAL)
+        db_session.add(account)
+        db_session.flush()
+        # Covers virtually the entire day so this is deterministic regardless of
+        # wall-clock time when the test runs.
+        update_preference(
+            db_session, account.id,
+            quiet_hours_start=dtime(0, 0, 0), quiet_hours_end=dtime(23, 59, 59), quiet_hours_timezone="UTC",
+        )
 
-    delivery = send_sms_notification(
-        db_session, event_name="number.suspended", account_id=account.id,
-        recipient_phone="+15551234567", context={"e164": "+15550001111", "reason_line": ""},
-    )
-    assert delivery.status == "suppressed"
-    assert "quiet hours" in delivery.error
-    assert sent == []
+        delivery = send_sms_notification(
+            db_session, event_name="number.suspended", account_id=account.id,
+            recipient_phone="+15551234567", context={"e164": "+15550001111", "reason_line": ""},
+        )
+        assert delivery.status == "suppressed"
+        assert "quiet hours" in delivery.error
+        assert sent == []
+    finally:
+        # See test_email_is_held_during_quiet_hours's finally block - same
+        # shared-row-mutation-must-be-undone reasoning.
+        template.priority = NotificationPriority.CRITICAL
+        db_session.commit()
 
 
 def _signup_and_login_owner(client, email: str) -> str:

@@ -8,18 +8,26 @@ render.yaml's zoiko-local-daily-reconciliation cron service):
 Not wired into the FastAPI app itself - owns its own DB session, same
 pattern as app.events.consumer. Deliberately a thin script: it only calls
 existing, already-tested service functions (run_zoikonex_reconciliation,
-list_due_renewals) and logs a summary; it contains no reconciliation logic
-of its own. Exits 1 if this run found new exceptions or numbers are overdue
-for renewal, so cron/host alerting can key off the exit code without
-parsing log output.
+list_due_renewals, expire_overdue_cases, purge_expired_recordings) and logs
+a summary; it contains no reconciliation logic of its own. Exits 1 if this
+run found new exceptions, numbers overdue for renewal, or any purge
+failures, so cron/host alerting can key off the exit code without parsing
+log output.
+
+expire_overdue_cases and purge_expired_recordings both existed with no
+scheduler calling them (see their own docstrings) - this is that scheduler.
+Nothing new was built for it; this reuses the one daily job slot that
+already existed for reconciliation/renewals.
 """
 
 import logging
 import sys
 
 from app.billing.service import run_zoikonex_reconciliation
+from app.compliance.service import expire_overdue_cases
 from app.core.database import SessionLocal
 from app.numbering.numbers.service import list_due_renewals
+from app.retention.service import purge_expired_recordings
 
 logger = logging.getLogger("zoiko.ops.reconciliation")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -48,6 +56,18 @@ def main() -> int:
         due = list_due_renewals(db)
         logger.info("numbers_due_for_renewal count=%d", len(due))
         if due:
+            exit_code = 1
+
+        expired = expire_overdue_cases(db)
+        logger.info("compliance_cases_expired count=%d", expired["expired"])
+
+        purged = purge_expired_recordings(db)
+        total_failed = sum(bucket["failed"] for bucket in purged.values())
+        logger.info(
+            "retention_purge voicemail=%s call_recording=%s video_recording=%s",
+            purged["voicemail"], purged["call_recording"], purged["video_recording"],
+        )
+        if total_failed > 0:
             exit_code = 1
     except Exception:
         logger.exception("scheduled_reconciliation run failed")

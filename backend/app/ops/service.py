@@ -3,7 +3,6 @@ from datetime import datetime, timezone
 
 import sqlalchemy as sa
 from sqlalchemy.orm import Session
-from twilio.request_validator import RequestValidator
 
 from app.audit.service import log_event
 from app.core.config import settings
@@ -131,7 +130,7 @@ def _check_twilio_webhook_signature_pipeline() -> dict:
     secret (the exact one Twilio would sign with) and round-trips it
     through the real validator (app.integrations.telecom.twilio.
     validate_webhook_signature) - no network call and no real Twilio
-    request needed, so this works even though the Twilio account here is
+    request needed, so this works even though the Twilio  account here is
     trial-only with no real number to place an actual test call to."""
     start = time.perf_counter()
     if not settings.twilio_auth_token:
@@ -140,10 +139,9 @@ def _check_twilio_webhook_signature_pipeline() -> dict:
             "detail": "TWILIO_AUTH_TOKEN is not configured",
         }
     try:
-        validator = RequestValidator(settings.twilio_auth_token)
         url = f"{settings.public_base_url or 'https://synthetic-check.invalid'}/media/voice/incoming"
         params = {"CallSid": "CAsynthetic00000000000000000000", "From": "+15005550006", "To": "+15005550001"}
-        signature = validator.compute_signature(url, params)
+        signature = telecom.compute_webhook_signature(url, params)
         accepted = telecom.validate_webhook_signature(url, params, signature)
         detail = None if accepted else "A signature computed with our own configured secret was rejected"
         return {"success": accepted, "duration_ms": (time.perf_counter() - start) * 1000, "detail": detail}
@@ -159,7 +157,7 @@ async def run_synthetic_checks(db: Session) -> list[SyntheticCheckRun]:
     reported as failing, since "not set up in this environment" isn't a
     monitoring alert). Persists every run for trend/history visibility via
     list_synthetic_check_runs, not just the latest result."""
-    results: dict[str, dict] = {
+    results: dict[str,  dict] = {
         "database_connectivity": _check_database_connectivity(db),
         "twilio_webhook_signature_pipeline": _check_twilio_webhook_signature_pipeline(),
     }

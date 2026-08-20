@@ -161,3 +161,50 @@ services:
         value: "false"
       - key: WEBPUSH_FAILOVER_ENABLED
         value: "false"
+
+      # Multi-provider failover secondaries - credentials for the vendor
+      # clients the *_FAILOVER_ENABLED flags above gate. Every client is
+      # real (integrations/<category>/_secondary_stub.py already makes a
+      # correctly-shaped live API call, not a placeholder), just never
+      # exercised against an actual vendor account. Fill in whichever
+      # you've signed up for and flip its matching flag above - no code
+      # change needed at that point, this is the only step deploy-time
+      # activation requires. Safe to leave the rest blank indefinitely.
+      - key: VONAGE_API_KEY
+        sync: false
+      - key: VONAGE_API_SECRET
+        sync: false
+      - key: VONAGE_APPLICATION_ID
+        sync: false
+      - key: VONAGE_PRIVATE_KEY
+        sync: false # full PEM contents from the Vonage Application's generated private key file
+      - key: VONAGE_SMS_FROM
+        sync: false
+      - key: DAILY_API_KEY
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: DEEPGRAM_API_KEY
+        sync: false
+      - key: SUMSUB_APP_TOKEN
+        sync: false
+      - key: SUMSUB_SECRET_KEY
+        sync: false
+      - key: SUMSUB_LEVEL_NAME
+        value: basic-kyc-level # must match a verification level configured in the Sumsub dashboard
+      - key: STORAGE_SECONDARY_ACCESS_KEY_ID
+        sync: false
+      - key: STORAGE_SECONDARY_SECRET_ACCESS_KEY
+        sync: false
+      - key: STORAGE_SECONDARY_BUCKET
+        sync: false
+      - key: STORAGE_SECONDARY_ENDPOINT
+        sync: false # a genuinely different S3-compatible provider/account than the primary Backblaze bucket above
+      - key: STORAGE_SECONDARY_REGION
+        value: auto
+      - key: SENDGRID_API_KEY
+        sync: false
+      - key: ONESIGNAL_APP_ID
+        sync: false
+      - key: ONESIGNAL_API_KEY
+        sync: false

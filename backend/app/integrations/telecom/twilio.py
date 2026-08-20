@@ -599,3 +599,12 @@ def validate_webhook_signature(url: str, params: dict, signature: str | None) ->
         return False
     validator = RequestValidator(settings.twilio_auth_token)
     return validator.validate(url, params, signature)
+
+
+def compute_webhook_signature(url: str, params: dict) -> str:
+    """Computes the X-Twilio-Signature our own configured auth token would
+    produce for a given URL/params pair - the inverse of
+    validate_webhook_signature, used by synthetic self-checks to round-trip
+    a signature through the real validator without a live Twilio request."""
+    validator = RequestValidator(settings.twilio_auth_token)
+    return validator.compute_signature(url, params)

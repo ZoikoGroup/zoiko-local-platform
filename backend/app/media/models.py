@@ -321,4 +321,11 @@ class ReceptionistCall(Base):
     callback_window: Mapped[ReceptionistCallbackWindow | None] = mapped_column(
         Enum(ReceptionistCallbackWindow, name="receptionist_callback_window_enum"), nullable=True
     )
+    # AI-minute metering (Pricing doc §5.3 "100 AI-handled minutes included,
+    # then $0.39/min") - populated from the same Twilio CallDuration used
+    # for call_seconds once the underlying call ends (see
+    # media.service.update_call_status). Whole-call duration, same caveat
+    # as usage/service.py's call_seconds: it's every TwiML leg of the call,
+    # not narrowly "AI-processing time". Null until the call actually ends.
+    duration_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

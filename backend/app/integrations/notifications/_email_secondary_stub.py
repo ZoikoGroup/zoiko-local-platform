@@ -14,20 +14,24 @@ from app.integrations.notifications.email import EmailError
 _SEND_URL = "https://api.sendgrid.com/v3/mail/send"
 
 
-def send_email(to: str, subject: str, body: str) -> str | None:
+def send_email(to: str, subject: str, body: str, headers: dict[str, str] | None = None) -> str | None:
     if not settings.sendgrid_api_key:
         raise EmailError("Secondary email provider (SendGrid) is not configured - set SENDGRID_API_KEY")
+
+    payload = {
+        "personalizations": [{"to": [{"email": to}]}],
+        "from": {"email": settings.email_from_address},
+        "subject": subject,
+        "content": [{"type": "text/plain", "value": body}],
+    }
+    if headers:
+        payload["headers"] = headers
 
     try:
         response = httpx.post(
             _SEND_URL,
             headers={"Authorization": f"Bearer {settings.sendgrid_api_key}"},
-            json={
-                "personalizations": [{"to": [{"email": to}]}],
-                "from": {"email": settings.email_from_address},
-                "subject": subject,
-                "content": [{"type": "text/plain", "value": body}],
-            },
+            json=payload,
             timeout=15.0,
         )
         response.raise_for_status()

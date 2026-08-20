@@ -109,6 +109,11 @@ MAX_CONCURRENT_CALLS_BY_RISK_STATE = {
 # every other threshold in this module.
 MAX_TRIAL_LIFETIME_SPEND_CENTS = 2000  # $20.00
 
+# Pricing doc §5.3 "100 AI-handled minutes included... no unlimited AI
+# evaluation" during trial - same "conservative first pass, not a tuned
+# production value" caveat as every other threshold in this module.
+MAX_TRIAL_AI_RECEPTIONIST_MINUTES = 30
+
 # Twilio Calls.create's own time_limit parameter (seconds) - hangs up the
 # call automatically once reached, a real hard cap enforced by Twilio itself
 # rather than a check that only runs before the call starts. Only applied to
@@ -412,6 +417,39 @@ def assert_cumulative_trial_usage_ok(db: Session, account_id: str) -> None:
             f"Trial usage limit reached: {total_cents}c all-time (limit {MAX_TRIAL_LIFETIME_SPEND_CENTS}c) - "
             f"upgrade to a paid plan to continue"
         )
+
+
+def is_ai_receptionist_trial_cap_exceeded(db: Session, account_id: str) -> bool:
+    """Production Readiness Standard Table 15 "AI: Separate AI minute cap;
+    no unlimited AI evaluation" - only meaningful while the account is
+    still in a TRIAL_* risk_state, same scoping as
+    assert_cumulative_trial_usage_ok. Unlike that function, this never
+    raises: called from qualify_caller, which must always let a live call
+    get a TwiML response - a hit here means "skip AI enrichment for this
+    call," not "fail the call." Records a signal each time it trips, same
+    "every occurrence feeds the rolling risk score" design as every other
+    signal in this module (see compute_account_risk_score) - not deduped."""
+    from sqlalchemy import func as sa_func
+
+    from app.usage.models import UsageEvent
+
+    account = db.query(Account).filter(Account.id == account_id).first()
+    if account is None or account.risk_state not in (AccountRiskState.TRIAL_LOW, AccountRiskState.TRIAL_VERIFIED):
+        return False
+
+    total_minutes = (
+        db.query(sa_func.coalesce(sa_func.sum(UsageEvent.quantity), 0))
+        .filter(UsageEvent.account_id == account_id, UsageEvent.event_type == "ai_receptionist_minutes")
+        .scalar()
+    )
+    if float(total_minutes) <= MAX_TRIAL_AI_RECEPTIONIST_MINUTES:
+        return False
+
+    record_risk_signal(
+        db, account_id=account_id, signal_type=RiskSignalType.AI_RECEPTIONIST_TRIAL_CAP_EXCEEDED,
+        detail=f"trial AI receptionist usage {float(total_minutes):.1f}min exceeds cap {MAX_TRIAL_AI_RECEPTIONIST_MINUTES}min",
+    )
+    return True
 
 
 def get_call_time_limit_for_account(db: Session, account_id: str) -> int | None:
@@ -931,6 +969,26 @@ def is_suspected_fingerprint_abuse(
     return len(accounts) >= DEVICE_FINGERPRINT_ACCOUNT_THRESHOLD
 
 
+def _check_and_record_fingerprint(
+    db: Session, *, fingerprint_hash: str | None, account_id: str, context: str
+) -> None:
+    """Shared body for check_fingerprint_on_{signup,login,call} - same
+    detection (never raises/blocks, a coarse client-side fingerprint has
+    real false-positive risk like a shared office network or family
+    device), just recorded from a different action so the sighting log
+    (and therefore is_suspected_fingerprint_abuse) reflects every place a
+    device actually touched an account, not only its first one."""
+    if not fingerprint_hash:
+        return
+    if is_suspected_fingerprint_abuse(db, fingerprint_hash, candidate_account_id=account_id):
+        record_risk_signal(
+            db, account_id=account_id, signal_type=RiskSignalType.DEVICE_FINGERPRINT_ABUSE,
+            detail=f"fingerprint seen across {DEVICE_FINGERPRINT_ACCOUNT_THRESHOLD}+ accounts in "
+                   f"{DEVICE_FINGERPRINT_WINDOW_HOURS}h (at {context})",
+        )
+    record_fingerprint_sighting(db, fingerprint_hash=fingerprint_hash, account_id=account_id)
+
+
 def check_fingerprint_on_signup(db: Session, *, fingerprint_hash: str | None, account_id: str) -> None:
     """Wired into signup (see app.numbering.identity.service.
     create_account_with_owner) - records the sighting and raises a
@@ -939,15 +997,27 @@ def check_fingerprint_on_signup(db: Session, *, fingerprint_hash: str | None, ac
     (open_fraud_case_if_needed), not a hard signup gate - a coarse
     client-side fingerprint has real false-positive risk (shared office
     network, family device)."""
-    if not fingerprint_hash:
-        return
-    if is_suspected_fingerprint_abuse(db, fingerprint_hash, candidate_account_id=account_id):
-        record_risk_signal(
-            db, account_id=account_id, signal_type=RiskSignalType.DEVICE_FINGERPRINT_ABUSE,
-            detail=f"fingerprint seen across {DEVICE_FINGERPRINT_ACCOUNT_THRESHOLD}+ accounts in "
-                   f"{DEVICE_FINGERPRINT_WINDOW_HOURS}h",
-        )
-    record_fingerprint_sighting(db, fingerprint_hash=fingerprint_hash, account_id=account_id)
+    _check_and_record_fingerprint(db, fingerprint_hash=fingerprint_hash, account_id=account_id, context="signup")
+
+
+def check_fingerprint_on_login(db: Session, *, fingerprint_hash: str | None, account_id: str) -> None:
+    """Same detection as check_fingerprint_on_signup, wired into
+    app.numbering.identity.routes.login instead - a fingerprint that's
+    unremarkable at signup (one new account) becomes a much stronger
+    signal if it keeps recurring across logins to many DIFFERENT accounts
+    (farmed/credential-stuffed account access from one device), which a
+    signup-only check would never see since each account only signs up
+    once."""
+    _check_and_record_fingerprint(db, fingerprint_hash=fingerprint_hash, account_id=account_id, context="login")
+
+
+def check_fingerprint_on_call(db: Session, *, fingerprint_hash: str | None, account_id: str) -> None:
+    """Same detection as check_fingerprint_on_signup, wired into
+    app.media.voice's authenticated outbound-call route - covers the one
+    other browser-driven action a device can take against an account
+    (placing a call), same rationale as check_fingerprint_on_login for why
+    a single signup-time check isn't enough on its own."""
+    _check_and_record_fingerprint(db, fingerprint_hash=fingerprint_hash, account_id=account_id, context="call placement")
 
 
 def add_blocked_destination(db: Session, *, prefix: str, reason: str, actor: str) -> BlockedDestination:

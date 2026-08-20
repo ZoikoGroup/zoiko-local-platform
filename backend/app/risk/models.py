@@ -60,6 +60,16 @@ class RiskSignalType(str, enum.Enum):
     # classic toll-fraud/robo-dial pattern this catches independent of the
     # existing per-window velocity check.
     CONCURRENT_CALL_LIMIT_EXCEEDED = "concurrent_call_limit_exceeded"
+    # Pricing doc §5.3 "no unlimited AI evaluation" trial control - distinct
+    # from SPEND_LIMIT_EXCEEDED/CumulativeTrialUsageExceededError above,
+    # which cap rated telecom $ spend; AI Receptionist minutes have no
+    # per-minute wholesale cost captured today (see usage.service's
+    # ai_receptionist_minutes event, which never sets estimated_cost_cents),
+    # so they'd otherwise never trip that $ cap at all. Detection-and-
+    # degrade, not a hard block - see qualify_caller's docstring: a live
+    # call must always get a TwiML response, so hitting this cap skips AI
+    # enrichment rather than failing the call.
+    AI_RECEPTIONIST_TRIAL_CAP_EXCEEDED = "ai_receptionist_trial_cap_exceeded"
 
 
 class AccountRiskState(str, enum.Enum):

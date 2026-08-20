@@ -21,8 +21,10 @@ from app.billing.schemas import (
     RejectBillingActionRequest,
     ResolveReconciliationExceptionRequest,
     RunBillingCycleRequest,
+    SetAIReceptionistAddonRequest,
     SimulatePaymentEventRequest,
     SubscriptionResponse,
+    TerminateSubscriptionRequest,
     UsageSummaryResponse,
     ZoikoNexReconciliationExceptionResponse,
     ZoikoNexReconciliationRunResponse,
@@ -149,6 +151,20 @@ def cancel_subscription(
         return service.cancel_subscription(db, current_user.account_id, actor=current_user.id, reason=payload.reason)
     except service.SubscriptionAlreadyCanceledError as e:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e
+
+
+@router.put("/subscription/ai-receptionist-addon", response_model=SubscriptionResponse)
+def set_ai_receptionist_addon(
+    payload: SetAIReceptionistAddonRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin),
+):
+    """Owner/Admin only, same commercial-decision gating as change_plan
+    above. Pricing doc §5.3 $29/workspace/month AI Receptionist add-on -
+    purely local entitlement flip; no real payment is collected here any
+    more than change_plan collects one (see run_billing_cycle for why -
+    this doesn't add an invoice line yet)."""
+    return service.set_ai_receptionist_addon(db, current_user.account_id, enabled=payload.enabled, actor=current_user.id)
 
 
 @router.get("/usage-summary", response_model=UsageSummaryResponse)
@@ -376,6 +392,22 @@ def request_refund_payment(
     )
 
 
+@router.post("/subscription/terminate/request", response_model=BillingActionRequestResponse, status_code=201)
+def request_terminate_subscription(
+    payload: TerminateSubscriptionRequest,
+    db: Session = Depends(get_db),
+    staff: PlatformStaff = Depends(require_capability("billing.terminate_subscription")),
+):
+    """SUPER_ADMIN only - stages the terminal, one-way deprovisioning of a
+    canceled/past-due subscription (Commercial Billing Operating Standard
+    doc §M3) for a different staff member to approve - same segregation-of-
+    duties bar as every other sensitive billing action here."""
+    return service.request_billing_action(
+        db, action_type=BillingActionType.TERMINATE_SUBSCRIPTION,
+        payload=payload.model_dump(), requested_by=staff.id,
+    )
+
+
 @router.get("/actions", response_model=list[BillingActionRequestResponse])
 def list_billing_actions(
     request_status: str | None = None,
@@ -415,6 +447,10 @@ def approve_billing_action(
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(e)) from e
     except KillSwitchTrippedError as e:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e)) from e
+    except service.SubscriptionAlreadyTerminatedError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e
+    except service.SubscriptionNotEligibleForTerminationError as e:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e)) from e
     except service.TestAccountRestrictedError as e:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e)) from e
 

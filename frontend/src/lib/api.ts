@@ -58,11 +58,12 @@ async function request<T>(
 // Architecture doc §5 "Fraud and Risk: device fingerprinting" - a coarse,
 // no-third-party-SDK client fingerprint (not a real anti-tampering
 // fingerprint like FingerprintJS) built from a few stable, low-invasiveness
-// signals. Sent as an optional header; the backend never requires it and
-// never blocks signup on it (see backend app.risk.service.
-// check_fingerprint_on_signup's docstring) - this is a detection signal,
-// not an access gate.
-async function computeDeviceFingerprint(): Promise<string | null> {
+// signals. Sent as an optional header on signup, login, and placing a call
+// (the three actions a device can take against an account); the backend
+// never requires it and never blocks any of them on it (see backend
+// app.risk.service.check_fingerprint_on_{signup,login,call}'s docstrings) -
+// this is a detection signal, not an access gate.
+export async function computeDeviceFingerprint(): Promise<string | null> {
   if (typeof window === "undefined" || !window.crypto?.subtle) return null;
   try {
     const raw = [
@@ -102,9 +103,11 @@ export type LoginResult = {
   mfa_token: string | null;
 };
 
-export function login(input: { email: string; password: string }): Promise<LoginResult> {
+export async function login(input: { email: string; password: string }): Promise<LoginResult> {
+  const fingerprint = await computeDeviceFingerprint();
   return request("/auth/login", {
     method: "POST",
+    headers: fingerprint ? { "X-Device-Fingerprint": fingerprint } : {},
     body: JSON.stringify(input),
   });
 }
@@ -1115,13 +1118,17 @@ export function listCalls(token: string, limit?: number): Promise<CallLogEntry[]
   });
 }
 
-export function placeOutboundCall(
+export async function placeOutboundCall(
   token: string,
   input: { to: string; from: string; message?: string }
 ): Promise<{ sid: string; status: string; to: string; from: string }> {
+  const fingerprint = await computeDeviceFingerprint();
   return request("/media/voice/outbound", {
     method: "POST",
-    headers: { Authorization: `Bearer ${token}` },
+    headers: {
+      Authorization: `Bearer ${token}`,
+      ...(fingerprint ? { "X-Device-Fingerprint": fingerprint } : {}),
+    },
     body: JSON.stringify(input),
   });
 }

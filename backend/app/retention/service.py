@@ -197,6 +197,10 @@ def purge_expired_recordings(db: Session) -> dict[str, dict[str, int]]:
     is kept - roadmap doc's "linked to immutable audit records" requirement
     covers the audit trail, not the raw media.
 
+    Called from app.ops.scheduled_reconciliation's daily run - still
+    depends on that script actually being scheduled externally (see its own
+    docstring), this function has no timer of its own.
+
     A failed deletion (provider unreachable, already gone, etc.) leaves
     recording_url untouched so it's retried next run, and logs its own
     audit event rather than failing silently - matches the doc's "no silent
