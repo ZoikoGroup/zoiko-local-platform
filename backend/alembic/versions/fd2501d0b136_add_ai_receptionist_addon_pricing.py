@@ -61,12 +61,12 @@ def upgrade() -> None:
         "subscriptions",
         sa.Column("ai_receptionist_addon_enabled", sa.Boolean(), nullable=False, server_default=sa.false()),
     )
-    # plans.included_ai_receptionist_minutes already exists as of migration
-    # 61bc6e50e6db (merged in from a parallel branch that added the same
-    # column under this name first) - seed into that column rather than
-    # adding a second, redundantly-named one.
-    op.execute("UPDATE plans SET included_ai_receptionist_minutes = 50 WHERE plan_code = 'pro'")
-    op.execute("UPDATE plans SET included_ai_receptionist_minutes = 150 WHERE plan_code = 'scale'")
+    # Seeding plans.included_ai_receptionist_minutes (Pro=50/Scale=150) is
+    # deliberately NOT done here - that column is added by 61bc6e50e6db, on
+    # an unrelated sibling branch this migration has no ordering guarantee
+    # against (both are just children of a shared ancestor). Done instead in
+    # the merge migration that reconciles both branches, the first point
+    # where both are guaranteed to have already run - see its own comment.
 
     conn = op.get_bind()
     now = conn.execute(sa.text("SELECT now()")).scalar()
@@ -92,7 +92,6 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    op.execute("UPDATE plans SET included_ai_receptionist_minutes = 0 WHERE plan_code IN ('pro', 'scale')")
     op.drop_column("subscriptions", "ai_receptionist_addon_enabled")
     op.drop_index("ix_ai_receptionist_addon_rates_price_book_version", table_name="ai_receptionist_addon_rates")
     op.drop_table("ai_receptionist_addon_rates")
