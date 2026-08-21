@@ -287,8 +287,14 @@ def buy_number(phone_number: str) -> dict:
             raise TelecomError(_clean_twilio_error_message(e)) from e
         return {"sid": number.sid, "phone_number": number.phone_number, "capabilities": number.capabilities}
 
-    secondary_fn = (lambda: secondary.buy_number(phone_number)) if settings.telecom_failover_enabled else None
-    return with_failover(_breaker, _primary, secondary_fn, TelecomError)
+    # Vonage failover deliberately skipped here (2026-08-21) - confirmed live
+    # that this account's Vonage credentials authenticate fine everywhere
+    # else (balance check, search) but get a flat 401 specifically on
+    # /number/buy, so falling back here only adds a slow, guaranteed-to-fail
+    # second attempt before the customer sees an error. Every other telecom
+    # operation (search, calls, SMS) still fails over normally - remove this
+    # override once Vonage's account is confirmed able to purchase numbers.
+    return with_failover(_breaker, _primary, None, TelecomError)
 
 
 def place_call(
