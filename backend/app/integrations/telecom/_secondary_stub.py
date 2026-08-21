@@ -39,7 +39,7 @@ _NUMBER_BUY_URL = "https://rest.nexmo.com/number/buy"
 _OWNED_NUMBERS_URL = "https://rest.nexmo.com/account/numbers"
 _VOICE_CALLS_URL = "https://api.nexmo.com/v1/calls"
 
-_NUMBER_TYPE = {"local": "landline", "mobile": "mobile", "tollfree": "landline-toll-free"}
+_NUMBER_TYPE = {"local": "landline", "mobile": "mobile-lvn", "tollfree": "landline-toll-free"}
 
 _NOT_CROSS_VENDOR_COMPATIBLE = (
     "{op} cannot fail over to Vonage: {reason} - Twilio and Vonage don't "

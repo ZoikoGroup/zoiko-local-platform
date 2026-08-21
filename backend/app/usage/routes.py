@@ -8,7 +8,9 @@ from app.staff.models import PlatformStaff
 from app.usage import service
 from app.usage.models import UsageDisputeStatus
 from app.usage.schemas import (
+    AIUsageRateResponse,
     CallingRateResponse,
+    NumberRateResponse,
     OpenUsageDisputeRequest,
     ResolveUsageDisputeRequest,
     UsageDisputeResponse,
@@ -36,6 +38,24 @@ def list_calling_rates(
     # Any authenticated member can see pricing before placing a call -
     # not an Owner/Admin-only view like the usage ledger itself.
     return service.list_calling_rates(db)
+
+
+@router.get("/number-rates", response_model=list[NumberRateResponse])
+def list_number_rates(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    # Same visibility bar as calling-rates above - any authenticated member
+    # can see what an additional number costs before buying one.
+    return service.list_number_rates(db)
+
+
+@router.get("/ai-usage-rate", response_model=AIUsageRateResponse | None)
+def get_ai_usage_rate(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    return service.get_ai_usage_rate(db)
 
 
 @router.post("/disputes", response_model=UsageDisputeResponse, status_code=status.HTTP_201_CREATED)

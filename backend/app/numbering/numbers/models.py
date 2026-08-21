@@ -68,6 +68,19 @@ class SupportedCountry(Base):
         Enum(MarketActivationStatus, name="market_activation_status_enum"),
         nullable=False, default=MarketActivationStatus.CLOSED,
     )
+    # Readiness doc §6.2: "PAID_OPEN only after legal/tax/telecom/privacy/
+    # consumer review and named sign-off." Previously set_market_activation_
+    # status only recorded a free-text `reason` on the audit log - anyone
+    # with the capability could flip a country to PAID_OPEN with a reason
+    # like "testing." These two columns are the actual named-reviewer
+    # evidence the doc requires, enforced (non-null) specifically for a
+    # transition INTO PAID_OPEN - see set_market_activation_status.
+    # NULL on this project's 8 pre-existing PAID_OPEN countries (see the
+    # comment above) since backfilling a fake reviewer name would be
+    # exactly the kind of invented approval this doc prohibits - they
+    # remain honestly unaudited until someone actually does that review.
+    legal_signoff_reference: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    legal_signoff_by: Mapped[str | None] = mapped_column(String(100), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 

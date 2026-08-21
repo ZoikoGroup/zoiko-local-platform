@@ -1,11 +1,13 @@
 "use client";
 
 import { useEffect, useState, useCallback } from "react";
+import Link from "next/link";
 import {
   getComplianceRules,
   openComplianceCase,
   listMyNumbers,
   listSupportedCountries,
+  listNumberRates,
   searchNumbers,
   reserveNumber,
   createNumberCheckoutSession,
@@ -26,6 +28,7 @@ import {
   type ComplianceRule,
   type MyPhoneNumber,
   type NumberSearchResult,
+  type NumberRate,
   type SupportedCountry,
   type TeamMember,
   type PortingRequest,
@@ -53,6 +56,36 @@ const PORTING_STATUS_STYLES: Record<string, string> = {
   rejected: "bg-red-50 text-red-700",
   canceled: "bg-slate-100 text-slate-600",
 };
+
+const NUMBER_TYPE_LABELS: Record<string, string> = {
+  local: "Local",
+  mobile: "Mobile",
+  tollfree: "Toll-Free",
+};
+
+const CAPABILITY_LABELS: { key: string; label: string }[] = [
+  { key: "voice", label: "Voice" },
+  { key: "sms", label: "SMS" },
+  { key: "mms", label: "MMS" },
+  { key: "fax", label: "Fax" },
+];
+
+function hasCapability(capabilities: Record<string, boolean> | null, key: string): boolean {
+  if (!capabilities) return false;
+  const hit = Object.entries(capabilities).find(([k]) => k.toLowerCase() === key);
+  return hit ? Boolean(hit[1]) : false;
+}
+
+function formatMonthlyFee(rate: NumberRate | undefined): string {
+  if (!rate) return "—";
+  const amount = (rate.recurring_price_cents / 100).toFixed(2);
+  return `$${amount}${rate.currency !== "USD" ? ` ${rate.currency}` : ""}/mo`;
+}
+
+function formatAddressRequirement(value: string | null): string {
+  if (!value || value.toLowerCase() === "none") return "None";
+  return value.charAt(0).toUpperCase() + value.slice(1);
+}
 
 const EMPTY_PORTING_FORM = {
   phone_number: "",
@@ -107,10 +140,12 @@ export default function NumbersPage() {
 
   const [step, setStep] = useState<Step>("search");
   const [countryCode, setCountryCode] = useState("US");
+  const [numberType, setNumberType] = useState("local");
   const [areaCode, setAreaCode] = useState("");
   const [searchResults, setSearchResults] = useState<NumberSearchResult[]>([]);
   const [searchBusy, setSearchBusy] = useState(false);
   const [searchError, setSearchError] = useState<string | null>(null);
+  const [numberRates, setNumberRates] = useState<NumberRate[]>([]);
 
   const [reservedNumber, setReservedNumber] = useState<MyPhoneNumber | null>(null);
   const [reserveBusy, setReserveBusy] = useState(false);
@@ -123,6 +158,7 @@ export default function NumbersPage() {
 
   const [purchaseBusy, setPurchaseBusy] = useState(false);
   const [purchaseError, setPurchaseError] = useState<string | null>(null);
+  const [purchaseQuotaExceeded, setPurchaseQuotaExceeded] = useState(false);
   const [emergencyAcknowledged, setEmergencyAcknowledged] = useState(false);
 
   const [portingRequests, setPortingRequests] = useState<PortingRequest[]>([]);
@@ -162,6 +198,11 @@ export default function NumbersPage() {
         );
       })
       .catch(() => setCountriesError("Couldn't load the list of supported countries."));
+  }, [token]);
+
+  useEffect(() => {
+    if (!token) return;
+    listNumberRates(token).then(setNumberRates).catch(() => {});
   }, [token]);
 
   // Stripe redirects the browser back here after Checkout (success or
@@ -238,7 +279,13 @@ export default function NumbersPage() {
     setSearchError(null);
     setSearchResults([]);
     try {
-      setSearchResults(await searchNumbers(token, { country: countryCode, area_code: areaCode || undefined }));
+      setSearchResults(
+        await searchNumbers(token, {
+          country: countryCode,
+          number_type: numberType,
+          area_code: areaCode || undefined,
+        })
+      );
     } catch (err) {
       setSearchError(
         err instanceof ApiError
@@ -255,7 +302,7 @@ export default function NumbersPage() {
     setReserveBusy(true);
     setReserveError(null);
     try {
-      const number = await reserveNumber(token, { e164: phoneNumber, country: countryCode });
+      const number = await reserveNumber(token, { e164: phoneNumber, country: countryCode, number_type: numberType });
       setReservedNumber(number);
       setStep("reserved");
     } catch (err) {
@@ -296,6 +343,7 @@ export default function NumbersPage() {
     if (!token || !reservedNumber || !emergencyAcknowledged) return;
     setPurchaseBusy(true);
     setPurchaseError(null);
+    setPurchaseQuotaExceeded(false);
     try {
       await acknowledgeEmergencyCallingLimitation(token);
       const session = await createNumberCheckoutSession(token, reservedNumber.e164);
@@ -323,6 +371,13 @@ export default function NumbersPage() {
         await loadMyNumbers();
       } else if (err instanceof ApiError && err.status === 409) {
         setPurchaseError(`${err.message} — go back and reserve a number again.`);
+      } else if (err instanceof ApiError && err.status === 402) {
+        // NumberQuotaExceededError / BillingSuspendedError - the backend's
+        // own message already explains why, but it's a dead end without a
+        // way to actually act on it (see the Link rendered alongside this
+        // below).
+        setPurchaseError(err.message);
+        setPurchaseQuotaExceeded(true);
       } else {
         setPurchaseError(
           err instanceof ApiError
@@ -346,6 +401,7 @@ export default function NumbersPage() {
     setCaseOpened(false);
     setComplianceError(null);
     setPurchaseError(null);
+    setPurchaseQuotaExceeded(false);
     setEmergencyAcknowledged(false);
   }
 
@@ -556,7 +612,7 @@ export default function NumbersPage() {
         )}
         {actionError && <p className="text-sm text-red-600 bg-red-50 rounded-lg px-3 py-2">{actionError}</p>}
 
-        <div className="space-y-2">
+        <div className="space-y-2 max-h-[32rem] overflow-y-auto pr-1">
           {myNumbers.map((n) => (
             <div key={n.id} className="rounded-lg border border-slate-200 px-4 py-3 space-y-3">
               <div className="flex items-center justify-between">
@@ -869,6 +925,21 @@ export default function NumbersPage() {
                 </option>
               ))}
             </select>
+            <label htmlFor="search-type" className="sr-only">
+              Number type
+            </label>
+            <select
+              id="search-type"
+              value={numberType}
+              onChange={(e) => setNumberType(e.target.value)}
+              className="rounded-lg border border-slate-300 px-3 py-2 text-sm"
+            >
+              {Object.entries(NUMBER_TYPE_LABELS).map(([value, label]) => (
+                <option key={value} value={value}>
+                  {label}
+                </option>
+              ))}
+            </select>
             <input
               value={areaCode}
               onChange={(e) => setAreaCode(e.target.value.replace(/\D/g, ""))}
@@ -892,31 +963,81 @@ export default function NumbersPage() {
           {reserveError && <p className="text-sm text-red-600 bg-red-50 rounded-lg px-3 py-2">{reserveError}</p>}
 
           {searchResults.length > 0 && (
-            <ul className="space-y-2">
-              {searchResults.map((result) => (
-                <li
-                  key={result.phone_number}
-                  className="flex items-center justify-between rounded-lg border border-slate-200 px-4 py-3"
-                >
-                  <div>
-                    <span className="font-mono text-slate-800">{result.phone_number}</span>
-                    {result.locality && (
-                      <span className="ml-2 text-xs text-slate-400">
-                        {result.locality}
-                        {result.region ? `, ${result.region}` : ""}
-                      </span>
-                    )}
-                  </div>
-                  <button
-                    onClick={() => handleReserve(result.phone_number)}
-                    disabled={reserveBusy}
-                    className="text-sm font-medium text-indigo-600 hover:text-indigo-800 disabled:opacity-60"
-                  >
-                    Reserve
-                  </button>
-                </li>
-              ))}
-            </ul>
+            <div className="overflow-x-auto -mx-2">
+              <table className="w-full text-sm min-w-[720px]">
+                <thead>
+                  <tr className="text-left text-xs font-medium text-slate-500 border-b border-slate-200">
+                    <th className="px-2 py-2 font-medium">Number</th>
+                    <th className="px-2 py-2 font-medium">Type</th>
+                    <th className="px-2 py-2 font-medium text-center" colSpan={CAPABILITY_LABELS.length}>
+                      Capabilities
+                    </th>
+                    <th className="px-2 py-2 font-medium">Address Requirement</th>
+                    <th className="px-2 py-2 font-medium">Monthly fee</th>
+                    <th className="px-2 py-2 font-medium"></th>
+                  </tr>
+                  <tr className="text-left text-[11px] text-slate-400 border-b border-slate-200">
+                    <th className="px-2 pb-1"></th>
+                    <th className="px-2 pb-1"></th>
+                    {CAPABILITY_LABELS.map((c) => (
+                      <th key={c.key} className="px-2 pb-1 text-center font-normal">
+                        {c.label}
+                      </th>
+                    ))}
+                    <th className="px-2 pb-1"></th>
+                    <th className="px-2 pb-1"></th>
+                    <th className="px-2 pb-1"></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {searchResults.map((result) => {
+                    const rate =
+                      numberRates.find((r) => r.country === countryCode && r.number_type === numberType) ??
+                      numberRates.find((r) => r.number_type === numberType);
+                    return (
+                      <tr key={result.phone_number} className="border-b border-slate-100 last:border-0">
+                        <td className="px-2 py-3">
+                          <span className="font-mono text-slate-800">{result.phone_number}</span>
+                          {result.locality && (
+                            <div className="text-xs text-slate-400">
+                              {result.locality}
+                              {result.region ? `, ${result.region}` : ""}
+                            </div>
+                          )}
+                        </td>
+                        <td className="px-2 py-3 text-slate-600">{NUMBER_TYPE_LABELS[numberType] ?? numberType}</td>
+                        {CAPABILITY_LABELS.map((c) => (
+                          <td key={c.key} className="px-2 py-3 text-center">
+                            {hasCapability(result.capabilities, c.key) ? (
+                              <span className="text-emerald-600" title={c.label} aria-label={`${c.label} supported`}>
+                                ✓
+                              </span>
+                            ) : (
+                              <span className="text-slate-300" title={`No ${c.label}`} aria-label={`${c.label} not supported`}>
+                                —
+                              </span>
+                            )}
+                          </td>
+                        ))}
+                        <td className="px-2 py-3 text-slate-600">
+                          {formatAddressRequirement(result.address_requirements)}
+                        </td>
+                        <td className="px-2 py-3 text-slate-600">{formatMonthlyFee(rate)}</td>
+                        <td className="px-2 py-3 text-right">
+                          <button
+                            onClick={() => handleReserve(result.phone_number)}
+                            disabled={reserveBusy}
+                            className="text-xs font-medium text-indigo-600 border border-indigo-200 rounded-lg px-3 py-1.5 hover:bg-indigo-50 disabled:opacity-60"
+                          >
+                            Reserve
+                          </button>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
           )}
         </div>
       )}
@@ -1008,15 +1129,19 @@ export default function NumbersPage() {
             <span className="font-mono text-slate-800">{reservedNumber.e164}</span>
           </div>
           <div className="flex justify-between text-sm">
-            <span className="text-slate-500">Purchase price</span>
+            <span className="text-slate-500">Monthly rate for this number</span>
             <span className="text-slate-800">
-              Your first number is included free with a paid plan — additional numbers are a
-              small monthly charge (test mode — no real charge either way).
+              {formatMonthlyFee(
+                numberRates.find(
+                  (r) => r.country === reservedNumber.country && r.number_type === reservedNumber.number_type
+                ) ?? numberRates.find((r) => r.number_type === reservedNumber.number_type)
+              )}
             </span>
           </div>
           <p className="text-xs text-slate-400">
-            If this number isn&apos;t included, you&apos;ll be redirected to Stripe&apos;s secure payment page to
-            complete the purchase.
+            Your first number is included free with a paid plan. If it isn&apos;t included — or this number type
+            costs more than the included allowance — you&apos;ll be redirected to Stripe&apos;s secure payment page
+            to pay the difference (test mode — no real charge either way).
           </p>
 
           <div className="bg-amber-50 border border-amber-200 rounded-lg p-3 space-y-2">
@@ -1039,7 +1164,17 @@ export default function NumbersPage() {
           </div>
 
           {purchaseError && (
-            <p className="text-sm text-red-600 bg-red-50 rounded-lg px-3 py-2">{purchaseError}</p>
+            <p className="text-sm text-red-600 bg-red-50 rounded-lg px-3 py-2">
+              {purchaseError}
+              {purchaseQuotaExceeded && (
+                <>
+                  {" "}
+                  <Link href="/dashboard/billing" className="font-medium underline hover:text-red-700">
+                    Upgrade your plan →
+                  </Link>
+                </>
+              )}
+            </p>
           )}
 
           <div className="flex items-center gap-3">
@@ -1080,7 +1215,7 @@ export default function NumbersPage() {
         {portingError && <p className="text-sm text-red-600 bg-red-50 rounded-lg px-3 py-2">{portingError}</p>}
 
         {portingRequests.length > 0 && (
-          <div className="space-y-2">
+          <div className="space-y-2 max-h-96 overflow-y-auto pr-1">
             {portingRequests.map((r) => (
               <div
                 key={r.id}

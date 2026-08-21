@@ -180,6 +180,89 @@ def test_get_plans_returns_all_six_seeded_plans(client):
     assert codes == {"free_trial", "starter", "business", "pro", "scale", "enterprise"}
 
 
+def test_pro_and_scale_get_included_ai_receptionist_minutes(client):
+    """Global Plans, Pricing & Commercial Launch Standard doc §5.3 - "Pro
+    included allowance 50 minutes/account/month" / "Scale included
+    allowance 150 minutes/account/month" - not multiplied by seat count,
+    which this table already guarantees (one row per plan tier)."""
+    token = _signup_and_login(client, "billingplans2@example.com")
+    response = client.get("/billing/plans", headers={"Authorization": f"Bearer {token}"})
+    minutes = {p["plan_code"]: p["included_ai_receptionist_minutes"] for p in response.json()}
+    assert minutes["pro"] == 50
+    assert minutes["scale"] == 150
+    assert minutes["starter"] == 0
+    assert minutes["business"] == 0
+
+
+def test_plan_cache_round_trip_preserves_included_ai_receptionist_minutes(client, db_session):
+    """Regression test: _serialize_plan/_deserialize_plan (the Redis cache
+    layer behind list_plans) previously omitted included_ai_receptionist_
+    minutes entirely - a cache MISS returned the right number (straight
+    from the DB), but a cache HIT would silently drop it. Forces a
+    serialize+deserialize round trip directly rather than depending on
+    Redis actually being reachable in this test environment."""
+    plans = service.list_plans(db_session)
+    pro = next(p for p in plans if p.plan_code == "pro")
+    round_tripped = service._deserialize_plan(service._serialize_plan(pro))
+    assert round_tripped.included_ai_receptionist_minutes == 50
+
+
+def test_get_active_price_catalog_entry_returns_the_real_annual_prices(db_session):
+    """Global Plans, Pricing & Commercial Launch doc: "Annual billing is
+    paid upfront... approximately 17% savings" - $129/$199/$299/$449,
+    seeded by migration 4ec152435b05 alongside the existing monthly rows."""
+    from app.billing.models import BillingPeriod
+
+    expected = {"starter": 12900, "business": 19900, "pro": 29900, "scale": 44900}
+    for plan_code, amount_cents in expected.items():
+        entry = service.get_active_price_catalog_entry(db_session, plan_code, billing_period=BillingPeriod.ANNUAL)
+        assert entry is not None, plan_code
+        assert entry.amount_minor_units == amount_cents
+        assert entry.is_placeholder is False
+
+
+def test_change_plan_records_the_chosen_billing_period(client, db_session):
+    from app.billing.models import BillingPeriod
+
+    token = _signup_and_login(client, "annualplan1@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    response = client.put(
+        "/billing/subscription/plan", json={"plan_code": "starter", "billing_period": "annual"}, headers=headers,
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["billing_period"] == "annual"
+
+    account_id = client.get("/auth/me", headers=headers).json()["account_id"]
+    sub = service.get_or_create_subscription(db_session, account_id)
+    assert sub.billing_period == BillingPeriod.ANNUAL
+
+
+def test_ai_receptionist_addon_grants_included_minutes_on_a_zero_allowance_plan(client, db_session):
+    """Doc §5.3: "$29/workspace/month add-on; 100 AI-handled minutes
+    included" - the only route Starter/Business have to any included AI
+    Receptionist minutes at all (Pro/Scale get a baked-in plan allowance
+    instead - see test_pro_and_scale_get_included_ai_receptionist_minutes)."""
+    token = _signup_and_login(client, "aiaddon1@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    account_id = client.get("/auth/me", headers=headers).json()["account_id"]
+    service.change_plan(db_session, account_id, "starter", actor="test-actor")
+
+    assert service.get_included_ai_receptionist_minutes(db_session, account_id) == 0
+
+    response = client.put(
+        "/billing/subscription/ai-receptionist-addon", json={"active": True}, headers=headers,
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["ai_receptionist_addon_active"] is True
+    assert service.get_included_ai_receptionist_minutes(db_session, account_id) == 100
+
+    disabled = client.put(
+        "/billing/subscription/ai-receptionist-addon", json={"active": False}, headers=headers,
+    )
+    assert disabled.json()["ai_receptionist_addon_active"] is False
+    assert service.get_included_ai_receptionist_minutes(db_session, account_id) == 0
+
+
 def test_get_subscription_returns_default_free_trial(client):
     token = _signup_and_login(client, "billingsub1@example.com")
     response = client.get("/billing/subscription", headers={"Authorization": f"Bearer {token}"})
@@ -375,16 +458,17 @@ def test_usage_summary_route_returns_zeroed_resources_for_a_fresh_account(client
 
 
 def test_number_purchase_blocked_once_plan_number_quota_is_reached(client, monkeypatch):
-    """free_trial's max_numbers=3 - the 4th purchase attempt must be
-    rejected with 402, without ever calling the real Twilio buy_number."""
+    """free_trial's max_numbers=1 (Global Plans, Pricing & Commercial
+    Launch Standard doc §7: "Maximum one trial number") - the 2nd purchase
+    attempt must be rejected with 402, without ever calling the real
+    Twilio buy_number."""
     _stub_buy_number(monkeypatch)
     token = _signup_and_login(client, "quotanumbers1@example.com")
     headers = {"Authorization": f"Bearer {token}"}
 
-    for e164 in ("+15550011111", "+15550011112", "+15550011113"):
-        response = _reserve_and_purchase(client, headers, e164)
-        assert response.status_code == 200, response.text
-        assert response.json()["status"] == "active"
+    response = _reserve_and_purchase(client, headers, "+15550011111")
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "active"
 
     over_limit = _reserve_and_purchase(client, headers, "+15550022222")
     assert over_limit.status_code == 402, over_limit.text
@@ -399,9 +483,8 @@ def test_number_purchase_succeeds_after_upgrading_plan(client, monkeypatch):
     token = _signup_and_login(client, "quotanumbers2@example.com")
     headers = {"Authorization": f"Bearer {token}"}
 
-    for e164 in ("+15550033331", "+15550033332", "+15550033333"):
-        response = _reserve_and_purchase(client, headers, e164)
-        assert response.status_code == 200, response.text
+    response = _reserve_and_purchase(client, headers, "+15550033331")
+    assert response.status_code == 200, response.text
 
     blocked = _reserve_and_purchase(client, headers, "+15550044444")
     assert blocked.status_code == 402, blocked.text

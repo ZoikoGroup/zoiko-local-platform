@@ -567,3 +567,96 @@ def test_edit_receptionist_call_summary_requires_auth(client, db_session):
 
     response = client.patch("/media/receptionist/calls/does-not-matter", json={"summary": "x"})
     assert response.status_code == 401
+
+
+def test_call_ending_records_ai_receptionist_minutes_usage_event(client, db_session):
+    """Global Plans, Pricing & Commercial Launch Standard doc §5.3 - AI
+    Receptionist minutes are billed at $0.39/min overage. A call that
+    actually reached the AI receptionist (has a ReceptionistCall row) must
+    record an ai_receptionist_minutes usage event, priced from AIUsageRate,
+    once the call's final status/duration lands."""
+    from app.usage.models import UsageEvent
+
+    _, account_id = _signup_and_login(client, "receptionistusage1@example.com")
+    number = PhoneNumber(
+        e164="+15550066666", country="US", status=PhoneNumberStatus.ACTIVE, account_id=account_id,
+        ai_receptionist_enabled=True,
+    )
+    db_session.add(number)
+    db_session.commit()
+
+    # The number has to exist and be recognized BEFORE the inbound leg (so
+    # incoming_call actually routes it to the receptionist instead of the
+    # "unrecognized number" branch), and update_call_status looks up an
+    # existing CallRecord by call_sid, which only /media/voice/incoming
+    # creates - same two-step webhook sequence as test_status_callback_
+    # updates_call_duration in test_voice.py.
+    incoming_url = "http://testserver/media/voice/incoming"
+    incoming_params = {"To": "+15550066666", "From": "+15559990000", "CallSid": "CArecusage1", "CallStatus": "ringing"}
+    incoming_response = client.post(
+        "/media/voice/incoming", data=incoming_params,
+        headers={"X-Twilio-Signature": _twilio_signature(incoming_url, incoming_params)},
+    )
+    assert incoming_response.status_code == 200
+
+    respond_url = "http://testserver/media/receptionist/respond"
+    respond_params = {
+        "CallSid": "CArecusage1", "To": "+15550066666", "From": "+15559990000",
+        "SpeechResult": "Hi, calling about a quote, please call back.",
+    }
+    client.post(
+        "/media/receptionist/respond", data=respond_params,
+        headers={"X-Twilio-Signature": _twilio_signature(respond_url, respond_params)},
+    )
+
+    status_url = "http://testserver/media/voice/status-callback"
+    status_params = {"CallSid": "CArecusage1", "CallStatus": "completed", "CallDuration": "125"}
+    signature = _twilio_signature(status_url, status_params)
+    response = client.post(
+        "/media/voice/status-callback", data=status_params, headers={"X-Twilio-Signature": signature}
+    )
+    assert response.status_code == 204
+
+    event = (
+        db_session.query(UsageEvent)
+        .filter(UsageEvent.event_type == "ai_receptionist_minutes")
+        .order_by(UsageEvent.created_at.desc())
+        .first()
+    )
+    assert event is not None
+    assert event.account_id == account_id
+    assert event.quantity == 3  # ceil(125s / 60) = 3 minutes
+    assert event.estimated_cost_cents == 3 * 39
+
+
+def test_call_not_reaching_receptionist_does_not_record_ai_minutes(client, db_session):
+    """A plain forwarded/voicemail call must never create a
+    ReceptionistCall row, so it must never be counted as AI Receptionist
+    usage either - the presence of a ReceptionistCall is what
+    distinguishes the two, not just that a call happened on a number with
+    the flag enabled."""
+    from app.usage.models import UsageEvent
+
+    token, account_id = _signup_and_login(client, "receptionistusage2@example.com")
+    number = PhoneNumber(
+        e164="+15550077777", country="US", status=PhoneNumberStatus.ACTIVE, account_id=account_id,
+        ai_receptionist_enabled=False,
+    )
+    db_session.add(number)
+    db_session.commit()
+
+    incoming_url = "http://testserver/media/voice/incoming"
+    incoming_params = {"To": "+15550077777", "From": "+15559990000", "CallSid": "CAnorecep1", "CallStatus": "ringing"}
+    client.post(
+        "/media/voice/incoming", data=incoming_params,
+        headers={"X-Twilio-Signature": _twilio_signature(incoming_url, incoming_params)},
+    )
+
+    status_url = "http://testserver/media/voice/status-callback"
+    status_params = {"CallSid": "CAnorecep1", "CallStatus": "completed", "CallDuration": "60"}
+    client.post(
+        "/media/voice/status-callback", data=status_params,
+        headers={"X-Twilio-Signature": _twilio_signature(status_url, status_params)},
+    )
+
+    assert db_session.query(UsageEvent).filter(UsageEvent.event_type == "ai_receptionist_minutes").count() == 0

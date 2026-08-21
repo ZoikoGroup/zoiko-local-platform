@@ -509,20 +509,26 @@ def test_concurrency_limit_blocks_extra_simultaneous_calls(client, db_session, m
 
     monkeypatch.setattr("app.media.service.telecom.place_call", _fake_place_call)
 
+    from app.risk.models import AccountRiskState
+    from app.risk.service import MAX_CONCURRENT_CALLS_BY_RISK_STATE
+
     token = _signup_and_login(client, "concurrencylimit1@example.com")
     headers = {"Authorization": f"Bearer {token}"}
     account_id = client.get("/auth/me", headers=headers).json()["account_id"]
     _active_number(db_session, account_id, "+15550070030")
 
-    # MAX_CONCURRENT_CALLS_TRIAL is 3 - the first 3 (each left "in-progress",
-    # matching the fake response above, so they count as still live) succeed,
-    # the 4th must be blocked.
-    for i in range(3):
+    # A fresh signup defaults to TRIAL_LOW - read the real configured limit
+    # rather than hardcoding it a second time here (this exact test used to
+    # assume 3, went stale when the tier was tuned down to 1, and the
+    # resulting 429-vs-200 mismatch was masked by an unrelated infra bug
+    # for a while - see the migration that fixed the real root cause).
+    limit = MAX_CONCURRENT_CALLS_BY_RISK_STATE[AccountRiskState.TRIAL_LOW]
+    for i in range(limit):
         response = _place_call(client, headers, f"+1416555000{i}", "+15550070030")
         assert response.status_code == 200, response.text
 
-    fourth = _place_call(client, headers, "+14165550009", "+15550070030")
-    assert fourth.status_code == 429
+    over_limit = _place_call(client, headers, "+14165550009", "+15550070030")
+    assert over_limit.status_code == 429
 
 
 def test_cumulative_trial_usage_blocks_after_lifetime_cap(client, db_session):

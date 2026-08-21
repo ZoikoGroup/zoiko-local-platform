@@ -2,8 +2,14 @@ import logging
 import uuid
 
 from app.events.consumer import handle_message, persist_event
-from app.events.models import EventLog
-from app.events.service import publish_event, publish_number_reserved, publish_video_room_created
+from app.events.models import EventLog, EventOutbox
+from app.events.service import (
+    flush_pending_outbox_events,
+    publish_event,
+    publish_event_durably,
+    publish_number_reserved,
+    publish_video_room_created,
+)
 from app.integrations.eventbus.kafka import EventBusError
 
 
@@ -129,3 +135,108 @@ def test_handle_message_sends_to_dlq_after_repeated_persist_failures(monkeypatch
     assert dlq["payload"]["original_topic"] == "zoiko.calls"
     assert dlq["payload"]["event_id"] == envelope["event_id"]
     assert "simulated persistence failure" in dlq["payload"]["error"]
+
+
+# --- Outbox pattern (producer-side durability) ---
+
+
+def test_publish_event_durably_writes_a_row_without_committing(db_session):
+    """publish_event_durably must NOT commit itself - that's the whole
+    point (see EventOutbox's docstring): the caller's own commit is what
+    makes the event row atomic with the business change it records."""
+    account_id = str(uuid.uuid4())
+    event_id = publish_event_durably(
+        db_session, "zoiko.billing", "subscription.plan_changed", account_id,
+        {"subscription_id": "sub-1", "previous_plan": "starter", "new_plan": "pro"},
+    )
+    assert event_id is not None
+
+    # Visible within the same uncommitted session (flush, not commit).
+    row = db_session.query(EventOutbox).filter(EventOutbox.payload["event_id"].astext == event_id).first()
+    assert row is not None
+    assert row.topic == "zoiko.billing"
+    assert row.event_type == "subscription.plan_changed"
+    assert row.account_id == account_id
+    assert row.published_at is None
+    assert row.payload["data"] == {"subscription_id": "sub-1", "previous_plan": "starter", "new_plan": "pro"}
+
+
+def test_flush_pending_outbox_events_publishes_and_marks_rows(db_session, monkeypatch):
+    published = []
+    monkeypatch.setattr(
+        "app.events.service.eventbus.publish",
+        lambda topic, key, payload: published.append((topic, key, payload)),
+    )
+
+    account_id = str(uuid.uuid4())
+    publish_event_durably(db_session, "zoiko.numbers", "number.activated", account_id, {"number_id": "num-2"})
+    db_session.commit()
+
+    # Real dev DB, not a fresh test DB - other pending rows can genuinely
+    # exist from other activity, so this asserts on THIS test's own row
+    # (scoped by account_id), not the flush's aggregate counts.
+    flush_pending_outbox_events(db_session)
+    assert any(topic == "zoiko.numbers" for topic, _key, _payload in published)
+
+    row = db_session.query(EventOutbox).filter(EventOutbox.account_id == account_id).first()
+    assert row.published_at is not None
+
+
+def test_flush_pending_outbox_events_records_failure_without_marking_published(db_session, monkeypatch):
+    def _raise(topic, key, payload):
+        raise EventBusError("broker unreachable")
+
+    monkeypatch.setattr("app.events.service.eventbus.publish", _raise)
+
+    account_id = str(uuid.uuid4())
+    publish_event_durably(db_session, "zoiko.numbers", "number.activated", account_id, {"number_id": "num-3"})
+    db_session.commit()
+
+    flush_pending_outbox_events(db_session)
+
+    row = db_session.query(EventOutbox).filter(EventOutbox.account_id == account_id).first()
+    assert row.published_at is None
+    assert row.attempt_count == 1
+    assert "broker unreachable" in row.last_error
+
+
+def test_flush_pending_outbox_events_does_not_republish_an_already_published_row(db_session, monkeypatch):
+    published = []
+    monkeypatch.setattr(
+        "app.events.service.eventbus.publish",
+        lambda topic, key, payload: published.append(topic),
+    )
+
+    account_id = str(uuid.uuid4())
+    publish_event_durably(db_session, "zoiko.numbers", "number.activated", account_id, {"number_id": "num-4"})
+    db_session.commit()
+
+    flush_pending_outbox_events(db_session)
+    first_publish_count = len(published)
+    flush_pending_outbox_events(db_session)
+
+    assert len(published) == first_publish_count  # not published a second time
+
+
+def test_change_plan_writes_a_durable_outbox_event(client, db_session):
+    """Integration test for the one representative call site this
+    session wired: billing_service.change_plan now writes an EventOutbox
+    row in the same transaction as the plan change, instead of the old
+    fire-and-forget publish_subscription_plan_changed after commit."""
+    from app.billing import service as billing_service
+    from app.numbering.identity.models import Account, AccountType
+
+    account = Account(name="Outbox Test Co", account_type=AccountType.BUSINESS)
+    db_session.add(account)
+    db_session.flush()
+
+    billing_service.change_plan(db_session, account.id, "starter", actor="test-actor")
+
+    row = (
+        db_session.query(EventOutbox)
+        .filter(EventOutbox.event_type == "subscription.plan_changed", EventOutbox.account_id == account.id)
+        .first()
+    )
+    assert row is not None
+    assert row.payload["data"]["new_plan"] == "starter"
+    assert row.payload["data"]["previous_plan"] == "free_trial"

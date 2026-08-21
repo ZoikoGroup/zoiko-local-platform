@@ -16,6 +16,7 @@ from app.ops import service
 from app.ops.models import IncidentStatus, KillSwitchScope
 from app.ops.schemas import (
     CreateIncidentRequest,
+    EventOutboxFlushResponse,
     IncidentResponse,
     KillSwitchResponse,
     SetKillSwitchRequest,
@@ -257,3 +258,17 @@ def deactivate_kill_switch(
 ):
     """SUPER_ADMIN only."""
     return service.set_kill_switch(db, scope, False, actor=staff.id)
+
+
+@router.post("/event-outbox/flush", response_model=EventOutboxFlushResponse)
+def flush_event_outbox(
+    db: Session = Depends(get_db),
+    _staff: PlatformStaff = Depends(require_capability("ops.manage_event_outbox")),
+):
+    """Same manual-trigger-plus-external-cron pattern as POST
+    /billing/zoikonex/reconciliation/run and POST /compliance/cases/
+    sweep-expired - publishes every not-yet-published EventOutbox row to
+    Kafka (see events.service.flush_pending_outbox_events)."""
+    from app.events.service import flush_pending_outbox_events
+
+    return flush_pending_outbox_events(db)

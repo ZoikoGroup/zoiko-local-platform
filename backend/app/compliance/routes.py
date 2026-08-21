@@ -191,3 +191,15 @@ def reject_case(
 ):
     case = _get_case_or_404(db, case_id)
     return service.reject_case(db, case, actor=staff.id, reason=payload.reason)
+
+
+@router.post("/cases/sweep-expired", response_model=list[ComplianceCaseResponse])
+def sweep_expired_cases(
+    db: Session = Depends(get_db),
+    _staff: PlatformStaff = Depends(require_capability("compliance.review_case")),
+):
+    """Same manual-trigger-plus-external-cron pattern as POST
+    /billing/zoikonex/reconciliation/run - meant to be hit periodically by
+    a scheduled job, with a staff-triggerable route for on-demand runs
+    between them. Marks any PENDING case past its expires_at as EXPIRED."""
+    return service.sweep_expired_compliance_cases(db)

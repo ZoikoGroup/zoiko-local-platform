@@ -161,7 +161,9 @@ export function removeTeamMember(token: string, userId: string): Promise<void> {
   });
 }
 
-export function googleAuth(credential: string): Promise<{ access_token: string; token_type: string }> {
+export function googleAuth(
+  credential: string
+): Promise<{ access_token: string; token_type: string; is_new_account: boolean }> {
   return request("/auth/google", {
     method: "POST",
     body: JSON.stringify({ credential }),
@@ -776,6 +778,7 @@ export type MyPhoneNumber = {
   id: string;
   e164: string;
   country: string;
+  number_type: string;
   status: string;
   assigned_user_id: string | null;
   reserved_until: string | null;
@@ -801,7 +804,36 @@ export type NumberSearchResult = {
   locality: string | null;
   region: string | null;
   capabilities: Record<string, boolean> | null;
+  address_requirements: string | null;
 };
+
+export type NumberRate = {
+  country: string;
+  number_type: string;
+  recurring_price_cents: number;
+  currency: string;
+  is_placeholder: boolean;
+};
+
+export function listNumberRates(token: string): Promise<NumberRate[]> {
+  return request<NumberRate[]>("/usage/number-rates", {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export type AIUsageRate = {
+  overage_price_cents_per_minute: number;
+  addon_monthly_price_cents: number;
+  addon_included_minutes: number;
+  currency: string;
+  is_placeholder: boolean;
+};
+
+export function getAIUsageRate(token: string): Promise<AIUsageRate | null> {
+  return request<AIUsageRate | null>("/usage/ai-usage-rate", {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
 
 export function searchNumbers(
   token: string,
@@ -817,7 +849,7 @@ export function searchNumbers(
 
 export function reserveNumber(
   token: string,
-  input: { e164: string; country: string }
+  input: { e164: string; country: string; number_type?: string }
 ): Promise<MyPhoneNumber> {
   return request<MyPhoneNumber>("/numbers/reserve", {
     method: "POST",
@@ -1346,13 +1378,18 @@ export type Plan = {
   monthly_voice_minutes: number;
   monthly_video_minutes: number;
   monthly_ai_summaries: number;
+  included_ai_receptionist_minutes: number;
   trial_days: number;
 };
+
+export type BillingPeriod = "monthly" | "annual";
 
 export type Subscription = {
   id: string;
   plan_code: string;
   status: "trialing" | "active" | "past_due" | "canceled";
+  billing_period: BillingPeriod;
+  ai_receptionist_addon_active: boolean;
   trial_ends_at: string | null;
   current_period_start: string;
   current_period_end: string;
@@ -1369,6 +1406,7 @@ export type PriceCatalogEntry = {
   id: string;
   plan_code: string;
   catalog_version: string;
+  billing_period: BillingPeriod;
   amount_minor_units: number;
   currency_code: string;
   status: string;
@@ -1411,11 +1449,23 @@ export function getSubscription(token: string): Promise<Subscription> {
   });
 }
 
-export function changeSubscriptionPlan(token: string, planCode: string): Promise<Subscription> {
+export function changeSubscriptionPlan(
+  token: string,
+  planCode: string,
+  billingPeriod: BillingPeriod = "monthly"
+): Promise<Subscription> {
   return request<Subscription>("/billing/subscription/plan", {
     method: "PUT",
     headers: { Authorization: `Bearer ${token}` },
-    body: JSON.stringify({ plan_code: planCode }),
+    body: JSON.stringify({ plan_code: planCode, billing_period: billingPeriod }),
+  });
+}
+
+export function setAIReceptionistAddon(token: string, active: boolean): Promise<Subscription> {
+  return request<Subscription>("/billing/subscription/ai-receptionist-addon", {
+    method: "PUT",
+    headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ active }),
   });
 }
 
@@ -1429,10 +1479,15 @@ export function cancelSubscription(token: string, reason?: string): Promise<Subs
 
 // null means this plan has no price on file yet (only expected for
 // Enterprise, which is sales-led/custom).
-export function getPriceCatalogEntry(token: string, planCode: string): Promise<PriceCatalogEntry | null> {
-  return request<PriceCatalogEntry | null>(`/billing/price-catalog/${planCode}`, {
-    headers: { Authorization: `Bearer ${token}` },
-  });
+export function getPriceCatalogEntry(
+  token: string,
+  planCode: string,
+  billingPeriod: BillingPeriod = "monthly"
+): Promise<PriceCatalogEntry | null> {
+  return request<PriceCatalogEntry | null>(
+    `/billing/price-catalog/${planCode}?billing_period=${billingPeriod}`,
+    { headers: { Authorization: `Bearer ${token}` } }
+  );
 }
 
 export function getUsageSummary(token: string): Promise<UsageSummary> {

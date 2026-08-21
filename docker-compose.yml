@@ -67,7 +67,12 @@ services:
     image: redis:7-alpine
     restart: unless-stopped
     ports:
-      - "6380:6379"  # host 6380 -> avoids conflict with any other local Redis on 6379
+      - "6381:6379"  # host 6381 -> 6379 and 6380 are both already taken on this dev machine
+                      # (a native/other-project Redis on 6379, and the separate zoikonex-redis
+                      # mock-services container on 6380 - confirmed live, same class of collision
+                      # as the postgres 5433 note above). Only matters for reaching Redis from the
+                      # HOST (e.g. a natively-run uvicorn, redis-cli) - the backend container talks
+                      # to it via the internal Docker network as redis:6379 regardless of this.
     volumes:
       - zoiko_redis_data:/data
 

@@ -393,3 +393,39 @@ def test_unsubscribing_stops_incident_notifications(client, monkeypatch):
 
     me = client.get("/ops/status-subscription/me", headers=headers).json()
     assert me["is_active"] is False
+
+
+def test_flush_event_outbox_requires_the_capability(client, db_session):
+    """SUPPORT lacks ops.manage_event_outbox (SUPER_ADMIN-only grant, see
+    migration a651ca32ef6b) - require_capability's fail-closed design
+    means a role with no grant row is denied, not silently allowed."""
+    token = _create_and_login_staff(db_session, client, "opssupport1@zoikolocal.com")
+    response = client.post("/ops/event-outbox/flush", headers={"Authorization": f"Bearer {token}"})
+    assert response.status_code == 403
+
+
+def test_flush_event_outbox_publishes_pending_rows(client, db_session, monkeypatch):
+    import uuid
+
+    from app.events.service import publish_event_durably
+    from app.staff.models import PlatformStaffRole
+
+    published = []
+    monkeypatch.setattr(
+        "app.events.service.eventbus.publish",
+        lambda topic, key, payload: published.append(topic),
+    )
+
+    publish_event_durably(
+        db_session, "zoiko.numbers", "number.activated", str(uuid.uuid4()), {"number_id": "n1"},
+    )
+    db_session.commit()
+
+    token = _create_and_login_staff(
+        db_session, client, "opssuperadmin1@zoikolocal.com", role=PlatformStaffRole.SUPER_ADMIN,
+    )
+    response = client.post("/ops/event-outbox/flush", headers={"Authorization": f"Bearer {token}"})
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["published"] >= 1
+    assert "zoiko.numbers" in published

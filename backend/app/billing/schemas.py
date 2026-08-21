@@ -13,6 +13,7 @@ class PlanResponse(BaseModel):
     monthly_voice_minutes: int
     monthly_video_minutes: int
     monthly_ai_summaries: int
+    included_ai_receptionist_minutes: int
     trial_days: int
 
 
@@ -22,6 +23,7 @@ class PriceCatalogEntryResponse(BaseModel):
     id: str
     plan_code: str
     catalog_version: str
+    billing_period: str
     amount_minor_units: int
     currency_code: str
     status: str
@@ -39,6 +41,7 @@ class PriceCatalogEntryResponse(BaseModel):
 class CreatePriceCatalogEntryRequest(BaseModel):
     plan_code: str
     catalog_version: str
+    billing_period: str = "monthly"
     amount_minor_units: int
     currency_code: str = "USD"
     is_placeholder: bool = True
@@ -58,6 +61,8 @@ class SubscriptionResponse(BaseModel):
     id: str
     plan_code: str
     status: str
+    billing_period: str
+    ai_receptionist_addon_active: bool
     trial_ends_at: datetime | None
     current_period_start: datetime
     current_period_end: datetime
@@ -68,6 +73,11 @@ class SubscriptionResponse(BaseModel):
 
 class ChangePlanRequest(BaseModel):
     plan_code: str
+    billing_period: str = "monthly"
+
+
+class SetAIReceptionistAddonRequest(BaseModel):
+    active: bool
 
 
 class CancelSubscriptionRequest(BaseModel):
@@ -160,6 +170,25 @@ class ZoikoNexSyncEventResponse(BaseModel):
     event_type: str
     zoikonex_ref: str | None
     payload: dict
+    created_at: datetime
+
+
+class CustomerBillingHistoryEntryResponse(BaseModel):
+    """GET /billing/invoices - deliberately NOT ZoikoNexSyncEventResponse.
+    That schema's `payload: dict` is an unfiltered internal diagnostic blob
+    (bill_cycle_close_error/capture_error carry raw ZoikoNex-side error
+    text - see run_billing_cycle's docstring on the confirmed-live bugs
+    those come from; placeholder_price is business-sensitive pricing-
+    governance metadata) - fine for GET /billing/zoikonex/sync-log
+    (staff-only), never fine for a paying customer. This is an explicit
+    allow-list of fields, not a filtered copy of that payload."""
+
+    id: str
+    event_type: str
+    reference: str | None
+    amount_minor_units: int | None
+    status: str | None
+    reason: str | None
     created_at: datetime
 
 

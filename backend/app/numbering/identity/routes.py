@@ -147,9 +147,9 @@ def google_auth(payload: GoogleAuthRequest, db: Session = Depends(get_db)):
     if claims is None or not claims.get("email"):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid Google credential")
 
-    user = service.find_or_create_user_from_google(db, claims["email"], claims.get("name"))
+    user, is_new_account = service.find_or_create_user_from_google(db, claims["email"], claims.get("name"))
     token = create_access_token(subject=user.id, scope="customer")
-    return TokenResponse(access_token=token)
+    return TokenResponse(access_token=token, is_new_account=is_new_account)
 
 
 @router.get("/me", response_model=UserResponse)

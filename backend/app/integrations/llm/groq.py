@@ -19,7 +19,17 @@ def circuit_state() -> str:
 
 _CHAT_COMPLETIONS_URL = "https://api.groq.com/openai/v1/chat/completions"
 _MODELS_URL = "https://api.groq.com/openai/v1/models"
-_MODEL = "llama-3.1-8b-instant"
+# 2026-08-19: llama-3.1-8b-instant was retired from Groq's catalog entirely
+# (confirmed live: GET /v1/models no longer lists any general-purpose Meta
+# Llama chat model, only small llama-prompt-guard-2-* moderation models -
+# every real call through this module was silently 404ing as a result,
+# breaking voicemail/call summarization and AI receptionist qualification
+# in production, not just tests). qwen/qwen3.6-27b verified live against
+# both real system prompts below (json_object mode, correct field shapes,
+# and critically the qualification prompt's "always a full sentence, never
+# a fragment" requirement, which a couple of the other current models
+# tested did not reliably satisfy).
+_MODEL = "qwen/qwen3.6-27b"
 MODEL_VERSION = f"groq/{_MODEL}"
 
 

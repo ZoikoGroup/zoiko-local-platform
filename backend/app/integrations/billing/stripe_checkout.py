@@ -107,7 +107,12 @@ def refund_payment(payment_intent_id: str) -> dict:
                 )
         except stripe.error.StripeError as e:
             raise PaymentError(f"Stripe refund failed: {e}") from e
-        return {"id": refund.id, "status": refund.status}
+        # amount/currency: the real refunded figure per Stripe's own
+        # response - callers need this instead of assuming a flat constant
+        # now that checkout amounts vary by NumberRate (country/number_type
+        # and inclusion-threshold surcharges), see
+        # app.numbering.numbers.service._refund_and_notify_failed_purchase.
+        return {"id": refund.id, "status": refund.status, "amount": refund.amount, "currency": refund.currency}
 
     return with_failover(_breaker, _primary, None, PaymentError)
 

@@ -38,7 +38,9 @@ export default function SignupPage() {
         return;
       }
       saveToken(result.access_token);
-      router.push("/dashboard");
+      // New accounts go through plan selection first, not straight into
+      // the product - the login page (returning users) skips this.
+      router.push("/choose-plan");
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Something went wrong");
     } finally {
@@ -49,9 +51,12 @@ export default function SignupPage() {
   async function handleGoogleCredential(credential: string) {
     setError(null);
     try {
-      const { access_token } = await googleAuth(credential);
+      const { access_token, is_new_account } = await googleAuth(credential);
       saveToken(access_token);
-      router.push("/dashboard");
+      // An existing customer can land on /signup by mistake (bookmark,
+      // stray link) and sign in with Google - that must never route them
+      // through plan selection, which really reassigns a real subscription.
+      router.push(is_new_account ? "/choose-plan" : "/dashboard");
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Google sign-in failed");
     }

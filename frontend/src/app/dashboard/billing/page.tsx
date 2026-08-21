@@ -7,15 +7,19 @@ import {
   listPlans,
   getSubscription,
   changeSubscriptionPlan,
+  setAIReceptionistAddon,
   cancelSubscription,
   getPriceCatalogEntry,
   getUsageSummary,
+  getAIUsageRate,
   ApiError,
   type UsageEvent,
   type Plan,
   type PriceCatalogEntry,
   type Subscription,
   type UsageSummary,
+  type BillingPeriod,
+  type AIUsageRate,
 } from "@/lib/api";
 import { getToken } from "@/lib/auth";
 
@@ -47,7 +51,8 @@ function formatPrice(entry: PriceCatalogEntry | null | undefined): string {
     minimumFractionDigits: 2,
     maximumFractionDigits: 2,
   });
-  return `${entry.currency_code} ${amount}/mo`;
+  const suffix = entry.billing_period === "annual" ? "/yr" : "/mo";
+  return `${entry.currency_code} ${amount}${suffix}`;
 }
 
 function UsageBar({ resource }: { resource: { resource: string; used: number; limit: number } }) {
@@ -75,14 +80,21 @@ export default function BillingPage() {
   const [subscription, setSubscription] = useState<Subscription | null>(null);
   const [usageSummary, setUsageSummary] = useState<UsageSummary | null>(null);
   const [plans, setPlans] = useState<Plan[]>([]);
+  const [billingPeriod, setBillingPeriod] = useState<BillingPeriod>("monthly");
   const [prices, setPrices] = useState<Record<string, PriceCatalogEntry | null>>({});
   const [summaryLoading, setSummaryLoading] = useState(true);
   const [summaryError, setSummaryError] = useState<string | null>(null);
   const [changingPlan, setChangingPlan] = useState<string | null>(null);
   const [planError, setPlanError] = useState<string | null>(null);
+  const [confirmingPlan, setConfirmingPlan] = useState<string | null>(null);
+  const [planChangedTo, setPlanChangedTo] = useState<string | null>(null);
   const [canceling, setCanceling] = useState(false);
   const [cancelError, setCancelError] = useState<string | null>(null);
   const [confirmingCancel, setConfirmingCancel] = useState(false);
+
+  const [aiUsageRate, setAiUsageRate] = useState<AIUsageRate | null>(null);
+  const [addonBusy, setAddonBusy] = useState(false);
+  const [addonError, setAddonError] = useState<string | null>(null);
 
   const [events, setEvents] = useState<UsageEvent[]>([]);
   const [logLoading, setLogLoading] = useState(true);
@@ -109,14 +121,21 @@ export default function BillingPage() {
     if (!token || plans.length === 0) return;
     Promise.all(
       plans.map((plan) =>
-        getPriceCatalogEntry(token, plan.plan_code)
+        getPriceCatalogEntry(token, plan.plan_code, billingPeriod)
           .then((entry) => [plan.plan_code, entry] as const)
           .catch(() => [plan.plan_code, null] as const)
       )
     ).then((entries) => {
       setPrices(Object.fromEntries(entries));
     });
-  }, [token, plans]);
+  }, [token, plans, billingPeriod]);
+
+  useEffect(() => {
+    if (!token) return;
+    getAIUsageRate(token)
+      .then(setAiUsageRate)
+      .catch(() => {});
+  }, [token]);
 
   useEffect(() => {
     if (!token) return;
@@ -145,12 +164,28 @@ export default function BillingPage() {
     setChangingPlan(planCode);
     setPlanError(null);
     try {
-      await changeSubscriptionPlan(token, planCode);
+      await changeSubscriptionPlan(token, planCode, billingPeriod);
       await loadPlanAndUsage();
+      setConfirmingPlan(null);
+      setPlanChangedTo(planCode);
     } catch (err) {
       setPlanError(err instanceof ApiError ? err.message : "Couldn't change plan.");
     } finally {
       setChangingPlan(null);
+    }
+  }
+
+  async function handleToggleAddon(active: boolean) {
+    if (!token) return;
+    setAddonBusy(true);
+    setAddonError(null);
+    try {
+      const sub = await setAIReceptionistAddon(token, active);
+      setSubscription(sub);
+    } catch (err) {
+      setAddonError(err instanceof ApiError ? err.message : "Couldn't update the AI Receptionist add-on.");
+    } finally {
+      setAddonBusy(false);
     }
   }
 
@@ -284,12 +319,38 @@ export default function BillingPage() {
       </div>
 
       <div className="bg-white rounded-xl border border-slate-200 p-6 space-y-4">
-        <h3 className="font-semibold text-slate-900">Plans</h3>
+        <div className="flex items-center justify-between">
+          <h3 className="font-semibold text-slate-900">Plans</h3>
+          <div className="inline-flex items-center rounded-lg border border-slate-200 p-0.5 text-xs font-medium">
+            <button
+              onClick={() => setBillingPeriod("monthly")}
+              className={`rounded-md px-3 py-1 ${
+                billingPeriod === "monthly" ? "bg-indigo-600 text-white" : "text-slate-600 hover:text-slate-900"
+              }`}
+            >
+              Monthly
+            </button>
+            <button
+              onClick={() => setBillingPeriod("annual")}
+              className={`rounded-md px-3 py-1 ${
+                billingPeriod === "annual" ? "bg-indigo-600 text-white" : "text-slate-600 hover:text-slate-900"
+              }`}
+            >
+              Annual <span className="text-emerald-600">(save ~17%)</span>
+            </button>
+          </div>
+        </div>
         {planError && <p className="text-sm text-red-600 bg-red-50 rounded-lg px-3 py-2">{planError}</p>}
+        {planChangedTo && (
+          <p className="text-sm text-emerald-700 bg-emerald-50 rounded-lg px-3 py-2">
+            You&apos;re now on the {plans.find((p) => p.plan_code === planChangedTo)?.name ?? planChangedTo} plan.
+          </p>
+        )}
 
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
           {plans.map((plan) => {
             const isCurrent = subscription?.plan_code === plan.plan_code;
+            const isConfirming = confirmingPlan === plan.plan_code;
             return (
               <div
                 key={plan.plan_code}
@@ -314,15 +375,44 @@ export default function BillingPage() {
                   <li>{plan.monthly_voice_minutes.toLocaleString()} voice minutes / mo</li>
                   <li>{plan.monthly_video_minutes.toLocaleString()} video minutes / mo</li>
                   <li>{plan.monthly_ai_summaries.toLocaleString()} AI summaries / mo</li>
+                  {plan.included_ai_receptionist_minutes > 0 && (
+                    <li>{plan.included_ai_receptionist_minutes.toLocaleString()} AI Receptionist minutes / mo</li>
+                  )}
                 </ul>
-                {isAdmin && !isCurrent && (
+                {isAdmin && !isCurrent && !isConfirming && (
                   <button
-                    onClick={() => handleChangePlan(plan.plan_code)}
-                    disabled={changingPlan === plan.plan_code}
+                    onClick={() => {
+                      setPlanChangedTo(null);
+                      setConfirmingPlan(plan.plan_code);
+                    }}
                     className="w-full text-xs font-medium rounded-lg px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-60 text-white"
                   >
-                    {changingPlan === plan.plan_code ? "Switching..." : "Switch to this plan"}
+                    Switch to this plan
                   </button>
+                )}
+                {isAdmin && isConfirming && (
+                  <div className="space-y-1.5">
+                    <p className="text-xs text-slate-600">
+                      Move from {subscription ? plans.find((p) => p.plan_code === subscription.plan_code)?.name : "your current plan"} to{" "}
+                      {plan.name} ({formatPrice(prices[plan.plan_code])})?
+                    </p>
+                    <div className="flex gap-2">
+                      <button
+                        onClick={() => handleChangePlan(plan.plan_code)}
+                        disabled={changingPlan === plan.plan_code}
+                        className="flex-1 text-xs font-medium rounded-lg px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-60 text-white"
+                      >
+                        {changingPlan === plan.plan_code ? "Switching..." : "Confirm"}
+                      </button>
+                      <button
+                        onClick={() => setConfirmingPlan(null)}
+                        disabled={changingPlan === plan.plan_code}
+                        className="flex-1 text-xs font-medium rounded-lg px-3 py-1.5 border border-slate-300 text-slate-700 hover:bg-slate-50"
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                  </div>
                 )}
               </div>
             );
@@ -332,6 +422,46 @@ export default function BillingPage() {
           <p className="text-xs text-slate-400">Only an account Owner or Admin can change plans.</p>
         )}
       </div>
+
+      {aiUsageRate && subscription && (
+        <div className="bg-white rounded-xl border border-slate-200 p-6 space-y-3">
+          <div className="flex items-center justify-between">
+            <div>
+              <h3 className="font-semibold text-slate-900">AI Receptionist add-on</h3>
+              <p className="text-sm text-slate-500">
+                {(aiUsageRate.addon_monthly_price_cents / 100).toFixed(2)} {aiUsageRate.currency}/workspace/month —{" "}
+                {aiUsageRate.addon_included_minutes} AI-handled minutes included, then{" "}
+                {(aiUsageRate.overage_price_cents_per_minute / 100).toFixed(2)} {aiUsageRate.currency}/min.
+              </p>
+            </div>
+            {subscription.ai_receptionist_addon_active && (
+              <span className="text-xs font-medium text-emerald-700 bg-emerald-50 rounded-full px-2.5 py-1">
+                Active
+              </span>
+            )}
+          </div>
+          {addonError && <p className="text-sm text-red-600 bg-red-50 rounded-lg px-3 py-2">{addonError}</p>}
+          {isAdmin ? (
+            <button
+              onClick={() => handleToggleAddon(!subscription.ai_receptionist_addon_active)}
+              disabled={addonBusy}
+              className={`text-xs font-medium rounded-lg px-3 py-1.5 disabled:opacity-60 ${
+                subscription.ai_receptionist_addon_active
+                  ? "border border-slate-300 text-slate-700 hover:bg-slate-50"
+                  : "bg-indigo-600 hover:bg-indigo-700 text-white"
+              }`}
+            >
+              {addonBusy
+                ? "Saving..."
+                : subscription.ai_receptionist_addon_active
+                  ? "Remove add-on"
+                  : "Add to my plan"}
+            </button>
+          ) : (
+            <p className="text-xs text-slate-400">Only an account Owner or Admin can change add-ons.</p>
+          )}
+        </div>
+      )}
 
       <div className="bg-white rounded-xl border border-slate-200 p-6 space-y-4">
         <h3 className="font-semibold text-slate-900">Usage log</h3>

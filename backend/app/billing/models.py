@@ -16,6 +16,17 @@ class SubscriptionStatus(str, enum.Enum):
     CANCELED = "canceled"
 
 
+class BillingPeriod(str, enum.Enum):
+    """Global Plans, Pricing & Commercial Launch doc: "Annual billing is
+    paid upfront. The annual prices represent approximately 17% savings
+    versus twelve monthly payments." Previously there was no such
+    dimension anywhere in this codebase - every PriceCatalogEntry/
+    Subscription was implicitly monthly-only."""
+
+    MONTHLY = "monthly"
+    ANNUAL = "annual"
+
+
 class Plan(Base):
     """Architecture doc §5: "Subscription and Entitlement... Plans, limits,
     feature gates, number allowances, minute/video/AI quotas, grace
@@ -46,6 +57,15 @@ class Plan(Base):
     # regardless of tier.
     max_video_participants: Mapped[int] = mapped_column(Integer, nullable=False, server_default="8")
     monthly_ai_summaries: Mapped[int] = mapped_column(Integer, nullable=False)
+    # Global Plans, Pricing & Commercial Launch Standard doc §5.3 - "Pro
+    # included allowance 50 minutes/account/month" and "Scale included
+    # allowance 150 minutes/account/month... not multiplied by seat count."
+    # Account-level (this table has one row per plan tier, not per seat),
+    # which already matches the doc's "not multiplied by seat count" rule
+    # with no extra logic needed. 0 for every other tier - Starter/Business
+    # get no baked-in allowance (AI Receptionist is add-on only for them
+    # per the doc's capability table), Enterprise is "Custom commitment."
+    included_ai_receptionist_minutes: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
     trial_days: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     sort_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     # Populated once by app.integrations.billing.zoikonex.register_plan_in_catalog
@@ -111,12 +131,23 @@ class PriceCatalogEntry(Base):
 
     __tablename__ = "price_catalog_entries"
     __table_args__ = (
-        UniqueConstraint("plan_code", "catalog_version", name="uq_price_catalog_entry_plan_version"),
+        UniqueConstraint(
+            "plan_code", "catalog_version", "billing_period", name="uq_price_catalog_entry_plan_version_period"
+        ),
     )
 
     id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=new_uuid)
     plan_code: Mapped[str] = mapped_column(String(50), ForeignKey("plans.plan_code"), nullable=False, index=True)
     catalog_version: Mapped[str] = mapped_column(String(50), nullable=False)
+    # Pricing doc: "Annual billing is paid upfront... approximately 17%
+    # savings versus twelve monthly payments" - a genuinely different price
+    # point, not a derived discount applied at charge time, so it's its own
+    # catalog row (same Class-A-immutable discipline as every other price
+    # here) rather than a multiplier computed on the monthly amount.
+    billing_period: Mapped[BillingPeriod] = mapped_column(
+        Enum(BillingPeriod, name="billing_period_enum"),
+        nullable=False, default=BillingPeriod.MONTHLY, server_default=BillingPeriod.MONTHLY.name,
+    )
     amount_minor_units: Mapped[int] = mapped_column(Integer, nullable=False)
     currency_code: Mapped[str] = mapped_column(String(3), nullable=False, default="USD")
     status: Mapped[CatalogEntryStatus] = mapped_column(
@@ -164,6 +195,18 @@ class Subscription(Base):
     status: Mapped[SubscriptionStatus] = mapped_column(
         Enum(SubscriptionStatus, name="subscription_status_enum"), nullable=False, default=SubscriptionStatus.TRIALING
     )
+    billing_period: Mapped[BillingPeriod] = mapped_column(
+        Enum(BillingPeriod, name="billing_period_enum"),
+        nullable=False, default=BillingPeriod.MONTHLY, server_default=BillingPeriod.MONTHLY.name,
+    )
+    # Pricing doc §5.3: "$29/workspace/month add-on; 100 AI-handled minutes
+    # included" - Starter/Business get 0 baked-in AI Receptionist minutes
+    # (Plan.included_ai_receptionist_minutes), this is the only way those
+    # two tiers can get any included minutes at all. Same no-real-payment
+    # posture as change_plan - toggling this doesn't charge anything yet
+    # (no live ZoikoNex/Stripe recurring-charge path exists for
+    # subscriptions), it only grants the entitlement.
+    ai_receptionist_addon_active: Mapped[bool] = mapped_column(nullable=False, default=False, server_default="false")
     trial_ends_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     current_period_start: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     current_period_end: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

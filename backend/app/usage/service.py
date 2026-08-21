@@ -8,7 +8,9 @@ from app.billing.service import sync_usage_event_to_zoikonex
 from app.events.service import publish_usage_rated
 from app.usage.models import (
     DEFAULT_RATE_COUNTRY,
+    AIUsageRate,
     CallingRate,
+    NumberRate,
     UsageAdjustment,
     UsageDispute,
     UsageDisputeStatus,
@@ -56,6 +58,80 @@ def upsert_calling_rate(db: Session, *, country: str, price_per_minute_cents: in
     else:
         rate.price_per_minute_cents = price_per_minute_cents
         rate.currency = currency
+    db.commit()
+    db.refresh(rate)
+    return rate
+
+
+def list_number_rates(db: Session) -> list[NumberRate]:
+    return db.query(NumberRate).order_by(NumberRate.country.asc(), NumberRate.number_type.asc()).all()
+
+
+def get_number_rate(db: Session, country: str | None, number_type: str) -> NumberRate | None:
+    """country-specific rate for this number_type if one's configured, else
+    the DEFAULT_RATE_COUNTRY fallback, else None - same lookup shape as
+    get_calling_rate above."""
+    if country is not None:
+        rate = (
+            db.query(NumberRate)
+            .filter(NumberRate.country == country, NumberRate.number_type == number_type)
+            .first()
+        )
+        if rate is not None:
+            return rate
+    return (
+        db.query(NumberRate)
+        .filter(NumberRate.country == DEFAULT_RATE_COUNTRY, NumberRate.number_type == number_type)
+        .first()
+    )
+
+
+def upsert_number_rate(
+    db: Session, *, country: str, number_type: str = "local", recurring_price_cents: int,
+    currency: str = "USD", is_placeholder: bool = False,
+) -> NumberRate:
+    rate = db.query(NumberRate).filter(NumberRate.country == country, NumberRate.number_type == number_type).first()
+    if rate is None:
+        rate = NumberRate(
+            country=country, number_type=number_type, recurring_price_cents=recurring_price_cents,
+            currency=currency, is_placeholder=is_placeholder,
+        )
+        db.add(rate)
+    else:
+        rate.recurring_price_cents = recurring_price_cents
+        rate.currency = currency
+        rate.is_placeholder = is_placeholder
+    db.commit()
+    db.refresh(rate)
+    return rate
+
+
+def get_ai_usage_rate(db: Session) -> AIUsageRate | None:
+    """One active row expected (global, not country-specific - see
+    AIUsageRate's docstring); takes the most recently created if a price
+    revision ever adds a second one. Deliberately NOT the same discipline
+    as CallingRate/NumberRate's upserts below (those edit the existing row
+    in place) - upsert_ai_usage_rate always inserts a new row instead, so
+    a price revision stays reconstructable (which rate was in effect when),
+    matching PriceCatalogEntry's "new version, never a silent edit"
+    treatment of real approved prices rather than CallingRate/NumberRate's
+    placeholder-style single mutable row."""
+    return db.query(AIUsageRate).order_by(AIUsageRate.created_at.desc()).first()
+
+
+def upsert_ai_usage_rate(
+    db: Session, *, overage_price_cents_per_minute: int, addon_monthly_price_cents: int = 2900,
+    addon_included_minutes: int = 100, currency: str = "USD", is_placeholder: bool = False,
+) -> AIUsageRate:
+    """Always inserts - see get_ai_usage_rate's docstring on why this is
+    intentionally NOT an in-place edit like upsert_calling_rate/
+    upsert_number_rate below."""
+    rate = AIUsageRate(
+        overage_price_cents_per_minute=overage_price_cents_per_minute,
+        addon_monthly_price_cents=addon_monthly_price_cents, addon_included_minutes=addon_included_minutes,
+        currency=currency, is_placeholder=is_placeholder,
+    )
+    db.add(rate)
     db.commit()
     db.refresh(rate)
     return rate

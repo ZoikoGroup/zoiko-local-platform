@@ -48,23 +48,33 @@ def upgrade() -> None:
         name='account_risk_state_enum',
     )
     account_risk_state_enum.create(op.get_bind(), checkfirst=True)
-    op.add_column(
-        'accounts',
-        sa.Column(
-            'risk_state',
-            postgresql.ENUM(name='account_risk_state_enum', create_type=False),
-            nullable=False,
-            server_default='TRIAL_LOW',
-        ),
-    )
-    op.execute("UPDATE accounts SET risk_state = 'PAID_NORMAL'")
-    op.execute(
-        """
-        UPDATE accounts SET risk_state = 'REVIEW_REQUIRED'
-        WHERE id IN (SELECT account_id FROM fraud_cases WHERE status = 'OPEN')
-        """
-    )
-    op.alter_column('accounts', 'risk_state', server_default=None)
+
+    # checkfirst - a shared dev DB can already have this column from a
+    # concurrent branch's history reaching the same DDL under a different
+    # revision id before the chains were merged (same class of bug already
+    # fixed elsewhere in this chain - see "Fix migration chain bugs found
+    # by replaying it fresh"). Column-add has no checkfirst kwarg of its
+    # own, unlike the enum-type create above, so guard it explicitly.
+    inspector = sa.inspect(op.get_bind())
+    existing_columns = {col['name'] for col in inspector.get_columns('accounts')}
+    if 'risk_state' not in existing_columns:
+        op.add_column(
+            'accounts',
+            sa.Column(
+                'risk_state',
+                postgresql.ENUM(name='account_risk_state_enum', create_type=False),
+                nullable=False,
+                server_default='TRIAL_LOW',
+            ),
+        )
+        op.execute("UPDATE accounts SET risk_state = 'PAID_NORMAL'")
+        op.execute(
+            """
+            UPDATE accounts SET risk_state = 'REVIEW_REQUIRED'
+            WHERE id IN (SELECT account_id FROM fraud_cases WHERE status = 'OPEN')
+            """
+        )
+        op.alter_column('accounts', 'risk_state', server_default=None)
 
 
 def downgrade() -> None:

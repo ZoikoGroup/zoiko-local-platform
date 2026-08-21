@@ -9,6 +9,7 @@ from app.billing.models import (
     BillingActionRequest,
     BillingActionRequestStatus,
     BillingActionType,
+    BillingPeriod,
     CatalogEntryStatus,
     Plan,
     PriceCatalogEntry,
@@ -21,17 +22,21 @@ from app.billing.models import (
     ZoikoNexSyncEventType,
 )
 from app.core.config import settings
-from app.events.service import publish_subscription_canceled, publish_subscription_payment_event, publish_subscription_plan_changed
+from app.events.service import publish_subscription_canceled, publish_subscription_payment_event
 from app.integrations.billing import zoikonex as zoikonex_adapter
 from app.integrations.cache.redis import cache_get, cache_set
 from app.integrations.telecom import twilio as telecom
 from app.notifications.service import (
+    notify_credit_or_refund_processed,
+    notify_invoice_available,
     notify_payment_failed,
     notify_payment_reminder,
+    notify_payment_succeeded,
     notify_plan_changed,
     notify_plan_started,
     notify_service_restored,
     notify_trial_started,
+    send_internal_alert,
 )
 from app.ops.models import KillSwitchScope
 from app.ops.service import assert_kill_switch_not_active
@@ -100,6 +105,7 @@ def _serialize_plan(plan: Plan) -> dict:
         "monthly_video_minutes": plan.monthly_video_minutes,
         "max_video_participants": plan.max_video_participants,
         "monthly_ai_summaries": plan.monthly_ai_summaries,
+        "included_ai_receptionist_minutes": plan.included_ai_receptionist_minutes,
         "trial_days": plan.trial_days,
         "sort_order": plan.sort_order,
         "zoikonex_product_id": plan.zoikonex_product_id,
@@ -119,6 +125,7 @@ def _deserialize_plan(data: dict) -> Plan:
         monthly_video_minutes=data["monthly_video_minutes"],
         max_video_participants=data["max_video_participants"],
         monthly_ai_summaries=data["monthly_ai_summaries"],
+        included_ai_receptionist_minutes=data["included_ai_receptionist_minutes"],
         trial_days=data["trial_days"],
         sort_order=data["sort_order"],
         zoikonex_product_id=data["zoikonex_product_id"],
@@ -168,21 +175,25 @@ class CannotActivateEntryError(Exception):
     activate_price_catalog_entry)."""
 
 
-def get_active_price_catalog_entry(db: Session, plan_code: str, *, market: str = "GLOBAL") -> PriceCatalogEntry | None:
-    """The "current" price for a plan+market. Prefers the entry actually
-    promoted to ACTIVE (see activate_price_catalog_entry) - Production
-    Readiness & Go-Live Decision Standard §2.3/Table 8's PROPOSED/APPROVED/
-    ACTIVE/RETIRED lifecycle. Falls back to the most recently created
-    entry for this plan+market regardless of status when nothing has ever
-    been activated yet - preserves the original P0-1 dev/test convenience
-    (create a catalog entry, bill against it immediately in development)
-    without requiring every test/dev workflow to also call activate.
-    run_billing_cycle's own status/is_placeholder checks are what actually
-    keep a non-ACTIVE entry from being charged outside development."""
+def get_active_price_catalog_entry(
+    db: Session, plan_code: str, *, market: str = "GLOBAL", billing_period: BillingPeriod = BillingPeriod.MONTHLY,
+) -> PriceCatalogEntry | None:
+    """The "current" price for a plan+market+billing_period. Prefers the
+    entry actually promoted to ACTIVE (see activate_price_catalog_entry) -
+    Production Readiness & Go-Live Decision Standard §2.3/Table 8's
+    PROPOSED/APPROVED/ACTIVE/RETIRED lifecycle. Falls back to the most
+    recently created entry for this plan+market+period regardless of
+    status when nothing has ever been activated yet - preserves the
+    original P0-1 dev/test convenience (create a catalog entry, bill
+    against it immediately in development) without requiring every
+    test/dev workflow to also call activate. run_billing_cycle's own
+    status/is_placeholder checks are what actually keep a non-ACTIVE entry
+    from being charged outside development."""
     active = (
         db.query(PriceCatalogEntry)
         .filter(
             PriceCatalogEntry.plan_code == plan_code, PriceCatalogEntry.market == market,
+            PriceCatalogEntry.billing_period == billing_period,
             PriceCatalogEntry.status == CatalogEntryStatus.ACTIVE,
         )
         .first()
@@ -191,7 +202,10 @@ def get_active_price_catalog_entry(db: Session, plan_code: str, *, market: str =
         return active
     return (
         db.query(PriceCatalogEntry)
-        .filter(PriceCatalogEntry.plan_code == plan_code, PriceCatalogEntry.market == market)
+        .filter(
+            PriceCatalogEntry.plan_code == plan_code, PriceCatalogEntry.market == market,
+            PriceCatalogEntry.billing_period == billing_period,
+        )
         .order_by(PriceCatalogEntry.created_at.desc())
         .first()
     )
@@ -201,6 +215,7 @@ def create_price_catalog_entry(
     db: Session, *, plan_code: str, catalog_version: str, amount_minor_units: int,
     currency_code: str = "USD", is_placeholder: bool = True, actor: str,
     price_book_version: str | None = None, market: str = "GLOBAL",
+    billing_period: BillingPeriod = BillingPeriod.MONTHLY,
     effective_from: datetime | None = None, effective_to: datetime | None = None,
 ) -> PriceCatalogEntry:
     """SUPER_ADMIN-gated at the route - locking/changing a price is a
@@ -212,17 +227,21 @@ def create_price_catalog_entry(
     activate_price_catalog_entry advance the lifecycle."""
     existing = (
         db.query(PriceCatalogEntry)
-        .filter(PriceCatalogEntry.plan_code == plan_code, PriceCatalogEntry.catalog_version == catalog_version)
+        .filter(
+            PriceCatalogEntry.plan_code == plan_code, PriceCatalogEntry.catalog_version == catalog_version,
+            PriceCatalogEntry.billing_period == billing_period,
+        )
         .first()
     )
     if existing is not None:
         raise PriceCatalogEntryExistsError(
-            f"Catalog version {catalog_version!r} already exists for plan {plan_code!r} - use a new version"
+            f"Catalog version {catalog_version!r} ({billing_period.value}) already exists for plan {plan_code!r} - "
+            f"use a new version"
         )
     entry = PriceCatalogEntry(
         plan_code=plan_code, catalog_version=catalog_version, amount_minor_units=amount_minor_units,
         currency_code=currency_code, is_placeholder=is_placeholder,
-        price_book_version=price_book_version, market=market,
+        price_book_version=price_book_version, market=market, billing_period=billing_period,
         effective_from=effective_from, effective_to=effective_to,
     )
     db.add(entry)
@@ -277,10 +296,19 @@ def activate_price_catalog_entry(db: Session, entry_id: str, *, actor: str) -> P
     """Promotes an APPROVED entry to ACTIVE - the step that actually makes
     it the version run_billing_cycle will charge outside development
     (Production Readiness Standard §2.3/Table 8). At most one ACTIVE entry
-    can exist per plan_code+market: whatever was previously ACTIVE for the
-    same plan_code+market is moved to RETIRED in the same transaction,
-    never deleted, so past invoices remain reproducible against the exact
-    version that was active when they were issued."""
+    can exist per plan_code+market+billing_period: whatever was previously
+    ACTIVE for that same plan_code+market+billing_period is moved to
+    RETIRED in the same transaction, never deleted, so past invoices
+    remain reproducible against the exact version that was active when
+    they were issued.
+
+    billing_period is included in this "previously active" scope
+    (regression fix, 2026-08-19) - it was added to PriceCatalogEntry after
+    this function was originally written, and without it here, activating
+    a plan's ANNUAL entry would incorrectly retire that same plan's
+    already-ACTIVE MONTHLY entry (and vice versa) purely because they
+    share the same plan_code+market, which is wrong - they're two
+    independent, simultaneously-valid prices."""
     entry = db.query(PriceCatalogEntry).filter(PriceCatalogEntry.id == entry_id).first()
     if entry is None:
         raise PriceCatalogEntryNotFoundError(f"No such price catalog entry: {entry_id!r}")
@@ -292,6 +320,7 @@ def activate_price_catalog_entry(db: Session, entry_id: str, *, actor: str) -> P
         db.query(PriceCatalogEntry)
         .filter(
             PriceCatalogEntry.plan_code == entry.plan_code, PriceCatalogEntry.market == entry.market,
+            PriceCatalogEntry.billing_period == entry.billing_period,
             PriceCatalogEntry.status == CatalogEntryStatus.ACTIVE,
         )
         .all()
@@ -379,9 +408,10 @@ def sync_usage_event_to_zoikonex(db: Session, usage_event) -> None:
     except zoikonex_adapter.ZoikoNexError:
         result = {}
 
-    # Real ZoikoNex rating (not the local estimate above) - only for
-    # call_seconds, since that's the only event type with a real,
-    # already-decided price (Zoiko Local's own CallingRate card). Every
+    # Real ZoikoNex rating (not the local estimate above) - fires for any
+    # event_type that got a non-None estimate above (call_seconds,
+    # ai_receptionist_minutes, number_month - each has a real,
+    # already-decided price via CallingRate/AIUsageRate/NumberRate). Every
     # other event_type has no rate table yet, so there's nothing real to
     # submit - see zoikonex_adapter.rate_usage_event's docstring.
     rated = {}
@@ -472,17 +502,34 @@ def get_or_create_subscription(db: Session, account_id: str) -> Subscription:
     return sub
 
 
-def change_plan(db: Session, account_id: str, plan_code: str, *, actor: str) -> Subscription:
+def change_plan(
+    db: Session, account_id: str, plan_code: str, *, actor: str, billing_period: BillingPeriod = BillingPeriod.MONTHLY,
+) -> Subscription:
     plan = get_plan(db, plan_code)  # raises PlanNotFoundError for an invalid code
     sub = get_or_create_subscription(db, account_id)
     before_plan = sub.plan_code
 
     sub.plan_code = plan.plan_code
+    sub.billing_period = billing_period
     if sub.status == SubscriptionStatus.TRIALING:
         # Deliberately choosing a plan ends the trial early - matches how
         # every real subscription product treats an explicit upgrade.
         sub.status = SubscriptionStatus.ACTIVE
         sub.trial_ends_at = None
+    # Durable outbox write (see EventOutbox's docstring) instead of the
+    # fire-and-forget publish_subscription_plan_changed used elsewhere -
+    # a plan change is entitlement-critical (it changes what the account
+    # can do right now), so it's one of the representative call sites
+    # this pattern is scoped to, not every domain event. Written into the
+    # SAME transaction as the plan_code/billing_period update below via
+    # db.add() only (no commit here) - if this commit rolls back, the
+    # event row never existed either.
+    from app.events.service import publish_event_durably
+
+    publish_event_durably(
+        db, "zoiko.billing", "subscription.plan_changed", account_id,
+        {"subscription_id": sub.id, "previous_plan": before_plan, "new_plan": sub.plan_code},
+    )
     db.commit()
     db.refresh(sub)
     sync_subscription_to_zoikonex(db, sub)
@@ -490,9 +537,6 @@ def change_plan(db: Session, account_id: str, plan_code: str, *, actor: str) -> 
     log_event(
         db, actor=actor, action="subscription.plan_changed", target=f"subscription:{sub.id}",
         before={"plan_code": before_plan}, after={"plan_code": sub.plan_code},
-    )
-    publish_subscription_plan_changed(
-        account_id, subscription_id=sub.id, previous_plan=before_plan, new_plan=sub.plan_code,
     )
 
     # Production Readiness Standard doc's "trial-abuse step-up model" - a
@@ -516,6 +560,41 @@ def change_plan(db: Session, account_id: str, plan_code: str, *, actor: str) -> 
             new_plan=plan.name,
         )
     return sub
+
+
+def set_ai_receptionist_addon(db: Session, account_id: str, *, active: bool, actor: str) -> Subscription:
+    """Global Plans, Pricing & Commercial Launch doc §5.3: "$29/workspace/
+    month add-on; 100 AI-handled minutes included." Same no-real-payment
+    posture as change_plan - this only grants/revokes the entitlement, it
+    doesn't charge anything yet (no live recurring-charge path exists for
+    subscriptions - see run_billing_cycle's flat plan-fee-only scope)."""
+    sub = get_or_create_subscription(db, account_id)
+    before = sub.ai_receptionist_addon_active
+    sub.ai_receptionist_addon_active = active
+    db.commit()
+    db.refresh(sub)
+    log_event(
+        db, actor=actor, action="subscription.ai_receptionist_addon_changed", target=f"subscription:{sub.id}",
+        before={"ai_receptionist_addon_active": before}, after={"ai_receptionist_addon_active": active},
+    )
+    return sub
+
+
+def get_included_ai_receptionist_minutes(db: Session, account_id: str) -> int:
+    """Plan-baked-in allowance (Pro/Scale only) plus the add-on's included
+    minutes if the account has purchased it (Starter/Business's only route
+    to any included AI Receptionist minutes at all, per the doc's
+    capability table)."""
+    from app.usage.service import get_ai_usage_rate
+
+    sub = get_or_create_subscription(db, account_id)
+    plan = get_plan(db, sub.plan_code)
+    total = plan.included_ai_receptionist_minutes
+    if sub.ai_receptionist_addon_active:
+        rate = get_ai_usage_rate(db)
+        if rate is not None:
+            total += rate.addon_included_minutes
+    return total
 
 
 def assert_number_quota_available(db: Session, account_id: str, *, exclude_number_id: str | None = None) -> None:
@@ -548,19 +627,23 @@ def assert_number_quota_available(db: Session, account_id: str, *, exclude_numbe
         )
 
 
-def is_first_number_included(db: Session, account_id: str, *, exclude_number_id: str | None = None) -> bool:
-    """Global Plans, Pricing & Commercial Launch Standard doc: "First
-    standard local number: Included with each paid user in eligible
-    markets... Additional standard local number: From $4.99/month."
+def get_included_number_ids(db: Session, account_id: str, *, exclude_number_id: str | None = None) -> set[str]:
+    """Global Plans, Pricing & Commercial Launch doc: "Included local
+    number: 1 standard eligible number per paid user." Previously this
+    codebase read that as "the account's very first number is free,
+    period" regardless of team size - the doc's own wording is explicit
+    that the free-number POOL scales with paid seat count, so a 10-seat
+    Business account is entitled to up to 10 free numbers, not 1.
 
-    Phase-1 reading of "included with each paid user": the account's very
-    first number is free, not literally one free number per seat - there is
-    no existing per-seat number-consumption ledger in this codebase (seats
-    are gated by a simple headroom count in assert_seat_quota_available, not
-    individually-tracked entitlements), and the doc gives no metering rule
-    for how a multi-seat free allowance would be issued or decremented. This
-    is the same kind of engineering-judgment call already made for Pro/
-    Scale's entitlement numbers (see the plan-tier migration).
+    The pool size is the account's current seat count (db.query(User)...
+    count(), same source assert_seat_quota_available already uses) - not
+    separately capped against plan.max_team_seats, since seat count can
+    never exceed that cap in the first place (assert_seat_quota_available
+    blocks adding a member beyond it). No per-seat "claim" step exists -
+    an included number isn't assigned to a specific user, it's simply
+    "does the account currently have at least one open included slot,"
+    same self-service pattern as before, just with a variable-size pool
+    now instead of a hardcoded pool of 1.
 
     Free-trial accounts don't qualify - "paid user" is the doc's own
     wording - nor does a canceled subscription. The recurring "$4.99/month
@@ -568,12 +651,28 @@ def is_first_number_included(db: Session, account_id: str, *, exclude_number_id:
     codebase only has one-time Stripe Checkout for numbers today, and
     turning that into real recurring per-number billing (subscription
     items, proration, invoice lines) is a distinct, larger change than
-    "is the first number free" - out of scope for this fix."""
+    "how many numbers are free" - out of scope for this fix.
+
+    Single source of truth for "which numbers are the free ones" - returns
+    the ids of the account's N earliest-acquired qualifying numbers, where
+    N is the seat count (empty set if the account doesn't qualify at all,
+    or owns none yet). Used both to decide whether purchasing a NEW number
+    should be free (is_first_number_included below) and, at renewal time,
+    whether a SPECIFIC already-owned number should still be treated as a
+    free one (app.numbering.numbers.service.mark_number_renewed) - these
+    used to be two independently-maintained implementations with different
+    status sets and no shared subscription-qualification check, which
+    could (and in the free-trial case, did) disagree on which number was
+    really free."""
+    from app.numbering.identity.models import User
     from app.numbering.numbers.models import PhoneNumber, PhoneNumberStatus
 
     sub = get_or_create_subscription(db, account_id)
     if sub.plan_code == DEFAULT_PLAN_CODE or sub.status == SubscriptionStatus.CANCELED:
-        return False
+        return set()
+    seat_count = db.query(User).filter(User.account_id == account_id).count()
+    if seat_count <= 0:
+        return set()
     query = db.query(PhoneNumber).filter(
         PhoneNumber.account_id == account_id,
         PhoneNumber.status.in_([
@@ -586,7 +685,29 @@ def is_first_number_included(db: Session, account_id: str, *, exclude_number_id:
     )
     if exclude_number_id is not None:
         query = query.filter(PhoneNumber.id != exclude_number_id)
-    return query.count() == 0
+    earliest = query.order_by(PhoneNumber.created_at.asc()).limit(seat_count).all()
+    return {n.id for n in earliest}
+
+
+def is_first_number_included(db: Session, account_id: str, *, exclude_number_id: str | None = None) -> bool:
+    """Would purchasing a new number right now be free - true whenever the
+    account's included-number pool (get_included_number_ids) has room left
+    for one more, i.e. fewer already-owned qualifying numbers than paid
+    seats. The qualification check (plan/status) is repeated here (cheap -
+    get_or_create_subscription is a single indexed lookup) rather than
+    inferring it from an empty set, which is ambiguous on its own -
+    "doesn't qualify at all" and "qualifies but owns nothing yet" both
+    return an empty pool otherwise, exactly the bug a first version of
+    this refactor shipped with: a free_trial account's number purchase was
+    treated as included."""
+    from app.numbering.identity.models import User
+
+    sub = get_or_create_subscription(db, account_id)
+    if sub.plan_code == DEFAULT_PLAN_CODE or sub.status == SubscriptionStatus.CANCELED:
+        return False
+    seat_count = db.query(User).filter(User.account_id == account_id).count()
+    included_count = len(get_included_number_ids(db, account_id, exclude_number_id=exclude_number_id))
+    return included_count < seat_count
 
 
 def assert_seat_quota_available(db: Session, account_id: str) -> None:
@@ -817,6 +938,52 @@ def list_zoikonex_sync_events(db: Session, *, account_id: str | None = None, lim
     return query.order_by(ZoikoNexSyncEvent.created_at.desc()).limit(limit).all()
 
 
+# Production Readiness & Go-Live Decision Standard §9 acceptance chain -
+# "customer portal balance" had nothing customer-facing to show: sync-log
+# above is staff-only and accepts an arbitrary account_id. Scoped to the
+# billing-meaningful event types only (invoices, captured payments, credit/
+# debit notes, refunds) - SUBSCRIPTION_SYNC/USAGE_SYNC/PAYMENT_EVENT_RECEIVED
+# are internal plumbing a customer has no reason to see.
+CUSTOMER_VISIBLE_SYNC_EVENT_TYPES = (
+    ZoikoNexSyncEventType.INVOICE_GENERATED,
+    ZoikoNexSyncEventType.PAYMENT_COLLECTED,
+    ZoikoNexSyncEventType.CREDIT_NOTE_ISSUED,
+    ZoikoNexSyncEventType.DEBIT_NOTE_ISSUED,
+    ZoikoNexSyncEventType.REFUND_ISSUED,
+)
+
+
+def list_account_billing_history(db: Session, account_id: str, *, limit: int = 100) -> list[dict]:
+    """Returns curated dicts (CustomerBillingHistoryEntryResponse's shape),
+    NOT raw ZoikoNexSyncEvent rows - see that schema's docstring on why the
+    raw payload must never reach a customer. Only these specific fields are
+    ever pulled out of payload; every other key (including anything with
+    'error' in it, or the placeholder-price flag) is dropped by omission,
+    an allow-list rather than a block-list on purpose."""
+    events = (
+        db.query(ZoikoNexSyncEvent)
+        .filter(
+            ZoikoNexSyncEvent.account_id == account_id,
+            ZoikoNexSyncEvent.event_type.in_(CUSTOMER_VISIBLE_SYNC_EVENT_TYPES),
+        )
+        .order_by(ZoikoNexSyncEvent.created_at.desc())
+        .limit(limit)
+        .all()
+    )
+    return [
+        {
+            "id": e.id,
+            "event_type": e.event_type.value,
+            "reference": e.zoikonex_ref,
+            "amount_minor_units": e.payload.get("amount_minor_units"),
+            "status": e.payload.get("invoice_status") or e.payload.get("payment_status") or e.payload.get("status"),
+            "reason": e.payload.get("reason"),
+            "created_at": e.created_at,
+        }
+        for e in events
+    ]
+
+
 def get_zoikonex_reconciliation_summary(db: Session) -> dict:
     """Architecture doc §9 "Reconciliation: daily reconciliation jobs
     compare Zoiko Local entitlements and usage events with ZoikoNex
@@ -991,6 +1158,25 @@ def run_zoikonex_reconciliation(db: Session) -> ZoikoNexReconciliationRun:
         db.add(exc)
     db.commit()
     db.refresh(run)
+
+    if run.exceptions_found > 0:
+        # Email Communications System doc's BILL-INT-001 - previously a
+        # reconciliation run finding real drift had zero staff-facing
+        # signal beyond someone manually checking the reconciliation
+        # dashboard; a failed send here must never fail the reconciliation
+        # run itself (see send_internal_alert's own try/except per
+        # recipient).
+        send_internal_alert(
+            db, event_name="bill_int.reconciliation_exception",
+            summary=(
+                f"Reconciliation run {run.id} found {run.exceptions_found} new exception(s): "
+                f"{run.unsynced_subscriptions} unsynced subscriptions, {run.unsynced_usage_events} unsynced "
+                f"usage events, {run.unmatched_completed_calls} unmatched completed calls, "
+                f"{run.late_usage_events} late usage events."
+            ),
+            console_link=f"{settings.public_base_url}/staff/billing",
+            transaction_reference=run.id,
+        )
     return run
 
 
@@ -1299,8 +1485,20 @@ def run_billing_cycle(db: Session, account_id: str, *, actor: str) -> dict:
     # response body is frozen at first-creation time (always "DRAFT"),
     # even after the invoice has since been issued. get_invoice does a
     # live read instead of trusting create_invoice's own return value here.
+    from app.numbering.identity.models import User, UserRole
+
+    owner = db.query(User).filter(User.account_id == account_id, User.role == UserRole.OWNER).first()
+
     live_invoice = zoikonex_adapter.get_invoice(invoice["invoice_id"])
-    if live_invoice["status"] == "DRAFT":
+    # Gates BOTH notifications below, not just invoice issuance - a
+    # customer must get exactly one "invoice issued"/"payment received"
+    # pair per billing period, not a fresh "payment received" email every
+    # time staff re-runs/retries an already-billed period (ZoikoNex's
+    # payment-intent creation is itself idempotent per period, so a re-run
+    # was already silently a no-op charge-wise; it just wasn't a no-op
+    # notification-wise until this flag was added).
+    is_first_run_for_period = live_invoice["status"] == "DRAFT"
+    if is_first_run_for_period:
         # First run for this subscription+period. ISSUED invoices are Class
         # A immutable (ZN-ADR-012) - adding a line item or re-issuing one
         # would fail with a 422, so this branch only runs once per period.
@@ -1322,6 +1520,30 @@ def run_billing_cycle(db: Session, account_id: str, *, actor: str) -> dict:
             line_key="plan-fee",
         )
         issued = zoikonex_adapter.issue_invoice(invoice["invoice_id"])
+
+        if owner is not None:
+            tax_amount_minor_units = tax.get("tax_amount_minor_units") or 0
+            try:
+                # A notification failure here must not abort the function:
+                # the invoice is already issued at ZoikoNex (a real,
+                # non-retriable external effect per create_invoice's own
+                # docstring above), and this branch only ever runs once per
+                # period (ISSUED invoices are immutable) - if this raised
+                # uncaught, a retry would see live_invoice["status"] ==
+                # "ISSUED" next time and skip this whole branch forever,
+                # permanently losing the receipt even though the billing
+                # cycle itself completes successfully on retry.
+                notify_invoice_available(
+                    db, account_id=account_id, account_email=owner.email,
+                    invoice_reference=invoice["invoice_id"],
+                    billing_period=f"{sub.current_period_start.date()} to {sub.current_period_end.date()}",
+                    subtotal=f"{amount_minor_units / 100:.2f}",
+                    tax=f"{tax_amount_minor_units / 100:.2f}",
+                    total=f"{(amount_minor_units + tax_amount_minor_units) / 100:.2f}",
+                    currency=currency_code,
+                )
+            except Exception:
+                pass
     else:
         issued = {"status": live_invoice["status"]}
     try:
@@ -1365,6 +1587,24 @@ def run_billing_cycle(db: Session, account_id: str, *, actor: str) -> dict:
         zoikonex_adapter.capture_payment_intent(intent["payment_intent_id"])
         result["captured"] = True
         result["payment_status"] = "captured"
+
+        # Gated on is_first_run_for_period (not just "capture succeeded")
+        # so a re-run/retry of an already-billed period - ZoikoNex's own
+        # payment-intent creation is idempotent per period, so this branch
+        # can genuinely execute again for the same charge - doesn't send a
+        # second, spurious "payment received" email for money that was
+        # never actually charged twice.
+        if owner is not None and is_first_run_for_period:
+            try:
+                notify_payment_succeeded(
+                    db, account_id=account_id, account_email=owner.email,
+                    total=f"{amount_minor_units / 100:.2f}", currency=currency_code,
+                    description=f"{plan.name} plan - monthly subscription",
+                    payment_date=_db_now(db).date().isoformat(),
+                    payment_method_masked="on file with ZoikoNex",
+                )
+            except Exception:
+                pass
     except zoikonex_adapter.ZoikoNexCaptureFailedError as e:
         # Confirmed real ZoikoNex-side bug (evidence-ledger gRPC marshaling) -
         # authorised is a genuinely successful, reportable outcome on its own.

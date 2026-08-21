@@ -140,13 +140,18 @@ def reset_password(db: Session, token: str, new_password: str) -> User:
     return user
 
 
-def find_or_create_user_from_google(db: Session, email: str, name: str | None) -> User:
+def find_or_create_user_from_google(db: Session, email: str, name: str | None) -> tuple[User, bool]:
     """Logs in an existing account by email, or creates a brand new
-    individual account + Google-only User (no password) if none exists."""
+    individual account + Google-only User (no password) if none exists.
+    Returns (user, created) - the caller needs to tell the two apart: an
+    EXISTING customer clicking "Sign in with Google" on the signup page
+    must never be routed through post-signup plan selection (choose_plan
+    calls change_plan for real - silently reassigning an existing paid
+    account's real subscription would be a genuine bug, not cosmetic)."""
     user = db.query(User).filter(User.email == email).first()
     if user:
         log_event(db, actor=user.id, action="user.login", target=f"user:{user.id}", reason="google")
-        return user
+        return user, False
 
     account = Account(name=name or email, account_type=AccountType.INDIVIDUAL)
     db.add(account)
@@ -170,7 +175,7 @@ def find_or_create_user_from_google(db: Session, email: str, name: str | None) -
         reason="google",
         after={"account_id": account.id, "user_id": user.id, "email": user.email, "role": user.role},
     )
-    return user
+    return user, True
 
 
 def add_team_member(

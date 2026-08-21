@@ -701,3 +701,78 @@ def test_staff_can_filter_cases_by_status(client, db_session):
     ids = [c["id"] for c in response.json()]
     assert pending_case_id in ids
     assert approved_case_id not in ids
+
+
+def test_opening_a_case_sets_a_real_expiry(client, db_session):
+    """Regression test: expires_at used to be a schema field nothing ever
+    populated - a case sat PENDING forever with no real expiry, so
+    compliance.case_expired (Architecture doc §8) had no real call site."""
+    from datetime import datetime, timezone
+
+    from app.compliance.models import ComplianceCase
+    from app.compliance.service import COMPLIANCE_CASE_EXPIRY_DAYS
+
+    token = _signup_and_login(client, "complianceexpiry1@example.com")
+    case_id = _open_case(client, {"Authorization": f"Bearer {token}"})
+
+    case = db_session.query(ComplianceCase).filter(ComplianceCase.id == case_id).first()
+    assert case.expires_at is not None
+    days_until_expiry = (case.expires_at - datetime.now(timezone.utc)).days
+    assert days_until_expiry == COMPLIANCE_CASE_EXPIRY_DAYS - 1 or days_until_expiry == COMPLIANCE_CASE_EXPIRY_DAYS
+
+
+def test_sweep_marks_a_stale_pending_case_expired(client, db_session):
+    from datetime import datetime, timedelta, timezone
+
+    from app.audit.models import AuditEvent
+    from app.compliance.models import ComplianceCase, ComplianceCaseStatus
+
+    token = _signup_and_login(client, "complianceexpiry2@example.com")
+    case_id = _open_case(client, {"Authorization": f"Bearer {token}"})
+
+    case = db_session.query(ComplianceCase).filter(ComplianceCase.id == case_id).first()
+    assert case.expires_at is not None  # set by open_compliance_case
+    case.expires_at = datetime.now(timezone.utc) - timedelta(days=1)
+    db_session.commit()
+
+    staff_token = _create_and_login_staff(db_session, client, "staffexpiry1@zoikolocal.com")
+    response = client.post(
+        "/compliance/cases/sweep-expired", headers={"Authorization": f"Bearer {staff_token}"},
+    )
+    assert response.status_code == 200, response.text
+    swept_ids = [c["id"] for c in response.json()]
+    assert case_id in swept_ids
+
+    db_session.refresh(case)
+    assert case.status == ComplianceCaseStatus.EXPIRED
+
+    events = (
+        db_session.query(AuditEvent)
+        .filter(AuditEvent.action == "compliance.case_expired", AuditEvent.target == f"compliance_case:{case_id}")
+        .all()
+    )
+    assert len(events) == 1
+
+
+def test_sweep_does_not_touch_an_approved_case_even_past_expiry(client, db_session):
+    from datetime import datetime, timedelta, timezone
+
+    from app.compliance.models import ComplianceCase, ComplianceCaseStatus
+
+    token = _signup_and_login(client, "complianceexpiry3@example.com")
+    case_id = _open_case(client, {"Authorization": f"Bearer {token}"})
+
+    staff_token = _create_and_login_staff(db_session, client, "staffexpiry2@zoikolocal.com")
+    staff_headers = {"Authorization": f"Bearer {staff_token}"}
+    client.post(f"/compliance/cases/{case_id}/approve", headers=staff_headers)
+
+    case = db_session.query(ComplianceCase).filter(ComplianceCase.id == case_id).first()
+    case.expires_at = datetime.now(timezone.utc) - timedelta(days=1)
+    db_session.commit()
+
+    response = client.post("/compliance/cases/sweep-expired", headers=staff_headers)
+    swept_ids = [c["id"] for c in response.json()]
+    assert case_id not in swept_ids
+
+    db_session.refresh(case)
+    assert case.status == ComplianceCaseStatus.APPROVED  # untouched

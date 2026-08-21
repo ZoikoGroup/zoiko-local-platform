@@ -53,6 +53,7 @@ class NumberSearchResult(BaseModel):
     locality: str | None = None
     region: str | None = None
     capabilities: dict | None = None
+    address_requirements: str | None = None
 
 
 class ReserveNumberRequest(BaseModel):
@@ -129,6 +130,8 @@ class SupportedCountryResponse(BaseModel):
     name: str
     emergency_calling_supported: bool
     market_status: str
+    legal_signoff_reference: str | None = None
+    legal_signoff_by: str | None = None
 
 
 class UpsertSupportedCountryRequest(BaseModel):
@@ -146,6 +149,11 @@ class SetMarketActivationStatusRequest(BaseModel):
     # log_event's own audit row; this is the one piece only the caller
     # can supply.
     reason: str
+    # Readiness doc §6.2 - required (enforced at the service layer) only
+    # when status is "paid_open"; a ticket/decision ID and the named
+    # reviewer, distinct from the free-text `reason` above.
+    legal_signoff_reference: str | None = None
+    legal_signoff_by: str | None = None
 
 
 class NumberEligibilityRuleResponse(BaseModel):

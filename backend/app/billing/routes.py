@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.orm import Session
 
 from app.billing import service
-from app.billing.models import BillingActionRequestStatus, BillingActionType
+from app.billing.models import BillingActionRequestStatus, BillingActionType, BillingPeriod
 from app.billing.schemas import (
     ApprovePriceCatalogEntryRequest,
     BillingActionRequestResponse,
@@ -12,6 +12,7 @@ from app.billing.schemas import (
     ChangePlanRequest,
     CreatePriceCatalogEntryRequest,
     CreditNoteResponse,
+    CustomerBillingHistoryEntryResponse,
     DebitNoteResponse,
     IssueCreditNoteRequest,
     IssueDebitNoteRequest,
@@ -21,6 +22,7 @@ from app.billing.schemas import (
     RejectBillingActionRequest,
     ResolveReconciliationExceptionRequest,
     RunBillingCycleRequest,
+    SetAIReceptionistAddonRequest,
     SimulatePaymentEventRequest,
     SubscriptionResponse,
     UsageSummaryResponse,
@@ -46,7 +48,8 @@ def list_plans(db: Session = Depends(get_db), _current_user: User = Depends(get_
 
 @router.get("/price-catalog/{plan_code}", response_model=PriceCatalogEntryResponse | None)
 def get_price_catalog_entry(
-    plan_code: str, db: Session = Depends(get_db), _current_user: User = Depends(get_current_user),
+    plan_code: str, billing_period: str = "monthly",
+    db: Session = Depends(get_db), _current_user: User = Depends(get_current_user),
 ):
     """Customer-facing (not staff-only, unlike every other /price-catalog
     route below) - any authenticated customer choosing a plan needs to see
@@ -55,8 +58,10 @@ def get_price_catalog_entry(
     all - a customer couldn't see what any plan cost, partly because this
     was the only endpoint that could tell them and it 403'd for their own
     account's login. Nothing frontend or staff-side called this route
-    before this change, so nothing depends on the old staff-only gate."""
-    return service.get_active_price_catalog_entry(db, plan_code)
+    before this change, so nothing depends on the old staff-only gate.
+    billing_period defaults MONTHLY - annual pricing (added later) is opt-in
+    via the query param, not a breaking change to existing callers."""
+    return service.get_active_price_catalog_entry(db, plan_code, billing_period=BillingPeriod(billing_period))
 
 
 @router.post("/price-catalog", response_model=PriceCatalogEntryResponse, status_code=status.HTTP_201_CREATED)
@@ -71,6 +76,7 @@ def create_price_catalog_entry(
     try:
         return service.create_price_catalog_entry(
             db, plan_code=payload.plan_code, catalog_version=payload.catalog_version,
+            billing_period=BillingPeriod(payload.billing_period),
             amount_minor_units=payload.amount_minor_units, currency_code=payload.currency_code,
             is_placeholder=payload.is_placeholder, actor=staff.id,
             price_book_version=payload.price_book_version, market=payload.market,
@@ -130,9 +136,25 @@ def change_plan(
     entitlement limits apply and syncs the change to the MOCK ZoikoNex
     adapter (see app.integrations.billing.zoikonex's docstring)."""
     try:
-        return service.change_plan(db, current_user.account_id, payload.plan_code, actor=current_user.id)
+        return service.change_plan(
+            db, current_user.account_id, payload.plan_code, actor=current_user.id,
+            billing_period=BillingPeriod(payload.billing_period),
+        )
     except service.PlanNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
+
+
+@router.put("/subscription/ai-receptionist-addon", response_model=SubscriptionResponse)
+def set_ai_receptionist_addon(
+    payload: SetAIReceptionistAddonRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin),
+):
+    """Owner/Admin only, matching change_plan above. Global Plans, Pricing
+    & Commercial Launch doc §5.3's AI Receptionist add-on - the only route
+    Starter/Business plans have to any included AI Receptionist minutes at
+    all (Pro/Scale get an allowance baked into the plan itself)."""
+    return service.set_ai_receptionist_addon(db, current_user.account_id, active=payload.active, actor=current_user.id)
 
 
 @router.post("/subscription/cancel", response_model=SubscriptionResponse)
@@ -154,6 +176,18 @@ def cancel_subscription(
 @router.get("/usage-summary", response_model=UsageSummaryResponse)
 def usage_summary(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     return service.get_usage_summary(db, current_user.account_id)
+
+
+@router.get("/invoices", response_model=list[CustomerBillingHistoryEntryResponse])
+def list_own_invoices(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    """Customer-facing billing history - invoices, captured payments,
+    credit/debit notes, refunds for THIS account only (never an arbitrary
+    account_id like the staff-only /zoikonex/sync-log below). Returns a
+    curated field allow-list (CustomerBillingHistoryEntryResponse), never
+    the raw sync-log payload - see that schema's docstring. Any
+    authenticated member can view - same bar as calling-rates, not
+    Owner/Admin-only like the raw usage ledger."""
+    return service.list_account_billing_history(db, current_user.account_id)
 
 
 @router.post("/zoikonex/webhook", status_code=status.HTTP_204_NO_CONTENT)

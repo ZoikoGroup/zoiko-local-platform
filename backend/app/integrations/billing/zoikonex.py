@@ -74,7 +74,7 @@ from sqlalchemy.orm import Session
 from app.billing.models import Plan
 from app.core.config import settings
 from app.observability.service import trace_provider_call
-from app.usage.models import DEFAULT_RATE_COUNTRY, CallingRate
+from app.usage.models import DEFAULT_RATE_COUNTRY, AIUsageRate, CallingRate, NumberRate
 
 
 class ZoikoNexError(Exception):
@@ -416,21 +416,48 @@ def rate_usage_event(
     reasoning register_plan_in_catalog isn't auto-invoked) - until that
     happens, this keeps the exact same estimate the mock adapter it
     replaces already computed, purely for customer-facing visibility, not
-    as a real charge. Only call_seconds has a rate table today; every
-    other event_type returns no estimate rather than guessing."""
-    if event_type != "call_seconds":
-        return {"estimated_cost_cents": None}
+    as a real charge. call_seconds, ai_receptionist_minutes and
+    number_month each have a rate table today (CallingRate/AIUsageRate/
+    NumberRate); every other event_type returns no estimate rather than
+    guessing.
 
-    rate = None
-    if country_band is not None:
-        rate = db.query(CallingRate).filter(CallingRate.country == country_band).first()
-    if rate is None:
-        rate = db.query(CallingRate).filter(CallingRate.country == DEFAULT_RATE_COUNTRY).first()
-    if rate is None:
-        return {"estimated_cost_cents": None}
+    Deliberately event-level only, same simplification CallingRate already
+    used before this: prices the raw quantity flat, never subtracting a
+    plan's included allowance (monthly_voice_minutes,
+    included_ai_receptionist_minutes) from the estimate - entitlement
+    quotas are a separate concern from cost estimation."""
+    if event_type == "call_seconds":
+        rate = None
+        if country_band is not None:
+            rate = db.query(CallingRate).filter(CallingRate.country == country_band).first()
+        if rate is None:
+            rate = db.query(CallingRate).filter(CallingRate.country == DEFAULT_RATE_COUNTRY).first()
+        if rate is None:
+            return {"estimated_cost_cents": None}
+        minutes = math.ceil(quantity / 60)
+        return {"estimated_cost_cents": minutes * rate.price_per_minute_cents}
 
-    minutes = math.ceil(quantity / 60)
-    return {"estimated_cost_cents": minutes * rate.price_per_minute_cents}
+    if event_type == "ai_receptionist_minutes":
+        rate = db.query(AIUsageRate).order_by(AIUsageRate.created_at.desc()).first()
+        if rate is None:
+            return {"estimated_cost_cents": None}
+        return {"estimated_cost_cents": math.ceil(quantity) * rate.overage_price_cents_per_minute}
+
+    if event_type == "number_month":
+        # number_type isn't passed into this function - "local" is the only
+        # type this platform actually sells end-to-end today (see
+        # PhoneNumber.number_type's docstring), same simplification already
+        # established there.
+        rate = None
+        if country_band is not None:
+            rate = db.query(NumberRate).filter(NumberRate.country == country_band, NumberRate.number_type == "local").first()
+        if rate is None:
+            rate = db.query(NumberRate).filter(NumberRate.country == DEFAULT_RATE_COUNTRY, NumberRate.number_type == "local").first()
+        if rate is None:
+            return {"estimated_cost_cents": None}
+        return {"estimated_cost_cents": round(quantity) * rate.recurring_price_cents}
+
+    return {"estimated_cost_cents": None}
 
 
 # --- Evidence anchoring (evidence-ledger) ---

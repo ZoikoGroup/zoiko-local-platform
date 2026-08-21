@@ -170,6 +170,77 @@ def test_non_super_admin_staff_cannot_update_calling_rates(client, db_session):
     assert response.status_code == 403
 
 
+def test_customer_can_view_the_number_and_ai_usage_rate_cards(client):
+    """Global Plans, Pricing & Commercial Launch Standard doc §5.1/§5.3 -
+    the real, doc-approved baseline figures seeded by migration 61bc6e50e6db."""
+    token = _signup_and_login(client, "ratecard3@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    number_rates = client.get("/usage/number-rates", headers=headers)
+    assert number_rates.status_code == 200
+    default_rate = next(r for r in number_rates.json() if r["country"] == "XX")
+    assert default_rate["recurring_price_cents"] == 499
+    assert default_rate["is_placeholder"] is False
+
+    ai_rate = client.get("/usage/ai-usage-rate", headers=headers)
+    assert ai_rate.status_code == 200
+    assert ai_rate.json()["overage_price_cents_per_minute"] == 39
+    assert ai_rate.json()["is_placeholder"] is False
+
+
+def test_staff_can_update_number_and_ai_usage_rates(client, db_session):
+    from app.staff import service as staff_service
+    from app.staff.models import PlatformStaffRole
+
+    staff_service.create_staff(
+        db_session, email="staffrate3@zoikolocal.com", password="staffpass123", role=PlatformStaffRole.SUPER_ADMIN
+    )
+    staff_token = client.post(
+        "/staff/login", json={"email": "staffrate3@zoikolocal.com", "password": "staffpass123"}
+    ).json()["access_token"]
+    staff_headers = {"Authorization": f"Bearer {staff_token}"}
+
+    number_rate = client.put(
+        "/staff/number-rates",
+        json={"country": "GB", "number_type": "local", "recurring_price_cents": 599, "currency": "USD"},
+        headers=staff_headers,
+    )
+    assert number_rate.status_code == 200
+    assert number_rate.json()["recurring_price_cents"] == 599
+
+    ai_rate = client.put(
+        "/staff/ai-usage-rate", json={"overage_price_cents_per_minute": 45}, headers=staff_headers,
+    )
+    assert ai_rate.status_code == 200
+    assert ai_rate.json()["overage_price_cents_per_minute"] == 45
+
+    token = _signup_and_login(client, "ratecard4@example.com")
+    ai_rate_view = client.get(
+        "/usage/ai-usage-rate", headers={"Authorization": f"Bearer {token}"}
+    ).json()
+    assert ai_rate_view["overage_price_cents_per_minute"] == 45
+
+
+def test_non_super_admin_staff_cannot_update_number_or_ai_usage_rates(client, db_session):
+    from app.staff import service as staff_service
+    from app.staff.models import PlatformStaffRole
+
+    staff_service.create_staff(
+        db_session, email="staffrate4@zoikolocal.com", password="staffpass123", role=PlatformStaffRole.SUPPORT
+    )
+    staff_token = client.post(
+        "/staff/login", json={"email": "staffrate4@zoikolocal.com", "password": "staffpass123"}
+    ).json()["access_token"]
+    staff_headers = {"Authorization": f"Bearer {staff_token}"}
+
+    assert client.put(
+        "/staff/number-rates", json={"country": "GB", "recurring_price_cents": 599}, headers=staff_headers,
+    ).status_code == 403
+    assert client.put(
+        "/staff/ai-usage-rate", json={"overage_price_cents_per_minute": 45}, headers=staff_headers,
+    ).status_code == 403
+
+
 # --- Usage disputes / adjustments (append-only billing correction trail) ---
 
 

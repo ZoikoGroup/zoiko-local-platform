@@ -1,7 +1,7 @@
 import enum
 from datetime import datetime
 
-from sqlalchemy import DateTime, Enum, ForeignKey, Integer, Numeric, String, Text, func
+from sqlalchemy import DateTime, Enum, ForeignKey, Integer, Numeric, String, Text, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -35,6 +35,63 @@ class CallingRate(Base):
     country: Mapped[str] = mapped_column(String(2), unique=True, nullable=False, index=True)
     price_per_minute_cents: Mapped[int] = mapped_column(Integer, nullable=False)
     currency: Mapped[str] = mapped_column(String(3), nullable=False, default="USD")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class NumberRate(Base):
+    """Global Plans, Pricing & Commercial Launch Standard doc §5.1: "Additional
+    standard local number: From $4.99/month... exact retail price is
+    country/number-type specific." Keyed like CallingRate (country +
+    number_type, with a DEFAULT_RATE_COUNTRY fallback row) since the doc
+    only gives one baseline figure, not a full per-country card yet.
+
+    Same "prices UsageEvent rows for visibility; does not charge anyone"
+    posture as CallingRate - there's no live recurring-billing gateway
+    (see purchase_number's docstring on the matching one-time-purchase
+    gap). Unlike CallingRate's seeded test numbers, the baseline row here
+    IS the real, doc-approved figure - is_placeholder distinguishes that
+    for any future non-baseline rows added before a real commercial
+    decision backs them."""
+
+    __tablename__ = "number_rates"
+    __table_args__ = (UniqueConstraint("country", "number_type", name="uq_number_rate_country_type"),)
+
+    id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=new_uuid)
+    country: Mapped[str] = mapped_column(String(2), nullable=False, index=True)
+    number_type: Mapped[str] = mapped_column(String(30), nullable=False, default="local", server_default="local")
+    recurring_price_cents: Mapped[int] = mapped_column(Integer, nullable=False)
+    currency: Mapped[str] = mapped_column(String(3), nullable=False, default="USD")
+    is_placeholder: Mapped[bool] = mapped_column(nullable=False, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class AIUsageRate(Base):
+    """Global Plans, Pricing & Commercial Launch Standard doc §5.3: AI
+    Receptionist overage at $0.39/minute after the plan's included
+    allowance. Global, not country-specific - modeled as a table (not a
+    bare constant) for the same reason CallingRate/NumberRate are: a real
+    price revision must be a new auditable row, not a silent constant
+    edit. One active row expected; get_ai_usage_rate takes the most
+    recently created.
+
+    Same visibility-only posture as CallingRate/NumberRate - prices
+    ai_receptionist_minutes UsageEvent rows for display, does not charge
+    anyone.
+
+    addon_monthly_price_cents/addon_included_minutes: same doc, same §5.3 -
+    "$29/workspace/month add-on; 100 AI-handled minutes included" - the
+    subscription-level add-on Starter/Business use to get any included AI
+    Receptionist minutes at all (they get 0 baked into the plan itself,
+    unlike Pro/Scale - see Plan.included_ai_receptionist_minutes)."""
+
+    __tablename__ = "ai_usage_rates"
+
+    id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=new_uuid)
+    overage_price_cents_per_minute: Mapped[int] = mapped_column(Integer, nullable=False)
+    addon_monthly_price_cents: Mapped[int] = mapped_column(Integer, nullable=False, default=2900, server_default="2900")
+    addon_included_minutes: Mapped[int] = mapped_column(Integer, nullable=False, default=100, server_default="100")
+    currency: Mapped[str] = mapped_column(String(3), nullable=False, default="USD")
+    is_placeholder: Mapped[bool] = mapped_column(nullable=False, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 

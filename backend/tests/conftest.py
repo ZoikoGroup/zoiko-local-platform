@@ -222,6 +222,37 @@ def db_session():
     connection.close()
 
 
+@pytest.fixture(autouse=True)
+def _test_markets_stay_paid_open(db_session):
+    """2026-08-19: all 8 seeded countries were pulled back from PAID_OPEN to
+    CONTROLLED_BETA in the real dev DB (migration 877c1c4434e7 - no real
+    legal/tax review was ever recorded for them; a real product decision,
+    not a test-only concern - real customers should not be able to buy
+    numbers there until someone actually reviews each market).
+
+    Tried flagging test accounts is_test=True first (CONTROLLED_BETA's own
+    existing carve-out for that flag) - reverted, since a second, unrelated
+    gate (create_number_purchase_checkout_session's TestAccountRestrictedError)
+    specifically blocks is_test accounts from checkout, breaking every
+    real-commercial-account checkout test instead of fixing the market gate.
+
+    This is the correct fix: reset market_status back to PAID_OPEN for the
+    8 seeded countries inside THIS TEST'S OWN db_session transaction only -
+    same rollback-at-teardown boundary as every other test-time DB change,
+    so the real dev DB / real browser session stays on the pulled-back
+    CONTROLLED_BETA state the product decision requires. Tests that
+    specifically exercise CLOSED/SUSPENDED/CONTROLLED_BETA gating for a
+    non-is_test account already create their own dedicated test countries
+    (M1, M2, M3...) and are unaffected."""
+    from app.numbering.numbers.models import MarketActivationStatus, SupportedCountry
+
+    db_session.query(SupportedCountry).filter(
+        SupportedCountry.code.in_(["US", "CA", "GB", "AU", "DE", "FR", "IN", "SG"])
+    ).update({"market_status": MarketActivationStatus.PAID_OPEN}, synchronize_session=False)
+    db_session.commit()
+    yield
+
+
 @pytest.fixture()
 def client(db_session):
     def override_get_db():

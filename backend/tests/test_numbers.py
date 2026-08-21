@@ -762,6 +762,60 @@ def test_checkout_session_charges_for_a_second_number_even_on_a_paid_plan(client
     assert body["url"] == "https://checkout.stripe.com/c/pay/cs_test_second"
 
 
+def test_checkout_session_is_free_for_a_second_number_on_a_two_seat_account(client, db_session, monkeypatch):
+    """Global Plans, Pricing & Commercial Launch doc: "1 standard eligible
+    number per paid user" - the included-number pool scales with paid seat
+    count, not a flat 1-per-account regardless of team size (see
+    billing_service.get_included_number_ids). A 2-seat account gets 2 free
+    numbers; a 3rd would still be charged, same as the single-seat case
+    above."""
+    from app.billing import service as billing_service
+
+    # Not _stub_buy_number - that helper returns the same constant
+    # "PN_fake_sid" for every call, which collides on phone_numbers'
+    # real unique(provider_sid) constraint the moment a test actually
+    # purchases two numbers via the real telecom.buy_number path in one
+    # run (every prior test here only ever purchased one number this way,
+    # or purchased its "second" number through Stripe checkout instead -
+    # this is the first test to hit that combination).
+    monkeypatch.setattr(
+        "app.numbering.numbers.service.telecom.buy_number",
+        lambda e164: {"sid": f"PN_fake_{e164}", "phone_number": e164, "capabilities": {}},
+    )
+    monkeypatch.setattr("app.core.config.settings.stripe_payments_secret_key", "rk_test_fake")
+    monkeypatch.setattr(
+        "app.numbering.numbers.service.stripe_checkout.create_checkout_session",
+        lambda **kwargs: {"id": "cs_test_third", "url": "https://checkout.stripe.com/c/pay/cs_test_third"},
+    )
+
+    token = _signup_and_login(client, "twoseatnumbers@example.com", account_type="business")
+    headers = {"Authorization": f"Bearer {token}"}
+    account_id = client.get("/auth/me", headers=headers).json()["account_id"]
+    billing_service.change_plan(db_session, account_id, "starter", actor="test-actor")
+
+    added = client.post(
+        "/team/members",
+        json={"email": "twoseatnumbersmember1@example.com", "password": "supersecret123", "role": "member"},
+        headers=headers,
+    )
+    assert added.status_code == 201, added.text
+
+    _reserve(client, headers, "+15550013011")
+    first = client.post("/numbers/+15550013011/checkout-session", headers=headers)
+    assert first.json()["included"] is True
+
+    _reserve(client, headers, "+15550013012")
+    second = client.post("/numbers/+15550013012/checkout-session", headers=headers)
+    assert second.json()["included"] is True, second.text  # 2nd seat's free number
+
+    _reserve(client, headers, "+15550013013")
+    third = client.post("/numbers/+15550013013/checkout-session", headers=headers)
+    assert third.status_code == 200, third.text
+    body = third.json()
+    assert body["included"] is False
+    assert body["id"] == "cs_test_third"
+
+
 def test_non_commercial_account_cannot_create_a_checkout_session(client, db_session, monkeypatch):
     """Commercial Billing Operating Standard doc COM-03: non-commercial
     billing_classification accounts (DEMO/SANDBOX/etc.) must never create
@@ -873,7 +927,8 @@ def test_stripe_payment_webhook_refunds_a_genuine_fulfillment_failure(client, db
     refund_calls = []
     monkeypatch.setattr(
         "app.numbering.numbers.service.stripe_checkout.refund_payment",
-        lambda payment_intent_id: refund_calls.append(payment_intent_id) or {"id": "re_test", "status": "succeeded"},
+        lambda payment_intent_id: refund_calls.append(payment_intent_id)
+        or {"id": "re_test", "status": "succeeded", "amount": 499, "currency": "usd"},
     )
 
     token = _signup_and_login(client, "checkoutrefund1@example.com")
@@ -915,7 +970,8 @@ def test_stripe_payment_webhook_refunds_when_reservation_expired_before_it_arriv
     refund_calls = []
     monkeypatch.setattr(
         "app.numbering.numbers.service.stripe_checkout.refund_payment",
-        lambda payment_intent_id: refund_calls.append(payment_intent_id) or {"id": "re_test", "status": "succeeded"},
+        lambda payment_intent_id: refund_calls.append(payment_intent_id)
+        or {"id": "re_test", "status": "succeeded", "amount": 499, "currency": "usd"},
     )
 
     token = _signup_and_login(client, "checkoutrefund4@example.com")
@@ -1020,9 +1076,13 @@ def _upsert_market_country(client, staff_headers, code: str, name: str = "Market
 
 
 def _set_market_status(client, staff_headers, code: str, market_status: str, reason: str = "test setup"):
+    payload = {"status": market_status, "reason": reason}
+    if market_status == "paid_open":
+        payload["legal_signoff_reference"] = "TEST-SIGNOFF-001"
+        payload["legal_signoff_by"] = "test-legal-reviewer"
     response = client.put(
         f"/staff/countries/{code}/market-status",
-        json={"status": market_status, "reason": reason},
+        json=payload,
         headers=staff_headers,
     )
     assert response.status_code == 200, response.text
@@ -1066,6 +1126,12 @@ def test_purchase_is_blocked_for_a_non_test_account_in_controlled_beta(client, d
     staff_token = _create_staff_and_login(client, db_session, "staffmarket3@zoikolocal.com")
     staff_headers = {"Authorization": f"Bearer {staff_token}"}
     _upsert_market_country(client, staff_headers, "M3")
+    # A freshly-added country defaults to CLOSED (fail-closed - see
+    # SupportedCountry.market_status's docstring), not immediately
+    # reservable - open it first so the reserve below exercises the real
+    # target of this test (the purchase-time re-check), not just the
+    # default-closed gate a different test already covers on its own.
+    _set_market_status(client, staff_headers, "M3", "paid_open")
 
     token = _signup_and_login(client, "marketbeta1@example.com")
     headers = {"Authorization": f"Bearer {token}"}
@@ -1088,6 +1154,8 @@ def test_purchase_succeeds_for_a_test_account_in_controlled_beta(client, db_sess
     staff_token = _create_staff_and_login(client, db_session, "staffmarket4@zoikolocal.com")
     staff_headers = {"Authorization": f"Bearer {staff_token}"}
     _upsert_market_country(client, staff_headers, "M4")
+    # Same fail-closed default as M3 above - open it before reserving.
+    _set_market_status(client, staff_headers, "M4", "paid_open")
 
     token = _signup_and_login(client, "marketbeta2@example.com")
     headers = {"Authorization": f"Bearer {token}"}
@@ -1144,6 +1212,43 @@ def test_staff_can_open_a_market_for_paid_sale(client, db_session, monkeypatch):
     assert response.status_code == 200
 
 
+def test_opening_a_market_for_paid_sale_requires_a_named_legal_signoff(client, db_session, monkeypatch):
+    """Readiness Standard doc §6.2: "PAID_OPEN only after ... named
+    sign-off" - a free-text `reason` alone (e.g. "testing") used to be
+    enough to open a market for real commercial sale. legal_signoff_
+    reference/legal_signoff_by are now required specifically for this
+    transition."""
+    monkeypatch.setattr(
+        "app.numbering.numbers.service.telecom.search_available_numbers",
+        lambda country, number_type, area_code: [],
+    )
+    staff_token = _create_staff_and_login(client, db_session, "staffmarket8@zoikolocal.com")
+    staff_headers = {"Authorization": f"Bearer {staff_token}"}
+    _upsert_market_country(client, staff_headers, "M7")
+
+    missing_signoff = client.put(
+        "/staff/countries/M7/market-status",
+        json={"status": "paid_open", "reason": "Let's open this one"},
+        headers=staff_headers,
+    )
+    assert missing_signoff.status_code == 422, missing_signoff.text
+    assert "legal_signoff" in missing_signoff.json()["detail"]
+
+    with_signoff = client.put(
+        "/staff/countries/M7/market-status",
+        json={
+            "status": "paid_open", "reason": "Legal review complete",
+            "legal_signoff_reference": "LEGAL-2026-M7-001", "legal_signoff_by": "jane.counsel@zoikolocal.com",
+        },
+        headers=staff_headers,
+    )
+    assert with_signoff.status_code == 200, with_signoff.text
+    body = with_signoff.json()
+    assert body["market_status"] == "paid_open"
+    assert body["legal_signoff_reference"] == "LEGAL-2026-M7-001"
+    assert body["legal_signoff_by"] == "jane.counsel@zoikolocal.com"
+
+
 def test_set_market_activation_status_rejects_an_unsupported_country(client, db_session):
     staff_token = _create_staff_and_login(client, db_session, "staffmarket7@zoikolocal.com")
     response = client.put(
@@ -1165,3 +1270,90 @@ def test_set_market_activation_status_rejects_an_invalid_status_value(client, db
         headers=staff_headers,
     )
     assert response.status_code == 422
+
+
+def test_renewal_charges_additional_numbers_but_not_the_included_first(client, db_session):
+    """Global Plans, Pricing & Commercial Launch Standard doc §5.1 - the
+    account's first number is included, additional numbers renew at
+    $4.99/month - but ONLY for an account on a paid plan (is_first_number_
+    included's own documented policy: "paid user" is the doc's wording,
+    free_trial/canceled accounts never get a free number). This account is
+    explicitly upgraded to starter below - a fresh free_trial account is
+    covered by test_renewal_does_not_exempt_a_free_trial_accounts_number
+    right after this test, which exercises the exact opposite outcome for
+    exactly that reason.
+
+    Numbers are inserted directly (not via the real purchase flow) - two
+    purchases in quick succession for one account can trip the account
+    velocity kill-switch (app.risk.service), which is a different feature
+    being exercised correctly, not something this test is about."""
+    from datetime import datetime, timedelta, timezone
+
+    from app.numbering.numbers.models import PhoneNumber, PhoneNumberStatus
+    from app.usage.models import UsageEvent
+
+    token = _signup_and_login(client, "renewalcharge1@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    account_id = client.get("/auth/me", headers=headers).json()["account_id"]
+    assert client.put(
+        "/billing/subscription/plan", json={"plan_code": "starter"}, headers=headers
+    ).status_code == 200
+
+    now = datetime.now(timezone.utc)
+    past_due = now - timedelta(days=1)
+    first = PhoneNumber(
+        e164="+15550014001", country="US", status=PhoneNumberStatus.ACTIVE, account_id=account_id,
+        next_renewal_at=past_due, created_at=now - timedelta(days=60),
+    )
+    second = PhoneNumber(
+        e164="+15550014002", country="US", status=PhoneNumberStatus.ACTIVE, account_id=account_id,
+        next_renewal_at=past_due, created_at=now - timedelta(days=30),
+    )
+    db_session.add_all([first, second])
+    db_session.commit()
+
+    staff_token = _create_staff_and_login(client, db_session, "staffrenewalcharge1@zoikolocal.com")
+    staff_headers = {"Authorization": f"Bearer {staff_token}"}
+
+    client.post(f"/staff/numbers/{first.id}/mark-renewed", headers=staff_headers)
+    client.post(f"/staff/numbers/{second.id}/mark-renewed", headers=staff_headers)
+
+    events = db_session.query(UsageEvent).filter(UsageEvent.event_type == "number_month").all()
+    assert len(events) == 1
+    assert events[0].country_band == "US"
+    assert events[0].estimated_cost_cents == 499
+
+
+def test_renewal_does_not_exempt_a_free_trial_accounts_number(client, db_session):
+    """billing_service.is_first_number_included's own documented policy:
+    "paid user" is the doc's wording - a free_trial account (the default
+    for every fresh signup, never upgraded here) has NO included number at
+    all, so its one and only number's renewal must still be billed. This
+    is the exact regression the mismatch between mark_number_renewed and
+    is_first_number_included previously produced: a free-trial account's
+    number renewed for free indefinitely."""
+    from datetime import datetime, timedelta, timezone
+
+    from app.numbering.numbers.models import PhoneNumber, PhoneNumberStatus
+    from app.usage.models import UsageEvent
+
+    token = _signup_and_login(client, "renewalcharge2@example.com")
+    account_id = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"}).json()["account_id"]
+
+    now = datetime.now(timezone.utc)
+    only_number = PhoneNumber(
+        e164="+15550014003", country="US", status=PhoneNumberStatus.ACTIVE, account_id=account_id,
+        next_renewal_at=now - timedelta(days=1), created_at=now - timedelta(days=30),
+    )
+    db_session.add(only_number)
+    db_session.commit()
+
+    staff_token = _create_staff_and_login(client, db_session, "staffrenewalcharge2@zoikolocal.com")
+    client.post(
+        f"/staff/numbers/{only_number.id}/mark-renewed", headers={"Authorization": f"Bearer {staff_token}"}
+    )
+
+    events = db_session.query(UsageEvent).filter(
+        UsageEvent.event_type == "number_month", UsageEvent.account_id == account_id
+    ).all()
+    assert len(events) == 1

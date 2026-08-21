@@ -51,6 +51,12 @@ class Settings(BaseSettings):
 
     twilio_account_sid: str = ""
     twilio_auth_token: str = ""
+    # Restricted API Key (SKxxx + secret), scoped to only phone-numbers/voice/
+    # messaging permissions - preferred over the plain auth token above when
+    # set, since it can be individually revoked without rotating the whole
+    # account's master credential. Falls back to twilio_auth_token when blank.
+    twilio_api_key_sid: str = ""
+    twilio_api_key_secret: str = ""
     # The number system SMS notifications (not customer calls) are sent
     # from - a Zoiko-owned number, distinct from any customer's purchased
     # number. Blank until a real number is provisioned for this purpose.

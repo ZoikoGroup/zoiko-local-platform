@@ -7,7 +7,7 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "test": "vitest run"
+    "test": "cross-env NODE_OPTIONS=--no-experimental-webstorage vitest run"
   },
   "dependencies": {
     "livekit-client": "^2.21.0",
@@ -21,6 +21,7 @@
     "@types/node": "^20",
     "@types/react": "^19",
     "@types/react-dom": "^19",
+    "cross-env": "^10.1.0",
     "eslint": "^9",
     "eslint-config-next": "16.2.12",
     "jsdom": "^25.0.1",

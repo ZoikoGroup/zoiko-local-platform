@@ -47,17 +47,31 @@ def _clean_twilio_error_message(e: TwilioException) -> str:
     list fetch. Extracts Twilio's own "message" field from the embedded
     JSON where possible, instead of leaking that raw dump to the frontend."""
     if isinstance(e, TwilioRestException) and e.msg:
-        return e.msg
-    raw = str(e)
-    match = re.search(r"\{.*\}", raw)
-    if match:
-        try:
-            message = json.loads(match.group(0)).get("message")
-            if message:
-                return message
-        except (json.JSONDecodeError, AttributeError):
-            pass
-    return raw
+        message = e.msg
+    else:
+        raw = str(e)
+        match = re.search(r"\{.*\}", raw)
+        message = raw
+        if match:
+            try:
+                extracted = json.loads(match.group(0)).get("message")
+                if extracted:
+                    message = extracted
+            except (json.JSONDecodeError, AttributeError):
+                pass
+
+    # Confirmed live (2026-08-18): the extracted message IS clean at this
+    # point (no raw dump), but it's still written from Twilio's own
+    # perspective, aimed at whoever holds the Twilio account (us) - "This
+    # feature is not available on a Trial account. Please upgrade your
+    # account to gain access." A customer reading that reasonably assumes
+    # THEIR Zoiko subscription needs upgrading, not that our own Twilio
+    # account is trial-restricted. Same customer-safe-translation posture
+    # as the raw-dump fix above, just for a message that's clean but
+    # wrong-audience rather than unparsed.
+    if "trial account" in message.lower():
+        return "Number search/purchase is temporarily unavailable while we finish setting up this feature. Please try again shortly."
+    return message
 
 
 # Imported after TelecomError is defined - _secondary_stub imports it back
@@ -66,6 +80,12 @@ from app.integrations.telecom import _secondary_stub as secondary  # noqa: E402
 
 
 def _client() -> Client:
+    # An API Key (SKxxx + secret) authenticates as itself, so the account SID
+    # must be passed separately - unlike the master auth token, where the
+    # account SID doubles as the username. See twilio_api_key_sid's docstring
+    # in core/config.py for why this is preferred when set.
+    if settings.twilio_api_key_sid and settings.twilio_api_key_secret:
+        return Client(settings.twilio_api_key_sid, settings.twilio_api_key_secret, settings.twilio_account_sid)
     return Client(settings.twilio_account_sid, settings.twilio_auth_token)
 
 
@@ -85,10 +105,15 @@ def send_sms(to: str, body: str) -> dict:
     """Sends a system SMS notification from Zoiko's own notification
     number - NOT tied to any customer's purchased number. Distinct from
     voice.py's customer-facing calling features."""
-    if not settings.twilio_trial_number:
-        raise TelecomError("No Twilio notification number configured (TWILIO_TRIAL_NUMBER)")
 
     def _primary() -> dict:
+        # Deliberately raised from inside _primary (not before with_failover
+        # is called) - a missing TWILIO_TRIAL_NUMBER is exactly the kind of
+        # primary-provider failure the secondary should get a chance to
+        # rescue. Raising it earlier skipped with_failover entirely, silently
+        # defeating TELECOM_FAILOVER_ENABLED for this one function.
+        if not settings.twilio_trial_number:
+            raise TelecomError("No Twilio notification number configured (TWILIO_TRIAL_NUMBER)")
         try:
             with trace_provider_call("twilio", "send_sms"):
                 message = _client().messages.create(to=to, from_=settings.twilio_trial_number, body=body)

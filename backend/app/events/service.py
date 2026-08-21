@@ -3,6 +3,7 @@ import uuid
 from datetime import datetime, timezone
 
 from opentelemetry import metrics
+from sqlalchemy.orm import Session
 
 from app.integrations.eventbus import kafka as eventbus
 from app.integrations.eventbus.kafka import EventBusError
@@ -35,6 +36,66 @@ def publish_event(topic: str, event_type: str, account_id: str | None, data: dic
     except EventBusError:
         _publish_failures.add(1, attributes={"topic": topic, "event_type": event_type})
         logger.warning("Failed to publish event %s to topic %s", event_type, topic, exc_info=True)
+
+
+def publish_event_durably(db: Session, topic: str, event_type: str, account_id: str | None, data: dict) -> str:
+    """The outbox half of publish_event - see EventOutbox's docstring for
+    the full rationale. Call this BEFORE the caller's own db.commit()
+    (only db.add()s here, deliberately never commits) so the event row
+    lands in the exact same transaction as the business change it
+    records - if that transaction rolls back, the event row never existed
+    either. A separate sweep (flush_pending_outbox_events) actually
+    publishes it to Kafka afterward, retrying until it succeeds.
+
+    Returns the envelope's event_id (same shape publish_event's envelope
+    uses) so a caller can log/reference it if useful."""
+    from app.events.models import EventOutbox
+
+    event_id = str(uuid.uuid4())
+    envelope = {
+        "event_id": event_id,
+        "event_type": event_type,
+        "occurred_at": datetime.now(timezone.utc).isoformat(),
+        "account_id": account_id,
+        "data": data,
+    }
+    db.add(EventOutbox(topic=topic, event_type=event_type, account_id=account_id, payload=envelope))
+    return event_id
+
+
+def flush_pending_outbox_events(db: Session, *, batch_size: int = 100) -> dict:
+    """Actually publishes every not-yet-published EventOutbox row to
+    Kafka, oldest first. Meant to run periodically (same manual-trigger-
+    plus-external-cron pattern as app.compliance.service.sweep_expired_
+    compliance_cases / app.billing.service.run_zoikonex_reconciliation),
+    not on every request.
+
+    Commits after EACH row (not once at the end) so one row's publish
+    failure can't roll back the rows that already succeeded earlier in
+    the same batch - matches the Kafka CONSUMER side's own per-message
+    (not per-batch) commit granularity in app.events.consumer."""
+    from app.events.models import EventOutbox
+
+    pending = (
+        db.query(EventOutbox)
+        .filter(EventOutbox.published_at.is_(None))
+        .order_by(EventOutbox.created_at.asc())
+        .limit(batch_size)
+        .all()
+    )
+    published, failed = 0, 0
+    for row in pending:
+        try:
+            eventbus.publish(topic=row.topic, key=row.account_id, payload=row.payload)
+        except EventBusError as e:
+            row.attempt_count += 1
+            row.last_error = str(e)[:500]
+            failed += 1
+        else:
+            row.published_at = datetime.now(timezone.utc)
+            published += 1
+        db.commit()
+    return {"checked": len(pending), "published": published, "failed": failed}
 
 
 def publish_number_reserved(account_id: str, *, number_id: str, e164: str, country: str) -> None:
@@ -144,6 +205,19 @@ def publish_compliance_case_rejected(
     publish_event(
         "zoiko.compliance", "compliance.case_rejected", account_id,
         {"case_id": case_id, "jurisdiction": jurisdiction, "requirement_type": requirement_type, "reason": reason},
+    )
+
+
+def publish_compliance_case_expired(
+    account_id: str, *, case_id: str, jurisdiction: str, requirement_type: str
+) -> None:
+    """Architecture doc §8 event table - the one compliance event that had
+    no real call site until app.compliance.service.sweep_expired_
+    compliance_cases existed (a case was never actually marked EXPIRED
+    anywhere in the codebase before that)."""
+    publish_event(
+        "zoiko.compliance", "compliance.case_expired", account_id,
+        {"case_id": case_id, "jurisdiction": jurisdiction, "requirement_type": requirement_type},
     )
 
 

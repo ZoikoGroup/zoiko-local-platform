@@ -17,6 +17,7 @@ from app.numbering.numbers.schemas import (
 )
 from app.numbering.numbers.models import MarketActivationStatus, NumberEligibilityCaseStatus
 from app.numbering.numbers.service import (
+    MissingLegalSignoffError,
     NoStuckProvisioningError,
     NotDueForRenewalError,
     NumberEligibilityCaseNotFoundError,
@@ -46,8 +47,22 @@ from app.staff.schemas import (
     UpdateAccountBillingClassificationRequest,
 )
 from app.staff.service import LastGrantRemovalError, list_access_matrix
-from app.usage.schemas import CallingRateResponse, UpsertCallingRateRequest
-from app.usage.service import list_calling_rates, upsert_calling_rate
+from app.usage.schemas import (
+    AIUsageRateResponse,
+    CallingRateResponse,
+    NumberRateResponse,
+    UpsertAIUsageRateRequest,
+    UpsertCallingRateRequest,
+    UpsertNumberRateRequest,
+)
+from app.usage.service import (
+    get_ai_usage_rate,
+    list_calling_rates,
+    list_number_rates,
+    upsert_ai_usage_rate,
+    upsert_calling_rate,
+    upsert_number_rate,
+)
 
 router = APIRouter(prefix="/staff", tags=["staff"])
 
@@ -199,6 +214,51 @@ def upsert_calling_rate_route(
     )
 
 
+@router.get("/number-rates", response_model=list[NumberRateResponse])
+def list_number_rates_route(
+    db: Session = Depends(get_db),
+    _staff: PlatformStaff = Depends(get_current_staff),
+):
+    return list_number_rates(db)
+
+
+@router.put("/number-rates", response_model=NumberRateResponse)
+def upsert_number_rate_route(
+    payload: UpsertNumberRateRequest,
+    db: Session = Depends(get_db),
+    _staff: PlatformStaff = Depends(require_capability("billing.manage_number_rates")),
+):
+    # SUPER_ADMIN only (via the matrix) - same pricing-decision bar as
+    # calling-rates above.
+    return upsert_number_rate(
+        db, country=payload.country, number_type=payload.number_type,
+        recurring_price_cents=payload.recurring_price_cents, currency=payload.currency,
+        is_placeholder=payload.is_placeholder,
+    )
+
+
+@router.get("/ai-usage-rate", response_model=AIUsageRateResponse | None)
+def get_ai_usage_rate_route(
+    db: Session = Depends(get_db),
+    _staff: PlatformStaff = Depends(get_current_staff),
+):
+    return get_ai_usage_rate(db)
+
+
+@router.put("/ai-usage-rate", response_model=AIUsageRateResponse)
+def upsert_ai_usage_rate_route(
+    payload: UpsertAIUsageRateRequest,
+    db: Session = Depends(get_db),
+    _staff: PlatformStaff = Depends(require_capability("billing.manage_ai_usage_rates")),
+):
+    return upsert_ai_usage_rate(
+        db, overage_price_cents_per_minute=payload.overage_price_cents_per_minute,
+        addon_monthly_price_cents=payload.addon_monthly_price_cents,
+        addon_included_minutes=payload.addon_included_minutes,
+        currency=payload.currency, is_placeholder=payload.is_placeholder,
+    )
+
+
 @router.get("/countries", response_model=list[SupportedCountryResponse])
 def list_supported_countries_route(
     db: Session = Depends(get_db),
@@ -251,9 +311,12 @@ def set_market_activation_status_route(
     try:
         return set_market_activation_status(
             db, code, status=market_status, actor=staff.id, reason=payload.reason,
+            legal_signoff_reference=payload.legal_signoff_reference, legal_signoff_by=payload.legal_signoff_by,
         )
     except UnsupportedCountryError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
+    except MissingLegalSignoffError as e:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e)) from e
 
 
 @router.get("/number-eligibility-rules", response_model=list[NumberEligibilityRuleResponse])

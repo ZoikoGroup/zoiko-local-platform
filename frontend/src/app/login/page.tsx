@@ -59,9 +59,13 @@ export default function LoginPage() {
   async function handleGoogleCredential(credential: string) {
     setError(null);
     try {
-      const { access_token } = await googleAuth(credential);
+      const { access_token, is_new_account } = await googleAuth(credential);
       saveToken(access_token);
-      router.push("/dashboard");
+      // Symmetric with the signup page - someone who's never signed up
+      // before can also land on /login and use Google first, which
+      // creates their account here too. New accounts go through plan
+      // selection either way.
+      router.push(is_new_account ? "/choose-plan" : "/dashboard");
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Google sign-in failed");
     }

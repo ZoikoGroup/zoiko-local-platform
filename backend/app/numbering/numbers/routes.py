@@ -1,3 +1,5 @@
+import logging
+
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.orm import Session
 
@@ -40,6 +42,22 @@ from app.numbering.numbers.service import (
 )
 
 router = APIRouter(prefix="/numbers", tags=["numbers"])
+logger = logging.getLogger("zoiko.numbers")
+
+
+def _telecom_error_response(e: TelecomError) -> HTTPException:
+    """Provider Gateway's whole premise is that a customer only ever knows
+    "Zoiko Local" exists - never Twilio, never Vonage, never a raw HTTP
+    status line from either. Confirmed live: a Vonage 401 ("Vonage number
+    purchase request failed: Client error '401 Unauthorized' for url
+    'https://rest.nexmo.com/number/buy'...") was reaching the checkout
+    screen verbatim. The real detail still goes to the server log for
+    support/debugging - it's just never handed to the customer."""
+    logger.error("Telecom provider error surfaced to a customer-facing route: %s", e)
+    return HTTPException(
+        status_code=502,
+        detail="We couldn't complete this right now. Please try again shortly, or contact support if it continues.",
+    )
 
 
 @router.get("/countries", response_model=list[SupportedCountryResponse])
@@ -69,7 +87,7 @@ def search_numbers(
     except InvalidAreaCodeError as e:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e)) from e
     except TelecomError as e:
-        raise HTTPException(status_code=502, detail=str(e)) from e
+        raise _telecom_error_response(e) from e
 
 
 @router.post("/reserve", response_model=PhoneNumberResponse, status_code=status.HTTP_201_CREATED)
@@ -107,7 +125,7 @@ def purchase_number(
     except (ComplianceRequiredError, EmergencyDisclosureRequiredError, NumberEligibilityRequiredError) as e:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e)) from e
     except TelecomError as e:
-        raise HTTPException(status_code=502, detail=str(e)) from e
+        raise _telecom_error_response(e) from e
     except KillSwitchTrippedError as e:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e)) from e
     except AccountKillSwitchTrippedError as e:
@@ -173,6 +191,15 @@ def create_checkout_session(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e)) from e
     except stripe_checkout.PaymentError as e:
         raise HTTPException(status_code=502, detail=str(e)) from e
+    except TelecomError as e:
+        # Included-first-number path calls purchase_number() (and therefore
+        # the telecom provider) synchronously, before Stripe is ever
+        # involved - unlike search_numbers's route, this had no handler for
+        # a provider failure here at all, so it crashed as an unhandled 500
+        # instead of a clean customer-facing error (confirmed live: primary
+        # hit a Twilio trial-account number cap, failover to Vonage then
+        # hit a 401 - Vonage account not yet authorized to purchase).
+        raise _telecom_error_response(e) from e
 
 
 @router.post("/payments/webhook", status_code=status.HTTP_204_NO_CONTENT)
@@ -255,7 +282,7 @@ def cancel_number(
     except NumberConflictError as e:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e
     except TelecomError as e:
-        raise HTTPException(status_code=502, detail=str(e)) from e
+        raise _telecom_error_response(e) from e
 
 
 @router.post("/{e164}/sync-webhook", response_model=PhoneNumberResponse)
@@ -269,7 +296,7 @@ def sync_webhook(
     except NumberConflictError as e:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e
     except TelecomError as e:
-        raise HTTPException(status_code=502, detail=str(e)) from e
+        raise _telecom_error_response(e) from e
 
 
 @router.put("/{e164}/routing", response_model=PhoneNumberResponse)

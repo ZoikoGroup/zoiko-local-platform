@@ -283,6 +283,30 @@ def send_notification(
         except EmailError as e:
             delivery.status = NotificationDeliveryStatus.FAILED
             delivery.error = str(e)
+            if is_exempt:
+                # OPS-INT-001 "Critical Email Delivery Failure" - this
+                # branch only reaches here for SECURITY/CRITICAL templates
+                # (the doc's "essential security, porting, emergency,
+                # billing, or legal" class), which is exactly the case
+                # where silent failure is the worst outcome. Guarded
+                # against recursing into itself: send_internal_alert's own
+                # send_email failures are swallowed per-recipient inside
+                # that function, never raised back here.
+                try:
+                    # delivery.id isn't populated yet (its UUID default
+                    # fires at flush/commit time, both of which happen
+                    # after this block) - event_name+recipient is already
+                    # a stable, real reference at this point.
+                    send_internal_alert(
+                        db, event_name="ops_int.critical_email_delivery_failure",
+                        summary=(
+                            f"Template {event_name!r} failed to send to {recipient_email} after retries: {e}"
+                        ),
+                        console_link=f"{settings.public_base_url}/staff",
+                        delivery_reference=f"{event_name}:{recipient_email}",
+                    )
+                except NotificationTemplateMissingError:
+                    pass
 
     db.add(delivery)
     db.commit()
@@ -316,6 +340,57 @@ def send_notification(
         _fan_out_push(db, account_id=account_id, event_name=event_name, title=subject, body=body)
 
     return delivery
+
+
+def send_internal_alert(db: Session, *, event_name: str, summary: str, console_link: str = "", **extra: str) -> None:
+    """Email Communications System doc §10 "Internal Operational Alerts" -
+    staff/ops notifications, a different audience and delivery path from
+    send_notification above: no suppression, no unsubscribe, no per-
+    account preference (staff aren't accounts - PlatformStaff has no FK to
+    accounts.id), and no NotificationDelivery row (that table's account_id
+    is a required FK to accounts.id). Audited via log_event instead,
+    matching every other sensitive/system action in this codebase.
+
+    Delivered to every SUPER_ADMIN - the doc names no distribution-
+    list/on-call mechanism, so this uses the same highest-trust role every
+    other platform-wide sensitive action here is already gated to. Real
+    vendor paging (PagerDuty/Opsgenie) doesn't exist yet; email is the
+    only real channel today - the same gap OPS-INT-001 itself names
+    ("alternate-channel decision") when email delivery is what's failing.
+
+    `summary`/`console_link` are the two placeholders every one of the 39
+    seeded body templates shares (see that migration's docstring on why
+    the required-content-category guidance became two generic fields, not
+    39 bespoke ones) - `extra` covers whatever the subject line itself
+    needs (e.g. case_reference, tenant_reference)."""
+    template = db.query(NotificationTemplate).filter(NotificationTemplate.key == event_name).first()
+    if template is None:
+        raise NotificationTemplateMissingError(f"No internal alert template registered for event {event_name!r}")
+
+    context = {"summary": summary, "console_link": console_link, **extra}
+    subject = template.subject_template.format(**context)
+    body = template.body_template.format(**context)
+
+    from app.staff.models import PlatformStaff, PlatformStaffRole
+
+    recipients = db.query(PlatformStaff).filter(PlatformStaff.role == PlatformStaffRole.SUPER_ADMIN).all()
+    sent_to: list[str] = []
+    for staff in recipients:
+        try:
+            send_email(to=staff.email, subject=subject, body=body)
+            sent_to.append(staff.email)
+        except EmailError:
+            # One staff mailbox bouncing must never block the others, and
+            # never propagate into the real event that triggered this
+            # alert (e.g. a reconciliation run) - that event already
+            # succeeded/failed on its own merits regardless of whether
+            # anyone got told about it.
+            pass
+
+    log_event(
+        db, actor="system", action="internal_alert.sent", target=f"notification_template:{template.id}",
+        after={"event_name": event_name, "subject": subject, "recipients": sent_to},
+    )
 
 
 def _fan_out_push(db: Session, *, account_id: str, event_name: str, title: str, body: str) -> None:
@@ -1108,6 +1183,69 @@ def notify_payment_reminder(
             "dunning_consequence_summary": (
                 "Outbound calling, video, number purchases, and AI features will pause"
             ),
+        },
+    )
+
+
+def notify_invoice_available(
+    db: Session, *, account_id: str, account_email: str, invoice_reference: str, billing_period: str,
+    subtotal: str, tax: str, total: str, currency: str,
+) -> None:
+    """The 'billing.invoice_available' template was seeded but never
+    called from anywhere - run_billing_cycle issued real invoices with no
+    customer-facing evidence that one existed. This is the receipt/invoice
+    leg of the Production Readiness acceptance chain (Table 22)."""
+    send_notification(
+        db, event_name="billing.invoice_available", account_id=account_id, recipient_email=account_email,
+        context={
+            "user_display_name": account_email,
+            "transaction_reference": invoice_reference,
+            "billing_period": billing_period,
+            "transaction_subtotal": subtotal,
+            "transaction_tax": tax,
+            "transaction_total": total,
+            "transaction_currency": currency,
+        },
+    )
+
+
+def notify_payment_succeeded(
+    db: Session, *, account_id: str, account_email: str, total: str, currency: str, description: str,
+    payment_date: str, payment_method_masked: str,
+) -> None:
+    """Same gap as notify_invoice_available above - 'billing.payment_succeeded'
+    was seeded but run_billing_cycle's successful capture never triggered it."""
+    send_notification(
+        db, event_name="billing.payment_succeeded", account_id=account_id, recipient_email=account_email,
+        context={
+            "user_display_name": account_email,
+            "transaction_total": total,
+            "transaction_currency": currency,
+            "transaction_description": description,
+            "transaction_date": payment_date,
+            "transaction_payment_method_masked": payment_method_masked,
+        },
+    )
+
+
+def notify_credit_or_refund_processed(
+    db: Session, *, account_id: str, account_email: str, adjustment_type: str, amount: str, currency: str,
+    reference: str, reason: str,
+) -> None:
+    """'billing.credit_or_refund_processed' was seeded but no refund path
+    (the automatic post-payment-fulfillment-failure refund in
+    complete_number_purchase_from_checkout, or the staff-triggered
+    refund_zoikonex_payment/credit-note actions) ever called it - a
+    customer whose payment was refunded had no way to know it happened."""
+    send_notification(
+        db, event_name="billing.credit_or_refund_processed", account_id=account_id, recipient_email=account_email,
+        context={
+            "user_display_name": account_email,
+            "transaction_adjustment_type": adjustment_type,
+            "transaction_adjustment_amount": amount,
+            "transaction_currency": currency,
+            "transaction_reference": reference,
+            "transaction_adjustment_reason": reason,
         },
     )
 

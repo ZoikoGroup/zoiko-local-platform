@@ -131,3 +131,58 @@ in `DATABASE_URL` (`alembic current` and pytest's session-scoped schema fixture 
 live DB connection), so none of the above was verified beyond `python -m py_compile`/import
 checks and building the full FastAPI app object. Run `pytest` from an environment with real
 DB access before trusting this beyond "it imports."
+
+**Correction (2026-08-19):** Two claims above are now stale, confirmed built (not something
+built today — just never reflected here):
+
+*AI Receptionist is real*, not summarization-only as the 2026-08-01 entry says. Real
+answering (`POST /media/receptionist/respond`, `backend/app/media/receptionist.py`), caller
+qualification via Groq extraction, urgency-based escalation to a nominated team member
+(`escalation_user_id`), staff assignment/summary editing, and a deterministic guardrail
+scanner (`backend/app/intelligence/guardrails.py`) blocking pricing/legal/medical
+commitments — matching the roadmap doc's spec.
+
+*Device fingerprinting is real end-to-end*, not backend-only-and-waiting-on-frontend as the
+2026-08-06 entry says. Frontend sends a coarse, no-third-party-SDK fingerprint as an
+optional header on signup (`computeDeviceFingerprint()`, `frontend/src/lib/api.ts`);
+backend detection lives in `backend/app/risk/service.py`
+(`record_fingerprint_sighting`/`is_suspected_fingerprint_abuse`/`check_fingerprint_on_signup`).
+Payment risk is still genuinely not built (still no billing/payment system for it to hook
+into).
+
+Also: the Vonage `_secondary_stub.py` entry above ("none of these are tested against a live
+account") is stale for Vonage specifically — real Vonage credentials were added and
+live-tested this session (`search_available_numbers`/`buy_number` against a real account;
+found and fixed a real bug in the process, `mobile` → `mobile-lvn` number-type mapping).
+`TELECOM_FAILOVER_ENABLED=true` in `.env`. The other five secondaries (Daily.co/OpenAI/
+Deepgram/Sumsub/Backblaze B2/SendGrid/OneSignal) remain untested against live accounts, as
+originally stated.
+
+**Decision (2026-08-20): video calling stays in Zoiko Local.** The Commercial Billing
+Operating Standard doc (§1/§G1/§35) flags a "Critical" consistency conflict against the
+Phase 1 Roadmap doc: the newer Billing Standard says video should be a governed Zoiko Sema
+integration/handoff, not a separately-rated Zoiko Local product, while the Roadmap doc (the
+doc this build actually followed) says video launches in Phase 1 as a real Zoiko Local
+feature. Product owner confirmed directly: keep the existing, fully real, tested LiveKit
+video integration (`backend/app/media/video.py`, its own `Plan.monthly_video_minutes`/
+`Plan.max_video_participants` entitlements, and its Kafka event coverage) as a genuine
+Zoiko Local product. Not a code change — video already worked exactly this way; this
+resolves the doc conflict itself so it stops being re-flagged as open in future audits.
+If the Zoiko Sema boundary is ever revisited, that's a new decision to make explicitly,
+not a reversion to an old unresolved one.
+
+**Decision (2026-08-20): Zoiko Local price book formally approved.** All 8 real
+(`is_placeholder=False`) `price_catalog_entries` rows for `price_book_version`
+`2026-08-14-global-launch-usd` (Starter/Business/Pro/Scale × monthly/annual — the doc's own
+$12.99/$19.99/$29.99/$44.99 and $129/$199/$299/$449 figures) moved PROPOSED → APPROVED →
+ACTIVE via `approve_price_catalog_entry`/`activate_price_catalog_entry`, with real
+`approval_evidence`/`approved_by`/`approved_at` recorded under the product owner's direct
+authorization (not engineering self-ratifying its own placeholder load, per the Readiness
+Standard doc's Rule of Authority — see the 2026-08-19 revert of this same price book back to
+PROPOSED, which this entry now formally supersedes). `run_billing_cycle`'s own
+status/is_placeholder gate will now treat these as genuinely chargeable outside development.
+Fixed a real bug found while doing this: `activate_price_catalog_entry`'s "retire whatever
+was previously ACTIVE" query didn't scope by `billing_period` (added after that function was
+originally written) — activating a plan's ANNUAL entry would have silently retired that same
+plan's already-ACTIVE MONTHLY entry, and vice versa, purely because they share the same
+plan_code+market. Fixed and verified live: all 8 rows are correctly ACTIVE simultaneously.

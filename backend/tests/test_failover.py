@@ -138,6 +138,13 @@ def test_telecom_send_sms_falls_back_to_secondary_stub_when_enabled(monkeypatch)
     monkeypatch.setattr(twilio.settings, "twilio_trial_number", "+15550001111")
     monkeypatch.setattr(twilio.settings, "telecom_failover_enabled", True)
     monkeypatch.setattr(twilio, "_breaker", type(twilio._breaker)("telecom-test"))
+    # Explicitly blank, not relying on .env having no VONAGE_* set - real
+    # Vonage credentials were added to .env this session (live-tested
+    # search/purchase against a real account), so this test would
+    # otherwise silently depend on real environment state to reach the
+    # exact "not configured" branch it's testing.
+    monkeypatch.setattr(twilio.secondary.settings, "vonage_api_key", "")
+    monkeypatch.setattr(twilio.secondary.settings, "vonage_api_secret", "")
 
     def _raise_client():
         raise TwilioException("simulated outage")
@@ -146,6 +153,32 @@ def test_telecom_send_sms_falls_back_to_secondary_stub_when_enabled(monkeypatch)
 
     with pytest.raises(twilio.TelecomError, match="Secondary telecom provider .* is not configured"):
         twilio.send_sms("+15551234567", "hello")
+
+
+def test_telecom_send_sms_falls_back_when_trial_number_is_unset(monkeypatch):
+    """A blank TWILIO_TRIAL_NUMBER is a primary-provider failure like any
+    other - it must go through with_failover (and be rescuable by the
+    secondary) rather than raising before with_failover ever runs, which
+    silently defeated TELECOM_FAILOVER_ENABLED for exactly this case."""
+    from app.integrations.telecom import twilio
+
+    monkeypatch.setattr(twilio.settings, "twilio_trial_number", "")
+    monkeypatch.setattr(twilio.settings, "telecom_failover_enabled", True)
+    monkeypatch.setattr(twilio, "_breaker", type(twilio._breaker)("telecom-test"))
+
+    called = {}
+
+    def _secondary_send_sms(to, body):
+        called["to"] = to
+        called["body"] = body
+        return {"sid": "secondary-sid", "status": "queued"}
+
+    monkeypatch.setattr(twilio.secondary, "send_sms", _secondary_send_sms)
+
+    result = twilio.send_sms("+15551234567", "hello")
+
+    assert result == {"sid": "secondary-sid", "status": "queued"}
+    assert called == {"to": "+15551234567", "body": "hello"}
 
 
 def test_telecom_send_sms_reraises_original_error_when_failover_disabled(monkeypatch):

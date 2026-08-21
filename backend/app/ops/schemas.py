@@ -67,3 +67,9 @@ class KillSwitchResponse(BaseModel):
 
 class SetKillSwitchRequest(BaseModel):
     reason: str | None = None
+
+
+class EventOutboxFlushResponse(BaseModel):
+    checked: int
+    published: int
+    failed: int

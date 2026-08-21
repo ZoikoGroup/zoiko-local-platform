@@ -26,6 +26,12 @@ class GoogleAuthRequest(BaseModel):
 class TokenResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
+    # Only ever True from POST /auth/google when it just created a brand
+    # new account - the frontend uses this to decide whether to route
+    # through post-signup plan selection (an EXISTING customer signing in
+    # via Google must never see that screen, since choosing a plan there
+    # really reassigns their real subscription).
+    is_new_account: bool = False
 
 
 class LoginResponse(BaseModel):

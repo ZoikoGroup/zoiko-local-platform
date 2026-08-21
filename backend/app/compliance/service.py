@@ -1,5 +1,5 @@
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy.orm import Session
 
@@ -7,6 +7,7 @@ from app.audit.service import log_event
 from app.compliance.models import ComplianceCase, ComplianceCaseStatus, ComplianceRule
 from app.events.service import (
     publish_compliance_case_approved,
+    publish_compliance_case_expired,
     publish_compliance_case_rejected,
     publish_compliance_case_required,
 )
@@ -23,6 +24,14 @@ from app.notifications.service import (
 # a human compliance officer, not a general file-upload feature.
 _ALLOWED_DOCUMENT_CONTENT_TYPES = {"application/pdf", "image/jpeg", "image/png"}
 _MAX_DOCUMENT_SIZE_BYTES = 10 * 1024 * 1024
+
+# No doc gives an exact number here - same "reasonable Phase-1 default,
+# clearly labeled as such, not invented precision" posture as
+# billing_service.GRACE_PERIOD_DAYS/numbering.numbers.service.QUARANTINE_DAYS.
+# A case sitting PENDING this long without ever being approved/rejected is
+# treated as stale rather than left open forever - see
+# sweep_expired_compliance_cases.
+COMPLIANCE_CASE_EXPIRY_DAYS = 90
 
 # Stripe Identity VerificationSession status -> our case status. "requires_input"
 # is overloaded - confirmed live against a real submission: it's BOTH the
@@ -93,6 +102,7 @@ def open_compliance_case(
         number_id=number_id,
         jurisdiction=jurisdiction.upper(),
         requirement_type=requirement_type,
+        expires_at=datetime.now(timezone.utc) + timedelta(days=COMPLIANCE_CASE_EXPIRY_DAYS),
     )
     db.add(case)
     db.commit()
@@ -110,6 +120,41 @@ def open_compliance_case(
         account_id, case_id=case.id, jurisdiction=case.jurisdiction, requirement_type=requirement_type,
     )
     return case
+
+
+def sweep_expired_compliance_cases(db: Session) -> list[ComplianceCase]:
+    """Architecture doc §8 lists compliance.case_expired as a real event,
+    but nothing in this codebase ever moved a case to EXPIRED - expires_at
+    was populated (see open_compliance_case) but nothing read it back. This
+    is the read-back: any still-PENDING case whose expiry has passed is
+    marked EXPIRED, audited, and published, exactly like the approve/reject
+    paths below. Only PENDING cases are touched - an already APPROVED/
+    REJECTED case keeps its terminal status regardless of expires_at.
+
+    Meant to run periodically (same pattern as
+    app.ops.scheduled_reconciliation - an external Render Cron Job hitting
+    the staff-triggerable route this wraps), not on every request."""
+    now = datetime.now(timezone.utc)
+    expired = (
+        db.query(ComplianceCase)
+        .filter(ComplianceCase.status == ComplianceCaseStatus.PENDING, ComplianceCase.expires_at < now)
+        .all()
+    )
+    for case in expired:
+        case.status = ComplianceCaseStatus.EXPIRED
+    if expired:
+        db.commit()
+    for case in expired:
+        db.refresh(case)
+        _invalidate_cases_cache(case.account_id)
+        log_event(
+            db, actor="system", action="compliance.case_expired", target=f"compliance_case:{case.id}",
+            before={"status": "pending"}, after={"status": "expired", "expires_at": case.expires_at.isoformat()},
+        )
+        publish_compliance_case_expired(
+            case.account_id, case_id=case.id, jurisdiction=case.jurisdiction, requirement_type=case.requirement_type,
+        )
+    return expired
 
 
 def _cases_cache_key(account_id: str) -> str:

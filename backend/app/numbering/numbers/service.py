@@ -16,7 +16,9 @@ from app.integrations.cache.redis import cache_delete, cache_get, cache_set
 from app.integrations.telecom import twilio as telecom
 from app.ops.models import KillSwitchScope
 from app.ops.service import assert_kill_switch_not_active
+from app.usage import service as usage_service
 from app.notifications.service import (
+    notify_credit_or_refund_processed,
     notify_number_activated,
     notify_number_assigned,
     notify_number_order_not_approved,
@@ -24,6 +26,7 @@ from app.notifications.service import (
     notify_number_suspended,
     notify_number_unassigned,
     notify_number_verification_required,
+    send_internal_alert,
 )
 from app.numbering.identity.models import Account, AccountBillingClassification, AccountType, User, UserRole
 from app.numbering.numbers.models import (
@@ -42,13 +45,25 @@ RESERVATION_TTL_MINUTES = 12
 QUARANTINE_DAYS = 90
 RENEWAL_PERIOD_DAYS = 30
 
-# Real Stripe Checkout price for a number purchase (test mode - no real
-# money moves yet). One flat price for every number regardless of country
-# or type, a deliberate first-pass simplification - same "placeholder, not
-# a real rate card" posture as app.usage.models.CallingRate's per-country
-# calling prices. Revisit once real per-market pricing is decided.
+# Fallback Stripe Checkout price for a number purchase (test mode - no
+# real money moves yet), used only when usage_service.get_number_rate
+# returns nothing at all (e.g. a number_type with no seeded fallback row) -
+# create_number_purchase_checkout_session now prices from the real
+# NumberRate table (country/number_type specific, doc-sourced $4.99
+# baseline) first and only falls back to this flat placeholder as a last
+# resort. Revisit once real per-market pricing is fully populated.
 NUMBER_PURCHASE_PRICE_CENTS = 100
 NUMBER_PURCHASE_CURRENCY = "usd"
+# Global Plans, Pricing & Commercial Launch doc §5.1: "Apply an inclusion
+# threshold; higher-cost or regulated numbers show a surcharge before
+# checkout" - the doc requires this mechanism but gives no specific dollar
+# figure for the threshold itself (unlike the $4.99 baseline, which IS
+# doc-sourced). Set equal to the current NumberRate baseline as an honest
+# placeholder (not a ratified business figure) - this means today's single
+# seeded rate produces a $0 surcharge by construction, and the mechanism
+# activates correctly the moment a real higher-cost country/type rate is
+# added, without needing another code change.
+NUMBER_INCLUSION_THRESHOLD_CENTS = 499
 
 
 class NumberConflictError(Exception):
@@ -124,6 +139,15 @@ class MarketNotActivatedError(Exception):
     model yet to distinguish "internal tester" from "invited beta
     customer", so both non-PAID_OPEN-but-active states share the same
     is_test gate for now (see _assert_market_activated's docstring)."""
+
+
+class MissingLegalSignoffError(Exception):
+    """Readiness doc §6.2: "PAID_OPEN only after legal/tax/telecom/privacy/
+    consumer review and named sign-off." Raised by set_market_activation_
+    status when a transition INTO PAID_OPEN is attempted without both
+    legal_signoff_reference and legal_signoff_by - previously a free-text
+    audit `reason` (e.g. "testing") was sufficient to open a market for
+    real commercial sale, which is exactly the gap this doc calls out."""
 
 
 _SUPPORTED_COUNTRIES_CACHE_KEY = "numbers:supported_countries"
@@ -238,7 +262,8 @@ def _assert_market_activated(db: Session, country: str, account_id: str) -> None
 
 
 def set_market_activation_status(
-    db: Session, code: str, *, status: MarketActivationStatus, actor: str, reason: str
+    db: Session, code: str, *, status: MarketActivationStatus, actor: str, reason: str,
+    legal_signoff_reference: str | None = None, legal_signoff_by: str | None = None,
 ) -> SupportedCountry:
     """Staff-only, SUPER_ADMIN-gated at the route - moving a market between
     CLOSED/INTERNAL_TEST/CONTROLLED_BETA/PAID_OPEN/SUSPENDED is exactly the
@@ -246,12 +271,28 @@ def set_market_activation_status(
     from Engineering self-ratification; this function is the enforcement
     mechanism a human decision is recorded through, not the decision
     itself. `reason` is mandatory - see Annex B's "every override... has
-    actor, reason, timestamp and evidence"."""
+    actor, reason, timestamp and evidence".
+
+    Readiness doc §6.2: a transition INTO PAID_OPEN additionally requires
+    legal_signoff_reference (a ticket/decision ID) and legal_signoff_by (the
+    named reviewer) - `reason` alone used to be enough to open a market for
+    real commercial sale, which is exactly the "provider has numbers there"
+    shortcut this doc prohibits. Not required for any other transition
+    (INTERNAL_TEST/CONTROLLED_BETA/SUSPENDED/CLOSED), which don't carry the
+    same "customers can now actually pay for this" weight."""
     country = db.query(SupportedCountry).filter(SupportedCountry.code == code).first()
     if country is None:
         raise UnsupportedCountryError(f"{code!r} is not on Zoiko Local's supported country list yet")
+    if status == MarketActivationStatus.PAID_OPEN and not (legal_signoff_reference and legal_signoff_by):
+        raise MissingLegalSignoffError(
+            f"Opening {code!r} for paid sale requires legal_signoff_reference and legal_signoff_by "
+            f"(Readiness Standard doc §6.2 - a named legal/tax/telecom/privacy review, not just a reason string)"
+        )
     previous_status = country.market_status
     country.market_status = status
+    if status == MarketActivationStatus.PAID_OPEN:
+        country.legal_signoff_reference = legal_signoff_reference
+        country.legal_signoff_by = legal_signoff_by
     db.commit()
     db.refresh(country)
     _invalidate_supported_countries_cache()
@@ -259,7 +300,10 @@ def set_market_activation_status(
         db, actor=actor, action="market.activation_status_changed",
         target=f"supported_country:{code}", reason=reason,
         before={"market_status": previous_status.value},
-        after={"market_status": status.value},
+        after={
+            "market_status": status.value,
+            "legal_signoff_reference": legal_signoff_reference, "legal_signoff_by": legal_signoff_by,
+        },
     )
     return country
 
@@ -844,17 +888,43 @@ def create_number_purchase_checkout_session(db: Session, account_id: str, e164: 
 
     _assert_purchase_eligible(db, account_id, number, e164=e164)
 
+    rate = usage_service.get_number_rate(db, number.country, number.number_type)
+    rate_cents = rate.recurring_price_cents if rate is not None else NUMBER_PURCHASE_PRICE_CENTS
+
     if billing_service.is_first_number_included(db, account_id, exclude_number_id=number.id):
-        log_event(
-            db, actor_id=account_id, action="number.included_purchase",
-            target_type="phone_number", target_id=number.id, metadata={"e164": e164},
+        surcharge_cents = max(0, rate_cents - NUMBER_INCLUSION_THRESHOLD_CENTS)
+        if surcharge_cents == 0:
+            log_event(
+                db, actor_id=account_id, action="number.included_purchase",
+                target_type="phone_number", target_id=number.id, metadata={"e164": e164},
+            )
+            included_number = purchase_number(db, account_id, e164)
+            return {"id": None, "url": None, "included": True, "number": included_number}
+
+        # Doc §5.1: included number, but its real rate is above the
+        # inclusion threshold (a higher-cost or regulated number type) -
+        # the customer still gets the included entitlement (purchase_number
+        # below provisions it as such once Stripe confirms payment), but
+        # pays the incremental amount above the threshold first rather than
+        # getting the full rate for free.
+        session = stripe_checkout.create_checkout_session(
+            e164=e164,
+            amount_cents=surcharge_cents,
+            currency=NUMBER_PURCHASE_CURRENCY,
+            success_url=f"{settings.frontend_base_url}/dashboard/numbers?checkout=success",
+            cancel_url=f"{settings.frontend_base_url}/dashboard/numbers?checkout=cancelled",
+            metadata={"e164": e164, "account_id": account_id, "surcharge_cents": str(surcharge_cents)},
         )
-        included_number = purchase_number(db, account_id, e164)
-        return {"id": None, "url": None, "included": True, "number": included_number}
+        log_event(
+            db, actor_id=account_id, action="number.included_purchase_surcharge_checkout_created",
+            target_type="phone_number", target_id=number.id,
+            metadata={"e164": e164, "session_id": session["id"], "surcharge_cents": surcharge_cents},
+        )
+        return {"id": session["id"], "url": session["url"], "included": False, "number": None}
 
     session = stripe_checkout.create_checkout_session(
         e164=e164,
-        amount_cents=NUMBER_PURCHASE_PRICE_CENTS,
+        amount_cents=rate_cents,
         currency=NUMBER_PURCHASE_CURRENCY,
         success_url=f"{settings.frontend_base_url}/dashboard/numbers?checkout=success",
         cancel_url=f"{settings.frontend_base_url}/dashboard/numbers?checkout=cancelled",
@@ -901,12 +971,8 @@ def complete_number_purchase_from_checkout(
     """
     try:
         return purchase_number(db, account_id, e164)
-    except ReservationExpiredError:
-        if payment_intent_id:
-            try:
-                stripe_checkout.refund_payment(payment_intent_id)
-            except stripe_checkout.PaymentError:
-                pass
+    except ReservationExpiredError as e:
+        _refund_and_notify_failed_purchase(db, account_id, e164, payment_intent_id, reason=str(e))
         return None
     except (NumberConflictError, ComplianceRequiredError, NumberEligibilityRequiredError):
         return None
@@ -915,18 +981,48 @@ def complete_number_purchase_from_checkout(
         billing_service.NumberQuotaExceededError,
         billing_service.BillingSuspendedError,
         telecom.TelecomError,
-    ):
-        if payment_intent_id:
-            try:
-                stripe_checkout.refund_payment(payment_intent_id)
-            except stripe_checkout.PaymentError:
-                # Refund itself failed (e.g. provider outage) - logged by
-                # trace_provider_call already; swallowed here so a refund
-                # hiccup never turns into a 500 back to Stripe's webhook
-                # (which would just cause pointless redelivery retries of
-                # an event we've already fully handled on our side).
-                pass
+    ) as e:
+        _refund_and_notify_failed_purchase(db, account_id, e164, payment_intent_id, reason=str(e))
         return None
+
+
+def _refund_and_notify_failed_purchase(
+    db: Session, account_id: str, e164: str, payment_intent_id: str | None, *, reason: str
+) -> None:
+    """Shared by complete_number_purchase_from_checkout's two refundable
+    failure branches above - previously refunded silently with no
+    customer-facing evidence a refund happened (the 'billing.credit_or_
+    refund_processed' template was seeded but never called - same gap as
+    run_billing_cycle's invoice/payment notifications)."""
+    if not payment_intent_id:
+        return
+    try:
+        refund = stripe_checkout.refund_payment(payment_intent_id)
+    except stripe_checkout.PaymentError:
+        # Refund itself failed (e.g. provider outage) - logged by
+        # trace_provider_call already; swallowed here so a refund hiccup
+        # never turns into a 500 back to Stripe's webhook (which would
+        # just cause pointless redelivery retries of an event we've
+        # already fully handled on our side). No notification either -
+        # nothing was actually refunded yet.
+        return
+
+    owner = db.query(User).filter(User.account_id == account_id, User.role == UserRole.OWNER).first()
+    if owner is not None:
+        try:
+            # The refund itself already succeeded (we're past the guard
+            # above) - a notification failure here must not propagate.
+            # This whole function runs inside the Stripe webhook handler
+            # with no surrounding try/except, so an uncaught exception
+            # would 500 the webhook response, causing Stripe to redeliver
+            # the same event and re-run this already-completed refund path.
+            notify_credit_or_refund_processed(
+                db, account_id=account_id, account_email=owner.email, adjustment_type="refund",
+                amount=f"{refund['amount'] / 100:.2f}", currency=refund["currency"].upper(),
+                reference=payment_intent_id, reason=f"{e164} could not be provisioned after payment: {reason}",
+            )
+        except Exception:
+            pass
 
 
 # purchase_number is entirely synchronous - it never returns to the caller
@@ -1087,7 +1183,24 @@ def mark_number_renewed(db: Session, staff_id: str, number_id: str) -> PhoneNumb
     ownership is explicitly exempt from billing-suspension effects
     (app.billing.service.assert_billing_not_suspended's docstring), and
     there's no real per-number payment step to fail against yet, so this
-    must not invent a punitive failure mode that isn't backed by one."""
+    must not invent a punitive failure mode that isn't backed by one.
+
+    Global Plans, Pricing & Commercial Launch Standard doc §5.1 - "1
+    standard eligible number per paid user... Additional standard local
+    number: From $4.99/month." This DOES now record a real number_month
+    UsageEvent for every renewal beyond the account's included-number pool,
+    priced via NumberRate for visibility - see that table's docstring on
+    why this still doesn't charge anyone (same gap as the rest of this
+    function's existing docstring above). Which numbers count as
+    "included" is resolved by billing_service.get_included_number_ids - the
+    SAME function purchase-time eligibility uses (is_first_number_included)
+    - not a separate inline query. An earlier version of this function
+    computed its own answer (earliest ACTIVE number, no subscription-
+    qualification check) that could disagree with purchase-time
+    eligibility: a free-trial account's number renewed free forever
+    despite the doc's own "paid user" requirement, and a suspended first
+    number would silently hand free treatment to the second number
+    instead."""
     number = db.query(PhoneNumber).filter(PhoneNumber.id == number_id).with_for_update().first()
     now = datetime.now(timezone.utc)
     if number is None or not is_number_billable(number.status) or (
@@ -1095,6 +1208,7 @@ def mark_number_renewed(db: Session, staff_id: str, number_id: str) -> PhoneNumb
     ):
         raise NotDueForRenewalError(f"{number_id} is not currently due for renewal")
 
+    due_at = number.next_renewal_at
     number.next_renewal_at = now + timedelta(days=RENEWAL_PERIOD_DAYS)
     db.commit()
     db.refresh(number)
@@ -1104,6 +1218,13 @@ def mark_number_renewed(db: Session, staff_id: str, number_id: str) -> PhoneNumb
         target_type="phone_number", target_id=number.id,
         metadata={"e164": number.e164, "next_renewal_at": number.next_renewal_at.isoformat()},
     )
+
+    included_number_ids = billing_service.get_included_number_ids(db, number.account_id)
+    if number.id not in included_number_ids:
+        usage_service.record_usage_event(
+            db, account_id=number.account_id, event_type="number_month", quantity=1, unit="months",
+            country_band=number.country, idempotency_key=f"number_month:{number.id}:{due_at.date().isoformat()}",
+        )
     return number
 
 
@@ -1168,6 +1289,19 @@ def suspend_numbers_for_account_by_system(db: Session, account_id: str, *, reaso
                     db, account_id=account_id, account_email=owner.email, e164=number.e164, reason=reason,
                     account_phone=owner.phone_number,
                 )
+
+        # TRUST-INT-003 "Calling Fraud Spend Spike" - the customer already
+        # gets told (notify_number_suspended above); staff previously had
+        # no signal at all that the risk engine had just auto-suspended a
+        # whole account short of manually checking the fraud console.
+        send_internal_alert(
+            db, event_name="trust_int.fraud_spend_spike",
+            summary=(
+                f"Risk engine auto-suspended {len(numbers)} number(s) on account {account_id}: {reason}"
+            ),
+            console_link=f"{settings.public_base_url}/staff/fraud",
+            tenant_reference=account_id,
+        )
 
     return numbers
 
