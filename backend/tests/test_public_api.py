@@ -136,11 +136,22 @@ def test_public_api_calls_voicemails_summaries_endpoints_smoke(client):
 
 
 def _make_active_number(client, db_session, token, e164: str):
-    from app.numbering.numbers.models import PhoneNumber, PhoneNumberStatus
+    from datetime import datetime, timezone
+
+    from app.numbering.numbers.models import CallerIdentity, CallerIdentityStatus, PhoneNumber, PhoneNumberStatus
 
     account_id = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"}).json()["account_id"]
     number = PhoneNumber(e164=e164, country="US", status=PhoneNumberStatus.ACTIVE, account_id=account_id)
     db_session.add(number)
+    db_session.commit()
+    # Real purchases auto-create a VERIFIED CallerIdentity (see
+    # assert_caller_id_authorized) - this helper bypasses purchase_number
+    # entirely, so it must create one itself or outbound calls get rejected
+    # as an unauthorized caller ID.
+    db_session.add(CallerIdentity(
+        phone_number_id=number.id, account_id=account_id, status=CallerIdentityStatus.VERIFIED,
+        verification_source="test-fixture", verified_at=datetime.now(timezone.utc),
+    ))
     db_session.commit()
 
 

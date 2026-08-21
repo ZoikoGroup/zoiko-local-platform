@@ -78,8 +78,9 @@ gated on the same AI-processing consent record. Not recorded: outbound calls (th
 calls handled by the AI Receptionist or plain voicemail branches (those already have their
 own dedicated capture — a receptionist transcript or a voicemail recording — so recording
 the outer call too would just duplicate audio already on file). Full AI Receptionist
-(answering, routing, escalation per the roadmap doc) is still not built — only
-summarization exists so far.
+(answering, routing, escalation per the roadmap doc) **has since been built — see the
+2026-08-20 entry below.** This paragraph is left as-is for history; don't trust the last
+sentence of it.
 
 **Exception (2026-08-06):** Three follow-up completions, all backend-only, no frontend changes.
 
@@ -106,9 +107,10 @@ limit); crossing `AUTO_SUSPEND_THRESHOLD` calls a new
 every active number on the account with no `User` in the loop (a system actor, not a
 customer/staff one). Staff can inspect via `GET /risk/accounts/{id}/score` and reverse via
 `POST /risk/accounts/{id}/reinstate` (new `reactivate_numbers_for_account_by_staff`,
-SUPER_ADMIN/COMPLIANCE_OFFICER only). Payment risk and device fingerprinting from the
-Architecture doc's §5 "Fraud and Risk" are still not built — there's no billing/payment
-system yet for the former, and fingerprinting needs frontend instrumentation for the latter.
+SUPER_ADMIN/COMPLIANCE_OFFICER only). Payment risk from the Architecture doc's §5 "Fraud
+and Risk" is still not built — there's no billing/payment system old enough to have
+payment-risk history yet. **Device fingerprinting has since been built — see the
+2026-08-20 entry below; don't trust the "not built" claim above for it.**
 
 *Provider Gateway secondaries are now real vendor clients, not stubs.* Every
 `_secondary_stub.py` (telecom→Vonage, video→Daily.co, llm→OpenAI, transcription→Deepgram,
@@ -186,3 +188,100 @@ was previously ACTIVE" query didn't scope by `billing_period` (added after that 
 originally written) — activating a plan's ANNUAL entry would have silently retired that same
 plan's already-ACTIVE MONTHLY entry, and vice versa, purely because they share the same
 plan_code+market. Fixed and verified live: all 8 rows are correctly ACTIVE simultaneously.
+
+**Merge note (2026-08-21):** the anilupdated branch's note below (from a separate, parallel
+session) says annual pricing and the AI Receptionist add-on price are still placeholder -
+that was true when it was written, but both are now built (see the two Decision entries
+above and the BillingPeriod/AI-add-on work in this same commit). It also loaded real prices
+under `catalog_version 2026-launch-001`, a different version string than the
+`2026-08-14-global-launch-usd` one approved above - reconciled in billing/service.py so only
+one version's rows are ACTIVE per plan/market/period; see that file's merge resolution for
+which one won and why.
+
+**Exception (2026-08-20):** This doc had drifted stale on two features that were actually
+finished a while ago — a full audit against the architecture/roadmap docs turned this up,
+so correcting it here instead of leaving the false claims above uncorrected.
+
+*AI Receptionist is fully built, not summarization-only.* `backend/app/media/receptionist.py`
+implements the live-call TwiML flow (business-hours answering, caller qualification via
+`extract_receptionist_qualification`, one bounded follow-up turn, DTMF callback-time
+selection, urgency-based escalation/human-handoff, and guardrails against
+legal/financial/medical/pricing commitments in `intelligence/guardrails.py`), wired into
+inbound routing at `media/voice.py` (`elif owner.ai_receptionist_enabled:`). Per-number
+config lives on `PhoneNumber.ai_receptionist_enabled`/`escalation_user_id`/
+`forwarding_number`. This shipped in the same work that added multi-turn/booking support;
+the "still not built" line above is wrong and predates it.
+
+*Device fingerprinting is built.* `RiskSignalType.DEVICE_FINGERPRINT_ABUSE` plus
+`check_fingerprint_on_signup`/`_on_login`/`_on_call` (`risk/service.py`) record a
+`DeviceFingerprintSighting` off an optional `X-Device-Fingerprint` header sent by the
+frontend already, and raise a `RiskSignal` once one fingerprint touches ≥4 distinct
+accounts in 24h — detection-only by design, never blocks the request (shared
+devices/networks would cause false positives). Fully covered in `test_risk.py`.
+
+*AI Receptionist call minutes are now metered.* `ReceptionistCall` gained a
+`duration_seconds` column (migration `9b4e2f7a1c63`); `update_call_status` (`media/service.py`) populates it from the same Twilio
+`CallDuration` used for `call_seconds`, and records a parallel `ai_receptionist_minutes`
+usage event (`usage/service.py`'s existing `record_usage_event`, same idempotency-key
+pattern as `call_seconds`/`video_participant_minutes`). This only meters usage — it does
+not yet enforce or bill the Pricing doc's included-allowance/overage rule (100 min on the
+$29 workspace add-on, 50/150 min on Pro/Scale, $0.39/min overage); `get_usage_summary`
+reports `ai_receptionist_minutes` the same "informational only" way it reports every other
+metered resource today. Building actual overage billing is a separate, larger piece of
+work than metering the raw usage — deliberately not done in the same pass.
+
+*Kafka event coverage extended again.* Added `audit.event.recorded` (published from
+`audit/service.py`'s `log_event()` — audit logging was Postgres-only before this),
+`number.purchase_confirmed` (numbering purchase completion), and named
+`payment.failed`/`payment.restored` events in billing (billing previously only published a
+generic `subscription.payment_event` with a status field; that publish call is left in
+place, these are additive). `video.session.started`/`video.session.ended` were added
+alongside the existing `video.room.created`/`video.room.ended` (also left in place, since
+some consumer logic may already key on the old names) — closes the gap against the
+Architecture doc's §8 event table except where noted otherwise.
+
+*The two existing expiry/purge sweeps are now actually scheduled.* `compliance.service.
+expire_overdue_cases()` and `retention.service.purge_expired_recordings()` existed but had
+no scheduler — both now run from `backend/app/ops/scheduled_reconciliation.py`, the same
+script `render.yaml`'s (currently-dropped, free-tier-unavailable) daily cron comment
+already pointed at. No new scheduling infrastructure was introduced; this just uses the one
+daily job slot that already existed for ZoikoNex reconciliation and number-renewal
+listing.
+
+*Real commercial prices loaded into the price catalog.* The Starter/Business/Pro/Scale
+figures from the "Global Plans, Pricing & Commercial Launch Standard" doc
+($12.99/$19.99/$29.99/$44.99 monthly) are now seeded as real, `ACTIVE`, non-placeholder
+`PriceCatalogEntry` rows (migration `c4a891fe6d27`, catalog_version `2026-launch-001`) —
+`run_billing_cycle` will actually charge these once real Stripe billing runs outside
+`development`. The `pro`/`scale` `Plan` rows themselves already existed from an earlier,
+separate migration (`4ebb299b8b5f`, 2026-08-14) that this session hadn't seen before
+starting this work — only the missing price-activation half needed building. Annual
+pricing (~17% off, billed upfront) is NOT modeled: `Subscription` has no billing-interval
+concept beyond one `current_period_start/end` pair, so only the monthly figures are
+active; adding a second interval is a bigger change than seeding a price. **Still
+placeholder/unimplemented:**
+the AI Receptionist add-on's own $29/mo price row, per-number-type/country `NumberRate`s
+(numbers still purchase at the old flat $1 test price), and a real PSTN
+origin×destination×direction×number-type rate card (`CallingRate` is still one flat
+cents-per-minute number keyed only by *origin* country — the Pricing doc's explicit
+recommended US figures were not back-filled into it in this pass because the model has
+nowhere to put a direction, and reshaping that table is a bigger schema change than seeding
+prices into a model that already supported it).
+
+*Uncaptured ZoikoNex payments now enter the reconciliation queue.* The
+`capture_payment_intent` failure itself (`integrations/billing/zoikonex.py`) is explicitly
+documented in its own code as broken on *ZoikoNex's* side (evidence-ledger gRPC marshaling)
+— that's a defect in a system this repo doesn't own the code for, so nothing here can "fix"
+the bug itself, and `run_billing_cycle`'s existing tolerate-and-return-`captured: False`
+behavior for that failure was left as-is. What was missing: that outcome never showed up
+anywhere staff could see it beyond hand-querying `ZoikoNexSyncEvent` payloads.
+`run_zoikonex_reconciliation` (migration `d1f7a3e9c052`) now adds a fourth leg -
+`PAYMENT_AUTHORISED_NOT_CAPTURED` - that scans for `PAYMENT_COLLECTED` sync events with
+`captured: false` and opens a real `ZoikoNexReconciliationException` for each one, same
+operations-queue treatment every other kind of drift already got. `ZoikoNexReconciliationRun`
+gained a matching `uncaptured_payments_found` counter.
+
+**Not touched in this pass, and why:** the 234-family email template estate (currently
+~100 seeded / ~48 wired) was left alone — writing plausible-sounding copy for ~150
+templates nobody has approved isn't a "fix," it's inventing customer-facing legal/
+compliance/billing language that should come from Product or Legal, not be guessed here.

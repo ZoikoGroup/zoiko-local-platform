@@ -24,6 +24,15 @@ const URGENCY_STYLES: Record<string, { badge: string; border: string }> = {
   low: { badge: "bg-slate-100 text-slate-600 ring-1 ring-inset ring-slate-200", border: "border-l-slate-300" },
 };
 
+// Self-service booking (Roadmap §7) - a caller-picked callback window, not
+// a real calendar slot. Mirrors backend/app/media/models.py's
+// ReceptionistCallbackWindow.
+const CALLBACK_WINDOW_LABELS: Record<string, string> = {
+  asap: "ASAP",
+  today: "Later today",
+  tomorrow: "Tomorrow",
+};
+
 const SOURCE_STYLES: Record<string, string> = {
   voicemail: "bg-indigo-50 text-indigo-600",
   call: "bg-emerald-50 text-emerald-600",
@@ -506,6 +515,12 @@ export default function AIInsightsPage() {
                             {c.urgency} urgency
                           </span>
                         )}
+                        {c.callback_requested && (
+                          <span className="text-xs font-medium text-emerald-700 bg-emerald-50 ring-1 ring-inset ring-emerald-200 rounded-full px-2.5 py-1">
+                            Callback requested
+                            {c.callback_window && ` — ${CALLBACK_WINDOW_LABELS[c.callback_window]}`}
+                          </span>
+                        )}
                       </div>
                     </div>
 
@@ -572,6 +587,9 @@ export default function AIInsightsPage() {
                         <ClockSmallIcon />
                         {new Date(c.created_at).toLocaleString()}
                       </span>
+                      {c.callback_preference && (
+                        <span>Prefers: {c.callback_preference}</span>
+                      )}
                     </div>
 
                     <div className="flex items-center gap-2 flex-wrap">

@@ -51,16 +51,12 @@ class AIUsageRateResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     overage_price_cents_per_minute: int
-    addon_monthly_price_cents: int
-    addon_included_minutes: int
     currency: str
     is_placeholder: bool
 
 
 class UpsertAIUsageRateRequest(BaseModel):
     overage_price_cents_per_minute: int
-    addon_monthly_price_cents: int = 2900
-    addon_included_minutes: int = 100
     currency: str = "USD"
     is_placeholder: bool = False
 

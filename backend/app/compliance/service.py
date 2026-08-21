@@ -61,6 +61,46 @@ def get_active_rules(db: Session, country: str) -> list[ComplianceRule]:
     )
 
 
+def list_all_rules(db: Session) -> list[ComplianceRule]:
+    """Staff-facing view across every country/requirement type, active or
+    not - unlike get_active_rules (single-country, active-only, used by the
+    live purchase-gating check), this is the management surface a staff
+    member needs to see what's configured before adding or deactivating a
+    rule."""
+    return db.query(ComplianceRule).order_by(ComplianceRule.country, ComplianceRule.requirement_type).all()
+
+
+def upsert_compliance_rule(
+    db: Session, *, country: str, requirement_type: str, required_documents: list[str], is_active: bool, actor: str
+) -> ComplianceRule:
+    """Staff-tunable, same "rules as data" doctrine as risk.upsert_fraud_rule
+    - deliberately NOT bulk-seeded by a migration (see a7be96c38a85's
+    docstring for why that broke the test suite): a signal/rule with no row
+    here simply never gates anything (fail-open by omission), and a real
+    deployment populates real rules deliberately through this endpoint."""
+    rule = (
+        db.query(ComplianceRule)
+        .filter(ComplianceRule.country == country.upper(), ComplianceRule.requirement_type == requirement_type)
+        .first()
+    )
+    if rule is None:
+        rule = ComplianceRule(
+            country=country.upper(), requirement_type=requirement_type,
+            required_documents=required_documents, is_active=is_active,
+        )
+        db.add(rule)
+    else:
+        rule.required_documents = required_documents
+        rule.is_active = is_active
+    db.commit()
+    db.refresh(rule)
+    log_event(
+        db, actor=actor, action="compliance.rule_updated", target=f"compliance_rule:{rule.id}",
+        after={"country": rule.country, "requirement_type": requirement_type, "is_active": is_active},
+    )
+    return rule
+
+
 def is_requirement_active(db: Session, country: str, requirement_type: str) -> bool:
     return (
         db.query(ComplianceRule)
@@ -88,6 +128,11 @@ def has_approved_case(db: Session, *, account_id: str, jurisdiction: str, requir
     )
 
 
+class NumberNotOwnedError(Exception):
+    """Raised when a case is opened against a number_id that either doesn't
+    exist or isn't owned by the account opening the case."""
+
+
 def open_compliance_case(
     db: Session,
     *,
@@ -97,6 +142,17 @@ def open_compliance_case(
     actor: str,
     number_id: str | None = None,
 ) -> ComplianceCase:
+    if number_id is not None:
+        from app.numbering.numbers.models import PhoneNumber
+
+        owned = (
+            db.query(PhoneNumber)
+            .filter(PhoneNumber.id == number_id, PhoneNumber.account_id == account_id)
+            .first()
+        )
+        if owned is None:
+            raise NumberNotOwnedError(number_id)
+
     case = ComplianceCase(
         account_id=account_id,
         number_id=number_id,
@@ -120,41 +176,6 @@ def open_compliance_case(
         account_id, case_id=case.id, jurisdiction=case.jurisdiction, requirement_type=requirement_type,
     )
     return case
-
-
-def sweep_expired_compliance_cases(db: Session) -> list[ComplianceCase]:
-    """Architecture doc §8 lists compliance.case_expired as a real event,
-    but nothing in this codebase ever moved a case to EXPIRED - expires_at
-    was populated (see open_compliance_case) but nothing read it back. This
-    is the read-back: any still-PENDING case whose expiry has passed is
-    marked EXPIRED, audited, and published, exactly like the approve/reject
-    paths below. Only PENDING cases are touched - an already APPROVED/
-    REJECTED case keeps its terminal status regardless of expires_at.
-
-    Meant to run periodically (same pattern as
-    app.ops.scheduled_reconciliation - an external Render Cron Job hitting
-    the staff-triggerable route this wraps), not on every request."""
-    now = datetime.now(timezone.utc)
-    expired = (
-        db.query(ComplianceCase)
-        .filter(ComplianceCase.status == ComplianceCaseStatus.PENDING, ComplianceCase.expires_at < now)
-        .all()
-    )
-    for case in expired:
-        case.status = ComplianceCaseStatus.EXPIRED
-    if expired:
-        db.commit()
-    for case in expired:
-        db.refresh(case)
-        _invalidate_cases_cache(case.account_id)
-        log_event(
-            db, actor="system", action="compliance.case_expired", target=f"compliance_case:{case.id}",
-            before={"status": "pending"}, after={"status": "expired", "expires_at": case.expires_at.isoformat()},
-        )
-        publish_compliance_case_expired(
-            case.account_id, case_id=case.id, jurisdiction=case.jurisdiction, requirement_type=case.requirement_type,
-        )
-    return expired
 
 
 def _cases_cache_key(account_id: str) -> str:
@@ -414,6 +435,48 @@ def reject_case(db: Session, case: ComplianceCase, *, actor: str, reason: str | 
         )
 
     return case
+
+
+def expire_overdue_cases(db: Session) -> dict[str, int]:
+    """Finds every PENDING case past its expires_at and transitions it to
+    EXPIRED. Called from app.ops.scheduled_reconciliation's daily run (same
+    posture as app.retention.service.purge_expired_recordings) - still
+    depends on that script actually being scheduled externally (see its own
+    docstring), this function has no timer of its own.
+
+    Only PENDING cases are in scope - an APPROVED/REJECTED case has already
+    reached a terminal human decision, and expires_at describes how long the
+    verification window stays open, not how long the decision stays valid.
+    """
+    now = datetime.now(timezone.utc)
+    overdue = (
+        db.query(ComplianceCase)
+        .filter(
+            ComplianceCase.status == ComplianceCaseStatus.PENDING,
+            ComplianceCase.expires_at.isnot(None),
+            ComplianceCase.expires_at < now,
+        )
+        .all()
+    )
+    for case in overdue:
+        case.status = ComplianceCaseStatus.EXPIRED
+        db.commit()
+        _invalidate_cases_cache(case.account_id)
+
+        log_event(
+            db,
+            actor_id=case.account_id,
+            action="compliance.case_expired",
+            target_type="compliance_case",
+            target_id=case.id,
+            before={"status": ComplianceCaseStatus.PENDING.value},
+            after={"status": case.status.value},
+        )
+        publish_compliance_case_expired(
+            case.account_id, case_id=case.id, jurisdiction=case.jurisdiction, requirement_type=case.requirement_type,
+        )
+
+    return {"expired": len(overdue)}
 
 
 class KYCAlreadyApprovedError(Exception):

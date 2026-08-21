@@ -10,7 +10,7 @@ never imports the twilio SDK directly, per the Provider Gateway rule.
 
 from urllib.parse import quote
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.orm import Session
 
@@ -235,7 +235,17 @@ async def outbound_call(
     request: Request,
     db: Session = Depends(get_db),
     current_user: User = Depends(require_writer),
+    x_device_fingerprint: str | None = Header(default=None),
 ):
+    # Architecture doc §5 "Fraud and Risk: device fingerprinting" - detection
+    # only, never blocks the call (see check_fingerprint_on_call's
+    # docstring). Recorded up front, before place_outbound_call, so even a
+    # call this account isn't allowed to make (destination blocked, velocity
+    # limit, etc.) still counts as this device touching this account - that
+    # association is the signal, independent of whether the call itself
+    # goes through.
+    risk_service.check_fingerprint_on_call(db, fingerprint_hash=x_device_fingerprint, account_id=current_user.account_id)
+
     status_callback_url = str(request.base_url) + "media/voice/status-callback"
     try:
         return media_service.place_outbound_call(

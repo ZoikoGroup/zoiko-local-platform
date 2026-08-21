@@ -8,7 +8,8 @@ from app.compliance.schemas import (
     ComplianceCaseResponse,
     ComplianceCaseStaffResponse,
     ComplianceRuleResponse,
-    DocumentDownloadUrl, 
+    ComplianceRuleUpsertRequest,
+    DocumentDownloadUrl,
     KYCVerificationStart,
 )
 from app.core.database import get_db
@@ -32,6 +33,29 @@ def _get_case_or_404(db: Session, case_id: str):
 def list_rules(country: str, db: Session = Depends(get_db)):
     return service.get_active_rules(db, country)
 
+
+@router.get("/staff/rules", response_model=list[ComplianceRuleResponse])
+def list_all_rules(
+    db: Session = Depends(get_db),
+    _staff: PlatformStaff = Depends(get_current_staff),
+):
+    """Any staff role can view what's configured (diagnostic, same posture
+    as risk's fraud-rules list) - adding or changing a rule is the
+    sensitive action, gated below."""
+    return service.list_all_rules(db)
+
+
+@router.put("/staff/rules", response_model=ComplianceRuleResponse)
+def upsert_rule(
+    payload: ComplianceRuleUpsertRequest,
+    db: Session = Depends(get_db),
+    staff: PlatformStaff = Depends(require_capability("compliance.manage_rules")),
+):
+    return service.upsert_compliance_rule(
+        db, country=payload.country, requirement_type=payload.requirement_type,
+        required_documents=payload.required_documents, is_active=payload.is_active, actor=staff.id,
+    )
+
   
 @router.post("/cases", response_model=ComplianceCaseResponse, status_code=201)
 def create_case(
@@ -39,14 +63,17 @@ def create_case(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_admin),
 ):
-    return service.open_compliance_case(
-        db,
-        account_id=current_user.account_id,
-        jurisdiction=payload.jurisdiction,
-        requirement_type=payload.requirement_type,
-        number_id=payload.number_id,
-        actor=current_user.id,
-    )
+    try:
+        return service.open_compliance_case(
+            db,
+            account_id=current_user.account_id,
+            jurisdiction=payload.jurisdiction,
+            requirement_type=payload.requirement_type,
+            number_id=payload.number_id,
+            actor=current_user.id,
+        )
+    except service.NumberNotOwnedError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"number {e} not found on this account") from e
 
 
 @router.get("/cases/me", response_model=list[ComplianceCaseResponse])
@@ -193,13 +220,14 @@ def reject_case(
     return service.reject_case(db, case, actor=staff.id, reason=payload.reason)
 
 
-@router.post("/cases/sweep-expired", response_model=list[ComplianceCaseResponse])
-def sweep_expired_cases(
+@router.post("/cases/expire")
+def expire_cases(
     db: Session = Depends(get_db),
     _staff: PlatformStaff = Depends(require_capability("compliance.review_case")),
 ):
-    """Same manual-trigger-plus-external-cron pattern as POST
-    /billing/zoikonex/reconciliation/run - meant to be hit periodically by
-    a scheduled job, with a staff-triggerable route for on-demand runs
-    between them. Marks any PENDING case past its expires_at as EXPIRED."""
-    return service.sweep_expired_compliance_cases(db)
+    """Manual on-demand trigger for the same sweep app.ops.
+    scheduled_reconciliation's daily run already calls automatically - see
+    expire_overdue_cases. Capability-gated like every other compliance
+    action in this router, even though the scheduled call site bypasses
+    this route entirely (it calls the service function directly)."""
+    return service.expire_overdue_cases(db)

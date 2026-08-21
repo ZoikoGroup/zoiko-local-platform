@@ -737,11 +737,10 @@ def test_sweep_marks_a_stale_pending_case_expired(client, db_session):
 
     staff_token = _create_and_login_staff(db_session, client, "staffexpiry1@zoikolocal.com")
     response = client.post(
-        "/compliance/cases/sweep-expired", headers={"Authorization": f"Bearer {staff_token}"},
+        "/compliance/cases/expire", headers={"Authorization": f"Bearer {staff_token}"},
     )
     assert response.status_code == 200, response.text
-    swept_ids = [c["id"] for c in response.json()]
-    assert case_id in swept_ids
+    assert response.json()["expired"] >= 1
 
     db_session.refresh(case)
     assert case.status == ComplianceCaseStatus.EXPIRED
@@ -770,9 +769,8 @@ def test_sweep_does_not_touch_an_approved_case_even_past_expiry(client, db_sessi
     case.expires_at = datetime.now(timezone.utc) - timedelta(days=1)
     db_session.commit()
 
-    response = client.post("/compliance/cases/sweep-expired", headers=staff_headers)
-    swept_ids = [c["id"] for c in response.json()]
-    assert case_id not in swept_ids
+    response = client.post("/compliance/cases/expire", headers=staff_headers)
+    assert response.status_code == 200, response.text
 
     db_session.refresh(case)
     assert case.status == ComplianceCaseStatus.APPROVED  # untouched

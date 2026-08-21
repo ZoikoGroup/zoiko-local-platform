@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 
 from app.audit.service import log_event
 from app.billing.models import (
+    AIReceptionistAddonRate,
     BillingActionRequest,
     BillingActionRequestStatus,
     BillingActionType,
@@ -22,7 +23,16 @@ from app.billing.models import (
     ZoikoNexSyncEventType,
 )
 from app.core.config import settings
-from app.events.service import publish_subscription_canceled, publish_subscription_payment_event
+# publish_subscription_plan_changed deliberately not imported here anymore -
+# change_plan() below replaced that fire-and-forget call with
+# publish_event_durably (see its own comment at the call site).
+from app.events.service import (
+    publish_payment_failed,
+    publish_payment_restored,
+    publish_subscription_canceled,
+    publish_subscription_payment_event,
+    publish_subscription_terminated,
+)
 from app.integrations.billing import zoikonex as zoikonex_adapter
 from app.integrations.cache.redis import cache_get, cache_set
 from app.integrations.telecom import twilio as telecom
@@ -35,6 +45,7 @@ from app.notifications.service import (
     notify_plan_changed,
     notify_plan_started,
     notify_service_restored,
+    notify_subscription_terminated,
     notify_trial_started,
     send_internal_alert,
 )
@@ -330,7 +341,7 @@ def activate_price_catalog_entry(db: Session, entry_id: str, *, actor: str) -> P
     entry.status = CatalogEntryStatus.ACTIVE
     if entry.effective_from is None:
         entry.effective_from = _db_now(db)
-    db.commit()
+    db.commit() 
     db.refresh(entry)
     log_event(
         db, actor=actor, action="billing.price_catalog_entry_activated", target=f"price_catalog_entry:{entry.id}",
@@ -562,41 +573,6 @@ def change_plan(
     return sub
 
 
-def set_ai_receptionist_addon(db: Session, account_id: str, *, active: bool, actor: str) -> Subscription:
-    """Global Plans, Pricing & Commercial Launch doc §5.3: "$29/workspace/
-    month add-on; 100 AI-handled minutes included." Same no-real-payment
-    posture as change_plan - this only grants/revokes the entitlement, it
-    doesn't charge anything yet (no live recurring-charge path exists for
-    subscriptions - see run_billing_cycle's flat plan-fee-only scope)."""
-    sub = get_or_create_subscription(db, account_id)
-    before = sub.ai_receptionist_addon_active
-    sub.ai_receptionist_addon_active = active
-    db.commit()
-    db.refresh(sub)
-    log_event(
-        db, actor=actor, action="subscription.ai_receptionist_addon_changed", target=f"subscription:{sub.id}",
-        before={"ai_receptionist_addon_active": before}, after={"ai_receptionist_addon_active": active},
-    )
-    return sub
-
-
-def get_included_ai_receptionist_minutes(db: Session, account_id: str) -> int:
-    """Plan-baked-in allowance (Pro/Scale only) plus the add-on's included
-    minutes if the account has purchased it (Starter/Business's only route
-    to any included AI Receptionist minutes at all, per the doc's
-    capability table)."""
-    from app.usage.service import get_ai_usage_rate
-
-    sub = get_or_create_subscription(db, account_id)
-    plan = get_plan(db, sub.plan_code)
-    total = plan.included_ai_receptionist_minutes
-    if sub.ai_receptionist_addon_active:
-        rate = get_ai_usage_rate(db)
-        if rate is not None:
-            total += rate.addon_included_minutes
-    return total
-
-
 def assert_number_quota_available(db: Session, account_id: str, *, exclude_number_id: str | None = None) -> None:
     """exclude_number_id excludes the number currently being (re-)purchased
     from its own count - a retry of a number already sitting in
@@ -812,6 +788,12 @@ def _apply_zoikonex_payment_event(
     publish_subscription_payment_event(
         account_id, subscription_id=sub.id, event_type=event_type, status=sub.status.value,
     )
+    # Named events from the Architecture doc's §8 table, additive alongside
+    # the generic subscription.payment_event above - not a replacement.
+    if event_type == "payment_failed":
+        publish_payment_failed(account_id, subscription_id=sub.id, reason=event_type)
+    elif event_type == "payment_restored":
+        publish_payment_restored(account_id, subscription_id=sub.id)
 
     from app.numbering.identity.models import User, UserRole
 
@@ -931,6 +913,79 @@ def cancel_subscription(db: Session, account_id: str, *, actor: str, reason: str
     return sub
 
 
+class SubscriptionAlreadyTerminatedError(Exception):
+    """Raised by terminate_subscription when the subscription is already TERMINATED."""
+
+
+class SubscriptionNotEligibleForTerminationError(Exception):
+    """Raised when terminating a subscription that's still TRIALING/ACTIVE -
+    termination is a deliberate follow-up to cancellation or unresolved
+    non-payment, not a way to skip past cancel_subscription."""
+
+
+def terminate_subscription(db: Session, account_id: str, *, actor: str, reason: str | None = None) -> dict:
+    """Commercial Billing Operating Standard doc §M3 - the terminal state
+    distinct from CANCELED/PAST_DUE (see SubscriptionStatus.TERMINATED's
+    docstring): a final ZoikoNex sync, real provider deprovisioning of
+    every owned number, and an irreversible status - unlike CANCELED,
+    nothing resubscribes a TERMINATED account back to life.
+
+    Staged through the same maker-checker BillingActionRequest flow as
+    credit notes/debit notes/refunds/run_billing_cycle (see
+    _execute_billing_action) - a different staff member must approve this
+    than the one who requested it, the same segregation-of-duties bar as
+    every other sensitive billing action in this file.
+
+    Only reachable from CANCELED or PAST_DUE - an ACTIVE/TRIALING account
+    must be cancelled first (see SubscriptionNotEligibleForTerminationError),
+    same "cancel first, terminate as a deliberate follow-up" ordering the
+    doc describes."""
+    sub = get_or_create_subscription(db, account_id)
+    if sub.status == SubscriptionStatus.TERMINATED:
+        raise SubscriptionAlreadyTerminatedError(f"Subscription for account {account_id} is already terminated")
+    if sub.status not in (SubscriptionStatus.CANCELED, SubscriptionStatus.PAST_DUE):
+        raise SubscriptionNotEligibleForTerminationError(
+            f"Subscription for account {account_id} must be canceled or past due before it can be terminated "
+            f"(currently {sub.status.value})"
+        )
+
+    before_status = sub.status
+    sub.status = SubscriptionStatus.TERMINATED
+    sub.terminated_at = _db_now(db)
+    db.commit()
+    db.refresh(sub)
+
+    # Best-effort, same posture as every other sync_subscription_to_zoikonex
+    # call site - an outage here must never leave the account stuck
+    # mid-termination (numbers already released below regardless).
+    sync_subscription_to_zoikonex(db, sub)
+
+    # Deferred import - app.numbering.numbers.service already imports this
+    # module (assert_number_quota_available etc.), so a module-level import
+    # here would be circular.
+    from app.numbering.numbers.service import release_numbers_for_account_by_system
+
+    released = release_numbers_for_account_by_system(db, account_id, actor=actor, reason=reason or "subscription terminated")
+
+    log_event(
+        db, actor=actor, action="billing.subscription_terminated", target=f"subscription:{sub.id}",
+        before={"status": before_status.value},
+        after={"status": sub.status.value, "reason": reason, "numbers_released": len(released)},
+    )
+    publish_subscription_terminated(
+        account_id, subscription_id=sub.id, reason=reason, numbers_released=len(released),
+    )
+
+    from app.numbering.identity.models import User, UserRole
+
+    owner = db.query(User).filter(User.account_id == account_id, User.role == UserRole.OWNER).first()
+    if owner is not None:
+        plan = get_plan(db, sub.plan_code)
+        notify_subscription_terminated(db, account_id=account_id, account_email=owner.email, plan_name=plan.name)
+
+    return {"terminated": True, "subscription_id": sub.id, "numbers_released": len(released)}
+
+
 def list_zoikonex_sync_events(db: Session, *, account_id: str | None = None, limit: int = 200) -> list[ZoikoNexSyncEvent]:
     query = db.query(ZoikoNexSyncEvent)
     if account_id:
@@ -1033,6 +1088,7 @@ def run_zoikonex_reconciliation(db: Session) -> ZoikoNexReconciliationRun:
         ZoikoNexReconciliationExceptionType.USAGE_EVENT_MISSING_SYNC: set(),
         ZoikoNexReconciliationExceptionType.CALL_RECORD_MISSING_USAGE_EVENT: set(),
         ZoikoNexReconciliationExceptionType.LATE_USAGE_EVENT: set(),
+        ZoikoNexReconciliationExceptionType.PAYMENT_AUTHORISED_NOT_CAPTURED: set(),
     }
     for exc in db.query(ZoikoNexReconciliationException).filter(
         ZoikoNexReconciliationException.resolved_at.is_(None)
@@ -1152,6 +1208,37 @@ def run_zoikonex_reconciliation(db: Session) -> ZoikoNexReconciliationRun:
                     ),
                 )
             )
+
+    # Fourth leg: payments authorised by ZoikoNex but never captured
+    # because of ZoikoNex's own confirmed capture-side bug (see
+    # zoikonex_adapter.capture_payment_intent's docstring). Before this,
+    # "authorised but not captured" was discoverable only by hand-querying
+    # ZoikoNexSyncEvent payloads - it never entered the operations queue
+    # this reconciliation job otherwise puts every other kind of drift into.
+    uncaptured_events = (
+        db.query(ZoikoNexSyncEvent)
+        .filter(
+            ZoikoNexSyncEvent.event_type == ZoikoNexSyncEventType.PAYMENT_COLLECTED,
+            ZoikoNexSyncEvent.payload["captured"].astext == "false",
+        )
+        .all()
+    )
+    for sync_event in uncaptured_events:
+        run.uncaptured_payments_found += 1
+        if sync_event.id in already_open[ZoikoNexReconciliationExceptionType.PAYMENT_AUTHORISED_NOT_CAPTURED]:
+            continue
+        new_exceptions.append(
+            ZoikoNexReconciliationException(
+                run_id=run.id,
+                account_id=sync_event.account_id,
+                exception_type=ZoikoNexReconciliationExceptionType.PAYMENT_AUTHORISED_NOT_CAPTURED,
+                subject_id=sync_event.id,
+                detail=(
+                    f"Payment intent {sync_event.zoikonex_ref} was authorised but capture failed: "
+                    f"{sync_event.payload.get('capture_error')}"
+                ),
+            )
+        )
 
     run.exceptions_found = len(new_exceptions)
     for exc in new_exceptions:
@@ -1715,6 +1802,42 @@ def refund_zoikonex_payment(
     return result
 
 
+def get_active_ai_receptionist_addon_rate(db: Session) -> AIReceptionistAddonRate | None:
+    """Mirrors get_active_price_catalog_entry's "prefer ACTIVE, fall back to
+    most-recently-created" dev convenience - there's only ever meant to be
+    one rate in flight at a time (no per-market variation in the doc for
+    this add-on), so no market/plan_code filter is needed here."""
+    active = (
+        db.query(AIReceptionistAddonRate)
+        .filter(AIReceptionistAddonRate.status == CatalogEntryStatus.ACTIVE)
+        .order_by(AIReceptionistAddonRate.created_at.desc())
+        .first()
+    )
+    if active is not None:
+        return active
+    return db.query(AIReceptionistAddonRate).order_by(AIReceptionistAddonRate.created_at.desc()).first()
+
+
+def set_ai_receptionist_addon(db: Session, account_id: str, *, enabled: bool, actor: str) -> Subscription:
+    """Pricing doc §5.3 "$29.00 per workspace/month" - a subscription-level
+    toggle, not a plan change (see change_plan for that), so this doesn't
+    touch plan_code or re-run entitlement checks. Audited the same way
+    every other billing state change in this module is (see
+    change_plan/cancel_subscription) - this is real money-adjacent state,
+    not a UI preference."""
+    sub = get_or_create_subscription(db, account_id)
+    previous = sub.ai_receptionist_addon_enabled
+    sub.ai_receptionist_addon_enabled = enabled
+    db.commit()
+    db.refresh(sub)
+    log_event(
+        db, actor_id=actor, action="billing.ai_receptionist_addon_changed",
+        target_type="subscription", target_id=sub.id,
+        metadata={"account_id": account_id, "previous": previous, "enabled": enabled},
+    )
+    return sub
+
+
 def get_usage_summary(db: Session, account_id: str) -> dict:
     """Compares this billing period's real usage against the account's plan
     limits. Voice minutes come from real UsageEvent rows (call_seconds,
@@ -1740,6 +1863,27 @@ def get_usage_summary(db: Session, account_id: str) -> dict:
     voice_minutes_used = float(totals.get("call_seconds", 0)) / 60
     video_minutes_used = float(totals.get("video_participant_minutes", 0))
     ai_summaries_used = float(totals.get("ai_summary", 0))
+    ai_receptionist_minutes_used = float(totals.get("ai_receptionist_minutes", 0))
+
+    # Pricing doc §5.3 included-allowance + overage math. Plan-granted
+    # minutes (Pro/Scale) and add-on-granted minutes (Starter/Business who
+    # bought the $29/mo add-on) stack; both are real columns/rows now (see
+    # Plan.included_ai_receptionist_minutes, AIReceptionistAddonRate) - this
+    # is still reporting-only, same as every other resource above. Nothing
+    # here charges the overage; see run_billing_cycle, which does not yet
+    # add this as an invoice line (CLAUDE.md's 2026-08-20 entry).
+    addon_rate = get_active_ai_receptionist_addon_rate(db) if sub.ai_receptionist_addon_enabled else None
+    ai_receptionist_minutes_included = plan.included_ai_receptionist_minutes + (
+        addon_rate.included_minutes if addon_rate is not None else 0
+    )
+    ai_receptionist_overage_minutes = max(0.0, ai_receptionist_minutes_used - ai_receptionist_minutes_included)
+    ai_receptionist_overage_cost_cents = None
+    if ai_receptionist_overage_minutes > 0:
+        overage_rate = addon_rate or get_active_ai_receptionist_addon_rate(db)
+        if overage_rate is not None:
+            ai_receptionist_overage_cost_cents = round(
+                ai_receptionist_overage_minutes * overage_rate.overage_rate_minor_units_per_minute
+            )
 
     return {
         "plan_code": plan.plan_code,
@@ -1748,10 +1892,18 @@ def get_usage_summary(db: Session, account_id: str) -> dict:
         "trial_ends_at": sub.trial_ends_at,
         "current_period_start": sub.current_period_start,
         "current_period_end": sub.current_period_end,
+        "ai_receptionist_addon_enabled": sub.ai_receptionist_addon_enabled,
         "resources": [
             {"resource": "voice_minutes", "used": round(voice_minutes_used, 1), "limit": plan.monthly_voice_minutes},
             {"resource": "video_minutes", "used": round(video_minutes_used, 1), "limit": plan.monthly_video_minutes},
             {"resource": "ai_summaries", "used": int(ai_summaries_used), "limit": plan.monthly_ai_summaries},
+            {
+                "resource": "ai_receptionist_minutes",
+                "used": round(ai_receptionist_minutes_used, 1),
+                "limit": ai_receptionist_minutes_included,
+                "overage_minutes": round(ai_receptionist_overage_minutes, 1),
+                "estimated_overage_cost_cents": ai_receptionist_overage_cost_cents,
+            },
         ],
     }
 
@@ -1823,6 +1975,8 @@ def _execute_billing_action(db: Session, request: BillingActionRequest, *, actor
             db, payload["account_id"], payload["payment_intent_id"],
             amount_minor_units=payload["amount_minor_units"], reason=payload["reason"], actor=actor,
         )
+    if request.action_type == BillingActionType.TERMINATE_SUBSCRIPTION:
+        return terminate_subscription(db, payload["account_id"], reason=payload.get("reason"), actor=actor)
     raise ValueError(f"Unhandled BillingActionType: {request.action_type}")  # pragma: no cover - exhaustive above
 
 

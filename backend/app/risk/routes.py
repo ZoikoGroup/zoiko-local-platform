@@ -89,7 +89,7 @@ def set_account_risk_state(
 
 @router.post("/accounts/{account_id}/reinstate", status_code=status.HTTP_200_OK)
 def reinstate_account_numbers(
-    account_id: str,
+    account_id: str, 
     payload: AccountReinstateRequest,
     db: Session = Depends(get_db),
     staff: PlatformStaff = Depends(require_capability("risk.reinstate_account")),
@@ -109,7 +109,7 @@ def list_account_kill_switches(
     """Production Readiness Standard Table 15's "Tenant" kill-switch scope -
     diagnostic view, same posture as the platform-wide kill-switch list."""
     return service.list_account_kill_switches(db, account_id)
-
+ 
 
 @router.post("/accounts/{account_id}/kill-switches/{scope}/activate", response_model=AccountKillSwitchResponse)
 def activate_account_kill_switch(

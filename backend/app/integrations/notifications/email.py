@@ -46,28 +46,36 @@ def health_check() -> dict:
     return {"configured": True, "ok": True, "detail": None}
 
 
-def send_email(to: str, subject: str, body: str) -> str | None:
+def send_email(to: str, subject: str, body: str, headers: dict[str, str] | None = None) -> str | None:
     """Returns Resend's own email id (None in stub/no-API-key mode) - the
     Email Communications System doc's delivery ledger needs it to match a
     later bounce/complaint/delivered webhook event back to the
     NotificationDelivery row it's about (see
-    notifications.service.handle_resend_webhook)."""
+    notifications.service.handle_resend_webhook).
+
+    headers: raw RFC 5322 headers (e.g. RFC 8058's List-Unsubscribe /
+    List-Unsubscribe-Post) - a body-text unsubscribe link alone doesn't
+    trigger Gmail/Yahoo's one-click "Unsubscribe" button, only these
+    headers do (doc §4.1/§11, A-23 BLOCKER)."""
     if not settings.resend_api_key:
-        logger.info("EMAIL (no Resend API key configured) to=%s subject=%r body=%r", to, subject, body)
+        logger.info("EMAIL (no Resend API key configured) to=%s subject=%r body=%r headers=%r", to, subject, body, headers)
         return None
 
     def _primary() -> str | None:
         try:
             with trace_provider_call("resend", "send_email"):
+                payload = {
+                    "from": settings.email_from_address,
+                    "to": [to],
+                    "subject": subject,
+                    "text": body,
+                }
+                if headers:
+                    payload["headers"] = headers
                 response = httpx.post(
                     _RESEND_API_URL,
                     headers={"Authorization": f"Bearer {settings.resend_api_key}"},
-                    json={
-                        "from": settings.email_from_address,
-                        "to": [to],
-                        "subject": subject,
-                        "text": body,
-                    },
+                    json=payload,
                     timeout=15.0,
                 )
                 response.raise_for_status()
@@ -75,5 +83,5 @@ def send_email(to: str, subject: str, body: str) -> str | None:
         except httpx.HTTPError as e:
             raise EmailError(f"Resend send failed: {e}") from e
 
-    secondary_fn = (lambda: secondary.send_email(to, subject, body)) if settings.email_failover_enabled else None
+    secondary_fn = (lambda: secondary.send_email(to, subject, body, headers)) if settings.email_failover_enabled else None
     return with_failover(_breaker, _primary, secondary_fn, EmailError)

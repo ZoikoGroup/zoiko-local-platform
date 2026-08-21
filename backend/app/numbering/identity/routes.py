@@ -21,6 +21,7 @@ from app.numbering.identity.schemas import (
     TokenResponse,
     UserResponse,
 )
+from app.risk import service as risk_service
 
 router = APIRouter(prefix="/auth", tags=["identity"])
 MFA_TOKEN_EXPIRE_MINUTES = 5
@@ -46,10 +47,22 @@ def signup(
 
 @router.post("/login", response_model=LoginResponse)
 @limiter.limit("5/minute")
-def login(request: Request, payload: LoginRequest, db: Session = Depends(get_db)):
+def login(
+    request: Request,
+    payload: LoginRequest,
+    db: Session = Depends(get_db),
+    x_device_fingerprint: str | None = Header(default=None),
+):
     user = service.authenticate_user(db, payload.email, payload.password)
     if not user:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid email or password")
+
+    # Architecture doc §5 "Fraud and Risk: device fingerprinting" - detection
+    # only, never blocks login itself (see check_fingerprint_on_login's
+    # docstring). Checked as soon as the password is verified, before the
+    # MFA branch below, since a credential-stuffing device is worth flagging
+    # even if MFA itself then stops the attempt from going further.
+    risk_service.check_fingerprint_on_login(db, fingerprint_hash=x_device_fingerprint, account_id=user.account_id)
 
     if user.mfa_enabled:
         mfa_token = create_access_token(

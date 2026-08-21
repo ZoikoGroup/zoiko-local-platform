@@ -12,6 +12,7 @@ import {
   getPriceCatalogEntry,
   getUsageSummary,
   getAIUsageRate,
+  getAIReceptionistAddonRate,
   ApiError,
   type UsageEvent,
   type Plan,
@@ -20,6 +21,7 @@ import {
   type UsageSummary,
   type BillingPeriod,
   type AIUsageRate,
+  type AIReceptionistAddonRate,
 } from "@/lib/api";
 import { getToken } from "@/lib/auth";
 
@@ -93,6 +95,7 @@ export default function BillingPage() {
   const [confirmingCancel, setConfirmingCancel] = useState(false);
 
   const [aiUsageRate, setAiUsageRate] = useState<AIUsageRate | null>(null);
+  const [addonRate, setAddonRate] = useState<AIReceptionistAddonRate | null>(null);
   const [addonBusy, setAddonBusy] = useState(false);
   const [addonError, setAddonError] = useState<string | null>(null);
 
@@ -134,6 +137,9 @@ export default function BillingPage() {
     if (!token) return;
     getAIUsageRate(token)
       .then(setAiUsageRate)
+      .catch(() => {});
+    getAIReceptionistAddonRate(token)
+      .then(setAddonRate)
       .catch(() => {});
   }, [token]);
 
@@ -423,18 +429,18 @@ export default function BillingPage() {
         )}
       </div>
 
-      {aiUsageRate && subscription && (
+      {addonRate && subscription && (
         <div className="bg-white rounded-xl border border-slate-200 p-6 space-y-3">
           <div className="flex items-center justify-between">
             <div>
               <h3 className="font-semibold text-slate-900">AI Receptionist add-on</h3>
               <p className="text-sm text-slate-500">
-                {(aiUsageRate.addon_monthly_price_cents / 100).toFixed(2)} {aiUsageRate.currency}/workspace/month —{" "}
-                {aiUsageRate.addon_included_minutes} AI-handled minutes included, then{" "}
-                {(aiUsageRate.overage_price_cents_per_minute / 100).toFixed(2)} {aiUsageRate.currency}/min.
+                {(addonRate.monthly_price_minor_units / 100).toFixed(2)} {addonRate.currency_code}/workspace/month —{" "}
+                {addonRate.included_minutes} AI-handled minutes included, then{" "}
+                {(addonRate.overage_rate_minor_units_per_minute / 100).toFixed(2)} {addonRate.currency_code}/min.
               </p>
             </div>
-            {subscription.ai_receptionist_addon_active && (
+            {subscription.ai_receptionist_addon_enabled && (
               <span className="text-xs font-medium text-emerald-700 bg-emerald-50 rounded-full px-2.5 py-1">
                 Active
               </span>
@@ -443,17 +449,17 @@ export default function BillingPage() {
           {addonError && <p className="text-sm text-red-600 bg-red-50 rounded-lg px-3 py-2">{addonError}</p>}
           {isAdmin ? (
             <button
-              onClick={() => handleToggleAddon(!subscription.ai_receptionist_addon_active)}
+              onClick={() => handleToggleAddon(!subscription.ai_receptionist_addon_enabled)}
               disabled={addonBusy}
               className={`text-xs font-medium rounded-lg px-3 py-1.5 disabled:opacity-60 ${
-                subscription.ai_receptionist_addon_active
+                subscription.ai_receptionist_addon_enabled
                   ? "border border-slate-300 text-slate-700 hover:bg-slate-50"
                   : "bg-indigo-600 hover:bg-indigo-700 text-white"
               }`}
             >
               {addonBusy
                 ? "Saving..."
-                : subscription.ai_receptionist_addon_active
+                : subscription.ai_receptionist_addon_enabled
                   ? "Remove add-on"
                   : "Add to my plan"}
             </button>

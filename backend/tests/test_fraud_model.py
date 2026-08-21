@@ -1,6 +1,6 @@
 from datetime import datetime, timedelta, timezone
 
-from app.numbering.numbers.models import PhoneNumber, PhoneNumberStatus
+from app.numbering.numbers.models import CallerIdentity, CallerIdentityStatus, PhoneNumber, PhoneNumberStatus
 
 
 def _signup_and_login(client, email: str) -> str:
@@ -28,6 +28,15 @@ def _create_staff_and_login(client, db_session, email: str, role):
 def _active_number(db_session, account_id: str, e164: str) -> PhoneNumber:
     number = PhoneNumber(e164=e164, country="US", status=PhoneNumberStatus.ACTIVE, account_id=account_id)
     db_session.add(number)
+    db_session.commit()
+    # Real purchases auto-create a VERIFIED CallerIdentity (see
+    # assert_caller_id_authorized) - this helper bypasses purchase_number
+    # entirely, so it must create one itself or every outbound call in these
+    # tests gets rejected as an unauthorized caller ID.
+    db_session.add(CallerIdentity(
+        phone_number_id=number.id, account_id=account_id, status=CallerIdentityStatus.VERIFIED,
+        verification_source="test-fixture", verified_at=datetime.now(timezone.utc),
+    ))
     db_session.commit()
     return number
 
@@ -521,7 +530,11 @@ def test_concurrency_limit_blocks_extra_simultaneous_calls(client, db_session, m
     # rather than hardcoding it a second time here (this exact test used to
     # assume 3, went stale when the tier was tuned down to 1, and the
     # resulting 429-vs-200 mismatch was masked by an unrelated infra bug
-    # for a while - see the migration that fixed the real root cause).
+    # for a while - see the migration that fixed the real root cause). Same
+    # tier/limit test_risk.py's
+    # test_concurrent_call_limit_blocks_a_second_in_flight_call_for_a_trial_account
+    # covers - kept here too since it's this suite's own fraud-model
+    # regression check for the same code path.
     limit = MAX_CONCURRENT_CALLS_BY_RISK_STATE[AccountRiskState.TRIAL_LOW]
     for i in range(limit):
         response = _place_call(client, headers, f"+1416555000{i}", "+15550070030")

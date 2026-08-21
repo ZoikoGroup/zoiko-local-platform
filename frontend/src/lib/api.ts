@@ -58,11 +58,12 @@ async function request<T>(
 // Architecture doc §5 "Fraud and Risk: device fingerprinting" - a coarse,
 // no-third-party-SDK client fingerprint (not a real anti-tampering
 // fingerprint like FingerprintJS) built from a few stable, low-invasiveness
-// signals. Sent as an optional header; the backend never requires it and
-// never blocks signup on it (see backend app.risk.service.
-// check_fingerprint_on_signup's docstring) - this is a detection signal,
-// not an access gate.
-async function computeDeviceFingerprint(): Promise<string | null> {
+// signals. Sent as an optional header on signup, login, and placing a call
+// (the three actions a device can take against an account); the backend
+// never requires it and never blocks any of them on it (see backend
+// app.risk.service.check_fingerprint_on_{signup,login,call}'s docstrings) -
+// this is a detection signal, not an access gate.
+export async function computeDeviceFingerprint(): Promise<string | null> {
   if (typeof window === "undefined" || !window.crypto?.subtle) return null;
   try {
     const raw = [
@@ -102,9 +103,11 @@ export type LoginResult = {
   mfa_token: string | null;
 };
 
-export function login(input: { email: string; password: string }): Promise<LoginResult> {
+export async function login(input: { email: string; password: string }): Promise<LoginResult> {
+  const fingerprint = await computeDeviceFingerprint();
   return request("/auth/login", {
     method: "POST",
+    headers: fingerprint ? { "X-Device-Fingerprint": fingerprint } : {},
     body: JSON.stringify(input),
   });
 }
@@ -355,6 +358,14 @@ export function unsubscribeFromPush(token: string, endpoint: string): Promise<vo
     headers: { Authorization: `Bearer ${token}` },
     body: JSON.stringify({ endpoint }),
   });
+}
+
+// Public half of the backend's VAPID keypair - safe to expose client-side
+// (that's the whole point of the VAPID public/private split). Blank when
+// no keypair is configured yet, same "not configured" posture the rest of
+// the Provider Gateway follows.
+export function getVapidPublicKey(): string {
+  return process.env.NEXT_PUBLIC_VAPID_PUBLIC_KEY ?? "";
 }
 
 export type NotificationPreferences = {
@@ -613,6 +624,141 @@ export function getProviderTraceSummary(staffToken: string, hours: number = 24):
   });
 }
 
+// --- Self-hosted error monitoring (staff-only) ---
+
+export type ErrorEvent = {
+  id: string;
+  request_id: string;
+  method: string;
+  path: string;
+  status_code: number;
+  exception_type: string | null;
+  exception_message: string | null;
+  account_id: string | null;
+  user_id: string | null;
+  created_at: string;
+};
+
+export type ErrorEventDetail = ErrorEvent & {
+  traceback: string | null;
+};
+
+export type ErrorCountSummary = {
+  exception_type: string | null;
+  path: string;
+  status_code: number;
+  count: number;
+};
+
+export function listErrors(staffToken: string, limit: number = 100): Promise<ErrorEvent[]> {
+  return request<ErrorEvent[]>(`/ops/errors?limit=${limit}`, {
+    headers: { Authorization: `Bearer ${staffToken}` },
+  });
+}
+
+export function getErrorSummary(staffToken: string, hours: number = 24): Promise<ErrorCountSummary[]> {
+  return request<ErrorCountSummary[]>(`/ops/errors/summary?hours=${hours}`, {
+    headers: { Authorization: `Bearer ${staffToken}` },
+  });
+}
+
+export function getErrorDetail(staffToken: string, errorId: string): Promise<ErrorEventDetail> {
+  return request<ErrorEventDetail>(`/ops/errors/${errorId}`, {
+    headers: { Authorization: `Bearer ${staffToken}` },
+  });
+}
+
+// --- Incidents (public status page + staff management) ---
+
+export type IncidentStatus = "investigating" | "monitoring" | "resolved";
+
+export type Incident = {
+  id: string;
+  title: string;
+  affected_service: string;
+  status: IncidentStatus;
+  impact_summary: string;
+  mitigation_summary: string | null;
+  started_at: string;
+  resolved_at: string | null;
+};
+
+export function listIncidents(limit: number = 50): Promise<Incident[]> {
+  return request<Incident[]>(`/ops/incidents?limit=${limit}`);
+}
+
+export function createIncident(
+  staffToken: string,
+  input: { title: string; affected_service: string; impact_summary: string }
+): Promise<Incident> {
+  return request<Incident>("/ops/incidents", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${staffToken}` },
+    body: JSON.stringify(input),
+  });
+}
+
+export function updateIncident(
+  staffToken: string,
+  incidentId: string,
+  input: { status: IncidentStatus; impact_summary?: string; mitigation_summary?: string }
+): Promise<Incident> {
+  return request<Incident>(`/ops/incidents/${incidentId}`, {
+    method: "PUT",
+    headers: { Authorization: `Bearer ${staffToken}` },
+    body: JSON.stringify(input),
+  });
+}
+
+export function resolveIncident(staffToken: string, incidentId: string): Promise<Incident> {
+  return request<Incident>(`/ops/incidents/${incidentId}/resolve`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${staffToken}` },
+  });
+}
+
+// --- Synthetic checks (staff-only) ---
+
+export type SyntheticCheckRun = {
+  id: string;
+  check_name: string;
+  success: boolean;
+  duration_ms: number;
+  detail: string | null;
+  created_at: string;
+};
+
+export type SyntheticCheckSummary = {
+  overall_healthy: boolean;
+  checks: SyntheticCheckRun[];
+};
+
+export function runSyntheticChecks(staffToken: string): Promise<SyntheticCheckRun[]> {
+  return request<SyntheticCheckRun[]>("/ops/synthetic-checks/run", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${staffToken}` },
+  });
+}
+
+export function listSyntheticChecks(
+  staffToken: string,
+  filters: { checkName?: string; limit?: number } = {}
+): Promise<SyntheticCheckRun[]> {
+  const params = new URLSearchParams();
+  if (filters.checkName) params.set("check_name", filters.checkName);
+  if (filters.limit) params.set("limit", String(filters.limit));
+  const query = params.toString() ? `?${params.toString()}` : "";
+  return request<SyntheticCheckRun[]>(`/ops/synthetic-checks${query}`, {
+    headers: { Authorization: `Bearer ${staffToken}` },
+  });
+}
+
+export function getSyntheticCheckSummary(staffToken: string): Promise<SyntheticCheckSummary> {
+  return request<SyntheticCheckSummary>("/ops/synthetic-checks/summary", {
+    headers: { Authorization: `Bearer ${staffToken}` },
+  });
+}
+
 // --- ZoikoNex mock billing adapter (staff-only) ---
 // No real ZoikoNex API exists yet - these routes simulate the webhook a
 // real ZoikoNex would eventually send, so the graceful-degradation
@@ -823,14 +969,30 @@ export function listNumberRates(token: string): Promise<NumberRate[]> {
 
 export type AIUsageRate = {
   overage_price_cents_per_minute: number;
-  addon_monthly_price_cents: number;
-  addon_included_minutes: number;
   currency: string;
   is_placeholder: boolean;
 };
 
 export function getAIUsageRate(token: string): Promise<AIUsageRate | null> {
   return request<AIUsageRate | null>("/usage/ai-usage-rate", {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+// The $29/workspace/month AI Receptionist add-on itself is priced
+// separately from the general AI overage rate above - its own versioned
+// table (see backend AIReceptionistAddonRate's docstring).
+export type AIReceptionistAddonRate = {
+  catalog_version: string;
+  monthly_price_minor_units: number;
+  included_minutes: number;
+  overage_rate_minor_units_per_minute: number;
+  currency_code: string;
+  is_placeholder: boolean;
+};
+
+export function getAIReceptionistAddonRate(token: string): Promise<AIReceptionistAddonRate | null> {
+  return request<AIReceptionistAddonRate | null>("/billing/ai-receptionist-addon-rate", {
     headers: { Authorization: `Bearer ${token}` },
   });
 }
@@ -1004,13 +1166,17 @@ export function listCalls(token: string, limit?: number): Promise<CallLogEntry[]
   });
 }
 
-export function placeOutboundCall(
+export async function placeOutboundCall(
   token: string,
   input: { to: string; from: string; message?: string }
 ): Promise<{ sid: string; status: string; to: string; from: string }> {
+  const fingerprint = await computeDeviceFingerprint();
   return request("/media/voice/outbound", {
     method: "POST",
-    headers: { Authorization: `Bearer ${token}` },
+    headers: {
+      Authorization: `Bearer ${token}`,
+      ...(fingerprint ? { "X-Device-Fingerprint": fingerprint } : {}),
+    },
     body: JSON.stringify(input),
   });
 }
@@ -1311,6 +1477,9 @@ export type ReceptionistCallEntry = {
   guardrail_flags: string[];
   is_likely_spam: boolean;
   spam_reason: string | null;
+  callback_preference: string | null;
+  callback_requested: boolean;
+  callback_window: "asap" | "today" | "tomorrow" | null;
   assigned_user_id: string | null;
   assigned_user_email: string | null;
   original_summary: string | null;
@@ -1389,7 +1558,7 @@ export type Subscription = {
   plan_code: string;
   status: "trialing" | "active" | "past_due" | "canceled";
   billing_period: BillingPeriod;
-  ai_receptionist_addon_active: boolean;
+  ai_receptionist_addon_enabled: boolean;
   trial_ends_at: string | null;
   current_period_start: string;
   current_period_end: string;
@@ -1461,11 +1630,11 @@ export function changeSubscriptionPlan(
   });
 }
 
-export function setAIReceptionistAddon(token: string, active: boolean): Promise<Subscription> {
+export function setAIReceptionistAddon(token: string, enabled: boolean): Promise<Subscription> {
   return request<Subscription>("/billing/subscription/ai-receptionist-addon", {
     method: "PUT",
     headers: { Authorization: `Bearer ${token}` },
-    body: JSON.stringify({ active }),
+    body: JSON.stringify({ enabled }),
   });
 }
 

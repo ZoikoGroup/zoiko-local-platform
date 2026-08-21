@@ -19,6 +19,7 @@ from app.notifications.service import (
     notify_porting_request_submitted,
 )
 from app.numbering.numbers.models import PhoneNumber, PhoneNumberStatus
+from app.numbering.numbers.service import _auto_verify_caller_identity
 from app.porting.models import PortingRequest, PortingRequestStatus
 
 
@@ -271,6 +272,12 @@ def complete_porting_request(
     request.created_number_id = number.id
     db.commit()
     db.refresh(request)
+
+    # Commercial Billing Operating Standard doc §R6 - the port_case's own
+    # authorization evidence (staff-verified losing/gaining carrier
+    # process) IS a legitimate verification/authorization source, same
+    # rationale as purchase_number's platform_provisioned_purchase.
+    _auto_verify_caller_identity(db, number, verification_source="port_in_authorization_evidence")
 
     log_event(
         db, actor=actor, action="porting.request_completed",

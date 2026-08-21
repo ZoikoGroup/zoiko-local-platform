@@ -241,26 +241,34 @@ def test_ai_receptionist_addon_grants_included_minutes_on_a_zero_allowance_plan(
     """Doc §5.3: "$29/workspace/month add-on; 100 AI-handled minutes
     included" - the only route Starter/Business have to any included AI
     Receptionist minutes at all (Pro/Scale get a baked-in plan allowance
-    instead - see test_pro_and_scale_get_included_ai_receptionist_minutes)."""
+    instead - see test_pro_and_scale_get_included_ai_receptionist_minutes).
+    Included-minutes total is read via get_usage_summary's resource limit,
+    same place the frontend reads it from - there's no standalone getter."""
+    def _included_minutes():
+        return next(
+            r["limit"] for r in service.get_usage_summary(db_session, account_id)["resources"]
+            if r["resource"] == "ai_receptionist_minutes"
+        )
+
     token = _signup_and_login(client, "aiaddon1@example.com")
     headers = {"Authorization": f"Bearer {token}"}
     account_id = client.get("/auth/me", headers=headers).json()["account_id"]
     service.change_plan(db_session, account_id, "starter", actor="test-actor")
 
-    assert service.get_included_ai_receptionist_minutes(db_session, account_id) == 0
+    assert _included_minutes() == 0
 
     response = client.put(
-        "/billing/subscription/ai-receptionist-addon", json={"active": True}, headers=headers,
+        "/billing/subscription/ai-receptionist-addon", json={"enabled": True}, headers=headers,
     )
     assert response.status_code == 200, response.text
-    assert response.json()["ai_receptionist_addon_active"] is True
-    assert service.get_included_ai_receptionist_minutes(db_session, account_id) == 100
+    assert response.json()["ai_receptionist_addon_enabled"] is True
+    assert _included_minutes() == 100
 
     disabled = client.put(
-        "/billing/subscription/ai-receptionist-addon", json={"active": False}, headers=headers,
+        "/billing/subscription/ai-receptionist-addon", json={"enabled": False}, headers=headers,
     )
-    assert disabled.json()["ai_receptionist_addon_active"] is False
-    assert service.get_included_ai_receptionist_minutes(db_session, account_id) == 0
+    assert disabled.json()["ai_receptionist_addon_enabled"] is False
+    assert _included_minutes() == 0
 
 
 def test_get_subscription_returns_default_free_trial(client):

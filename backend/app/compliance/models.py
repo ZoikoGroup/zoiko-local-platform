@@ -46,8 +46,8 @@ class ComplianceCase(Base):
     parallel branch, kept in its own module rather than sharing this
     file, since the two are unrelated despite both being "compliance").
 
-    number_id is a plain string (not yet a foreign key) since the
-    numbering/numbers table's FK relationship hasn't been wired up here.
+    number_id references phone_numbers.id (SET NULL on delete - losing the
+    number shouldn't destroy the case's own audit/decision history).
     """
 
     __tablename__ = "compliance_cases"
@@ -56,7 +56,9 @@ class ComplianceCase(Base):
     account_id: Mapped[str] = mapped_column(
         UUID(as_uuid=False), ForeignKey("accounts.id", ondelete="CASCADE"), nullable=False, index=True
     )
-    number_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    number_id: Mapped[str | None] = mapped_column(
+        UUID(as_uuid=False), ForeignKey("phone_numbers.id", ondelete="SET NULL"), nullable=True
+    )
     jurisdiction: Mapped[str] = mapped_column(String(2), nullable=False)
     requirement_type: Mapped[str] = mapped_column(String(100), nullable=False)
     status: Mapped[ComplianceCaseStatus] = mapped_column(

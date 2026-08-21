@@ -619,3 +619,102 @@ def test_refund_route_succeeds_for_super_admin(client, db_session):
     )
     assert approved.status_code == 200, approved.text
     assert approved.json()["result"]["refund_id"] == "zn-refund-test"
+
+
+# --- terminate_subscription (Commercial Billing Operating Standard doc §M3) ---
+
+
+def test_terminate_subscription_rejects_an_active_subscription(db_session):
+    account, _sub = _synced_paid_subscription(db_session, "Terminate Active Co")
+
+    try:
+        service.terminate_subscription(db_session, account.id, actor="test-actor")
+        assert False, "expected SubscriptionNotEligibleForTerminationError"
+    except service.SubscriptionNotEligibleForTerminationError:
+        pass
+
+
+def test_terminate_subscription_succeeds_from_canceled_and_releases_numbers(db_session, monkeypatch):
+    from app.numbering.numbers.models import PhoneNumber, PhoneNumberStatus
+
+    released_sids = []
+    monkeypatch.setattr(
+        "app.numbering.numbers.service.telecom.release_number", lambda sid: released_sids.append(sid)
+    )
+
+    account, sub = _synced_paid_subscription(db_session, "Terminate Canceled Co")
+    number = PhoneNumber(
+        e164="+15550001234", country="US", status=PhoneNumberStatus.ACTIVE,
+        account_id=account.id, provider_sid="PNtestterminate123",
+    )
+    db_session.add(number)
+    db_session.commit()
+
+    service.cancel_subscription(db_session, account.id, actor="test-actor")
+
+    result = service.terminate_subscription(db_session, account.id, actor="test-actor", reason="test termination")
+    assert result["terminated"] is True
+    assert result["numbers_released"] == 1
+    assert released_sids == ["PNtestterminate123"]
+
+    db_session.refresh(sub)
+    assert sub.status.value == "terminated"
+    assert sub.terminated_at is not None
+
+    db_session.refresh(number)
+    assert number.status == PhoneNumberStatus.CANCELLED
+
+
+def test_terminate_subscription_rejects_a_second_termination(db_session):
+    account, _sub = _synced_paid_subscription(db_session, "Terminate Twice Co")
+    service.cancel_subscription(db_session, account.id, actor="test-actor")
+    service.terminate_subscription(db_session, account.id, actor="test-actor")
+
+    try:
+        service.terminate_subscription(db_session, account.id, actor="test-actor")
+        assert False, "expected SubscriptionAlreadyTerminatedError"
+    except service.SubscriptionAlreadyTerminatedError:
+        pass
+
+
+def test_terminate_subscription_route_requires_super_admin(client, db_session):
+    account, _sub = _synced_paid_subscription(db_session, "Terminate Route Perms Co")
+    service.cancel_subscription(db_session, account.id, actor="test-actor")
+
+    support_token = _create_and_login_staff(
+        db_session, client, "terminatestaff1@zoikolocal.com", role=PlatformStaffRole.SUPPORT
+    )
+    response = client.post(
+        "/billing/subscription/terminate/request",
+        json={"account_id": account.id, "reason": "test"},
+        headers={"Authorization": f"Bearer {support_token}"},
+    )
+    assert response.status_code == 403
+
+
+def test_terminate_subscription_route_succeeds_for_super_admin(client, db_session, monkeypatch):
+    monkeypatch.setattr("app.numbering.numbers.service.telecom.release_number", lambda sid: None)
+
+    account, _sub = _synced_paid_subscription(db_session, "Terminate Route Success Co")
+    service.cancel_subscription(db_session, account.id, actor="test-actor")
+
+    requester_token = _create_and_login_staff(
+        db_session, client, "terminatestaff2@zoikolocal.com", role=PlatformStaffRole.SUPER_ADMIN
+    )
+    requested = client.post(
+        "/billing/subscription/terminate/request",
+        json={"account_id": account.id, "reason": "test"},
+        headers={"Authorization": f"Bearer {requester_token}"},
+    )
+    assert requested.status_code == 201, requested.text
+    action_id = requested.json()["id"]
+
+    approver_token = _create_and_login_staff(
+        db_session, client, "terminatestaff2approver@zoikolocal.com", role=PlatformStaffRole.SUPER_ADMIN
+    )
+    approved = client.post(
+        f"/billing/actions/{action_id}/approve",
+        headers={"Authorization": f"Bearer {approver_token}"},
+    )
+    assert approved.status_code == 200, approved.text
+    assert approved.json()["result"]["terminated"] is True

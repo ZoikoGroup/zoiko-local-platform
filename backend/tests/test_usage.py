@@ -1,7 +1,21 @@
+from datetime import datetime, timezone
+
 from twilio.request_validator import RequestValidator
 
 from app.core.config import settings
-from app.numbering.numbers.models import PhoneNumber, PhoneNumberStatus
+from app.numbering.numbers.models import CallerIdentity, CallerIdentityStatus, PhoneNumber, PhoneNumberStatus
+
+
+def _verify_caller_id(db_session, number: PhoneNumber) -> None:
+    """Real purchases auto-create a VERIFIED CallerIdentity (see
+    assert_caller_id_authorized) - tests that build a PhoneNumber directly
+    instead of going through purchase_number must create one too, or
+    outbound calls get rejected as an unauthorized caller ID."""
+    db_session.add(CallerIdentity(
+        phone_number_id=number.id, account_id=number.account_id, status=CallerIdentityStatus.VERIFIED,
+        verification_source="test-fixture", verified_at=datetime.now(timezone.utc),
+    ))
+    db_session.commit()
 
 
 def _twilio_signature(url: str, params: dict) -> str:
@@ -30,6 +44,7 @@ def _place_outbound_call(client, db_session, monkeypatch, token, account_id, e16
     number = PhoneNumber(e164=e164, country="GB", status=PhoneNumberStatus.ACTIVE, account_id=account_id)
     db_session.add(number)
     db_session.commit()
+    _verify_caller_id(db_session, number)
 
     response = client.post(
         "/media/voice/outbound",
@@ -99,6 +114,7 @@ def test_completed_call_falls_back_to_the_default_rate_for_an_unseeded_country(c
     number = PhoneNumber(e164="+81312345678", country="JP", status=PhoneNumberStatus.ACTIVE, account_id=account_id)
     db_session.add(number)
     db_session.commit()
+    _verify_caller_id(db_session, number)
     response = client.post(
         "/media/voice/outbound", json={"to": "+15559990002", "from": "+81312345678"},
         headers={"Authorization": f"Bearer {token}"},

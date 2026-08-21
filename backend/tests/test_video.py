@@ -210,15 +210,19 @@ def test_list_rooms_degrades_recording_url_to_none_on_a_genuine_s3_failure(clien
 
 
 def test_create_room_fails_cleanly_when_livekit_url_is_not_configured(client, monkeypatch):
-    """A missing LIVEKIT_URL makes the SDK's own client constructor raise a
-    plain ValueError (not a TwirpError) - must still surface as a clean 502,
-    not an unhandled 500."""
+    """A missing LIVEKIT_URL must raise a clean 502, not an unhandled 500 -
+    and not silently succeed either. _client() checks this explicitly
+    rather than trusting the SDK's own constructor: LiveKitAPI falls back
+    to os.getenv("LIVEKIT_URL") whenever a falsy url is passed, which would
+    otherwise silently resurrect the real env var's value and mask this
+    exact "not configured" scenario - confirmed live, that used to make
+    this test's monkeypatch a no-op (room creation actually succeeded)."""
     monkeypatch.setattr("app.integrations.video.livekit.settings.livekit_url", "")
     token = _signup_and_login(client, "videonolivekit@example.com")
 
     response = client.post("/media/video/rooms", headers={"Authorization": f"Bearer {token}"})
     assert response.status_code == 502
-    assert "url must be set" in response.json()["detail"]
+    assert "LiveKit is not configured" in response.json()["detail"]
 
 
 @pytest.mark.live
@@ -937,6 +941,47 @@ def test_host_can_deny_a_waiting_guest(client, db_session):
     body = status_response.json()
     assert body["status"] == "denied"
     assert body["token"] is None
+
+
+def test_create_room_uses_the_free_trial_plans_participant_cap(client, monkeypatch):
+    """Confirms the account's real billing plan drives real room capacity,
+    not a flat ceiling for every account (Roadmap doc §8 'Phase 1... up to
+    8 participants' vs the 'larger meetings' Phase 3 tier) - free_trial/
+    starter are seeded at max_video_participants=8."""
+    captured = {}
+
+    async def _capture(room_name, max_participants=None):
+        captured["max_participants"] = max_participants
+        return None
+
+    monkeypatch.setattr("app.media.service.video.create_room", _capture)
+    token = _signup_and_login(client, "videocaptrial@example.com")
+
+    response = client.post("/media/video/rooms", headers={"Authorization": f"Bearer {token}"})
+    assert response.status_code == 201
+    assert captured["max_participants"] == 8
+
+
+def test_create_room_uses_the_upgraded_plans_participant_cap(client, db_session, monkeypatch):
+    """Same as above but for an account upgraded to the business plan
+    (seeded at max_video_participants=25) - proves capacity actually scales
+    with the plan rather than being fixed at signup."""
+    from app.billing.service import change_plan
+
+    captured = {}
+
+    async def _capture(room_name, max_participants=None):
+        captured["max_participants"] = max_participants
+        return None
+
+    monkeypatch.setattr("app.media.service.video.create_room", _capture)
+    token = _signup_and_login(client, "videocapbusiness@example.com")
+    account_id = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"}).json()["account_id"]
+    change_plan(db_session, account_id, "business", actor=account_id)
+
+    response = client.post("/media/video/rooms", headers={"Authorization": f"Bearer {token}"})
+    assert response.status_code == 201
+    assert captured["max_participants"] == 25
 
 
 def test_create_room_defaults_to_not_confidential(client, monkeypatch):

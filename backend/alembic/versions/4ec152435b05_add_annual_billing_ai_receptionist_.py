@@ -11,12 +11,6 @@ Global Plans, Pricing & Commercial Launch doc gaps closed here:
     not a computed monthly*12*0.83) and subscriptions (which cadence this
     customer is actually on). Seeds the doc's own real annual figures
     ($129/$199/$299/$449) as ACTIVE alongside the existing monthly rows.
-- AI Receptionist add-on ($29/workspace/month, 100 included minutes) had
-  no price/entitlement modeled at all - only the per-minute overage rate
-  existed. addon_monthly_price_cents/addon_included_minutes on
-  ai_usage_rates default to the doc's real figures via server_default, so
-  the existing seeded row picks them up with no separate data migration.
-  ai_receptionist_addon_active on subscriptions is the actual toggle.
 - Market Activation Registry §6.2 "PAID_OPEN only after ... named sign-off"
   - legal_signoff_reference/legal_signoff_by give set_market_activation_
     status somewhere real to record that evidence going forward. Left NULL
@@ -58,13 +52,10 @@ def upgrade() -> None:
     billing_period_enum = postgresql.ENUM('MONTHLY', 'ANNUAL', name='billing_period_enum')
     billing_period_enum.create(op.get_bind(), checkfirst=True)
 
-    op.add_column('ai_usage_rates', sa.Column('addon_monthly_price_cents', sa.Integer(), server_default='2900', nullable=False))
-    op.add_column('ai_usage_rates', sa.Column('addon_included_minutes', sa.Integer(), server_default='100', nullable=False))
     op.add_column('price_catalog_entries', sa.Column('billing_period', billing_period_enum, server_default='MONTHLY', nullable=False))
     op.drop_constraint('uq_price_catalog_entry_plan_version', 'price_catalog_entries', type_='unique')
     op.create_unique_constraint('uq_price_catalog_entry_plan_version_period', 'price_catalog_entries', ['plan_code', 'catalog_version', 'billing_period'])
     op.add_column('subscriptions', sa.Column('billing_period', billing_period_enum, server_default='MONTHLY', nullable=False))
-    op.add_column('subscriptions', sa.Column('ai_receptionist_addon_active', sa.Boolean(), server_default='false', nullable=False))
     op.add_column('supported_countries', sa.Column('legal_signoff_reference', sa.String(length=100), nullable=True))
     op.add_column('supported_countries', sa.Column('legal_signoff_by', sa.String(length=100), nullable=True))
 
@@ -91,11 +82,8 @@ def downgrade() -> None:
     op.execute("DELETE FROM price_catalog_entries WHERE price_book_version = '2026-08-14-global-launch-usd' AND billing_period = 'ANNUAL'")
     op.drop_column('supported_countries', 'legal_signoff_by')
     op.drop_column('supported_countries', 'legal_signoff_reference')
-    op.drop_column('subscriptions', 'ai_receptionist_addon_active')
     op.drop_column('subscriptions', 'billing_period')
     op.drop_constraint('uq_price_catalog_entry_plan_version_period', 'price_catalog_entries', type_='unique')
     op.create_unique_constraint('uq_price_catalog_entry_plan_version', 'price_catalog_entries', ['plan_code', 'catalog_version'])
     op.drop_column('price_catalog_entries', 'billing_period')
-    op.drop_column('ai_usage_rates', 'addon_included_minutes')
-    op.drop_column('ai_usage_rates', 'addon_monthly_price_cents')
     postgresql.ENUM(name='billing_period_enum').drop(op.get_bind(), checkfirst=True)

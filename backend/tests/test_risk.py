@@ -1,7 +1,9 @@
+from datetime import datetime, timezone
+
 from twilio.request_validator import RequestValidator
 
 from app.core.config import settings
-from app.numbering.numbers.models import PhoneNumber, PhoneNumberStatus
+from app.numbering.numbers.models import CallerIdentity, CallerIdentityStatus, PhoneNumber, PhoneNumberStatus
 
 
 def _twilio_signature(url: str, params: dict) -> str:
@@ -33,6 +35,15 @@ def _create_staff_and_login(client, db_session, email: str, role):
 def _active_number(db_session, account_id: str, e164: str) -> PhoneNumber:
     number = PhoneNumber(e164=e164, country="US", status=PhoneNumberStatus.ACTIVE, account_id=account_id)
     db_session.add(number)
+    db_session.commit()
+    # Real purchases auto-create a VERIFIED CallerIdentity (see
+    # assert_caller_id_authorized) - this helper bypasses purchase_number
+    # entirely, so it must create one itself or every outbound call in these
+    # tests gets rejected as an unauthorized caller ID.
+    db_session.add(CallerIdentity(
+        phone_number_id=number.id, account_id=account_id, status=CallerIdentityStatus.VERIFIED,
+        verification_source="test-fixture", verified_at=datetime.now(timezone.utc),
+    ))
     db_session.commit()
     return number
 
@@ -546,6 +557,123 @@ def test_signup_endpoint_works_without_a_fingerprint_header(client):
         },
     )
     assert response.status_code == 201
+
+
+def test_check_fingerprint_on_login_is_a_noop_with_no_fingerprint(db_session):
+    from app.risk.models import DeviceFingerprintSighting
+    from app.risk.service import check_fingerprint_on_login
+
+    account_id = _real_accounts(db_session, 1, "fp-login-none")[0]
+    check_fingerprint_on_login(db_session, fingerprint_hash=None, account_id=account_id)
+
+    assert db_session.query(DeviceFingerprintSighting).filter(DeviceFingerprintSighting.account_id == account_id).count() == 0
+
+
+def test_check_fingerprint_on_login_records_a_sighting(db_session):
+    from app.risk.models import DeviceFingerprintSighting
+    from app.risk.service import check_fingerprint_on_login
+
+    account_id = _real_accounts(db_session, 1, "fp-login-record")[0]
+    check_fingerprint_on_login(db_session, fingerprint_hash="fp-login-record-hash", account_id=account_id)
+
+    sighting = (
+        db_session.query(DeviceFingerprintSighting)
+        .filter(DeviceFingerprintSighting.account_id == account_id)
+        .first()
+    )
+    assert sighting is not None
+    assert sighting.fingerprint_hash == "fp-login-record-hash"
+
+
+def test_check_fingerprint_on_login_raises_a_signal_at_threshold_but_never_blocks(db_session):
+    from app.risk.models import RiskSignal, RiskSignalType
+    from app.risk.service import DEVICE_FINGERPRINT_ACCOUNT_THRESHOLD, check_fingerprint_on_login
+
+    accounts = _real_accounts(db_session, DEVICE_FINGERPRINT_ACCOUNT_THRESHOLD, "fp-login-signal")
+    for account_id in accounts:
+        # Must not raise - detection only, never a login gate.
+        check_fingerprint_on_login(db_session, fingerprint_hash="fp-login-signal-hash", account_id=account_id)
+
+    signal = (
+        db_session.query(RiskSignal)
+        .filter(RiskSignal.account_id == accounts[-1], RiskSignal.signal_type == RiskSignalType.DEVICE_FINGERPRINT_ABUSE)
+        .first()
+    )
+    assert signal is not None
+
+
+def test_login_endpoint_accepts_an_optional_fingerprint_header(client):
+    client.post(
+        "/auth/signup",
+        json={
+            "account_name": "Login Fingerprint Co", "account_type": "business",
+            "email": "loginfingerprint@example.com", "password": "supersecret123",
+        },
+    )
+    response = client.post(
+        "/auth/login",
+        json={"email": "loginfingerprint@example.com", "password": "supersecret123"},
+        headers={"X-Device-Fingerprint": "login-header-hash"},
+    )
+    assert response.status_code == 200
+    assert response.json()["access_token"] is not None
+
+
+def test_login_endpoint_works_without_a_fingerprint_header(client):
+    client.post(
+        "/auth/signup",
+        json={
+            "account_name": "No Login Fingerprint Co", "account_type": "business",
+            "email": "nologinfingerprint@example.com", "password": "supersecret123",
+        },
+    )
+    response = client.post(
+        "/auth/login",
+        json={"email": "nologinfingerprint@example.com", "password": "supersecret123"},
+    )
+    assert response.status_code == 200
+
+
+def test_check_fingerprint_on_call_records_a_sighting(db_session):
+    from app.risk.models import DeviceFingerprintSighting
+    from app.risk.service import check_fingerprint_on_call
+
+    account_id = _real_accounts(db_session, 1, "fp-call-record")[0]
+    check_fingerprint_on_call(db_session, fingerprint_hash="fp-call-record-hash", account_id=account_id)
+
+    sighting = (
+        db_session.query(DeviceFingerprintSighting)
+        .filter(DeviceFingerprintSighting.account_id == account_id)
+        .first()
+    )
+    assert sighting is not None
+    assert sighting.fingerprint_hash == "fp-call-record-hash"
+
+
+def test_outbound_call_endpoint_accepts_an_optional_fingerprint_header(client, db_session, monkeypatch):
+    from app.risk.models import DeviceFingerprintSighting
+
+    monkeypatch.setattr(
+        "app.media.service.telecom.place_call",
+        lambda **kwargs: {"sid": "CAfingerprint", "status": "completed", "to": kwargs["to"], "from": kwargs["from_"]},
+    )
+    token = _signup_and_login(client, "callfingerprint@example.com")
+    account_id = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"}).json()["account_id"]
+    _active_number(db_session, account_id, "+15550007000")
+
+    response = client.post(
+        "/media/voice/outbound",
+        json={"to": "+15551230000", "from": "+15550007000"},
+        headers={"Authorization": f"Bearer {token}", "X-Device-Fingerprint": "call-header-hash"},
+    )
+    assert response.status_code == 200, response.text
+
+    sighting = (
+        db_session.query(DeviceFingerprintSighting)
+        .filter(DeviceFingerprintSighting.account_id == account_id, DeviceFingerprintSighting.fingerprint_hash == "call-header-hash")
+        .first()
+    )
+    assert sighting is not None
 
 
 def test_inbound_call_fanning_out_across_accounts_gets_flagged_via_the_real_webhook(client, db_session):

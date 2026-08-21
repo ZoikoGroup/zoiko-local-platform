@@ -660,3 +660,272 @@ def test_call_not_reaching_receptionist_does_not_record_ai_minutes(client, db_se
     )
 
     assert db_session.query(UsageEvent).filter(UsageEvent.event_type == "ai_receptionist_minutes").count() == 0
+
+
+def test_receptionist_asks_one_followup_when_name_and_reason_are_both_missing(client, db_session, monkeypatch):
+    """Multi-turn conversation (Roadmap §7): a completed qualification pass
+    that found neither a name nor a reason gets exactly one follow-up
+    question, merged into the SAME call row (never a second one), then
+    proceeds straight to the post-capture menu - never a second follow-up."""
+    token, account_id = _signup_and_login(client, "receptionistfollowup1@example.com")
+    number = PhoneNumber(
+        e164="+15550091111", country="US", status=PhoneNumberStatus.ACTIVE, account_id=account_id,
+        ai_receptionist_enabled=True,
+    )
+    db_session.add(number)
+    db_session.commit()
+
+    client.post(
+        "/compliance/consent", json={"consent_type": "ai_processing"}, headers={"Authorization": f"Bearer {token}"}
+    )
+
+    def _fake_qualify(db, account_id, transcript, jurisdiction=None):
+        if "Jamie" in transcript:
+            return (
+                {
+                    "name": "Jamie", "company": None, "reason": "a billing question",
+                    "summary": "Jamie called with a billing question.", "urgency": "low",
+                    "callback_preference": None,
+                },
+                "groq/test",
+            )
+        return (
+            {
+                "name": None, "company": None, "reason": None, "summary": None,
+                "urgency": "low", "callback_preference": None,
+            },
+            "groq/test",
+        )
+
+    monkeypatch.setattr("app.media.service.qualify_caller", _fake_qualify)
+
+    url = "http://testserver/media/receptionist/respond"
+    params = {"CallSid": "CArecfollow1", "To": "+15550091111", "From": "+15559991111", "SpeechResult": "uh, hello?"}
+    signature = _twilio_signature(url, params)
+    response = client.post("/media/receptionist/respond", data=params, headers={"X-Twilio-Signature": signature})
+    assert response.status_code == 200
+    assert "could you tell me your name" in response.text
+    assert "/media/receptionist/respond-followup" in response.text
+
+    calls = client.get("/media/receptionist/calls", headers={"Authorization": f"Bearer {token}"}).json()
+    assert len(calls) == 1
+    call_id = calls[0]["id"]
+    assert calls[0]["caller_name"] is None
+
+    followup_path = f"/media/receptionist/respond-followup?receptionist_call_id={call_id}"
+    followup_url = f"http://testserver{followup_path}"
+    followup_params = {
+        "CallSid": "CArecfollow1", "To": "+15550091111", "From": "+15559991111",
+        "SpeechResult": "Sorry, my name is Jamie and I have a billing question.",
+    }
+    followup_signature = _twilio_signature(followup_url, followup_params)
+    followup_response = client.post(
+        followup_path, data=followup_params, headers={"X-Twilio-Signature": followup_signature},
+    )
+    assert followup_response.status_code == 200
+    # No second follow-up loop - proceeds straight to the post-capture menu.
+    assert "could you tell me your name" not in followup_response.text
+    assert "press 2" in followup_response.text.lower()
+
+    calls = client.get("/media/receptionist/calls", headers={"Authorization": f"Bearer {token}"}).json()
+    assert len(calls) == 1  # still the same row, not a second one
+    assert calls[0]["id"] == call_id
+    assert calls[0]["caller_name"] == "Jamie"
+    assert calls[0]["reason"] == "a billing question"
+
+
+def test_receptionist_skips_followup_without_ai_consent(client, db_session):
+    """Without AI-processing consent, qualify_caller() never even runs
+    (model_version stays None) - asking a follow-up would be pointless
+    since the follow-up's own re-qualification attempt would fail
+    identically, so this must proceed straight to the post-capture menu."""
+    token, account_id = _signup_and_login(client, "receptionistfollowup2@example.com")
+    number = PhoneNumber(
+        e164="+15550092222", country="US", status=PhoneNumberStatus.ACTIVE, account_id=account_id,
+        ai_receptionist_enabled=True,
+    )
+    db_session.add(number)
+    db_session.commit()
+
+    url = "http://testserver/media/receptionist/respond"
+    params = {
+        "CallSid": "CArecfollow2", "To": "+15550092222", "From": "+15559992222",
+        "SpeechResult": "Hi, calling about an order.",
+    }
+    signature = _twilio_signature(url, params)
+    response = client.post("/media/receptionist/respond", data=params, headers={"X-Twilio-Signature": signature})
+    assert response.status_code == 200
+    assert "could you tell me your name" not in response.text
+    assert "press 2" in response.text.lower()
+
+
+def test_receptionist_menu_press_one_closes_out_the_call(client, db_session):
+    """Regression: pressing 1 (or the default/no-consent path reaching the
+    menu at all) must still close out with the same message callers got
+    before this menu existed - never trips callback_requested."""
+    token, account_id = _signup_and_login(client, "receptionistmenu1@example.com")
+    _capture_a_call(client, db_session, account_id, e164="+15550093333", call_sid="CArecmenu1")
+    call_id = client.get(
+        "/media/receptionist/calls", headers={"Authorization": f"Bearer {token}"}
+    ).json()[0]["id"]
+
+    menu_path = f"/media/receptionist/menu-select?receptionist_call_id={call_id}"
+    menu_url = f"http://testserver{menu_path}"
+    menu_params = {"CallSid": "CArecmenu1", "Digits": "1"}
+    menu_signature = _twilio_signature(menu_url, menu_params)
+    menu_response = client.post(menu_path, data=menu_params, headers={"X-Twilio-Signature": menu_signature})
+    assert menu_response.status_code == 200
+    assert "noted your message" in menu_response.text
+
+    calls = client.get("/media/receptionist/calls", headers={"Authorization": f"Bearer {token}"}).json()
+    assert calls[0]["callback_requested"] is False
+
+
+def test_receptionist_menu_press_two_then_window_records_callback_request(client, db_session, monkeypatch):
+    token, account_id = _signup_and_login(client, "receptionistcallback1@example.com")
+    number = PhoneNumber(
+        e164="+15550094444", country="US", status=PhoneNumberStatus.ACTIVE, account_id=account_id,
+        ai_receptionist_enabled=True,
+    )
+    db_session.add(number)
+    db_session.commit()
+
+    client.post(
+        "/compliance/consent", json={"consent_type": "ai_processing"}, headers={"Authorization": f"Bearer {token}"}
+    )
+    monkeypatch.setattr(
+        "app.media.service.qualify_caller",
+        lambda db, account_id, transcript, jurisdiction=None: (
+            {
+                "name": "Riley", "company": None, "reason": "asked about a return",
+                "summary": "Riley called asking about a return.", "urgency": "low",
+                "callback_preference": None,
+            },
+            "groq/test",
+        ),
+    )
+
+    url = "http://testserver/media/receptionist/respond"
+    params = {
+        "CallSid": "CAreccallback1", "To": "+15550094444", "From": "+15559994444",
+        "SpeechResult": "Hi, I'd like to return an item.",
+    }
+    signature = _twilio_signature(url, params)
+    respond_response = client.post(
+        "/media/receptionist/respond", data=params, headers={"X-Twilio-Signature": signature}
+    )
+    assert "press 2" in respond_response.text.lower()
+
+    call_id = client.get(
+        "/media/receptionist/calls", headers={"Authorization": f"Bearer {token}"}
+    ).json()[0]["id"]
+
+    menu_path = f"/media/receptionist/menu-select?receptionist_call_id={call_id}"
+    menu_url = f"http://testserver{menu_path}"
+    menu_params = {"CallSid": "CAreccallback1", "Digits": "2"}
+    menu_signature = _twilio_signature(menu_url, menu_params)
+    menu_response = client.post(menu_path, data=menu_params, headers={"X-Twilio-Signature": menu_signature})
+    assert menu_response.status_code == 200
+    assert "later today" in menu_response.text.lower()
+    assert "/media/receptionist/callback-select" in menu_response.text
+
+    callback_path = f"/media/receptionist/callback-select?receptionist_call_id={call_id}"
+    callback_url = f"http://testserver{callback_path}"
+    callback_params = {"CallSid": "CAreccallback1", "Digits": "2"}
+    callback_signature = _twilio_signature(callback_url, callback_params)
+    callback_response = client.post(
+        callback_path, data=callback_params, headers={"X-Twilio-Signature": callback_signature},
+    )
+    assert callback_response.status_code == 200
+    assert "later today" in callback_response.text.lower()
+
+    calls = client.get("/media/receptionist/calls", headers={"Authorization": f"Bearer {token}"}).json()
+    assert len(calls) == 1
+    assert calls[0]["id"] == call_id
+    assert calls[0]["callback_requested"] is True
+    assert calls[0]["callback_window"] == "today"
+
+
+def test_receptionist_callback_select_timeout_still_records_the_request(client, db_session):
+    """The caller already pressed 2 to reach this menu - a timeout/garbled
+    digit on the window sub-menu should still record callback_requested,
+    just with no specific window, rather than silently dropping the ask."""
+    token, account_id = _signup_and_login(client, "receptionistcallback2@example.com")
+    _capture_a_call(client, db_session, account_id, e164="+15550095555", call_sid="CAreccallback2")
+    call_id = client.get(
+        "/media/receptionist/calls", headers={"Authorization": f"Bearer {token}"}
+    ).json()[0]["id"]
+
+    callback_path = f"/media/receptionist/callback-select?receptionist_call_id={call_id}"
+    callback_url = f"http://testserver{callback_path}"
+    callback_params = {"CallSid": "CAreccallback2"}  # no Digits - timeout
+    callback_signature = _twilio_signature(callback_url, callback_params)
+    callback_response = client.post(
+        callback_path, data=callback_params, headers={"X-Twilio-Signature": callback_signature},
+    )
+    assert callback_response.status_code == 200
+
+    calls = client.get("/media/receptionist/calls", headers={"Authorization": f"Bearer {token}"}).json()
+    assert calls[0]["callback_requested"] is True
+    assert calls[0]["callback_window"] is None
+
+
+def test_receptionist_menu_timeout_closes_out_like_pressing_one(client, db_session):
+    """build_dtmf_menu_response falls through to its own action_url with no
+    Digits param on a timeout - menu-select must treat that the same as
+    pressing 1, not error or hang."""
+    token, account_id = _signup_and_login(client, "receptionistmenu2@example.com")
+    _capture_a_call(client, db_session, account_id, e164="+15550096666", call_sid="CArecmenu2")
+    call_id = client.get(
+        "/media/receptionist/calls", headers={"Authorization": f"Bearer {token}"}
+    ).json()[0]["id"]
+
+    menu_path = f"/media/receptionist/menu-select?receptionist_call_id={call_id}"
+    menu_url = f"http://testserver{menu_path}"
+    menu_params = {"CallSid": "CArecmenu2"}  # no Digits - timeout
+    menu_signature = _twilio_signature(menu_url, menu_params)
+    menu_response = client.post(menu_path, data=menu_params, headers={"X-Twilio-Signature": menu_signature})
+    assert menu_response.status_code == 200
+    assert "noted your message" in menu_response.text
+
+
+def test_receptionist_callback_preference_persisted_without_using_callback_menu(client, db_session, monkeypatch):
+    """Groq's qualification extraction already produces callback_preference
+    (a phone number or 'email' mentioned in speech) independent of whether
+    the caller ever uses the DTMF callback menu - it must be persisted
+    either way, not discarded."""
+    token, account_id = _signup_and_login(client, "receptionistcbpref1@example.com")
+    number = PhoneNumber(
+        e164="+15550097777", country="US", status=PhoneNumberStatus.ACTIVE, account_id=account_id,
+        ai_receptionist_enabled=True,
+    )
+    db_session.add(number)
+    db_session.commit()
+
+    client.post(
+        "/compliance/consent", json={"consent_type": "ai_processing"}, headers={"Authorization": f"Bearer {token}"}
+    )
+    monkeypatch.setattr(
+        "app.media.service.qualify_caller",
+        lambda db, account_id, transcript, jurisdiction=None: (
+            {
+                "name": "Morgan", "company": None, "reason": "asked about an invoice",
+                "summary": "Morgan called about an invoice and prefers email.", "urgency": "low",
+                "callback_preference": "email",
+            },
+            "groq/test",
+        ),
+    )
+
+    url = "http://testserver/media/receptionist/respond"
+    params = {
+        "CallSid": "CAreccbpref1", "To": "+15550097777", "From": "+15559997777",
+        "SpeechResult": "Hi, I have a question about my invoice, please email me.",
+    }
+    signature = _twilio_signature(url, params)
+    client.post("/media/receptionist/respond", data=params, headers={"X-Twilio-Signature": signature})
+
+    calls = client.get("/media/receptionist/calls", headers={"Authorization": f"Bearer {token}"}).json()
+    assert len(calls) == 1
+    assert calls[0]["callback_preference"] == "email"
+    assert calls[0]["callback_requested"] is False

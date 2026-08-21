@@ -105,6 +105,19 @@ def publish_number_reserved(account_id: str, *, number_id: str, e164: str, count
     )
 
 
+def publish_number_purchase_confirmed(
+    account_id: str, *, number_id: str, e164: str, payment_intent_id: str | None = None
+) -> None:
+    """There's no separate "order" entity in this codebase (unlike the
+    Architecture doc's order.reference) - the Stripe payment_intent_id is
+    the closest real correlation handle, when the purchase went through
+    checkout rather than e.g. a staff override."""
+    publish_event(
+        "zoiko.numbers", "number.purchase_confirmed", account_id,
+        {"number_id": number_id, "e164": e164, "payment_intent_id": payment_intent_id},
+    )
+
+
 def publish_number_activated(account_id: str, *, number_id: str, e164: str) -> None:
     publish_event("zoiko.numbers", "number.activated", account_id, {"number_id": number_id, "e164": e164})
 
@@ -144,6 +157,17 @@ def publish_video_room_created(account_id: str, *, room_name: str) -> None:
 
 def publish_video_room_ended(account_id: str, *, room_name: str) -> None:
     publish_event("zoiko.video", "video.room.ended", account_id, {"room_name": room_name})
+
+
+def publish_video_session_started(account_id: str, *, session_id: str, room_name: str) -> None:
+    """Same fact as publish_video_room_created, under the Architecture doc's §8 event
+    name. Kept as a separate publish alongside the room.* event rather than a rename,
+    since something may already be keyed on video.room.created."""
+    publish_event("zoiko.video", "video.session.started", account_id, {"session_id": session_id, "room_name": room_name})
+
+
+def publish_video_session_ended(account_id: str, *, session_id: str, room_name: str) -> None:
+    publish_event("zoiko.video", "video.session.ended", account_id, {"session_id": session_id, "room_name": room_name})
 
 
 def publish_voicemail_created(account_id: str, *, voicemail_id: str, phone_number_id: str) -> None:
@@ -212,9 +236,9 @@ def publish_compliance_case_expired(
     account_id: str, *, case_id: str, jurisdiction: str, requirement_type: str
 ) -> None:
     """Architecture doc §8 event table - the one compliance event that had
-    no real call site until app.compliance.service.sweep_expired_
-    compliance_cases existed (a case was never actually marked EXPIRED
-    anywhere in the codebase before that)."""
+    no real call site until app.compliance.service.expire_overdue_cases
+    existed (a case was never actually marked EXPIRED anywhere in the
+    codebase before that)."""
     publish_event(
         "zoiko.compliance", "compliance.case_expired", account_id,
         {"case_id": case_id, "jurisdiction": jurisdiction, "requirement_type": requirement_type},
@@ -271,6 +295,29 @@ def publish_subscription_payment_event(
     publish_event(
         "zoiko.billing", "subscription.payment_event", account_id,
         {"subscription_id": subscription_id, "event_type": event_type, "status": status},
+    )
+
+
+def publish_payment_failed(account_id: str, *, subscription_id: str, reason: str | None) -> None:
+    """Named event from the Architecture doc's §8 table. subscription.payment_event
+    (below) already carries this same fact generically; this is additive, not a
+    replacement, since something may already be keyed on the generic event."""
+    publish_event(
+        "zoiko.billing", "payment.failed", account_id,
+        {"subscription_id": subscription_id, "reason": reason},
+    )
+
+
+def publish_payment_restored(account_id: str, *, subscription_id: str) -> None:
+    publish_event("zoiko.billing", "payment.restored", account_id, {"subscription_id": subscription_id})
+
+
+def publish_subscription_terminated(
+    account_id: str, *, subscription_id: str, reason: str | None, numbers_released: int
+) -> None:
+    publish_event(
+        "zoiko.billing", "subscription.terminated", account_id,
+        {"subscription_id": subscription_id, "reason": reason, "numbers_released": numbers_released},
     )
 
 
@@ -420,3 +467,7 @@ def publish_call_flow_rolled_back(account_id: str, *, call_flow_id: str, restore
         "zoiko.routing", "call_flow.rolled_back", account_id,
         {"call_flow_id": call_flow_id, "restored_version": restored_version, "new_version": new_version},
     )
+
+
+def publish_audit_event_recorded(account_id: str | None, *, audit_id: str, action: str, target: str) -> None:
+    publish_event("zoiko.audit", "audit.event.recorded", account_id, {"audit_id": audit_id, "action": action, "target": target})

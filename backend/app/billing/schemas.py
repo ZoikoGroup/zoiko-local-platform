@@ -17,6 +17,17 @@ class PlanResponse(BaseModel):
     trial_days: int
 
 
+class AIReceptionistAddonRateResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    catalog_version: str
+    monthly_price_minor_units: int
+    included_minutes: int
+    overage_rate_minor_units_per_minute: int
+    currency_code: str
+    is_placeholder: bool
+
+
 class PriceCatalogEntryResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -62,7 +73,7 @@ class SubscriptionResponse(BaseModel):
     plan_code: str
     status: str
     billing_period: str
-    ai_receptionist_addon_active: bool
+    ai_receptionist_addon_enabled: bool
     trial_ends_at: datetime | None
     current_period_start: datetime
     current_period_end: datetime
@@ -76,18 +87,23 @@ class ChangePlanRequest(BaseModel):
     billing_period: str = "monthly"
 
 
-class SetAIReceptionistAddonRequest(BaseModel):
-    active: bool
-
-
 class CancelSubscriptionRequest(BaseModel):
     reason: str | None = None
+
+
+class SetAIReceptionistAddonRequest(BaseModel):
+    enabled: bool
 
 
 class UsageResourceSummary(BaseModel):
     resource: str
     used: float
     limit: int
+    # Pricing doc §5.3 included-allowance + overage - only populated for
+    # ai_receptionist_minutes today; None for every other resource, which
+    # has no overage-billing concept at all.
+    overage_minutes: float | None = None
+    estimated_overage_cost_cents: int | None = None
 
 
 class UsageSummaryResponse(BaseModel):
@@ -97,6 +113,7 @@ class UsageSummaryResponse(BaseModel):
     trial_ends_at: datetime | None
     current_period_start: datetime
     current_period_end: datetime
+    ai_receptionist_addon_enabled: bool
     resources: list[UsageResourceSummary]
 
 
@@ -107,6 +124,11 @@ class SimulatePaymentEventRequest(BaseModel):
 
 class RunBillingCycleRequest(BaseModel):
     account_id: str
+
+
+class TerminateSubscriptionRequest(BaseModel):
+    account_id: str
+    reason: str | None = None
 
 
 class RunBillingCycleResponse(BaseModel):

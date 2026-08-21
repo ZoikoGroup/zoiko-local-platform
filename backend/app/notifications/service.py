@@ -262,24 +262,42 @@ def send_notification(
         not pref.transactional_enabled
         or (template.domain is not None and template.domain in pref.disabled_domains)
     )
+    # Doc §A-29 (HIGH): configurable-category mail respects the account's
+    # quiet hours the same way SMS already does - CRITICAL/SECURITY still
+    # bypass this, same override every other suppression check gets.
+    is_quiet_hours = pref is not None and not is_exempt and is_within_quiet_hours(pref)
 
     if suppression is not None:
         delivery.status = NotificationDeliveryStatus.SUPPRESSED
         delivery.error = f"Suppressed: {suppression.reason.value} on file for this address"
     elif is_opted_out:
         delivery.status = NotificationDeliveryStatus.SUPPRESSED
+    elif is_quiet_hours:
+        delivery.status = NotificationDeliveryStatus.SUPPRESSED
+        delivery.error = "Suppressed: sent during the account's configured quiet hours"
     else:
         outgoing_body = body
+        email_headers = None
         if not is_exempt:
-            # RFC 8058 one-click unsubscribe (doc §4.1/§11) - appended in
-            # Python rather than requiring every one of the 128 template
-            # bodies to embed a {unsubscribe_url} placeholder themselves.
+            # RFC 8058 one-click unsubscribe (doc §4.1/§11, A-23 BLOCKER) -
+            # both the body link (for clients with no one-click support)
+            # AND the List-Unsubscribe/List-Unsubscribe-Post headers Gmail/
+            # Yahoo actually require to show their one-click button - a
+            # body link alone satisfies neither. Built once in Python
+            # rather than requiring every one of the 195 template bodies
+            # to embed a {unsubscribe_url} placeholder themselves.
             token = _create_unsubscribe_token(recipient_email, template.domain)
             unsubscribe_url = f"{settings.public_base_url}/notifications/unsubscribe?token={token}"
             label = template.domain or "these"
             outgoing_body = f"{body}\n\n---\nDon't want {label} emails like this? Unsubscribe: {unsubscribe_url}"
+            email_headers = {
+                "List-Unsubscribe": f"<{unsubscribe_url}>",
+                "List-Unsubscribe-Post": "List-Unsubscribe=One-Click",
+            }
         try:
-            delivery.provider_message_id = send_email(to=recipient_email, subject=subject, body=outgoing_body)
+            delivery.provider_message_id = send_email(
+                to=recipient_email, subject=subject, body=outgoing_body, headers=email_headers
+            )
         except EmailError as e:
             delivery.status = NotificationDeliveryStatus.FAILED
             delivery.error = str(e)
@@ -337,7 +355,7 @@ def send_notification(
     publish_notification_sent(account_id, event_name=event_name, channel="email", status=delivery.status.value)
 
     if account_id:
-        _fan_out_push(db, account_id=account_id, event_name=event_name, title=subject, body=body)
+        _fan_out_push(db, account_id=account_id, event_name=event_name, title=subject, body=body, is_exempt=is_exempt)
 
     return delivery
 
@@ -393,12 +411,31 @@ def send_internal_alert(db: Session, *, event_name: str, summary: str, console_l
     )
 
 
-def _fan_out_push(db: Session, *, account_id: str, event_name: str, title: str, body: str) -> None:
+def _fan_out_push(
+    db: Session, *, account_id: str, event_name: str, title: str, body: str, is_exempt: bool = False
+) -> None:
     """Best-effort push to every device subscribed for this account - a
     missing/expired subscription or a real push-service failure must never
     break the (already-sent) email notification, same rationale as SMS's
-    try/except in notify_number_suspended."""
+    try/except in notify_number_suspended.
+
+    Same opt-out/quiet-hours gating as SMS (transactional_enabled +
+    is_within_quiet_hours, bypassed for SECURITY/CRITICAL templates) - push
+    is an interruptive channel too (buzzes a phone/desktop), and previously
+    had zero preference checking at all: every subscriber got pushed
+    regardless of what they'd opted out of."""
     subscriptions = db.query(PushSubscription).filter(PushSubscription.account_id == account_id).all()
+    if not subscriptions:
+        return
+
+    pref = get_or_create_preference(db, account_id) if not is_exempt else None
+    if pref is not None and not pref.transactional_enabled:
+        suppressed_reason = "Suppressed: opted out of transactional notifications for this account"
+    elif pref is not None and is_within_quiet_hours(pref):
+        suppressed_reason = "Suppressed: sent during the account's configured quiet hours"
+    else:
+        suppressed_reason = None
+
     for subscription in subscriptions:
         delivery = NotificationDelivery(
             account_id=account_id,
@@ -408,18 +445,22 @@ def _fan_out_push(db: Session, *, account_id: str, event_name: str, title: str, 
             subject=title[:255],
             status=NotificationDeliveryStatus.SENT,
         )
-        try:
-            send_push(
-                endpoint=subscription.endpoint, p256dh=subscription.p256dh, auth=subscription.auth,
-                title=title, body=body,
-            )
-        except PushSubscriptionExpiredError:
-            delivery.status = NotificationDeliveryStatus.FAILED
-            delivery.error = "Subscription expired"
-            db.delete(subscription)
-        except PushError as e:
-            delivery.status = NotificationDeliveryStatus.FAILED
-            delivery.error = str(e)
+        if suppressed_reason is not None:
+            delivery.status = NotificationDeliveryStatus.SUPPRESSED
+            delivery.error = suppressed_reason
+        else:
+            try:
+                send_push(
+                    endpoint=subscription.endpoint, p256dh=subscription.p256dh, auth=subscription.auth,
+                    title=title, body=body,
+                )
+            except PushSubscriptionExpiredError:
+                delivery.status = NotificationDeliveryStatus.FAILED
+                delivery.error = "Subscription expired"
+                db.delete(subscription)
+            except PushError as e:
+                delivery.status = NotificationDeliveryStatus.FAILED
+                delivery.error = str(e)
 
         db.add(delivery)
         db.commit()
@@ -1100,6 +1141,19 @@ def notify_voicemail_received(
     )
 
 
+def notify_receptionist_callback_requested(
+    db: Session, *, account_id: str, account_email: str, caller_number: str, callback_window: str
+) -> None:
+    send_notification(
+        db, event_name="voice.receptionist_callback_requested", account_id=account_id, recipient_email=account_email,
+        context={
+            "user_display_name": account_email,
+            "caller_number": _mask_number(caller_number),
+            "callback_window": callback_window,
+        },
+    )
+
+
 def notify_voicemail_transcription_ready(db: Session, *, account_id: str, account_email: str) -> None:
     send_notification(
         db, event_name="voice.voicemail_transcription_ready", account_id=account_id, recipient_email=account_email,
@@ -1288,6 +1342,21 @@ def notify_administrator_removed(
             "organization_name": organization_name,
             "actor_display_name": removed_admin_display_name,
             "role_name": "Administrator",
+        },
+    )
+
+
+def notify_subscription_terminated(db: Session, *, account_id: str, account_email: str, plan_name: str) -> None:
+    """Email Communications System doc's billing.subscription_ended
+    template, previously seeded but never wired to a real call site - see
+    app.billing.service.terminate_subscription."""
+    send_notification(
+        db, event_name="billing.subscription_ended", account_id=account_id, recipient_email=account_email,
+        context={
+            "user_display_name": account_email,
+            "subscription_plan_name": plan_name,
+            "subscription_ended_date": _now_str(),
+            "subscription_post_end_status": "Terminated - owned numbers have been released",
         },
     )
 

@@ -120,15 +120,15 @@ def get_ai_usage_rate(db: Session) -> AIUsageRate | None:
 
 
 def upsert_ai_usage_rate(
-    db: Session, *, overage_price_cents_per_minute: int, addon_monthly_price_cents: int = 2900,
-    addon_included_minutes: int = 100, currency: str = "USD", is_placeholder: bool = False,
+    db: Session, *, overage_price_cents_per_minute: int, currency: str = "USD", is_placeholder: bool = False,
 ) -> AIUsageRate:
     """Always inserts - see get_ai_usage_rate's docstring on why this is
     intentionally NOT an in-place edit like upsert_calling_rate/
-    upsert_number_rate below."""
+    upsert_number_rate below. The $29/workspace/month add-on itself is
+    priced separately by billing.service's AIReceptionistAddonRate rows,
+    not through this function."""
     rate = AIUsageRate(
         overage_price_cents_per_minute=overage_price_cents_per_minute,
-        addon_monthly_price_cents=addon_monthly_price_cents, addon_included_minutes=addon_included_minutes,
         currency=currency, is_placeholder=is_placeholder,
     )
     db.add(rate)

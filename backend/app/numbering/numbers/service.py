@@ -10,7 +10,12 @@ from app.compliance.service import has_approved_case, is_requirement_active
 from app.consent.models import ConsentType
 from app.consent.service import has_active_consent
 from app.core.config import settings
-from app.events.service import publish_number_activated, publish_number_reserved, publish_number_suspended
+from app.events.service import (
+    publish_number_activated,
+    publish_number_purchase_confirmed,
+    publish_number_reserved,
+    publish_number_suspended,
+)
 from app.integrations.billing import stripe_checkout
 from app.integrations.cache.redis import cache_delete, cache_get, cache_set
 from app.integrations.telecom import twilio as telecom
@@ -30,6 +35,8 @@ from app.notifications.service import (
 )
 from app.numbering.identity.models import Account, AccountBillingClassification, AccountType, User, UserRole
 from app.numbering.numbers.models import (
+    CallerIdentity,
+    CallerIdentityStatus,
     IVROption,
     MarketActivationStatus,
     NumberEligibilityCase,
@@ -823,6 +830,12 @@ def purchase_number(db: Session, account_id: str, e164: str) -> PhoneNumber:
     )
     publish_number_activated(account_id, number_id=number.id, e164=e164)
 
+    # Commercial Billing Operating Standard doc §R6 - a real Twilio
+    # purchase IS itself a legitimate verification/authorization source,
+    # so this number's caller_identity is VERIFIED from the moment it's
+    # genuinely provisioned, not left pending a separate step.
+    _auto_verify_caller_identity(db, number, verification_source="platform_provisioned_purchase")
+
     # Trial-abuse step-up model (Production Readiness Standard doc) -
     # reaching ACTIVE is the "graduated into a real paying customer" moment.
     # Deferred import: app.risk.service imports this module (for
@@ -841,6 +854,94 @@ def purchase_number(db: Session, account_id: str, e164: str) -> PhoneNumber:
         )
 
     return number
+
+
+def _auto_verify_caller_identity(db: Session, number: PhoneNumber, *, verification_source: str) -> CallerIdentity:
+    """Called at the moment a number is genuinely provisioned (real Twilio
+    purchase - see purchase_number - or a completed port-in - see
+    app.porting.service.complete_porting_request) - both are themselves
+    legitimate verification/authorization sources (Commercial Billing
+    Operating Standard doc §R6), so the caller_identity this platform
+    creates is VERIFIED from the start rather than left pending a separate
+    step. Upserts rather than always inserting, so re-running this (e.g. a
+    retried purchase after a transient failure) can't create a duplicate
+    row for the same number."""
+    existing = db.query(CallerIdentity).filter(CallerIdentity.phone_number_id == number.id).first()
+    now = datetime.now(timezone.utc)
+    if existing is None:
+        existing = CallerIdentity(phone_number_id=number.id, account_id=number.account_id)
+        db.add(existing)
+    existing.status = CallerIdentityStatus.VERIFIED
+    existing.verification_source = verification_source
+    existing.verified_at = now
+    db.commit()
+    db.refresh(existing)
+    return existing
+
+
+class CallerIdNotAuthorizedError(Exception):
+    """Raised when routing would present a caller ID with no VERIFIED
+    caller_identity record on file - Commercial Billing Operating Standard
+    doc §R6 'routing rejects unauthorized combinations.'"""
+
+
+def assert_caller_id_authorized(db: Session, phone_number_id: str) -> None:
+    """Wired into place_outbound_call/place_outbound_call_for_account,
+    alongside (not instead of) the existing ownership/ACTIVE-status check -
+    ownership proves the account may use this number at all, this proves
+    the specific caller-ID presentation is a formally verified one."""
+    identity = db.query(CallerIdentity).filter(CallerIdentity.phone_number_id == phone_number_id).first()
+    if identity is None or identity.status != CallerIdentityStatus.VERIFIED:
+        status_label = identity.status.value if identity is not None else "unverified"
+        raise CallerIdNotAuthorizedError(
+            f"This number's caller ID is not authorized for outbound presentation ({status_label})"
+        )
+    if identity.expires_at is not None and identity.expires_at < datetime.now(timezone.utc):
+        raise CallerIdNotAuthorizedError("This number's caller-ID verification has expired")
+
+
+def revoke_caller_identity(
+    db: Session, phone_number_id: str, *, staff_id: str, reason: str | None = None
+) -> CallerIdentity:
+    """Fraud/abuse response (e.g. a confirmed spoofing complaint) - blocks
+    the number from outbound presentation without touching its ACTIVE
+    billing/ownership status, which is a separate concern (see
+    CallerIdentity's docstring) - a revoked number stays billed and owned,
+    it just can't be used as an outbound caller ID until reinstated."""
+    identity = db.query(CallerIdentity).filter(CallerIdentity.phone_number_id == phone_number_id).first()
+    if identity is None:
+        raise NumberConflictError(f"No caller-identity record exists for phone_number_id {phone_number_id}")
+    before_status = identity.status
+    identity.status = CallerIdentityStatus.REVOKED
+    db.commit()
+    db.refresh(identity)
+    log_event(
+        db, actor_id=staff_id, action="caller_identity.revoked",
+        target_type="caller_identity", target_id=identity.id, reason=reason,
+        metadata={"phone_number_id": phone_number_id, "before_status": before_status.value},
+    )
+    return identity
+
+
+def reinstate_caller_identity(
+    db: Session, phone_number_id: str, *, staff_id: str, reason: str | None = None
+) -> CallerIdentity:
+    """Reversal of revoke_caller_identity - a false positive or resolved
+    dispute shouldn't need a brand new number purchase to restore calling."""
+    identity = db.query(CallerIdentity).filter(CallerIdentity.phone_number_id == phone_number_id).first()
+    if identity is None:
+        raise NumberConflictError(f"No caller-identity record exists for phone_number_id {phone_number_id}")
+    before_status = identity.status
+    identity.status = CallerIdentityStatus.VERIFIED
+    identity.verified_at = datetime.now(timezone.utc)
+    db.commit()
+    db.refresh(identity)
+    log_event(
+        db, actor_id=staff_id, action="caller_identity.reinstated",
+        target_type="caller_identity", target_id=identity.id, reason=reason,
+        metadata={"phone_number_id": phone_number_id, "before_status": before_status.value},
+    )
+    return identity
 
 
 def create_number_purchase_checkout_session(db: Session, account_id: str, e164: str) -> dict:
@@ -970,7 +1071,11 @@ def complete_number_purchase_from_checkout(
       exception's own docstring.
     """
     try:
-        return purchase_number(db, account_id, e164)
+        number = purchase_number(db, account_id, e164)
+        publish_number_purchase_confirmed(
+            account_id, number_id=number.id, e164=number.e164, payment_intent_id=payment_intent_id,
+        )
+        return number
     except ReservationExpiredError as e:
         _refund_and_notify_failed_purchase(db, account_id, e164, payment_intent_id, reason=str(e))
         return None
@@ -1350,6 +1455,64 @@ def reactivate_numbers_for_account_by_staff(
     restore_risk_state_after_reinstatement(db, account_id, actor=staff_id)
 
     return numbers
+
+
+def release_numbers_for_account_by_system(
+    db: Session, account_id: str, *, actor: str, reason: str | None = None
+) -> list[PhoneNumber]:
+    """System/staff-initiated bulk deprovisioning, no per-number User in the
+    loop - used by billing.service.terminate_subscription (Commercial
+    Billing Operating Standard doc §M3 "termination... provider
+    deprovisioning") since a terminated account has no future Owner session
+    to call cancel_number itself. Releases every ACTIVE/SUSPENDED number on
+    the account; already-cancelled numbers are left alone.
+
+    A single number's Twilio release failing doesn't abort the rest - the
+    account is being torn down regardless, and leaving 9 of 10 numbers
+    stuck ACTIVE because the 10th's provider call failed would be worse
+    than one number needing a manual follow-up release."""
+    numbers = (
+        db.query(PhoneNumber)
+        .filter(
+            PhoneNumber.account_id == account_id,
+            PhoneNumber.status.in_([PhoneNumberStatus.ACTIVE, PhoneNumberStatus.SUSPENDED]),
+        )
+        .with_for_update()
+        .all()
+    )
+    released: list[PhoneNumber] = []
+    for number in numbers:
+        try:
+            if number.provider_sid:
+                telecom.release_number(number.provider_sid)
+        except telecom.TelecomError as e:
+            log_event(
+                db, actor_id=account_id, action="number.release_failed",
+                target_type="phone_number", target_id=number.id, reason=str(e), metadata={"e164": number.e164},
+            )
+            continue
+        number.status = PhoneNumberStatus.CANCELLED
+        number.cancelled_at = datetime.now(timezone.utc)
+        released.append(number)
+
+    db.commit()
+    if released:
+        _invalidate_numbers_cache(account_id)
+
+    owner = db.query(User).filter(User.account_id == account_id, User.role == UserRole.OWNER).first()
+    for number in released:
+        db.refresh(number)
+        log_event(
+            db, actor_id=actor, action="number.released_for_termination",
+            target_type="phone_number", target_id=number.id, reason=reason, metadata={"e164": number.e164},
+        )
+        # No publish_number_* event here - matches cancel_number above,
+        # which doesn't publish one either for an individual release;
+        # publish_number_suspended's semantics don't fit a CANCELLED number.
+        if owner is not None:
+            notify_number_released(db, account_id=account_id, account_email=owner.email, e164=number.e164)
+
+    return released
 
 
 def cancel_number(db: Session, user: User, e164: str) -> PhoneNumber:

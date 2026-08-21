@@ -230,6 +230,17 @@ class ReceptionistUrgency(str, enum.Enum):
     HIGH = "high"
 
 
+class ReceptionistCallbackWindow(str, enum.Enum):
+    """Self-service callback request (Roadmap §7) - a structured preference
+    the caller picks via DTMF, not a real calendar slot (no appointment/
+    booking system exists anywhere in this codebase). Staff act on it
+    manually via the AI Receptionist call log."""
+
+    ASAP = "asap"
+    TODAY = "today"
+    TOMORROW = "tomorrow"
+
+
 class ReceptionistCall(Base):
     """Guarded caller-qualification capture (Roadmap §7 "AI Receptionist" —
     Phase 1 scope: message capture + urgency detection + routing, not a
@@ -295,4 +306,26 @@ class ReceptionistCall(Base):
     # qualify_caller() produces.
     is_likely_spam: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     spam_reason: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # Already extracted by qualify_caller() (a phone number or "email"
+    # mentioned in speech) but previously discarded by capture_receptionist_call
+    # - persisted regardless of whether the caller also uses the DTMF
+    # callback menu below.
+    callback_preference: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    # Bounds the multi-turn follow-up to exactly one attempt ever, so a
+    # second /respond-followup hit for the same call can never re-trigger
+    # another follow-up loop.
+    followup_asked: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # Self-service booking (Roadmap §7) - a caller-selected callback window,
+    # not a real calendar slot. See ReceptionistCallbackWindow's docstring.
+    callback_requested: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    callback_window: Mapped[ReceptionistCallbackWindow | None] = mapped_column(
+        Enum(ReceptionistCallbackWindow, name="receptionist_callback_window_enum"), nullable=True
+    )
+    # AI-minute metering (Pricing doc §5.3 "100 AI-handled minutes included,
+    # then $0.39/min") - populated from the same Twilio CallDuration used
+    # for call_seconds once the underlying call ends (see
+    # media.service.update_call_status). Whole-call duration, same caveat
+    # as usage/service.py's call_seconds: it's every TwiML leg of the call,
+    # not narrowly "AI-processing time". Null until the call actually ends.
+    duration_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

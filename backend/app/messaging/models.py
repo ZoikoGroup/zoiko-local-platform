@@ -15,11 +15,6 @@ def new_uuid() -> str:
 
 class MessagingChannel(str, enum.Enum):
     WHATSAPP = "whatsapp"
-    # SMS by regulated market (architecture doc's separate Phase 3 item) is
-    # a distinct workstream (carrier registration, opt-out law varies by
-    # market) - this enum member is reserved so that work can reuse the
-    # same Conversation/Message shape instead of a parallel table, but no
-    # SMS sending path exists yet.
     SMS = "sms"
 
 

@@ -6,6 +6,7 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from app.audit.models import AuditEvent
+from app.events.service import publish_audit_event_recorded
 
 
 def _hash_state(state: dict[str, Any] | None) -> str | None:
@@ -117,6 +118,7 @@ def log_event(
     db.add(event)
     db.commit()
     db.refresh(event)
+    publish_audit_event_recorded(resolved_account_id, audit_id=event.id, action=action, target=resolved_target)
     return event
 
 

@@ -78,18 +78,15 @@ class AIUsageRate(Base):
     ai_receptionist_minutes UsageEvent rows for display, does not charge
     anyone.
 
-    addon_monthly_price_cents/addon_included_minutes: same doc, same §5.3 -
-    "$29/workspace/month add-on; 100 AI-handled minutes included" - the
-    subscription-level add-on Starter/Business use to get any included AI
-    Receptionist minutes at all (they get 0 baked into the plan itself,
-    unlike Pro/Scale - see Plan.included_ai_receptionist_minutes)."""
+    The $29/workspace/month add-on itself (with its own included-minutes
+    allowance and overage rate) is priced separately by
+    billing.models.AIReceptionistAddonRate, not by this table - see that
+    class's docstring."""
 
     __tablename__ = "ai_usage_rates"
 
     id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=new_uuid)
     overage_price_cents_per_minute: Mapped[int] = mapped_column(Integer, nullable=False)
-    addon_monthly_price_cents: Mapped[int] = mapped_column(Integer, nullable=False, default=2900, server_default="2900")
-    addon_included_minutes: Mapped[int] = mapped_column(Integer, nullable=False, default=100, server_default="100")
     currency: Mapped[str] = mapped_column(String(3), nullable=False, default="USD")
     is_placeholder: Mapped[bool] = mapped_column(nullable=False, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

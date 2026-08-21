@@ -28,7 +28,10 @@ _MODELS_URL = "https://api.groq.com/openai/v1/models"
 # both real system prompts below (json_object mode, correct field shapes,
 # and critically the qualification prompt's "always a full sentence, never
 # a fragment" requirement, which a couple of the other current models
-# tested did not reliably satisfy).
+# tested did not reliably satisfy). openai/gpt-oss-20b (anilupdated's
+# independent fix for this same bug) also verified live to work correctly -
+# kept qwen here since it went through more thorough side-by-side testing
+# this session; either is a safe choice if this ever needs revisiting.
 _MODEL = "qwen/qwen3.6-27b"
 MODEL_VERSION = f"groq/{_MODEL}"
 
