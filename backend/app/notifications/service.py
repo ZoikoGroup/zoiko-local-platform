@@ -1,6 +1,8 @@
 import hashlib
 import hmac
 import base64
+import re
+import unicodedata
 from datetime import datetime, time, timezone
 from zoneinfo import ZoneInfo
 
@@ -48,6 +50,43 @@ class InvalidTimezoneError(Exception):
 
 def _now_str() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+
+_SUBJECT_MAX_VALUE_LENGTH = 40
+_URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
+_EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
+# Zero-width/bidi-control characters used in real spoofing attacks (e.g.
+# RLO to visually reverse a suffix) - stripped alongside plain ASCII
+# control chars via unicodedata's category check below.
+_BIDI_CONTROL_CHARS = "​‌‍\u200E\u200F\u202A\u202B\u202C\u202D\u202E﻿"
+
+
+def _sanitize_subject_value(value: object) -> object:
+    """Email Communications System doc A-17 (BLOCKER) "subject hardening" -
+    a customer-controlled string (an org name, a display name, a raw
+    webhook URL) landing straight in an email subject line with no
+    escaping is both a spoofing vector (bidi/zero-width tricks) and a
+    phishing-lookalike vector (an attacker-chosen URL/email address
+    appearing to come from this platform's own notification). Only
+    applied to the SUBJECT's rendering of context, never the body - the
+    body legitimately contains real URLs (e.g. the unsubscribe link) and
+    longer text that would break if capped/stripped the same way."""
+    if not isinstance(value, str):
+        return value
+    cleaned = _URL_RE.sub("[link removed]", value)
+    cleaned = _EMAIL_RE.sub("[email removed]", cleaned)
+    cleaned = "".join(
+        ch for ch in cleaned
+        if ch not in _BIDI_CONTROL_CHARS and (ch in "\t\n" or unicodedata.category(ch)[0] != "C")
+    )
+    cleaned = cleaned.strip()
+    if len(cleaned) > _SUBJECT_MAX_VALUE_LENGTH:
+        cleaned = cleaned[: _SUBJECT_MAX_VALUE_LENGTH - 1].rstrip() + "…"
+    return cleaned
+
+
+def _sanitized_subject_context(context: dict) -> dict:
+    return {key: _sanitize_subject_value(value) for key, value in context.items()}
 
 
 def _mask_number(e164: str) -> str:
@@ -230,19 +269,35 @@ def send_notification(
     recipient_email: str,
     context: dict,
     account_id: str | None = None,
+    idempotency_key: str | None = None,
 ) -> NotificationDelivery:
     """The one pipeline every domain event goes through, instead of each
     call site building its own hardcoded subject/body string: resolve the
     template, render it, send it, and record what happened either way -
     the doc's "domain services publish events; they do not render or send
     email directly" principle, sized for what this platform actually
-    sends today."""
+    sends today.
+
+    idempotency_key (doc A-03, BLOCKER): optional so this doesn't force a
+    diff across every existing notify_* call site in one pass - wired into
+    the genuinely retry-prone ones (webhook-triggered sends, e.g. payment
+    failed/restored) first. Extending it to every call site is
+    straightforward but intentionally not done here - same "representative,
+    not universal" scoping this codebase already uses elsewhere (e.g. the
+    original Kafka event wiring)."""
+    if idempotency_key is not None:
+        existing = db.query(NotificationDelivery).filter(
+            NotificationDelivery.idempotency_key == idempotency_key
+        ).first()
+        if existing is not None:
+            return existing
+
     template = db.query(NotificationTemplate).filter(NotificationTemplate.key == event_name).first()
     if template is None:
         raise NotificationTemplateMissingError(f"No notification template registered for event {event_name!r}")
 
     is_exempt = _is_exempt_from_suppression(template)
-    subject = template.subject_template.format(**context)
+    subject = template.subject_template.format(**_sanitized_subject_context(context))
     body = template.body_template.format(**context)
 
     delivery = NotificationDelivery(
@@ -1210,7 +1265,9 @@ def notify_plan_changed(
     )
 
 
-def notify_payment_failed(db: Session, *, account_id: str, account_email: str, plan_name: str) -> None:
+def notify_payment_failed(
+    db: Session, *, account_id: str, account_email: str, plan_name: str, idempotency_key: str | None = None
+) -> None:
     send_notification(
         db, event_name="billing.payment_failed", account_id=account_id, recipient_email=account_email,
         context={
@@ -1220,6 +1277,7 @@ def notify_payment_failed(db: Session, *, account_id: str, account_email: str, p
             "transaction_description": f"{plan_name} plan services",
             "transaction_failure_category": "payment method issue",
         },
+        idempotency_key=idempotency_key,
     )
 
 
@@ -1361,7 +1419,9 @@ def notify_subscription_terminated(db: Session, *, account_id: str, account_emai
     )
 
 
-def notify_service_restored(db: Session, *, account_id: str, account_email: str) -> None:
+def notify_service_restored(
+    db: Session, *, account_id: str, account_email: str, idempotency_key: str | None = None
+) -> None:
     send_notification(
         db, event_name="billing.service_restored", account_id=account_id, recipient_email=account_email,
         context={
@@ -1369,6 +1429,7 @@ def notify_service_restored(db: Session, *, account_id: str, account_email: str)
             "scope_summary": "Outbound calling, video, number purchases, and AI features",
             "event_occurred_at": _now_str(),
         },
+        idempotency_key=idempotency_key,
     )
 
 

@@ -3,7 +3,7 @@ import uuid
 from datetime import datetime, time
 
 from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, Integer, JSON, String, Time, UniqueConstraint, func
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import ARRAY, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import Base
@@ -81,6 +81,23 @@ class SupportedCountry(Base):
     # remain honestly unaudited until someone actually does that review.
     legal_signoff_reference: Mapped[str | None] = mapped_column(String(100), nullable=True)
     legal_signoff_by: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    # Commercial Billing Operating Standard doc §34's "Market, Numbering,
+    # Regulatory & Capability Release Registry" names 11 required
+    # dimensions per market; this table only ever captured 2 of them
+    # (market_status, emergency_calling_supported) plus the legal-signoff
+    # pair. These five close the dimensions that had nowhere to live at
+    # all - schema readiness, deliberately NULL/False by default rather
+    # than filled with invented per-country data, which is exactly the
+    # kind of business/legal content an engineering pass shouldn't
+    # fabricate (same discipline as legal_signoff_reference/by above).
+    # numbering_restrictions/calling_cli_rules/tax are already partially
+    # covered elsewhere (NumberRate, CallingRate, existing tax handling)
+    # and aren't duplicated here.
+    customer_type_restrictions: Mapped[list[str] | None] = mapped_column(ARRAY(String(20)), nullable=True)
+    porting_supported: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    recording_consent_basis: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    payments_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    marketing_claims_approved: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -134,6 +151,17 @@ class PhoneNumber(Base):
     # mid-purchase, which is exactly what the staff recovery queue
     # (app/staff/service.py's list_stuck_provisioning) surfaces.
     provisioning_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Architecture doc's "Provisioning Job... retry_count, error_code"
+    # fields, in miniature - a real state-machine entity (a separate
+    # ProvisioningJob table with one row per attempt) is a bigger redesign
+    # than this pass covers; these two columns close the "no error/retry
+    # audit trail at all" half of that gap on the existing synchronous
+    # purchase flow instead. Populated in purchase_number's TelecomError
+    # branch and retry_provisioning; never cleared on success so "how many
+    # attempts did this number take, and what failed last" survives past
+    # the eventual ACTIVE status.
+    last_provisioning_error_code: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    provisioning_attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
     # Roadmap "Team and RBAC ... number assignment" — which team member this
     # number is handed to (e.g. a sales line given to one agent). NULL means

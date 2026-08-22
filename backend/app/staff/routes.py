@@ -13,6 +13,7 @@ from app.numbering.numbers.schemas import (
     ResolveNumberEligibilityCaseRequest,
     SetMarketActivationStatusRequest,
     SupportedCountryResponse,
+    UpdateCountryRegistryFieldsRequest,
     UpsertNumberEligibilityRuleRequest,
     UpsertSupportedCountryRequest,
 )
@@ -38,6 +39,7 @@ from app.numbering.numbers.service import (
     revoke_caller_identity,
     seed_market_release_registry,
     set_market_activation_status,
+    update_country_registry_fields,
     upsert_number_eligibility_rule,
     upsert_supported_country,
 )
@@ -46,6 +48,7 @@ from app.staff.models import PlatformStaff, PlatformStaffRole
 from app.staff.schemas import (
     AccessMatrixEntryResponse,
     AccountOverviewResponse,
+    SetAccountLegalHoldRequest,
     SetAccountTestFlagRequest,
     StaffLoginRequest,
     StaffTokenResponse,
@@ -138,6 +141,26 @@ def set_account_test_flag(
         service.set_account_test_flag(db, account_id, is_test=payload.is_test, actor=staff.id)
     except service.AccountNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
+
+    return service.get_account_overview(db, account_id)
+
+
+@router.put("/accounts/{account_id}/legal-hold", response_model=AccountOverviewResponse)
+def set_account_legal_hold(
+    account_id: str,
+    payload: SetAccountLegalHoldRequest,
+    db: Session = Depends(get_db),
+    staff: PlatformStaff = Depends(require_capability("accounts.manage_legal_hold")),
+):
+    """SUPER_ADMIN-only. Architecture doc §10 "legal hold model" - while
+    active, blocks app.retention.service's purge sweeps from deleting this
+    account's recordings/voicemail regardless of retention-window expiry."""
+    try:
+        service.set_account_legal_hold(db, account_id, on=payload.on, reference=payload.reference, actor=staff.id)
+    except service.AccountNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
+    except service.LegalHoldRequiresReferenceError as e:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e)) from e
 
     return service.get_account_overview(db, account_id)
 
@@ -376,6 +399,29 @@ def set_market_activation_status_route(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
     except MissingLegalSignoffError as e:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e)) from e
+
+
+@router.put("/countries/{code}/registry-fields", response_model=SupportedCountryResponse)
+def update_country_registry_fields_route(
+    code: str,
+    payload: UpdateCountryRegistryFieldsRequest,
+    db: Session = Depends(get_db),
+    staff: PlatformStaff = Depends(require_capability("numbers.manage_country_list")),
+):
+    """Commercial Billing Operating Standard doc §34 registry dimensions -
+    same SUPER_ADMIN bar as every other registry mutation on this table."""
+    try:
+        return update_country_registry_fields(
+            db, code,
+            customer_type_restrictions=payload.customer_type_restrictions,
+            porting_supported=payload.porting_supported,
+            recording_consent_basis=payload.recording_consent_basis,
+            payments_enabled=payload.payments_enabled,
+            marketing_claims_approved=payload.marketing_claims_approved,
+            actor=staff.id,
+        )
+    except UnsupportedCountryError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
 
 
 @router.get("/number-eligibility-rules", response_model=list[NumberEligibilityRuleResponse])

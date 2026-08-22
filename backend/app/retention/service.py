@@ -9,7 +9,7 @@ from app.integrations.storage.s3 import StorageError, delete_object
 from app.integrations.telecom import twilio as telecom
 from app.integrations.telecom.twilio import TelecomError
 from app.media.models import CallRecord, VideoSession, Voicemail
-from app.retention.models import ArtifactType, RetentionPolicy
+from app.retention.models import ArtifactType, ErasureRequest, ErasureRequestStatus, RetentionPolicy
 
 # Safety-net fallback when no policy row exists at all (shouldn't normally
 # happen once the migration seeds global defaults, but never leave retention
@@ -17,6 +17,21 @@ from app.retention.models import ArtifactType, RetentionPolicy
 DEFAULT_RETENTION_DAYS = 90
 
 PURGED_MARKER = "[deleted - retention policy]"
+
+
+def is_account_under_legal_hold(db: Session, account_id: str | None) -> bool:
+    """Architecture doc §10 "legal hold model for business customers" -
+    checked at the top of every purge loop below, before the normal
+    retention-window check even runs. A hold blocks purge regardless of
+    how overdue the recording otherwise is - staff set this via
+    app.staff.service.set_account_legal_hold specifically to stop a
+    scheduled sweep from destroying evidence mid-litigation."""
+    if account_id is None:
+        return False
+    from app.numbering.identity.models import Account
+
+    account = db.query(Account).filter(Account.id == account_id).first()
+    return account is not None and account.legal_hold
 
 
 def get_retention_days(db: Session, account_id: str, artifact_type: ArtifactType) -> int:
@@ -97,6 +112,8 @@ def list_retention_policies(db: Session, account_id: str) -> dict[str, int]:
 def _purge_voicemails(db: Session, now: datetime) -> tuple[int, int]:
     purged = failed = 0
     for vm in db.query(Voicemail).filter(Voicemail.recording_url.isnot(None)).all():
+        if is_account_under_legal_hold(db, vm.account_id):
+            continue
         retention_days = get_retention_days(db, vm.account_id, ArtifactType.VOICEMAIL)
         if vm.created_at >= now - timedelta(days=retention_days):
             continue
@@ -132,6 +149,8 @@ def _purge_call_recordings(db: Session, now: datetime) -> tuple[int, int]:
         .all()
     )
     for call in calls:
+        if is_account_under_legal_hold(db, call.account_id):
+            continue
         retention_days = get_retention_days(db, call.account_id, ArtifactType.CALL_RECORDING)
         if call.created_at >= now - timedelta(days=retention_days):
             continue
@@ -165,6 +184,8 @@ def _purge_call_recordings(db: Session, now: datetime) -> tuple[int, int]:
 def _purge_video_recordings(db: Session, now: datetime) -> tuple[int, int]:
     purged = failed = 0
     for session in db.query(VideoSession).filter(VideoSession.recording_url.isnot(None)).all():
+        if is_account_under_legal_hold(db, session.account_id):
+            continue
         retention_days = get_retention_days(db, session.account_id, ArtifactType.VIDEO_RECORDING)
         reference_time = session.ended_at or session.started_at or session.created_at
         if reference_time >= now - timedelta(days=retention_days):
@@ -215,3 +236,62 @@ def purge_expired_recordings(db: Session) -> dict[str, dict[str, int]]:
         "call_recording": {"purged": call_purged, "failed": call_failed},
         "video_recording": {"purged": video_purged, "failed": video_failed},
     }
+
+
+class ErasureRequestNotFoundError(Exception):
+    """Raised resolving an erasure request that doesn't exist."""
+
+
+def create_erasure_request(db: Session, *, account_id: str, requested_by: str, notes: str | None) -> ErasureRequest:
+    """Architecture doc §10 "right-to-erasure workflow" - customer-
+    initiated, not automatic. Opens a staff-visible request; a human
+    decides what's actually erasable (some records must legally be
+    retained - billing/tax evidence, an open compliance case, a legal
+    hold) via resolve_erasure_request, same posture as ComplianceCase."""
+    request = ErasureRequest(account_id=account_id, requested_by=requested_by, notes=notes)
+    db.add(request)
+    db.commit()
+    db.refresh(request)
+    log_event(
+        db, actor=requested_by, action="retention.erasure_requested", target=f"erasure_request:{request.id}",
+        after={"account_id": account_id, "notes": notes},
+    )
+    return request
+
+
+def list_erasure_requests(db: Session, *, account_id: str | None = None) -> list[ErasureRequest]:
+    """Staff-facing queue (account_id=None) or a customer's own history
+    (account_id set) - same optional-filter shape as
+    app.compliance.service.list_all_cases."""
+    query = db.query(ErasureRequest)
+    if account_id is not None:
+        query = query.filter(ErasureRequest.account_id == account_id)
+    return query.order_by(ErasureRequest.created_at.desc()).all()
+
+
+def resolve_erasure_request(
+    db: Session, request_id: str, *, status: ErasureRequestStatus, resolution_notes: str | None, actor: str
+) -> ErasureRequest:
+    """Staff-only. Deliberately does not itself delete anything - marking
+    COMPLETED is staff attesting the actual deletion (of whatever's really
+    erasable, which varies per request) was carried out through the
+    relevant domain's own tools (e.g. app.retention.service's purge
+    helpers, or a direct action for data those don't cover), not a
+    trigger that performs it."""
+    if status == ErasureRequestStatus.PENDING:
+        raise ValueError("resolve_erasure_request cannot set status back to PENDING")
+    request = db.query(ErasureRequest).filter(ErasureRequest.id == request_id).first()
+    if request is None:
+        raise ErasureRequestNotFoundError(f"No such erasure request: {request_id!r}")
+    before_status = request.status
+    request.status = status
+    request.resolved_by = actor
+    request.resolution_notes = resolution_notes
+    request.resolved_at = datetime.now(timezone.utc)
+    db.commit()
+    db.refresh(request)
+    log_event(
+        db, actor=actor, action="retention.erasure_request_resolved", target=f"erasure_request:{request.id}",
+        before={"status": before_status.value}, after={"status": status.value, "resolution_notes": resolution_notes},
+    )
+    return request

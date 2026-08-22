@@ -75,6 +75,9 @@ def list_accounts_overview(db: Session) -> list[dict]:
             "number_count": number_counts.get(account.id, 0),
             "billing_classification": account.billing_classification,
             "billing_source": account.billing_source,
+            "is_test": account.is_test,
+            "legal_hold": account.legal_hold,
+            "legal_hold_reference": account.legal_hold_reference,
             "created_at": account.created_at,
         }
         for account in accounts
@@ -102,6 +105,9 @@ def get_account_overview(db: Session, account_id: str) -> dict:
         "number_count": db.query(PhoneNumber).filter(PhoneNumber.account_id == account_id).count(),
         "billing_classification": account.billing_classification,
         "billing_source": account.billing_source,
+        "is_test": account.is_test,
+        "legal_hold": account.legal_hold,
+        "legal_hold_reference": account.legal_hold_reference,
         "created_at": account.created_at,
     }
 
@@ -114,7 +120,7 @@ def update_account_billing_classification(
     by staff for the non-default cases (marking an account DEMO, SANDBOX,
     a PARTNER_SPONSORED deal, etc.) - see Account model's docstring for
     why the public signup path only ever creates COMMERCIAL_STANDALONE."""
-    account = db.query(Account).filter(Account.id == account_id).first()
+    account = db.query(Account).filter( Account.id == account_id).first()
     if account is None:
         raise AccountNotFoundError(f"No such account: {account_id!r}")
 
@@ -156,6 +162,40 @@ def set_account_test_flag(db: Session, account_id: str, *, is_test: bool, actor:
     return account
 
 
+class LegalHoldRequiresReferenceError(Exception):
+    """Raised when activating a legal hold with no reference - a real
+    case/matter reference is required (same "record a reference, not just
+    a reason" discipline as the market-activation legal sign-off), not a
+    free-text justification."""
+
+
+def set_account_legal_hold(
+    db: Session, account_id: str, *, on: bool, reference: str | None, actor: str
+) -> Account:
+    """Architecture doc §10 "legal hold model for business customers" -
+    while active, app.retention.service's purge sweeps skip every
+    recording/voicemail on this account regardless of how overdue its
+    normal retention window is. Staff-only (same SUPER_ADMIN bar as the
+    test-flag toggle above) - this can override a customer's own configured
+    retention preference, which is exactly the kind of override that needs
+    a real audit trail, not a routine support action."""
+    if on and not reference:
+        raise LegalHoldRequiresReferenceError("Activating a legal hold requires a real case/matter reference")
+    account = db.query(Account).filter(Account.id == account_id).first()
+    if account is None:
+        raise AccountNotFoundError(f"No such account: {account_id!r}")
+    previous = {"legal_hold": account.legal_hold, "legal_hold_reference": account.legal_hold_reference}
+    account.legal_hold = on
+    account.legal_hold_reference = reference if on else None
+    db.commit()
+    db.refresh(account)
+    log_event(
+        db, actor=actor, action="account.legal_hold_changed", target=f"account:{account.id}",
+        before=previous, after={"legal_hold": account.legal_hold, "legal_hold_reference": account.legal_hold_reference},
+    )
+    return account
+
+
 def list_stuck_provisioning(db: Session) -> list[dict]:
     """Staff recovery queue - numbers stranded mid-purchase by a process
     crash, joined with enough account context to act without a second
@@ -178,6 +218,8 @@ def list_stuck_provisioning(db: Session) -> list[dict]:
             "account_name": accounts[n.account_id].name if n.account_id in accounts else None,
             "account_owner_email": owners.get(n.account_id),
             "provisioning_started_at": n.provisioning_started_at,
+            "last_provisioning_error_code": n.last_provisioning_error_code,
+            "provisioning_attempt_count": n.provisioning_attempt_count,
         }
         for n in numbers
     ]

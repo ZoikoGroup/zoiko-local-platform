@@ -116,4 +116,14 @@ class PlatformKillSwitch(Base):
     activated_by: Mapped[str | None] = mapped_column(String(100), nullable=True)
     activated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     deactivated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Commercial Billing Operating Standard doc §U2 - an emergency
+    # commercial override must be "time-bounded" (named approver, reason,
+    # scope, expiry...). NULL means no expiry was set at activation time
+    # (still allowed - not every real incident has a known resolution ETA
+    # up front) but every switch that DOES set one gets auto-deactivated
+    # by expire_overdue_kill_switches (app.ops.scheduled_reconciliation)
+    # and treated as inactive immediately by assert_kill_switch_not_active
+    # even before that sweep runs, so a forgotten switch can't silently
+    # stay active past its own stated expiry.
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

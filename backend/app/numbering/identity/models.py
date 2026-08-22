@@ -96,6 +96,23 @@ class Account(Base):
         Enum(AccountRiskState, name="account_risk_state_enum"),
         nullable=False, default=AccountRiskState.TRIAL_LOW,
     )
+    # Architecture doc §10 "legal hold model for business customers" - a
+    # simple boolean+reference rather than a separate table, since only
+    # one hold is ever meaningfully "in effect" for retention-purge
+    # purposes at a time (multiple concurrent legal matters on one account
+    # would still just mean "don't purge," which this already captures;
+    # the actual case details live wherever legal tracks the matter, this
+    # is only the retention-system-facing flag). Checked by
+    # app.retention.service's purge sweeps - see legal_hold_reference's
+    # docstring on why is_account_under_legal_hold takes account_id, not
+    # a per-recording check.
+    legal_hold: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # A real case/matter reference (not free text praise like "just in
+    # case") - required whenever legal_hold=True, enforced in
+    # app.numbering.identity.service.set_account_legal_hold, same
+    # "record a reference, not just a reason" discipline as
+    # SupportedCountry.legal_signoff_reference.
+    legal_hold_reference: Mapped[str | None] = mapped_column(String(100), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     users: Mapped[list["User"]] = relationship(

@@ -15,6 +15,14 @@ but 4ec152435b05 had already run against this real database (adding those
 already-applied migration's file doesn't retroactively undo what it did to
 a real database - this migration is the actual DROP, confirmed live via
 `alembic check` after the merge (which is exactly what caught this drift).
+
+IF EXISTS/IF NOT EXISTS on every column op below: this migration is only
+meaningful for a database whose history actually ran the OLD
+(pre-edit) 4ec152435b05 and therefore has these 3 columns to drop. A
+from-scratch bootstrap (a fresh dev DB, CI, or anyone cloning this repo
+today) runs 4ec152435b05's CURRENT source, which never creates them in
+the first place - this DROP must not fail just because there was nothing
+to drop in that case.
 """
 from typing import Sequence, Union
 
@@ -30,12 +38,21 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    op.drop_column('ai_usage_rates', 'addon_monthly_price_cents')
-    op.drop_column('ai_usage_rates', 'addon_included_minutes')
-    op.drop_column('subscriptions', 'ai_receptionist_addon_active')
+    op.execute("ALTER TABLE ai_usage_rates DROP COLUMN IF EXISTS addon_monthly_price_cents")
+    op.execute("ALTER TABLE ai_usage_rates DROP COLUMN IF EXISTS addon_included_minutes")
+    op.execute("ALTER TABLE subscriptions DROP COLUMN IF EXISTS ai_receptionist_addon_active")
 
 
 def downgrade() -> None:
-    op.add_column('subscriptions', sa.Column('ai_receptionist_addon_active', sa.Boolean(), server_default='false', nullable=False))
-    op.add_column('ai_usage_rates', sa.Column('addon_included_minutes', sa.Integer(), server_default='100', nullable=False))
-    op.add_column('ai_usage_rates', sa.Column('addon_monthly_price_cents', sa.Integer(), server_default='2900', nullable=False))
+    op.execute(
+        "ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS ai_receptionist_addon_active "
+        "boolean NOT NULL DEFAULT false"
+    )
+    op.execute(
+        "ALTER TABLE ai_usage_rates ADD COLUMN IF NOT EXISTS addon_included_minutes "
+        "integer NOT NULL DEFAULT 100"
+    )
+    op.execute(
+        "ALTER TABLE ai_usage_rates ADD COLUMN IF NOT EXISTS addon_monthly_price_cents "
+        "integer NOT NULL DEFAULT 2900"
+    )

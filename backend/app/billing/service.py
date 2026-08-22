@@ -800,15 +800,26 @@ def _apply_zoikonex_payment_event(
     owner = db.query(User).filter(User.account_id == account_id, User.role == UserRole.OWNER).first()
     if owner is not None:
         plan = get_plan(db, sub.plan_code)
+        # Email Communications System doc A-03 (BLOCKER) "idempotency" - a
+        # retried ZoikoNex webhook delivering the same external_event_id
+        # twice must not double-send this notification. No key for the
+        # staff-triggered simulator path (external_event_id is None there
+        # by construction) since a manual staff action isn't a retry risk.
+        notif_idempotency_key = f"{event_type}:{external_event_id}" if external_event_id else None
         if event_type == "payment_failed":
-            notify_payment_failed(db, account_id=account_id, account_email=owner.email, plan_name=plan.name)
+            notify_payment_failed(
+                db, account_id=account_id, account_email=owner.email, plan_name=plan.name,
+                idempotency_key=notif_idempotency_key,
+            )
         elif event_type == "payment_retry":
             notify_payment_reminder(
                 db, account_id=account_id, account_email=owner.email, plan_name=plan.name,
                 grace_period_ends_at=sub.grace_period_ends_at.strftime("%Y-%m-%d") if sub.grace_period_ends_at else "",
             )
         elif event_type == "payment_restored":
-            notify_service_restored(db, account_id=account_id, account_email=owner.email)
+            notify_service_restored(
+                db, account_id=account_id, account_email=owner.email, idempotency_key=notif_idempotency_key,
+            )
 
     return sub
 

@@ -17,7 +17,9 @@ log output.
 expire_overdue_cases and purge_expired_recordings both existed with no
 scheduler calling them (see their own docstrings) - this is that scheduler.
 Nothing new was built for it; this reuses the one daily job slot that
-already existed for reconciliation/renewals.
+already existed for reconciliation/renewals. expire_overdue_kill_switches
+(Commercial Billing Operating Standard doc §U2 "time-bounded overrides")
+was added to this same slot when kill switches gained an expires_at.
 """
 
 import logging
@@ -27,6 +29,7 @@ from app.billing.service import run_zoikonex_reconciliation
 from app.compliance.service import expire_overdue_cases
 from app.core.database import SessionLocal
 from app.numbering.numbers.service import list_due_renewals
+from app.ops.service import expire_overdue_kill_switches
 from app.retention.service import purge_expired_recordings
 
 logger = logging.getLogger("zoiko.ops.reconciliation")
@@ -60,6 +63,12 @@ def main() -> int:
 
         expired = expire_overdue_cases(db)
         logger.info("compliance_cases_expired count=%d", expired["expired"])
+
+        expired_switches = expire_overdue_kill_switches(db)
+        logger.info(
+            "kill_switches_expired platform=%d account=%d",
+            expired_switches["platform"], expired_switches["account"],
+        )
 
         purged = purge_expired_recordings(db)
         total_failed = sum(bucket["failed"] for bucket in purged.values())

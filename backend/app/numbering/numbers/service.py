@@ -234,6 +234,45 @@ def upsert_supported_country(
     return country
 
 
+def update_country_registry_fields(
+    db: Session, code: str, *, customer_type_restrictions: list[str] | None, porting_supported: bool,
+    recording_consent_basis: str | None, payments_enabled: bool, marketing_claims_approved: bool, actor: str,
+) -> SupportedCountry:
+    """Commercial Billing Operating Standard doc §34 registry dimensions -
+    separate from upsert_supported_country (which only ever covered basic
+    country creation/enablement) since these represent a distinct real
+    review per dimension, not a bundled property of adding a country to
+    the list. Same SUPER_ADMIN bar as every other registry mutation on
+    this table."""
+    country = db.query(SupportedCountry).filter(SupportedCountry.code == code).first()
+    if country is None:
+        raise UnsupportedCountryError(f"{code!r} is not on Zoiko Local's supported country list yet")
+    before = {
+        "customer_type_restrictions": country.customer_type_restrictions,
+        "porting_supported": country.porting_supported,
+        "recording_consent_basis": country.recording_consent_basis,
+        "payments_enabled": country.payments_enabled,
+        "marketing_claims_approved": country.marketing_claims_approved,
+    }
+    country.customer_type_restrictions = customer_type_restrictions
+    country.porting_supported = porting_supported
+    country.recording_consent_basis = recording_consent_basis
+    country.payments_enabled = payments_enabled
+    country.marketing_claims_approved = marketing_claims_approved
+    db.commit()
+    db.refresh(country)
+    _invalidate_supported_countries_cache()
+    log_event(
+        db, actor=actor, action="numbering.country_registry_fields_updated", target=f"supported_country:{code}",
+        before=before, after={
+            "customer_type_restrictions": customer_type_restrictions, "porting_supported": porting_supported,
+            "recording_consent_basis": recording_consent_basis, "payments_enabled": payments_enabled,
+            "marketing_claims_approved": marketing_claims_approved,
+        },
+    )
+    return country
+
+
 def remove_supported_country(db: Session, code: str) -> None:
     db.query(SupportedCountry).filter(SupportedCountry.code == code).delete()
     db.commit()
@@ -645,6 +684,13 @@ def reserve_number(db: Session, account_id: str, e164: str, country: str, number
         metadata={"e164": e164},
     )
     publish_number_reserved(account_id, number_id=number.id, e164=e164, country=country)
+
+    # Deferred import - see reactivate_numbers_for_account_by_staff's
+    # comment on why (app.risk.service imports this module already).
+    from app.risk.service import check_number_acquisition_velocity
+
+    check_number_acquisition_velocity(db, account_id)
+
     return number
 
 
@@ -797,11 +843,17 @@ def purchase_number(db: Session, account_id: str, e164: str) -> PhoneNumber:
 
     try:
         bought = telecom.buy_number(e164)
-    except telecom.TelecomError:
+    except telecom.TelecomError as e:
         # payment/provisioning failure must not strand the number silently —
         # release it back to Reserved so the customer can retry or it can expire
         number.status = PhoneNumberStatus.RESERVED
         number.provisioning_started_at = None
+        # Architecture doc's "Provisioning Job... retry_count, error_code" -
+        # see PhoneNumber.last_provisioning_error_code's docstring. Not
+        # cleared on the eventual success - the count is a lifetime total,
+        # not "attempts since the last failure."
+        number.last_provisioning_error_code = str(e)[:100]
+        number.provisioning_attempt_count += 1
         db.commit()
         _invalidate_numbers_cache(account_id)
         log_event(
@@ -820,6 +872,7 @@ def purchase_number(db: Session, account_id: str, e164: str) -> PhoneNumber:
     number.provider_sid = bought["sid"]
     number.reserved_until = None
     number.provisioning_started_at = None
+    number.provisioning_attempt_count += 1
     number.next_renewal_at = now + timedelta(days=RENEWAL_PERIOD_DAYS)
     db.commit()
     db.refresh(number)
@@ -920,6 +973,11 @@ def revoke_caller_identity(
         target_type="caller_identity", target_id=identity.id, reason=reason,
         metadata={"phone_number_id": phone_number_id, "before_status": before_status.value},
     )
+
+    from app.risk.service import check_caller_id_change_velocity
+
+    check_caller_id_change_velocity(db, identity.account_id)
+
     return identity
 
 
@@ -941,6 +999,11 @@ def reinstate_caller_identity(
         target_type="caller_identity", target_id=identity.id, reason=reason,
         metadata={"phone_number_id": phone_number_id, "before_status": before_status.value},
     )
+
+    from app.risk.service import check_caller_id_change_velocity
+
+    check_caller_id_change_velocity(db, identity.account_id)
+
     return identity
 
 
@@ -1186,9 +1249,11 @@ def retry_provisioning(db: Session, staff_id: str, number_id: str) -> PhoneNumbe
 
     try:
         bought = telecom.buy_number(number.e164)
-    except telecom.TelecomError:
+    except telecom.TelecomError as e:
         number.status = PhoneNumberStatus.RESERVED
         number.provisioning_started_at = None
+        number.last_provisioning_error_code = str(e)[:100]
+        number.provisioning_attempt_count += 1
         db.commit()
         _invalidate_numbers_cache(number.account_id)
         log_event(
@@ -1201,6 +1266,7 @@ def retry_provisioning(db: Session, staff_id: str, number_id: str) -> PhoneNumbe
     number.provider_sid = bought["sid"]
     number.reserved_until = None
     number.provisioning_started_at = None
+    number.provisioning_attempt_count += 1
     number.next_renewal_at = datetime.now(timezone.utc) + timedelta(days=RENEWAL_PERIOD_DAYS)
     db.commit()
     db.refresh(number)

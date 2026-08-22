@@ -109,6 +109,10 @@ def test_send_email_raises_cleanly_on_resend_failure(monkeypatch):
     from app.integrations.notifications.email import EmailError, send_email
 
     monkeypatch.setattr("app.core.config.settings.resend_api_key", "re_fake_invalid_key_for_test")
+    # This test exercises the real-send Resend error path directly, which
+    # the environment-isolation guard (A-46) would otherwise short-circuit
+    # to log-mode in the default "development" test environment.
+    monkeypatch.setattr("app.core.config.settings.environment", "production")
 
     def _raise(*args, **kwargs):
         raise httpx.ConnectError("simulated network failure")
