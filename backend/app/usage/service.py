@@ -38,22 +38,44 @@ NON_BILLABLE_DISPOSITIONS = {"failed", "busy", "no-answer", "canceled"}
 
 def get_calling_rate(db: Session, country: str | None) -> CallingRate | None:
     """country-specific rate if one's configured, else the DEFAULT_RATE_
-    COUNTRY fallback, else None (no rate configured at all yet)."""
+    COUNTRY fallback, else None (no rate configured at all yet).
+    destination_country IS NULL - the origin-only rate every row has today
+    (see CallingRate's docstring); nothing here parses a call's real
+    destination yet, so this deliberately never matches a
+    destination-specific row even once one exists."""
     if country is not None:
-        rate = db.query(CallingRate).filter(CallingRate.country == country).first()
+        rate = (
+            db.query(CallingRate)
+            .filter(CallingRate.country == country, CallingRate.destination_country.is_(None))
+            .first()
+        )
         if rate is not None:
             return rate
-    return db.query(CallingRate).filter(CallingRate.country == DEFAULT_RATE_COUNTRY).first()
+    return (
+        db.query(CallingRate)
+        .filter(CallingRate.country == DEFAULT_RATE_COUNTRY, CallingRate.destination_country.is_(None))
+        .first()
+    )
 
 
 def list_calling_rates(db: Session) -> list[CallingRate]:
     return db.query(CallingRate).order_by(CallingRate.country.asc()).all()
 
 
-def upsert_calling_rate(db: Session, *, country: str, price_per_minute_cents: int, currency: str = "USD") -> CallingRate:
-    rate = db.query(CallingRate).filter(CallingRate.country == country).first()
+def upsert_calling_rate(
+    db: Session, *, country: str, price_per_minute_cents: int, currency: str = "USD",
+    destination_country: str | None = None,
+) -> CallingRate:
+    rate = (
+        db.query(CallingRate)
+        .filter(CallingRate.country == country, CallingRate.destination_country == destination_country)
+        .first()
+    )
     if rate is None:
-        rate = CallingRate(country=country, price_per_minute_cents=price_per_minute_cents, currency=currency)
+        rate = CallingRate(
+            country=country, destination_country=destination_country,
+            price_per_minute_cents=price_per_minute_cents, currency=currency,
+        )
         db.add(rate)
     else:
         rate.price_per_minute_cents = price_per_minute_cents

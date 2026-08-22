@@ -38,6 +38,10 @@ class UpdateAccountBillingClassificationRequest(BaseModel):
     billing_source: str
 
 
+class SetAccountTestFlagRequest(BaseModel):
+    is_test: bool
+
+
 class AccessMatrixEntryResponse(BaseModel):
     capability: str
     roles: list[str]

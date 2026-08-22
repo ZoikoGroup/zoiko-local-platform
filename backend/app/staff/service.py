@@ -134,6 +134,28 @@ def update_account_billing_classification(
     return account
 
 
+def set_account_test_flag(db: Session, account_id: str, *, is_test: bool, actor: str) -> Account:
+    """Staff-only mutator for Account.is_test - previously this flag had no
+    route/service function anywhere (only settable via a direct DB update),
+    even though it's the one thing that lets an account through the
+    CONTROLLED_BETA/INTERNAL_TEST market-activation gate (see
+    numbering.numbers.service._assert_market_activated) without a real
+    legal sign-off. Real customer accounts should never get this flag -
+    it's for internal/QA testing only."""
+    account = db.query(Account).filter(Account.id == account_id).first()
+    if account is None:
+        raise AccountNotFoundError(f"No such account: {account_id!r}")
+    previous = account.is_test
+    account.is_test = is_test
+    db.commit()
+    db.refresh(account)
+    log_event(
+        db, actor=actor, action="account.test_flag_changed", target=f"account:{account.id}",
+        before={"is_test": previous}, after={"is_test": is_test},
+    )
+    return account
+
+
 def list_stuck_provisioning(db: Session) -> list[dict]:
     """Staff recovery queue - numbers stranded mid-purchase by a process
     crash, joined with enough account context to act without a second

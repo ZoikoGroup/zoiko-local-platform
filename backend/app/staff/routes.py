@@ -46,6 +46,7 @@ from app.staff.models import PlatformStaff, PlatformStaffRole
 from app.staff.schemas import (
     AccessMatrixEntryResponse,
     AccountOverviewResponse,
+    SetAccountTestFlagRequest,
     StaffLoginRequest,
     StaffTokenResponse,
     UpdateAccountBillingClassificationRequest,
@@ -116,6 +117,25 @@ def update_account_billing_classification(
         service.update_account_billing_classification(
             db, account_id, billing_classification=classification, billing_source=source, actor=staff.id,
         )
+    except service.AccountNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
+
+    return service.get_account_overview(db, account_id)
+
+
+@router.put("/accounts/{account_id}/test-flag", response_model=AccountOverviewResponse)
+def set_account_test_flag(
+    account_id: str,
+    payload: SetAccountTestFlagRequest,
+    db: Session = Depends(get_db),
+    staff: PlatformStaff = Depends(require_capability("accounts.manage_test_flag")),
+):
+    """SUPER_ADMIN-only. is_test is the only way to bypass the
+    CONTROLLED_BETA/INTERNAL_TEST market-activation gate without a real
+    legal sign-off - for internal/QA testing accounts only, never for real
+    customers."""
+    try:
+        service.set_account_test_flag(db, account_id, is_test=payload.is_test, actor=staff.id)
     except service.AccountNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
 
@@ -251,7 +271,7 @@ def upsert_calling_rate_route(
     # endpoints above.
     return upsert_calling_rate(
         db, country=payload.country, price_per_minute_cents=payload.price_per_minute_cents,
-        currency=payload.currency,
+        currency=payload.currency, destination_country=payload.destination_country,
     )
 
 

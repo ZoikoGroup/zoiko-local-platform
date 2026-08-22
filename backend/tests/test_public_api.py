@@ -80,6 +80,48 @@ def test_owner_can_revoke_a_key_and_it_stops_authenticating(client):
     assert response.status_code == 401
 
 
+def test_cannot_revoke_another_accounts_api_key(client):
+    """ApiKeyAuthorizationError path - a key exists, but the caller is a
+    different account than the one that owns it. Must 403, not 404 (the
+    key genuinely exists) and not succeed."""
+    owner_a_token = _signup_and_login(client, "api-owner6a@example.com")
+    created = client.post(
+        "/developer/api-keys", json={"label": "Account A's key"},
+        headers={"Authorization": f"Bearer {owner_a_token}"},
+    ).json()
+
+    owner_b_token = _signup_and_login(client, "api-owner6b@example.com")
+    response = client.delete(
+        f"/developer/api-keys/{created['id']}", headers={"Authorization": f"Bearer {owner_b_token}"}
+    )
+    assert response.status_code == 403
+
+    # Untouched - still authenticates, confirming the cross-account delete
+    # attempt had no effect on the real owner's key.
+    still_works = client.get(
+        "/public/v1/numbers", headers={"Authorization": f"Bearer {created['raw_key']}"}
+    )
+    assert still_works.status_code == 200
+
+
+def test_list_api_keys_cache_hit_returns_consistent_data(client):
+    """list_api_keys caches for 30s (service.py's _api_keys_cache_key) -
+    exercise the cache-hit branch with a second GET inside that window and
+    confirm it returns the same data as the cache-miss first call, not
+    stale/corrupted data from the (de)serialization round-trip."""
+    token = _signup_and_login(client, "api-owner7@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    client.post("/developer/api-keys", json={"label": "Cache Test Key"}, headers=headers)
+
+    first = client.get("/developer/api-keys", headers=headers)
+    second = client.get("/developer/api-keys", headers=headers)
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert first.json() == second.json()
+    assert len(second.json()) == 1
+    assert second.json()[0]["label"] == "Cache Test Key"
+
+
 def test_key_limit_is_enforced(client):
     token = _signup_and_login(client, "api-owner5@example.com")
     headers = {"Authorization": f"Bearer {token}"}
