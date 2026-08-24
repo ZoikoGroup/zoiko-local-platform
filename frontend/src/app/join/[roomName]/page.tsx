@@ -4,6 +4,7 @@ import { useEffect, useRef, useState, type FormEvent } from "react";
 import { useParams } from "next/navigation";
 import { Room, RoomEvent, Track } from "livekit-client";
 import { guestJoinVideoRoom, checkGuestWaitingStatus, ApiError } from "@/lib/api";
+import MeetingRoom, { createParticipantTile, type ReactionEvent } from "@/components/MeetingRoom";
 
 type CallState = "lobby" | "requesting" | "waiting" | "in-call" | "ended" | "denied" | "expired" | "not-found";
 type DeviceStatus = "idle" | "requesting" | "ready" | "blocked";
@@ -39,21 +40,22 @@ export default function GuestJoinPage() {
   const [cameraStatus, setCameraStatus] = useState<DeviceStatus>("idle");
   const [micStatus, setMicStatus] = useState<DeviceStatus>("idle");
   const [lobbyVideoStream, setLobbyVideoStream] = useState<MediaStream | null>(null);
-  const [participantCount, setParticipantCount] = useState(0);
   const [waitingId, setWaitingId] = useState<string | null>(null);
   const [recording, setRecording] = useState(false);
   const [chatOpen, setChatOpen] = useState(false);
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
   const [chatInput, setChatInput] = useState("");
   const [unreadChatCount, setUnreadChatCount] = useState(0);
+  const [reactions, setReactions] = useState<ReactionEvent[]>([]);
+  const [participants, setParticipants] = useState<{ identity: string; name: string }[]>([]);
 
   const roomRef = useRef<Room | null>(null);
   const lobbyVideoRef = useRef<HTMLVideoElement>(null);
   const localVideoRef = useRef<HTMLVideoElement>(null);
   const remoteContainerRef = useRef<HTMLDivElement>(null);
   const attachedElements = useRef<Map<string, HTMLMediaElement>>(new Map());
+  const participantTiles = useRef<Map<string, HTMLDivElement>>(new Map());
   const pendingJoinRef = useRef<{ camera: boolean; mic: boolean } | null>(null);
-  const chatEndRef = useRef<HTMLDivElement>(null);
   const chatOpenRef = useRef(false);
   // Mirror of lobbyVideoStream for the unmount cleanup below, which is
   // registered once at mount time - reading the state variable directly
@@ -91,11 +93,6 @@ export default function GuestJoinPage() {
   useEffect(() => {
     chatOpenRef.current = chatOpen;
   }, [chatOpen]);
-
-  useEffect(() => {
-    if (!chatOpen) return;
-    chatEndRef.current?.scrollIntoView({ block: "end" });
-  }, [chatMessages, chatOpen]);
 
   function stopLobbyVideoPreview() {
     lobbyVideoStream?.getTracks().forEach((t) => t.stop());
@@ -137,42 +134,70 @@ export default function GuestJoinPage() {
     }
   }
 
+  function getOrCreateTile(identity: string, name: string): HTMLDivElement {
+    const existing = participantTiles.current.get(identity);
+    if (existing) return existing;
+    const tile = createParticipantTile(identity, name);
+    remoteContainerRef.current?.appendChild(tile);
+    participantTiles.current.set(identity, tile);
+    return tile;
+  }
+
+  function clearRemoteTiles() {
+    participantTiles.current.forEach((tile) => tile.remove());
+    participantTiles.current.clear();
+    setParticipants([]);
+  }
+
   async function connectToRoom(liveKitToken: string, url: string) {
     const { camera: useCamera, mic: useMic } = pendingJoinRef.current ?? { camera: false, mic: false };
 
     const room = new Room();
     roomRef.current = room;
 
-    room.on(RoomEvent.TrackSubscribed, (track) => {
+    room.on(RoomEvent.TrackSubscribed, (track, _publication, participant) => {
       if (track.kind === Track.Kind.Video || track.kind === Track.Kind.Audio) {
+        const tile = getOrCreateTile(participant.identity, participant.name || participant.identity);
         const el = track.attach();
         attachedElements.current.set(track.sid ?? el.id, el);
-        remoteContainerRef.current?.appendChild(el);
+        tile.appendChild(el);
       }
     });
     room.on(RoomEvent.TrackUnsubscribed, (track) => {
       track.detach().forEach((el) => el.remove());
     });
-    room.on(RoomEvent.ParticipantConnected, () => setParticipantCount(room.remoteParticipants.size));
-    room.on(RoomEvent.ParticipantDisconnected, () => setParticipantCount(room.remoteParticipants.size));
+    room.on(RoomEvent.ParticipantConnected, (participant) => {
+      getOrCreateTile(participant.identity, participant.name || participant.identity);
+      setParticipants((prev) => [...prev, { identity: participant.identity, name: participant.name || participant.identity }]);
+    });
+    room.on(RoomEvent.ParticipantDisconnected, (participant) => {
+      setParticipants((prev) => prev.filter((p) => p.identity !== participant.identity));
+      participantTiles.current.get(participant.identity)?.remove();
+      participantTiles.current.delete(participant.identity);
+    });
     room.on(RoomEvent.DataReceived, (payload, participant) => {
-      let text: string;
+      let parsed: { type?: string; text?: string; emoji?: string };
       try {
-        const parsed = JSON.parse(CHAT_DECODER.decode(payload));
-        if (parsed?.type !== "chat" || typeof parsed.text !== "string") return;
-        text = parsed.text;
+        parsed = JSON.parse(CHAT_DECODER.decode(payload));
       } catch {
         return;
       }
-      setChatMessages((prev) => [
-        ...prev,
-        { id: `${Date.now()}-${Math.random()}`, senderName: participant?.name || "Guest", isLocal: false, text, ts: Date.now() },
-      ]);
-      if (!chatOpenRef.current) setUnreadChatCount((c) => c + 1);
+      if (parsed.type === "chat" && typeof parsed.text === "string") {
+        setChatMessages((prev) => [
+          ...prev,
+          { id: `${Date.now()}-${Math.random()}`, senderName: participant?.name || "Guest", isLocal: false, text: parsed.text as string, ts: Date.now() },
+        ]);
+        if (!chatOpenRef.current) setUnreadChatCount((c) => c + 1);
+      } else if (parsed.type === "reaction" && typeof parsed.emoji === "string") {
+        const id = `${Date.now()}-${Math.random()}`;
+        setReactions((prev) => [...prev, { id, identity: participant?.identity ?? "unknown", emoji: parsed.emoji as string }]);
+        setTimeout(() => setReactions((prev) => prev.filter((r) => r.id !== id)), 2500);
+      }
     });
     room.on(RoomEvent.Disconnected, () => {
       setCallState("ended");
       roomRef.current = null;
+      clearRemoteTiles();
     });
 
     await room.connect(url, liveKitToken);
@@ -181,7 +206,13 @@ export default function GuestJoinPage() {
     setCameraOn(useCamera);
     setMicOn(useMic);
 
-    setParticipantCount(room.remoteParticipants.size);
+    // Participants already in the room when we connect don't fire
+    // ParticipantConnected (that only fires for joins after us) - without
+    // this, someone already on the call with both camera and mic off would
+    // never get a tile at all.
+    const already = Array.from(room.remoteParticipants.values());
+    already.forEach((p) => getOrCreateTile(p.identity, p.name || p.identity));
+    setParticipants(already.map((p) => ({ identity: p.identity, name: p.name || p.identity })));
     setCallState("in-call");
   }
 
@@ -253,6 +284,8 @@ export default function GuestJoinPage() {
     setChatMessages([]);
     setChatOpen(false);
     setUnreadChatCount(0);
+    clearRemoteTiles();
+    setReactions([]);
   }
 
   function handleSendChatMessage(e: FormEvent) {
@@ -266,6 +299,15 @@ export default function GuestJoinPage() {
       { id: `${Date.now()}-${Math.random()}`, senderName: "You", isLocal: true, text, ts: Date.now() },
     ]);
     setChatInput("");
+  }
+
+  function handleSendReaction(emoji: string) {
+    const room = roomRef.current;
+    if (!room) return;
+    room.localParticipant.publishData(CHAT_ENCODER.encode(JSON.stringify({ type: "reaction", emoji })), { reliable: true });
+    const id = `${Date.now()}-${Math.random()}`;
+    setReactions((prev) => [...prev, { id, identity: "local", emoji }]);
+    setTimeout(() => setReactions((prev) => prev.filter((r) => r.id !== id)), 2500);
   }
 
   function handleToggleMicInCall() {
@@ -405,112 +447,32 @@ export default function GuestJoinPage() {
         )}
 
         {callState === "in-call" && (
-          <div className="bg-slate-900 rounded-xl border border-slate-800 p-4 space-y-3">
-            <div className="flex items-center justify-between text-xs text-slate-400 px-1">
-              <span>{displayName}</span>
-              <div className="flex items-center gap-3">
-                {recording && (
-                  <span className="flex items-center gap-1.5 text-red-400">
-                    <span className="w-1.5 h-1.5 rounded-full bg-red-500 animate-pulse" />
-                    Recording
-                  </span>
-                )}
-                <span>{participantCount} other participant{participantCount === 1 ? "" : "s"}</span>
-              </div>
-            </div>
-
-            <div className="flex gap-3 items-stretch">
-              <div className="flex-1 min-w-0 grid gap-3 grid-cols-[repeat(auto-fit,minmax(160px,1fr))]">
-                <div className="relative aspect-video bg-black rounded-lg overflow-hidden">
-                  <video ref={localVideoRef} autoPlay muted playsInline className="w-full h-full object-cover" />
-                  <span className="absolute bottom-2 left-2 text-xs text-white/80 bg-black/40 rounded px-2 py-0.5">
-                    You
-                  </span>
-                </div>
-                <div
-                  ref={remoteContainerRef}
-                  className="contents [&>video]:aspect-video [&>video]:w-full [&>video]:rounded-lg [&>video]:bg-black [&>video]:object-cover [&>audio]:hidden"
-                />
-              </div>
-
-              {chatOpen && (
-                <div className="w-56 shrink-0 flex flex-col bg-slate-950 border border-slate-800 rounded-lg">
-                  <div className="px-3 py-2 border-b border-slate-800 text-xs font-medium text-slate-300">In-call chat</div>
-                  <div className="flex-1 min-h-[160px] max-h-[280px] overflow-y-auto px-3 py-2 space-y-2">
-                    {chatMessages.length === 0 ? (
-                      <p className="text-xs text-slate-500">No messages yet.</p>
-                    ) : (
-                      chatMessages.map((m) => (
-                        <div key={m.id} className="text-sm">
-                          <span className={`text-xs font-medium ${m.isLocal ? "text-indigo-400" : "text-slate-400"}`}>
-                            {m.senderName}
-                          </span>
-                          <p className="text-slate-200 break-words">{m.text}</p>
-                        </div>
-                      ))
-                    )}
-                    <div ref={chatEndRef} />
-                  </div>
-                  <form onSubmit={handleSendChatMessage} className="flex items-center gap-1.5 p-2 border-t border-slate-800">
-                    <input
-                      value={chatInput}
-                      onChange={(e) => setChatInput(e.target.value)}
-                      placeholder="Message everyone"
-                      className="flex-1 min-w-0 text-sm rounded-lg bg-slate-800 border border-slate-700 text-white px-2.5 py-1.5 placeholder:text-slate-500 focus:outline-none focus:ring-2 focus:ring-indigo-500/40"
-                    />
-                    <button
-                      type="submit"
-                      disabled={!chatInput.trim()}
-                      className="text-xs font-medium rounded-lg px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-40 text-white"
-                    >
-                      Send
-                    </button>
-                  </form>
-                </div>
-              )}
-            </div>
-
-            <div className="flex items-center justify-center gap-3 pt-2">
-              <button
-                onClick={handleToggleMicInCall}
-                className={`text-xs font-medium rounded-lg px-3 py-2 ${
-                  micOn ? "bg-slate-800 text-white" : "bg-red-700 text-white"
-                }`}
-              >
-                {micOn ? "Mute" : "Unmute"}
-              </button>
-              <button
-                onClick={handleToggleCameraInCall}
-                className={`text-xs font-medium rounded-lg px-3 py-2 ${
-                  cameraOn ? "bg-slate-800 text-white" : "bg-red-700 text-white"
-                }`}
-              >
-                {cameraOn ? "Stop Video" : "Start Video"}
-              </button>
-              <button
-                onClick={() => {
-                  setChatOpen((v) => !v);
-                  setUnreadChatCount(0);
-                }}
-                className={`relative text-xs font-medium rounded-lg px-3 py-2 ${
-                  chatOpen ? "bg-emerald-700 text-white" : "bg-slate-800 text-white"
-                }`}
-              >
-                Chat
-                {unreadChatCount > 0 && (
-                  <span className="absolute -top-1.5 -right-1.5 flex items-center justify-center w-4 h-4 rounded-full bg-red-500 text-white text-[10px] font-bold">
-                    {unreadChatCount > 9 ? "9+" : unreadChatCount}
-                  </span>
-                )}
-              </button>
-              <button
-                onClick={handleLeave}
-                className="text-xs font-medium rounded-lg px-4 py-2 bg-red-700 hover:bg-red-600 text-white"
-              >
-                Leave Call
-              </button>
-            </div>
-          </div>
+          <MeetingRoom
+            displayName={displayName}
+            micOn={micOn}
+            cameraOn={cameraOn}
+            onToggleMic={handleToggleMicInCall}
+            onToggleCamera={handleToggleCameraInCall}
+            localVideoRef={localVideoRef}
+            remoteContainerRef={remoteContainerRef}
+            participants={participants}
+            reactions={reactions}
+            onSendReaction={handleSendReaction}
+            chatOpen={chatOpen}
+            onToggleChat={() => {
+              setChatOpen((v) => !v);
+              setUnreadChatCount(0);
+            }}
+            unreadChatCount={unreadChatCount}
+            chatMessages={chatMessages}
+            chatInput={chatInput}
+            onChatInputChange={setChatInput}
+            onSendChat={handleSendChatMessage}
+            onLeave={handleLeave}
+            leaveLabel="Leave call"
+            topLeft={<span className="truncate">{displayName}</span>}
+            recordingBadge={recording}
+          />
         )}
       </div>
     </main>
