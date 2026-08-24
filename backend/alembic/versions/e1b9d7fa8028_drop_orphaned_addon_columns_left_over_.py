@@ -23,11 +23,16 @@ from-scratch bootstrap (a fresh dev DB, CI, or anyone cloning this repo
 today) runs 4ec152435b05's CURRENT source, which never creates them in
 the first place - this DROP must not fail just because there was nothing
 to drop in that case.
+
+(2026-08-24 merge note: a parallel session independently hit and fixed
+this same fresh-database crash via a SQLAlchemy inspector column-
+existence check instead of raw SQL IF EXISTS - functionally equivalent,
+kept this version since Postgres's own IF EXISTS already covers it
+without a round-trip through information_schema.)
 """
 from typing import Sequence, Union
 
 from alembic import op
-import sqlalchemy as sa
 
 
 # revision identifiers, used by Alembic.
