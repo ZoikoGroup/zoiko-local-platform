@@ -1,3 +1,4 @@
+import uuid
 from datetime import datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -12,18 +13,16 @@ from app.consent.service import has_active_consent
 from app.core.config import settings
 from app.events.service import (
     publish_number_activated,
-    publish_number_purchase_confirmed,
     publish_number_reserved,
     publish_number_suspended,
 )
-from app.integrations.billing import stripe_checkout
 from app.integrations.cache.redis import cache_delete, cache_get, cache_set
+from app.integrations.storage import s3 as storage
 from app.integrations.telecom import twilio as telecom
 from app.ops.models import KillSwitchScope
 from app.ops.service import assert_kill_switch_not_active
 from app.usage import service as usage_service
 from app.notifications.service import (
-    notify_credit_or_refund_processed,
     notify_number_activated,
     notify_number_assigned,
     notify_number_order_not_approved,
@@ -82,14 +81,8 @@ class ReservationExpiredError(NumberConflictError):
     """Raised specifically when the account's OWN reservation on this
     number lapsed (RESERVATION_TTL_MINUTES) - a subclass of
     NumberConflictError so anything already catching that broadly still
-    catches this, but distinct enough that complete_number_purchase_from_
-    checkout can tell it apart from "already fulfilled/duplicate webhook."
-    Confirmed live (Commercial Billing Operating Standard acceptance test,
-    2026-08-13): before this existed, a real Stripe payment that completed
-    after the reservation had already expired was silently kept with no
-    number delivered and no refund issued, because this case raised the
-    same NumberConflictError as the harmless "already fulfilled" case and
-    complete_number_purchase_from_checkout couldn't distinguish them."""
+    catches this, but distinct enough for callers to give the customer a
+    clearer "reserve it again" message than the generic conflict case."""
 
 
 class NonCommercialAccountError(Exception):
@@ -380,6 +373,24 @@ class NumberEligibilityCaseNotFoundError(Exception):
     """Raised when a case id doesn't exist."""
 
 
+class NumberDocumentTypeUnsupportedError(Exception):
+    """Same accepted-types posture as compliance.service.UnsupportedDocumentTypeError."""
+
+
+class NumberDocumentTooLargeError(Exception):
+    """Same size cap as compliance.service.DocumentTooLargeError."""
+
+
+class NumberEligibilityDocumentRequiredError(Exception):
+    """Raised when submit_number_eligibility_bundle is called before any
+    document has been uploaded to the case - Twilio's bundle requires a
+    real supporting document, there's nothing to submit without one."""
+
+
+_ALLOWED_ELIGIBILITY_DOCUMENT_CONTENT_TYPES = {"application/pdf", "image/jpeg", "image/png"}
+_MAX_ELIGIBILITY_DOCUMENT_SIZE_BYTES = 10 * 1024 * 1024
+
+
 def get_active_eligibility_rule(db: Session, country: str, number_type: str) -> NumberEligibilityRule | None:
     return (
         db.query(NumberEligibilityRule)
@@ -551,6 +562,145 @@ def submit_number_eligibility_evidence(
     log_event(
         db, actor=actor, action="number.eligibility_evidence_submitted",
         target=f"number_eligibility_case:{case.id}", after={"evidence_count": len(case.evidence)},
+    )
+    return case
+
+
+def submit_number_eligibility_document(
+    db: Session, case_id: str, *, account_id: str, document_type: str,
+    filename: str, content_type: str, data: bytes, actor: str,
+) -> NumberEligibilityCase:
+    """Real gap closed 2026-08-22 - mirrors compliance.service.submit_document
+    exactly (server-generated storage key, content-type/size validation,
+    upload via the same S3 Provider Gateway) since this is the same kind of
+    evidence, just scoped to a number-eligibility case instead of an
+    account-level KYC case. Does NOT itself talk to Twilio - this only
+    stores our own copy; submit_number_eligibility_bundle below uploads
+    (a copy of) the most recent one to Twilio when the customer is ready
+    to submit for review."""
+    case = _get_eligibility_case(db, case_id)
+    if case.account_id != account_id:
+        raise NumberEligibilityCaseNotFoundError(f"No eligibility case with id {case_id}")
+    if content_type not in _ALLOWED_ELIGIBILITY_DOCUMENT_CONTENT_TYPES:
+        raise NumberDocumentTypeUnsupportedError(
+            f"{content_type} is not an accepted document type - upload a PDF, JPEG, or PNG"
+        )
+    if len(data) > _MAX_ELIGIBILITY_DOCUMENT_SIZE_BYTES:
+        raise NumberDocumentTooLargeError("Document exceeds the 10MB upload limit")
+
+    storage_key = f"numbering-eligibility-documents/{case.id}/{uuid.uuid4()}-{filename}"
+    storage.upload_object(storage_key, data, content_type)
+
+    new_doc = {
+        "document_type": document_type,
+        "storage_key": storage_key,
+        "filename": filename,
+        "content_type": content_type,
+        "uploaded_at": datetime.now(timezone.utc).isoformat(),
+    }
+    case.documents = [*case.documents, new_doc]  # reassign, not .append() - JSON columns need a new object to detect the change
+    db.commit()
+    db.refresh(case)
+    log_event(
+        db, actor=actor, action="number.eligibility_document_submitted",
+        target=f"number_eligibility_case:{case.id}", after={"document_type": document_type, "filename": filename},
+    )
+    return case
+
+
+def submit_number_eligibility_bundle(
+    db: Session, case_id: str, *, account_id: str, end_user_attributes: dict, end_user_type: str = "individual",
+    actor: str,
+) -> NumberEligibilityCase:
+    """The real submission to Twilio's own compliance review - our
+    `evidence`/`documents` fields alone were never enough, Twilio requires
+    its own reviewed Regulatory Bundle before it will activate a
+    restricted number type (confirmed live against Twilio's Regulations
+    API for GB local/individual, 2026-08-22). Requires at least one
+    document already uploaded via submit_number_eligibility_document.
+    Real, no-mock - every Twilio call here is a genuine API call, same
+    discipline as every other Provider Gateway integration this session."""
+    case = _get_eligibility_case(db, case_id)
+    if case.account_id != account_id:
+        raise NumberEligibilityCaseNotFoundError(f"No eligibility case with id {case_id}")
+    if not case.documents:
+        raise NumberEligibilityDocumentRequiredError(
+            "Upload a supporting document before submitting this case for review"
+        )
+    latest_doc = case.documents[-1]
+
+    owner = db.query(User).filter(User.account_id == account_id, User.role == UserRole.OWNER).first()
+    email = end_user_attributes.get("email") or (owner.email if owner is not None else "")
+
+    end_user = telecom.create_regulatory_end_user(
+        friendly_name=f"{case.country} {end_user_type} - eligibility case {case.id}",
+        end_user_type=end_user_type, attributes=end_user_attributes,
+    )
+
+    file_bytes = storage.download_object(latest_doc["storage_key"])
+    supporting_document = telecom.upload_supporting_document(
+        friendly_name=f"{case.country} supporting document - eligibility case {case.id}",
+        document_type=latest_doc["document_type"],
+        attributes={k: v for k, v in end_user_attributes.items() if k in ("first_name", "last_name")},
+        file_bytes=file_bytes, content_type=latest_doc["content_type"],
+    )
+
+    bundle = telecom.create_regulatory_bundle(
+        friendly_name=f"Zoiko Local {case.country} {case.number_type} - {case.id}",
+        email=email,
+        iso_country=case.country, end_user_type=end_user_type, number_type=case.number_type,
+    )
+    telecom.create_bundle_item_assignment(bundle["sid"], end_user["sid"])
+    telecom.create_bundle_item_assignment(bundle["sid"], supporting_document["sid"])
+    submitted = telecom.submit_bundle_for_review(bundle["sid"])
+
+    case.twilio_end_user_sid = end_user["sid"]
+    case.twilio_supporting_document_sid = supporting_document["sid"]
+    case.twilio_bundle_sid = bundle["sid"]
+    case.twilio_bundle_status = submitted["status"]
+    db.commit()
+    db.refresh(case)
+    log_event(
+        db, actor=actor, action="number.eligibility_bundle_submitted",
+        target=f"number_eligibility_case:{case.id}",
+        after={"twilio_bundle_sid": bundle["sid"], "twilio_bundle_status": submitted["status"]},
+    )
+    return case
+
+
+def sync_number_eligibility_bundle_status(db: Session, case_id: str, *, account_id: str, actor: str) -> NumberEligibilityCase:
+    """On-demand check, not a webhook - Twilio's bundle review isn't
+    instant, and depending on a webhook here would tie this to the same
+    fragile local ngrok tunnel that already caused a real lost-webhook
+    incident elsewhere in this project (see the video-recording sweep's
+    own docstring) for an event that fires rarely enough this is simpler
+    and just as reliable. Flipping to APPROVED here flows through the
+    SAME NumberEligibilityCaseStatus.APPROVED status purchase_number
+    already checks via has_approved_eligibility_case - no separate
+    purchase-gate code needed for the Twilio-approval path."""
+    case = _get_eligibility_case(db, case_id)
+    if case.account_id != account_id:
+        raise NumberEligibilityCaseNotFoundError(f"No eligibility case with id {case_id}")
+    if not case.twilio_bundle_sid:
+        raise NumberEligibilityDocumentRequiredError("This case hasn't been submitted to Twilio for review yet")
+
+    result = telecom.get_bundle_status(case.twilio_bundle_sid)
+    before_status = case.status
+    case.twilio_bundle_status = result["status"]
+    case.twilio_bundle_rejection_reason = result.get("rejection_reason")
+    if result["status"] == "twilio-approved":
+        case.status = NumberEligibilityCaseStatus.APPROVED
+        case.resolved_at = datetime.now(timezone.utc)
+    elif result["status"] == "twilio-rejected":
+        case.status = NumberEligibilityCaseStatus.REJECTED
+        case.review_notes = result.get("rejection_reason")
+        case.resolved_at = datetime.now(timezone.utc)
+    db.commit()
+    db.refresh(case)
+    log_event(
+        db, actor=actor, action="number.eligibility_bundle_status_synced",
+        target=f"number_eligibility_case:{case.id}",
+        before={"status": before_status}, after={"status": case.status, "twilio_bundle_status": result["status"]},
     )
     return case
 
@@ -841,8 +991,23 @@ def purchase_number(db: Session, account_id: str, e164: str) -> PhoneNumber:
         target_type="phone_number", target_id=number.id, metadata={"e164": e164},
     )
 
+    # An approved eligibility case's Twilio bundle (if this number's
+    # country/number_type has one - see submit_number_eligibility_bundle)
+    # must be passed to Twilio's own purchase call, not just recorded on
+    # our side - Twilio requires it for restricted number types regardless
+    # of what our own eligibility case status says.
+    eligibility_case = (
+        db.query(NumberEligibilityCase)
+        .filter(
+            NumberEligibilityCase.phone_number_id == number.id,
+            NumberEligibilityCase.status == NumberEligibilityCaseStatus.APPROVED,
+        )
+        .first()
+    )
+    bundle_sid = eligibility_case.twilio_bundle_sid if eligibility_case is not None else None
+
     try:
-        bought = telecom.buy_number(e164)
+        bought = telecom.buy_number(e164, bundle_sid=bundle_sid)
     except telecom.TelecomError as e:
         # payment/provisioning failure must not strand the number silently —
         # release it back to Reserved so the customer can retry or it can expire
@@ -1008,28 +1173,31 @@ def reinstate_caller_identity(
 
 
 def create_number_purchase_checkout_session(db: Session, account_id: str, e164: str) -> dict:
-    """Real Stripe Checkout (test mode) for a number purchase.
+    """Architecture doc §9: "Zoiko Local creates or updates plan, seat,
+    number, and add-on entitlement events; ZoikoNex converts them into
+    billing schedules" - a number's cost is meant to become a line item on
+    the SAME ZoikoNex invoice as the plan fee, not a separate charge on a
+    different rail. Previously this created a standalone one-time Stripe
+    Checkout Session for any non-included number, completely disconnected
+    from the subscription invoice - real gap fixed 2026-08-22.
 
     Commercial Billing Operating Standard doc's canonical transaction chain
     puts eligibility strictly BEFORE any charge ("eligibility -> customer
-    authorization -> service entitlement -> ... -> charge/tax/fee result";
-    T1: "Live charge authorization requires ... market/service eligibility")
-    - _assert_purchase_eligible runs here, before Stripe is ever contacted,
-    so a customer who still needs KYC/eligibility documents is never
-    charged while waiting on them. purchase_number (called once Stripe
-    confirms payment via the webhook - see complete_number_purchase_from_
-    checkout below) re-checks the same gate as defense-in-depth against the
-    case's status changing in the gap between session creation and webhook
-    delivery, then performs the actual provisioning. Returns {id, url} -
-    the customer is redirected to url.
+    authorization -> service entitlement -> ... -> charge/tax/fee result")
+    - _assert_purchase_eligible runs here before the number is provisioned,
+    same as it always has.
 
     Global Plans, Pricing & Commercial Launch Standard doc: the account's
-    first number is included with a paid plan, not charged. When
-    billing_service.is_first_number_included says so, this skips Stripe
-    entirely and calls purchase_number directly - same eligibility gate,
-    same provisioning path, just no charge/redirect. See that function's
-    docstring for why this doesn't yet implement the doc's recurring
-    "$4.99/month" price for additional numbers."""
+    first number is included with a paid plan, not charged - unchanged by
+    this fix. When billing_service.is_first_number_included says so, this
+    calls purchase_number directly with no charge at all. Otherwise the
+    number is STILL provisioned immediately (the customer isn't blocked
+    waiting on a redirect/payment), but its cost is recorded via
+    billing_service.record_pending_number_charge - run_billing_cycle's
+    next run for this account adds it as a real invoice line item
+    alongside the plan fee. See that function's docstring for why this
+    doesn't yet implement the doc's recurring "$4.99/month" price for
+    additional numbers."""
     # Commercial Billing Operating Standard doc §14/§T stopgap - see
     # Account.is_test's docstring. Overlaps with _assert_commercial_account
     # above (see TestAccountRestrictedError's docstring) - both are
@@ -1067,130 +1235,40 @@ def create_number_purchase_checkout_session(db: Session, account_id: str, e164: 
 
         # Doc §5.1: included number, but its real rate is above the
         # inclusion threshold (a higher-cost or regulated number type) -
-        # the customer still gets the included entitlement (purchase_number
-        # below provisions it as such once Stripe confirms payment), but
-        # pays the incremental amount above the threshold first rather than
-        # getting the full rate for free.
-        session = stripe_checkout.create_checkout_session(
-            e164=e164,
-            amount_cents=surcharge_cents,
-            currency=NUMBER_PURCHASE_CURRENCY,
-            success_url=f"{settings.frontend_base_url}/dashboard/numbers?checkout=success",
-            cancel_url=f"{settings.frontend_base_url}/dashboard/numbers?checkout=cancelled",
-            metadata={"e164": e164, "account_id": account_id, "surcharge_cents": str(surcharge_cents)},
+        # the customer still gets the included entitlement (provisioned
+        # immediately below), but owes the incremental amount above the
+        # threshold on their next invoice rather than getting the full
+        # rate for free.
+        purchased = purchase_number(db, account_id, e164)
+        billing_service.record_pending_number_charge(
+            db, account_id, charge_type="number_purchase", phone_number_id=purchased.id,
+            description=f"Phone number purchase - {e164}", amount_minor_units=surcharge_cents,
+            currency_code=NUMBER_PURCHASE_CURRENCY.upper(),
         )
         log_event(
-            db, actor_id=account_id, action="number.included_purchase_surcharge_checkout_created",
+            db, actor_id=account_id, action="number.included_purchase_surcharge_pending",
             target_type="phone_number", target_id=number.id,
-            metadata={"e164": e164, "session_id": session["id"], "surcharge_cents": surcharge_cents},
+            metadata={"e164": e164, "surcharge_cents": surcharge_cents},
         )
-        return {"id": session["id"], "url": session["url"], "included": False, "number": None}
+        return {
+            "id": None, "url": None, "included": False, "number": purchased,
+            "pending_charge_amount_minor_units": surcharge_cents,
+        }
 
-    session = stripe_checkout.create_checkout_session(
-        e164=e164,
-        amount_cents=rate_cents,
-        currency=NUMBER_PURCHASE_CURRENCY,
-        success_url=f"{settings.frontend_base_url}/dashboard/numbers?checkout=success",
-        cancel_url=f"{settings.frontend_base_url}/dashboard/numbers?checkout=cancelled",
-        metadata={"e164": e164, "account_id": account_id},
+    purchased = purchase_number(db, account_id, e164)
+    billing_service.record_pending_number_charge(
+        db, account_id, charge_type="number_purchase", phone_number_id=purchased.id,
+        description=f"Phone number purchase - {e164}", amount_minor_units=rate_cents,
+        currency_code=NUMBER_PURCHASE_CURRENCY.upper(),
     )
     log_event(
-        db, actor_id=account_id, action="number.checkout_session_created",
-        target_type="phone_number", target_id=number.id, metadata={"e164": e164, "session_id": session["id"]},
+        db, actor_id=account_id, action="number.purchase_pending_next_invoice",
+        target_type="phone_number", target_id=number.id, metadata={"e164": e164, "rate_cents": rate_cents},
     )
-    return {"id": session["id"], "url": session["url"], "included": False, "number": None}
-
-
-def complete_number_purchase_from_checkout(
-    db: Session, *, e164: str, account_id: str, payment_intent_id: str | None = None
-) -> PhoneNumber | None:
-    """Called from the Stripe payment webhook once checkout.session.completed
-    fires - runs the existing purchase_number flow with all its gates
-    intact, rather than duplicating any of that logic. Returns None (not an
-    error) for every known way purchase_number can fail to actually reach
-    ACTIVE after a successful payment:
-
-    - NumberConflictError (NOT the ReservationExpiredError subclass below):
-      the number is no longer purchasable because it's already bought, or
-      the webhook was retried after already succeeding once - idempotency
-      against Stripe's at-least-once webhook delivery. Not refunded - this
-      path means the number was already (or is being) fulfilled, or a
-      duplicate delivery of an already-handled event.
-    - ComplianceRequiredError / NumberEligibilityRequiredError:
-      purchase_number already persisted the number into COMPLIANCE_PENDING
-      and (for the KYC case) sent its own customer notification - correct
-      behavior, nothing further for this handler to do. Not refunded - the
-      customer still gets the number once the relevant case clears, this
-      isn't a failure.
-    - ReservationExpiredError / NumberQuotaExceededError /
-      BillingSuspendedError / EmergencyDisclosureRequiredError /
-      TelecomError: genuine post-payment fulfillment failures - the
-      customer paid and won't be getting a number for it. Automatically
-      refunded via Stripe (if payment_intent_id is available) so no real
-      launch would leave a collected-but-unfulfilled payment sitting
-      uncorrected. ReservationExpiredError was folded into the no-refund
-      NumberConflictError bucket until a live acceptance test (2026-08-13)
-      caught it silently keeping a real completed payment - see that
-      exception's own docstring.
-    """
-    try:
-        number = purchase_number(db, account_id, e164)
-        publish_number_purchase_confirmed(
-            account_id, number_id=number.id, e164=number.e164, payment_intent_id=payment_intent_id,
-        )
-        return number
-    except ReservationExpiredError as e:
-        _refund_and_notify_failed_purchase(db, account_id, e164, payment_intent_id, reason=str(e))
-        return None
-    except (NumberConflictError, ComplianceRequiredError, NumberEligibilityRequiredError):
-        return None
-    except (
-        EmergencyDisclosureRequiredError,
-        billing_service.NumberQuotaExceededError,
-        billing_service.BillingSuspendedError,
-        telecom.TelecomError,
-    ) as e:
-        _refund_and_notify_failed_purchase(db, account_id, e164, payment_intent_id, reason=str(e))
-        return None
-
-
-def _refund_and_notify_failed_purchase(
-    db: Session, account_id: str, e164: str, payment_intent_id: str | None, *, reason: str
-) -> None:
-    """Shared by complete_number_purchase_from_checkout's two refundable
-    failure branches above - previously refunded silently with no
-    customer-facing evidence a refund happened (the 'billing.credit_or_
-    refund_processed' template was seeded but never called - same gap as
-    run_billing_cycle's invoice/payment notifications)."""
-    if not payment_intent_id:
-        return
-    try:
-        refund = stripe_checkout.refund_payment(payment_intent_id)
-    except stripe_checkout.PaymentError:
-        # Refund itself failed (e.g. provider outage) - logged by
-        # trace_provider_call already; swallowed here so a refund hiccup
-        # never turns into a 500 back to Stripe's webhook (which would
-        # just cause pointless redelivery retries of an event we've
-        # already fully handled on our side). No notification either -
-        # nothing was actually refunded yet.
-        return
-
-    owner = db.query(User).filter(User.account_id == account_id, User.role == UserRole.OWNER).first()
-    if owner is not None:
-        try:
-            # The refund itself already succeeded (we're past the guard
-            # above) - a notification failure here must not propagate.
-            # This whole function runs inside the Stripe webhook handler
-            # with no surrounding try/except, so an uncaught exception
-            # would 500 the webhook response, causing Stripe to redeliver
-            # the same event and re-run this already-completed refund path.
-            notify_credit_or_refund_processed(
-                db, account_id=account_id, account_email=owner.email, adjustment_type="refund",
-                amount=f"{refund['amount'] / 100:.2f}", currency=refund["currency"].upper(),
-                reference=payment_intent_id, reason=f"{e164} could not be provisioned after payment: {reason}",
-            )
-        except Exception:
-            pass
+    return {
+        "id": None, "url": None, "included": False, "number": purchased,
+        "pending_charge_amount_minor_units": rate_cents,
+    }
 
 
 # purchase_number is entirely synchronous - it never returns to the caller
@@ -1624,6 +1702,7 @@ def configure_routing(
     escalation_user_id: str | None = None,
     whatsapp_enabled: bool = False,
     sms_enabled: bool = False,
+    escalation_phone_number: str | None = None,
 ) -> PhoneNumber:
     number = db.query(PhoneNumber).filter(PhoneNumber.e164 == e164).first()
     if number is None or number.account_id != user.account_id:
@@ -1656,6 +1735,7 @@ def configure_routing(
     number.business_hours_timezone = business_hours_timezone
     number.ai_receptionist_enabled = ai_receptionist_enabled
     number.escalation_user_id = escalation_user_id
+    number.escalation_phone_number = escalation_phone_number
     number.whatsapp_enabled = whatsapp_enabled
     number.sms_enabled = sms_enabled
     db.commit()
@@ -1668,6 +1748,7 @@ def configure_routing(
             "e164": e164,
             "forwarding_number": forwarding_number,
             "escalation_user_id": escalation_user_id,
+            "escalation_phone_number": escalation_phone_number,
         },
     )
     return number

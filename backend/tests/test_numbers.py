@@ -34,8 +34,17 @@ def _reserve(client, headers, e164: str, country: str = "US"):
 def _stub_buy_number(monkeypatch):
     monkeypatch.setattr(
         "app.numbering.numbers.service.telecom.buy_number",
-        lambda e164: {"sid": "PN_fake_sid", "phone_number": e164, "capabilities": {}},
+        lambda e164, bundle_sid=None: {"sid": "PN_fake_sid", "phone_number": e164, "capabilities": {}},
     )
+
+
+def _find_eligibility_case_id(db_session, e164: str) -> str:
+    from app.numbering.numbers.models import NumberEligibilityCase, PhoneNumber
+
+    number = db_session.query(PhoneNumber).filter(PhoneNumber.e164 == e164).first()
+    case = db_session.query(NumberEligibilityCase).filter(NumberEligibilityCase.phone_number_id == number.id).first()
+    assert case is not None, f"expected an eligibility case to have been auto-opened for {e164}"
+    return case.id
 
 
 def test_purchase_succeeds_when_no_compliance_rule_is_active_for_the_country(client, monkeypatch):
@@ -101,6 +110,22 @@ def test_purchase_succeeds_once_compliance_case_is_approved(client, db_session, 
         f"/compliance/cases/{case_id}/approve", headers={"Authorization": f"Bearer {staff_token}"}
     )
     assert approve.status_code == 200
+
+    # GB also has a real, active NumberEligibilityRule (Twilio Regulatory
+    # Bundle requirement) as of 2026-08-22 - a separate gate from the
+    # account-level KYC case just approved above. Not this test's real
+    # focus (it's testing the compliance-case retry path specifically),
+    # so clear it the fast way: staff directly approves the case, same as
+    # the compliance one above, rather than the full document/bundle flow
+    # covered by its own dedicated tests.
+    still_blocked = client.post("/numbers/purchase", json={"e164": "+442079460002"}, headers=headers)
+    assert still_blocked.status_code == 403, still_blocked.text
+    eligibility_case_id = _find_eligibility_case_id(db_session, "+442079460002")
+    approve_eligibility = client.post(
+        f"/staff/number-eligibility-cases/{eligibility_case_id}/approve",
+        headers={"Authorization": f"Bearer {staff_token}"},
+    )
+    assert approve_eligibility.status_code == 200, approve_eligibility.text
 
     response = client.post("/numbers/purchase", json={"e164": "+442079460002"}, headers=headers)
     assert response.status_code == 200, response.text
@@ -398,6 +423,17 @@ def test_purchase_retries_successfully_from_compliance_pending_after_approval(cl
     ).json()["access_token"]
     client.post(f"/compliance/cases/{case_id}/approve", headers={"Authorization": f"Bearer {staff_token}"})
 
+    # Same real, separate GB eligibility gate as test_purchase_succeeds_
+    # once_compliance_case_is_approved above - cleared the fast way here
+    # too, since this test's focus is the compliance-retry path.
+    still_blocked = client.post("/numbers/purchase", json={"e164": "+442079460012"}, headers=headers)
+    assert still_blocked.status_code == 403, still_blocked.text
+    eligibility_case_id = _find_eligibility_case_id(db_session, "+442079460012")
+    client.post(
+        f"/staff/number-eligibility-cases/{eligibility_case_id}/approve",
+        headers={"Authorization": f"Bearer {staff_token}"},
+    )
+
     retry = client.post("/numbers/purchase", json={"e164": "+442079460012"}, headers=headers)
     assert retry.status_code == 200, retry.text
     assert retry.json()["status"] == "active"
@@ -653,21 +689,6 @@ def test_staff_cannot_mark_renewed_a_number_not_yet_due(client, db_session, monk
 # --- Real Stripe Checkout for number purchase (test mode) ---
 
 
-def _stripe_webhook_body_and_signature(secret: str, event_type: str, session_object: dict) -> tuple[bytes, str]:
-    import hashlib
-    import hmac
-    import json
-    import time
-
-    body = json.dumps(
-        {"id": "evt_test", "object": "event", "type": event_type, "data": {"object": session_object}}
-    ).encode()
-    timestamp = str(int(time.time()))
-    signed_payload = f"{timestamp}.{body.decode()}"
-    signature = hmac.new(secret.encode(), signed_payload.encode(), hashlib.sha256).hexdigest()
-    return body, f"t={timestamp},v1={signature}"
-
-
 def test_create_checkout_session_requires_auth(client):
     response = client.post("/numbers/+15550013001/checkout-session")
     assert response.status_code == 401
@@ -681,39 +702,15 @@ def test_create_checkout_session_fails_when_number_not_reserved_by_account(clien
     assert response.status_code == 409
 
 
-def test_create_checkout_session_returns_stripe_hosted_url(client, monkeypatch):
-    monkeypatch.setattr("app.core.config.settings.stripe_payments_secret_key", "rk_test_fake")
-    monkeypatch.setattr(
-        "app.numbering.numbers.service.stripe_checkout.create_checkout_session",
-        lambda **kwargs: {"id": "cs_test_123", "url": "https://checkout.stripe.com/c/pay/cs_test_123"},
-    )
-
-    token = _signup_and_login(client, "checkoutsuccess@example.com")
-    headers = {"Authorization": f"Bearer {token}"}
-    _reserve(client, headers, "+15550013003")
-
-    response = client.post("/numbers/+15550013003/checkout-session", headers=headers)
-    assert response.status_code == 200, response.text
-    body = response.json()
-    assert body["id"] == "cs_test_123"
-    assert body["url"] == "https://checkout.stripe.com/c/pay/cs_test_123"
-    assert body["included"] is False
-    assert body["number"] is None
-
-
 def test_checkout_session_is_free_for_the_first_number_on_a_paid_plan(client, db_session, monkeypatch):
     """Global Plans, Pricing & Commercial Launch Standard doc: the first
     standard local number is included with a paid plan - a starter-plan
-    account's very first checkout must skip Stripe entirely and come back
-    already ACTIVE."""
+    account's very first checkout must come back already ACTIVE with no
+    charge, no pending-invoice-charge row at all."""
     from app.billing import service as billing_service
+    from app.billing.models import PendingAccountCharge
 
     _stub_buy_number(monkeypatch)
-    stripe_called = []
-    monkeypatch.setattr(
-        "app.numbering.numbers.service.stripe_checkout.create_checkout_session",
-        lambda **kwargs: stripe_called.append(kwargs) or {"id": "cs_should_not_be_called", "url": "https://x"},
-    )
 
     token = _signup_and_login(client, "checkoutincluded@example.com")
     headers = {"Authorization": f"Bearer {token}"}
@@ -727,21 +724,30 @@ def test_checkout_session_is_free_for_the_first_number_on_a_paid_plan(client, db
     assert body["included"] is True
     assert body["id"] is None
     assert body["url"] is None
+    assert body["pending_charge_amount_minor_units"] is None
     assert body["number"]["e164"] == "+15550013006"
     assert body["number"]["status"] == "active"
-    assert stripe_called == []
+    assert db_session.query(PendingAccountCharge).filter(PendingAccountCharge.account_id == account_id).count() == 0
 
 
-def test_checkout_session_charges_for_a_second_number_even_on_a_paid_plan(client, db_session, monkeypatch):
-    """Only the account's FIRST number is included - a second number on the
-    same paid plan must still go through Stripe like before."""
+def test_checkout_session_charges_for_a_second_number_creates_a_pending_charge_not_stripe(client, db_session, monkeypatch):
+    """Architecture doc §9: a non-included number is provisioned immediately
+    (the customer isn't blocked waiting on a redirect), and its cost is
+    recorded as a PendingAccountCharge for the next run_billing_cycle to
+    pick up alongside the plan fee - not a separate standalone Stripe
+    charge. Only the account's FIRST number is included - a second number
+    on the same paid plan is the paid path."""
     from app.billing import service as billing_service
+    from app.billing.models import PendingAccountCharge, PendingAccountChargeStatus
 
-    _stub_buy_number(monkeypatch)
-    monkeypatch.setattr("app.core.config.settings.stripe_payments_secret_key", "rk_test_fake")
+    # Not _stub_buy_number - that helper returns the same constant
+    # "PN_fake_sid" for every call, which collides on phone_numbers' real
+    # unique(provider_sid) constraint the moment a test purchases two
+    # numbers via the real telecom.buy_number path in one run (see the
+    # two-seat test below, which hit this exact issue first).
     monkeypatch.setattr(
-        "app.numbering.numbers.service.stripe_checkout.create_checkout_session",
-        lambda **kwargs: {"id": "cs_test_second", "url": "https://checkout.stripe.com/c/pay/cs_test_second"},
+        "app.numbering.numbers.service.telecom.buy_number",
+        lambda e164, bundle_sid=None: {"sid": f"PN_fake_{e164}", "phone_number": e164, "capabilities": {}},
     )
 
     token = _signup_and_login(client, "checkoutsecondnumber@example.com")
@@ -758,8 +764,20 @@ def test_checkout_session_charges_for_a_second_number_even_on_a_paid_plan(client
     assert second.status_code == 200, second.text
     body = second.json()
     assert body["included"] is False
-    assert body["id"] == "cs_test_second"
-    assert body["url"] == "https://checkout.stripe.com/c/pay/cs_test_second"
+    assert body["id"] is None
+    assert body["url"] is None
+    assert body["number"]["e164"] == "+15550013008"
+    assert body["number"]["status"] == "active"
+    assert body["pending_charge_amount_minor_units"] == 499
+
+    charge = (
+        db_session.query(PendingAccountCharge)
+        .filter(PendingAccountCharge.account_id == account_id)
+        .one()
+    )
+    assert charge.status == PendingAccountChargeStatus.PENDING
+    assert charge.amount_minor_units == 499
+    assert charge.charge_type == "number_purchase"
 
 
 def test_checkout_session_is_free_for_a_second_number_on_a_two_seat_account(client, db_session, monkeypatch):
@@ -770,22 +788,16 @@ def test_checkout_session_is_free_for_a_second_number_on_a_two_seat_account(clie
     numbers; a 3rd would still be charged, same as the single-seat case
     above."""
     from app.billing import service as billing_service
+    from app.billing.models import PendingAccountCharge
 
     # Not _stub_buy_number - that helper returns the same constant
     # "PN_fake_sid" for every call, which collides on phone_numbers'
     # real unique(provider_sid) constraint the moment a test actually
-    # purchases two numbers via the real telecom.buy_number path in one
-    # run (every prior test here only ever purchased one number this way,
-    # or purchased its "second" number through Stripe checkout instead -
-    # this is the first test to hit that combination).
+    # purchases more than one number via the real telecom.buy_number path
+    # in one run.
     monkeypatch.setattr(
         "app.numbering.numbers.service.telecom.buy_number",
-        lambda e164: {"sid": f"PN_fake_{e164}", "phone_number": e164, "capabilities": {}},
-    )
-    monkeypatch.setattr("app.core.config.settings.stripe_payments_secret_key", "rk_test_fake")
-    monkeypatch.setattr(
-        "app.numbering.numbers.service.stripe_checkout.create_checkout_session",
-        lambda **kwargs: {"id": "cs_test_third", "url": "https://checkout.stripe.com/c/pay/cs_test_third"},
+        lambda e164, bundle_sid=None: {"sid": f"PN_fake_{e164}", "phone_number": e164, "capabilities": {}},
     )
 
     token = _signup_and_login(client, "twoseatnumbers@example.com", account_type="business")
@@ -813,7 +825,9 @@ def test_checkout_session_is_free_for_a_second_number_on_a_two_seat_account(clie
     assert third.status_code == 200, third.text
     body = third.json()
     assert body["included"] is False
-    assert body["id"] == "cs_test_third"
+    assert body["id"] is None
+    assert body["pending_charge_amount_minor_units"] == 499
+    assert db_session.query(PendingAccountCharge).filter(PendingAccountCharge.account_id == account_id).count() == 1
 
 
 def test_non_commercial_account_cannot_create_a_checkout_session(client, db_session, monkeypatch):
@@ -822,7 +836,6 @@ def test_non_commercial_account_cannot_create_a_checkout_session(client, db_sess
     a live charge, even if everything else about the request is valid."""
     from app.numbering.identity.models import Account, AccountBillingClassification
 
-    monkeypatch.setattr("app.core.config.settings.stripe_payments_secret_key", "rk_test_fake")
     token = _signup_and_login(client, "checkoutdemo@example.com")
     headers = {"Authorization": f"Bearer {token}"}
     account_id = client.get("/auth/me", headers=headers).json()["account_id"]
@@ -836,234 +849,25 @@ def test_non_commercial_account_cannot_create_a_checkout_session(client, db_sess
     assert response.status_code == 403
 
 
-def test_create_checkout_session_returns_502_when_stripe_call_fails(client, monkeypatch):
-    from app.integrations.billing.stripe_checkout import PaymentError
+def test_create_checkout_session_returns_502_when_telecom_provider_fails(client, monkeypatch):
+    """The paid, non-included path now calls purchase_number() (and
+    therefore the telecom provider) synchronously in the same request,
+    same as the already-free included path always has - a provider
+    failure must surface as the same clean customer-facing 502 as every
+    other route that provisions a number."""
+    from app.integrations.telecom.twilio import TelecomError
 
-    monkeypatch.setattr("app.core.config.settings.stripe_payments_secret_key", "rk_test_fake")
+    def _raise(e164, bundle_sid=None):
+        raise TelecomError("Trial account has reached the maximum number of phone numbers allowed.")
 
-    def _raise(**kwargs):
-        raise PaymentError("Stripe create checkout session failed: connection timed out")
+    monkeypatch.setattr("app.numbering.numbers.service.telecom.buy_number", _raise)
 
-    monkeypatch.setattr("app.numbering.numbers.service.stripe_checkout.create_checkout_session", _raise)
-
-    token = _signup_and_login(client, "checkoutstripedown@example.com")
+    token = _signup_and_login(client, "checkouttelecomdown@example.com")
     headers = {"Authorization": f"Bearer {token}"}
     _reserve(client, headers, "+15550013004")
 
     response = client.post("/numbers/+15550013004/checkout-session", headers=headers)
     assert response.status_code == 502
-
-
-def test_stripe_payment_webhook_rejects_invalid_signature(client, monkeypatch):
-    monkeypatch.setattr("app.core.config.settings.stripe_payments_webhook_secret", "whsec_test")
-    body, _ = _stripe_webhook_body_and_signature(
-        "whsec_test", "checkout.session.completed", {"id": "cs_test_bad_sig", "metadata": {}}
-    )
-    response = client.post(
-        "/numbers/payments/webhook", content=body, headers={"Stripe-Signature": "t=123,v1=not-real"}
-    )
-    assert response.status_code == 403
-
-
-def test_stripe_payment_webhook_completes_the_purchase(client, db_session, monkeypatch):
-    """End-to-end: reserve -> real (mocked-at-the-SDK-boundary) Stripe
-    webhook fires checkout.session.completed -> the number reaches ACTIVE
-    via the existing purchase_number flow, with no direct call to
-    /numbers/purchase anywhere in this test."""
-    _stub_buy_number(monkeypatch)
-    monkeypatch.setattr("app.core.config.settings.stripe_payments_webhook_secret", "whsec_test")
-
-    token = _signup_and_login(client, "checkoutwebhook@example.com")
-    headers = {"Authorization": f"Bearer {token}"}
-    account_id = client.get("/auth/me", headers=headers).json()["account_id"]
-    _reserve(client, headers, "+15550013005")
-
-    body, signature = _stripe_webhook_body_and_signature(
-        "whsec_test", "checkout.session.completed",
-        {"id": "cs_test_complete", "metadata": {"e164": "+15550013005", "account_id": account_id}},
-    )
-    response = client.post("/numbers/payments/webhook", content=body, headers={"Stripe-Signature": signature})
-    assert response.status_code == 204
-
-    numbers = client.get("/numbers", headers=headers).json()
-    purchased = next(n for n in numbers if n["e164"] == "+15550013005")
-    assert purchased["status"] == "active"
-
-
-def test_stripe_payment_webhook_is_idempotent_against_retried_delivery(client, db_session, monkeypatch):
-    _stub_buy_number(monkeypatch)
-    monkeypatch.setattr("app.core.config.settings.stripe_payments_webhook_secret", "whsec_test")
-
-    token = _signup_and_login(client, "checkoutwebhookretry@example.com")
-    headers = {"Authorization": f"Bearer {token}"}
-    account_id = client.get("/auth/me", headers=headers).json()["account_id"]
-    _reserve(client, headers, "+15550013006")
-
-    body, signature = _stripe_webhook_body_and_signature(
-        "whsec_test", "checkout.session.completed",
-        {"id": "cs_test_retry", "metadata": {"e164": "+15550013006", "account_id": account_id}},
-    )
-    first = client.post("/numbers/payments/webhook", content=body, headers={"Stripe-Signature": signature})
-    assert first.status_code == 204
-    # Stripe redelivers the same event (at-least-once delivery) - must not
-    # error even though the number is no longer purchasable.
-    second = client.post("/numbers/payments/webhook", content=body, headers={"Stripe-Signature": signature})
-    assert second.status_code == 204
-
-
-def test_stripe_payment_webhook_refunds_a_genuine_fulfillment_failure(client, db_session, monkeypatch):
-    """The exact scenario hit live during manual testing: payment succeeds,
-    Twilio then can't provision the number (e.g. trial account number
-    limit) - the customer paid for nothing, so the payment must be
-    refunded automatically."""
-    from app.integrations.telecom.twilio import TelecomError
-
-    def _raise_buy(e164):
-        raise TelecomError("Trial account has reached the maximum number of phone numbers allowed.")
-
-    monkeypatch.setattr("app.numbering.numbers.service.telecom.buy_number", _raise_buy)
-    monkeypatch.setattr("app.core.config.settings.stripe_payments_webhook_secret", "whsec_test")
-
-    refund_calls = []
-    monkeypatch.setattr(
-        "app.numbering.numbers.service.stripe_checkout.refund_payment",
-        lambda payment_intent_id: refund_calls.append(payment_intent_id)
-        or {"id": "re_test", "status": "succeeded", "amount": 499, "currency": "usd"},
-    )
-
-    token = _signup_and_login(client, "checkoutrefund1@example.com")
-    headers = {"Authorization": f"Bearer {token}"}
-    account_id = client.get("/auth/me", headers=headers).json()["account_id"]
-    _reserve(client, headers, "+15550013007")
-
-    body, signature = _stripe_webhook_body_and_signature(
-        "whsec_test", "checkout.session.completed",
-        {
-            "id": "cs_test_refund", "payment_intent": "pi_test_refund_me",
-            "metadata": {"e164": "+15550013007", "account_id": account_id},
-        },
-    )
-    response = client.post("/numbers/payments/webhook", content=body, headers={"Stripe-Signature": signature})
-    assert response.status_code == 204
-    assert refund_calls == ["pi_test_refund_me"]
-
-    numbers = client.get("/numbers", headers=headers).json()
-    number = next(n for n in numbers if n["e164"] == "+15550013007")
-    assert number["status"] == "reserved"  # released back, not stranded
-
-
-def test_stripe_payment_webhook_refunds_when_reservation_expired_before_it_arrived(client, db_session, monkeypatch):
-    """Confirmed live during a production acceptance test (2026-08-13): a
-    real Stripe payment that completes after RESERVATION_TTL_MINUTES has
-    already lapsed was silently kept - purchase_number's ReservationExpired
-    Error used to be indistinguishable from the harmless "already
-    fulfilled/duplicate webhook" NumberConflictError case, so no refund
-    ever fired. This is the real customer-money scenario that fix covers -
-    distinct from the "genuine fulfillment failure" (Twilio rejects the
-    purchase) and "idempotent replay" (already ACTIVE) tests above/below,
-    where the number itself is still sitting RESERVED, just past its TTL."""
-    from datetime import datetime, timedelta, timezone
-
-    from app.numbering.numbers.models import PhoneNumber
-
-    monkeypatch.setattr("app.core.config.settings.stripe_payments_webhook_secret", "whsec_test")
-    refund_calls = []
-    monkeypatch.setattr(
-        "app.numbering.numbers.service.stripe_checkout.refund_payment",
-        lambda payment_intent_id: refund_calls.append(payment_intent_id)
-        or {"id": "re_test", "status": "succeeded", "amount": 499, "currency": "usd"},
-    )
-
-    token = _signup_and_login(client, "checkoutrefund4@example.com")
-    headers = {"Authorization": f"Bearer {token}"}
-    account_id = client.get("/auth/me", headers=headers).json()["account_id"]
-    _reserve(client, headers, "+15550013010")
-
-    number = db_session.query(PhoneNumber).filter(PhoneNumber.e164 == "+15550013010").first()
-    number.reserved_until = datetime.now(timezone.utc) - timedelta(minutes=1)
-    db_session.commit()
-
-    body, signature = _stripe_webhook_body_and_signature(
-        "whsec_test", "checkout.session.completed",
-        {
-            "id": "cs_test_expired", "payment_intent": "pi_test_expired_reservation",
-            "metadata": {"e164": "+15550013010", "account_id": account_id},
-        },
-    )
-    response = client.post("/numbers/payments/webhook", content=body, headers={"Stripe-Signature": signature})
-    assert response.status_code == 204
-    assert refund_calls == ["pi_test_expired_reservation"]
-
-
-def test_stripe_payment_webhook_does_not_refund_a_compliance_pending_outcome(client, db_session, monkeypatch):
-    """Compliance-pending is not a failure - the customer still gets the
-    number once their case is approved, so the payment must be kept."""
-    from app.compliance.models import ComplianceRule
-
-    db_session.add(ComplianceRule(country="US", requirement_type="kyc_individual", is_active=True))
-    db_session.commit()
-
-    monkeypatch.setattr("app.core.config.settings.stripe_payments_webhook_secret", "whsec_test")
-    refund_calls = []
-    monkeypatch.setattr(
-        "app.numbering.numbers.service.stripe_checkout.refund_payment",
-        lambda payment_intent_id: refund_calls.append(payment_intent_id),
-    )
-
-    token = _signup_and_login(client, "checkoutrefund2@example.com")
-    headers = {"Authorization": f"Bearer {token}"}
-    account_id = client.get("/auth/me", headers=headers).json()["account_id"]
-    _reserve(client, headers, "+15550013008")
-
-    body, signature = _stripe_webhook_body_and_signature(
-        "whsec_test", "checkout.session.completed",
-        {
-            "id": "cs_test_compliance", "payment_intent": "pi_test_compliance",
-            "metadata": {"e164": "+15550013008", "account_id": account_id},
-        },
-    )
-    response = client.post("/numbers/payments/webhook", content=body, headers={"Stripe-Signature": signature})
-    assert response.status_code == 204
-    assert refund_calls == []
-
-    numbers = client.get("/numbers", headers=headers).json()
-    number = next(n for n in numbers if n["e164"] == "+15550013008")
-    assert number["status"] == "compliance_pending"
-
-
-def test_stripe_payment_webhook_does_not_refund_an_idempotent_replay(client, db_session, monkeypatch):
-    _stub_buy_number(monkeypatch)
-    monkeypatch.setattr("app.core.config.settings.stripe_payments_webhook_secret", "whsec_test")
-    refund_calls = []
-    monkeypatch.setattr(
-        "app.numbering.numbers.service.stripe_checkout.refund_payment",
-        lambda payment_intent_id: refund_calls.append(payment_intent_id),
-    )
-
-    token = _signup_and_login(client, "checkoutrefund3@example.com")
-    headers = {"Authorization": f"Bearer {token}"}
-    account_id = client.get("/auth/me", headers=headers).json()["account_id"]
-    _reserve(client, headers, "+15550013009")
-
-    body, signature = _stripe_webhook_body_and_signature(
-        "whsec_test", "checkout.session.completed",
-        {
-            "id": "cs_test_noreplay", "payment_intent": "pi_test_noreplay",
-            "metadata": {"e164": "+15550013009", "account_id": account_id},
-        },
-    )
-    client.post("/numbers/payments/webhook", content=body, headers={"Stripe-Signature": signature})
-    client.post("/numbers/payments/webhook", content=body, headers={"Stripe-Signature": signature})
-    assert refund_calls == []
-
-
-def test_stripe_payment_webhook_ignores_unrelated_event_types(client, monkeypatch):
-    monkeypatch.setattr("app.core.config.settings.stripe_payments_webhook_secret", "whsec_test")
-    body, signature = _stripe_webhook_body_and_signature(
-        "whsec_test", "payment_intent.created", {"id": "pi_test_unrelated"}
-    )
-    response = client.post("/numbers/payments/webhook", content=body, headers={"Stripe-Signature": signature})
-    assert response.status_code == 204
 
 
 # --- Market Activation Registry ---
@@ -1357,3 +1161,183 @@ def test_renewal_does_not_exempt_a_free_trial_accounts_number(client, db_session
         UsageEvent.event_type == "number_month", UsageEvent.account_id == account_id
     ).all()
     assert len(events) == 1
+
+
+# --- Twilio Regulatory Bundle eligibility (real gap closed 2026-08-22) ---
+
+
+def _open_eligibility_case_via_blocked_checkout(client, db_session, staff_headers, headers, *, code: str, e164: str):
+    """Real product behavior: a NumberEligibilityCase is auto-opened the
+    first time a checkout attempt hits an active NumberEligibilityRule for
+    that country/number_type - there's no direct "open a case" endpoint,
+    matching create_number_purchase_checkout_session's own docstring."""
+    _upsert_market_country(client, staff_headers, code)
+    _set_market_status(client, staff_headers, code, "paid_open")
+    client.put(
+        "/staff/number-eligibility-rules",
+        json={
+            "country": code, "number_type": "local",
+            "required_evidence": ["first_name", "last_name", "email", "phone_number", "government_issued_document"],
+            "is_active": True, "emergency_calling_supported": False,
+            "recording_supported": True, "allowed_calling_directions": "both",
+        },
+        headers=staff_headers,
+    )
+    _reserve(client, headers, e164, country=code)
+    response = client.post(f"/numbers/{e164}/checkout-session", headers=headers)
+    assert response.status_code == 403, response.text
+
+    from app.numbering.numbers.models import NumberEligibilityCase, PhoneNumber
+
+    number = db_session.query(PhoneNumber).filter(PhoneNumber.e164 == e164).first()
+    case = db_session.query(NumberEligibilityCase).filter(NumberEligibilityCase.phone_number_id == number.id).first()
+    assert case is not None
+    return case
+
+
+def test_submit_eligibility_document_uploads_and_appears_on_case(client, db_session, monkeypatch):
+    monkeypatch.setattr(
+        "app.numbering.numbers.service.storage.upload_object", lambda key, data, content_type: None,
+    )
+    staff_token = _create_staff_and_login(client, db_session, "staffelig1@zoikolocal.com")
+    staff_headers = {"Authorization": f"Bearer {staff_token}"}
+    token = _signup_and_login(client, "eligdoc1@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    case = _open_eligibility_case_via_blocked_checkout(
+        client, db_session, staff_headers, headers, code="E1", e164="+9990011001"
+    )
+
+    response = client.post(
+        f"/numbers/eligibility-cases/{case.id}/documents",
+        data={"document_type": "government_issued_document"},
+        files={"file": ("id.png", b"fake-image-bytes", "image/png")},
+        headers=headers,
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert len(body["documents"]) == 1
+    assert body["documents"][0]["document_type"] == "government_issued_document"
+    assert body["documents"][0]["filename"] == "id.png"
+
+
+def test_submit_eligibility_document_rejects_unsupported_content_type(client, db_session, monkeypatch):
+    monkeypatch.setattr(
+        "app.numbering.numbers.service.storage.upload_object", lambda key, data, content_type: None,
+    )
+    staff_token = _create_staff_and_login(client, db_session, "staffelig2@zoikolocal.com")
+    staff_headers = {"Authorization": f"Bearer {staff_token}"}
+    token = _signup_and_login(client, "eligdoc2@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    case = _open_eligibility_case_via_blocked_checkout(
+        client, db_session, staff_headers, headers, code="E2", e164="+9990011002"
+    )
+
+    response = client.post(
+        f"/numbers/eligibility-cases/{case.id}/documents",
+        data={"document_type": "government_issued_document"},
+        files={"file": ("id.exe", b"not-a-real-document", "application/x-msdownload")},
+        headers=headers,
+    )
+    assert response.status_code == 422
+
+
+def test_submit_eligibility_bundle_requires_a_document_first(client, db_session):
+    staff_token = _create_staff_and_login(client, db_session, "staffelig3@zoikolocal.com")
+    staff_headers = {"Authorization": f"Bearer {staff_token}"}
+    token = _signup_and_login(client, "eligbundle1@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    case = _open_eligibility_case_via_blocked_checkout(
+        client, db_session, staff_headers, headers, code="E3", e164="+9990011003"
+    )
+
+    response = client.post(
+        f"/numbers/eligibility-cases/{case.id}/submit-bundle",
+        json={
+            "end_user_attributes": {
+                "first_name": "Ada", "last_name": "Lovelace", "email": "ada@example.com", "phone_number": "+447000000000",
+            },
+        },
+        headers=headers,
+    )
+    assert response.status_code == 422
+    assert "document" in response.json()["detail"].lower()
+
+
+def test_sync_eligibility_bundle_status_approves_case_and_unblocks_purchase(client, db_session, monkeypatch):
+    """End-to-end (Twilio calls monkeypatched at the Provider Gateway
+    boundary, everything else real): upload -> submit bundle -> Twilio
+    approves -> sync picks that up -> the SAME NumberEligibilityCaseStatus.
+    APPROVED purchase_number already checks via has_approved_eligibility_case
+    unblocks the retry, with no separate purchase-gate code needed."""
+    monkeypatch.setattr(
+        "app.numbering.numbers.service.storage.upload_object", lambda key, data, content_type: None,
+    )
+    monkeypatch.setattr(
+        "app.numbering.numbers.service.storage.download_object", lambda key: b"fake-image-bytes",
+    )
+    monkeypatch.setattr(
+        "app.numbering.numbers.service.telecom.create_regulatory_end_user",
+        lambda **kwargs: {"sid": "BV_fake_end_user", "type": kwargs["end_user_type"]},
+    )
+    monkeypatch.setattr(
+        "app.numbering.numbers.service.telecom.upload_supporting_document",
+        lambda **kwargs: {"sid": "RD_fake_doc", "type": kwargs["document_type"]},
+    )
+    monkeypatch.setattr(
+        "app.numbering.numbers.service.telecom.create_regulatory_bundle",
+        lambda **kwargs: {"sid": "BU_fake_bundle", "status": "draft"},
+    )
+    monkeypatch.setattr(
+        "app.numbering.numbers.service.telecom.create_bundle_item_assignment",
+        lambda bundle_sid, object_sid: {"sid": "BA_fake_assignment"},
+    )
+    monkeypatch.setattr(
+        "app.numbering.numbers.service.telecom.submit_bundle_for_review",
+        lambda bundle_sid: {"sid": bundle_sid, "status": "pending-review"},
+    )
+    monkeypatch.setattr(
+        "app.numbering.numbers.service.telecom.get_bundle_status",
+        lambda bundle_sid: {"sid": bundle_sid, "status": "twilio-approved", "rejection_reason": None},
+    )
+    _stub_buy_number(monkeypatch)
+
+    staff_token = _create_staff_and_login(client, db_session, "staffelig4@zoikolocal.com")
+    staff_headers = {"Authorization": f"Bearer {staff_token}"}
+    token = _signup_and_login(client, "eligbundle2@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    e164 = "+9990011004"
+
+    case = _open_eligibility_case_via_blocked_checkout(
+        client, db_session, staff_headers, headers, code="E4", e164=e164
+    )
+
+    client.post(
+        f"/numbers/eligibility-cases/{case.id}/documents",
+        data={"document_type": "government_issued_document"},
+        files={"file": ("id.png", b"fake-image-bytes", "image/png")},
+        headers=headers,
+    )
+    submitted = client.post(
+        f"/numbers/eligibility-cases/{case.id}/submit-bundle",
+        json={
+            "end_user_attributes": {
+                "first_name": "Ada", "last_name": "Lovelace", "email": "ada@example.com", "phone_number": "+447000000000",
+            },
+        },
+        headers=headers,
+    )
+    assert submitted.status_code == 200, submitted.text
+    assert submitted.json()["twilio_bundle_sid"] == "BU_fake_bundle"
+    assert submitted.json()["twilio_bundle_status"] == "pending-review"
+
+    synced = client.post(f"/numbers/eligibility-cases/{case.id}/sync-bundle-status", headers=headers)
+    assert synced.status_code == 200, synced.text
+    assert synced.json()["status"] == "approved"
+    assert synced.json()["twilio_bundle_status"] == "twilio-approved"
+
+    retry = client.post(f"/numbers/{e164}/checkout-session", headers=headers)
+    assert retry.status_code == 200, retry.text
+    assert retry.json()["number"]["status"] == "active"

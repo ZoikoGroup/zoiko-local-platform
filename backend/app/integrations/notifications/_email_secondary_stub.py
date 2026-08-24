@@ -14,15 +14,26 @@ from app.integrations.notifications.email import EmailError
 _SEND_URL = "https://api.sendgrid.com/v3/mail/send"
 
 
-def send_email(to: str, subject: str, body: str, headers: dict[str, str] | None = None) -> str | None:
+def send_email(
+    to: str,
+    subject: str,
+    body: str,
+    headers: dict[str, str] | None = None,
+    html: str | None = None,
+    from_address: str | None = None,
+) -> str | None:
     if not settings.sendgrid_api_key:
         raise EmailError("Secondary email provider (SendGrid) is not configured - set SENDGRID_API_KEY")
 
+    content = [{"type": "text/plain", "value": body}]
+    if html:
+        content.append({"type": "text/html", "value": html})
+
     payload = {
         "personalizations": [{"to": [{"email": to}]}],
-        "from": {"email": settings.email_from_address},
+        "from": {"email": from_address or settings.email_from_address},
         "subject": subject,
-        "content": [{"type": "text/plain", "value": body}],
+        "content": content,
     }
     if headers:
         payload["headers"] = headers

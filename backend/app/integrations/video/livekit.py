@@ -120,12 +120,17 @@ async def end_room(room_name: str) -> None:
     await with_failover_async(_breaker, _primary, secondary_fn, VideoError)
 
 
-async def start_room_recording(room_name: str) -> str:
+async def start_room_recording(room_name: str, object_key: str) -> str:
     """Starts a composite (mixed) recording of the whole room, uploaded to
     the configured S3-compatible bucket - LiveKit's Egress API has no free
     built-in storage, every request must specify a real destination. Returns
     the egress_id, needed to stop it later and to correlate the webhook's
     egress_ended event back to this session.
+
+    object_key is the caller's choice of S3 path (see media.service.
+    start_video_recording) - deliberately not derived from room_name here,
+    since room_name is an internal random id ("zl-<uuid hex>"), unfit for a
+    filename a human ever sees.
     """
     if not (settings.s3_bucket and settings.s3_access_key_id and settings.s3_secret_access_key):
         raise VideoError(
@@ -155,10 +160,7 @@ async def start_room_recording(room_name: str) -> str:
                     file_outputs=[
                         livekit_api.EncodedFileOutput(
                             file_type=livekit_api.EncodedFileType.MP4,
-                            # room_name is already globally unique (zl-<uuid hex>)
-                            # and a room is only ever recorded once in this design,
-                            # so no need for LiveKit's {time}-style filepath templates.
-                            filepath=f"recordings/{room_name}.mp4",
+                            filepath=object_key,
                             s3=s3_upload,
                         )
                     ],
@@ -184,6 +186,35 @@ async def stop_room_recording(egress_id: str) -> None:
         raise VideoError(str(e)) from e
     finally:
         await client.aclose()
+
+
+async def get_egress_status(egress_id: str) -> dict | None:
+    """Direct poll of LiveKit's own record of an egress job - the source of
+    truth the egress_ended webhook is only ever a notification about.
+    Confirmed live (2026-08-21): a webhook can go missing (e.g. our own
+    backend restarting mid-delivery) for a recording that genuinely
+    completed successfully on LiveKit's side, with a real file already
+    uploaded - blindly trusting elapsed time and declaring it failed would
+    have permanently hidden a real, existing recording from the customer.
+    Returns None if LiveKit has no record of this egress_id at all."""
+    try:
+        client = _client()
+    except ValueError as e:
+        raise VideoError(str(e)) from e
+
+    try:
+        with trace_provider_call("livekit", "get_egress_status"):
+            result = await client.egress.list_egress(livekit_api.ListEgressRequest(egress_id=egress_id))
+    except livekit_api.TwirpError as e:
+        raise VideoError(str(e)) from e
+    finally:
+        await client.aclose()
+
+    if not result.items:
+        return None
+    info = result.items[0]
+    location = info.file_results[0].location if info.file_results else info.file.location
+    return {"status": info.status, "location": location or None, "error": info.error}
 
 
 def verify_webhook_event(body: str, auth_token: str) -> livekit_api.WebhookEvent:

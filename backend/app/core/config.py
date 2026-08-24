@@ -96,6 +96,10 @@ class Settings(BaseSettings):
     s3_region: str = "auto"
 
     groq_api_key: str = ""
+    # Path to the ffmpeg binary - "ffmpeg" (relying on PATH) works once
+    # backend/Dockerfile's `apt-get install ffmpeg` is in the image. Only
+    # needs overriding for local dev on a machine without ffmpeg on PATH.
+    ffmpeg_path: str = "ffmpeg"
 
     # Cohere (integrations/embeddings) - real semantic search over AI
     # summaries. Free trial key, rate-limited, no billing account needed
@@ -161,6 +165,23 @@ class Settings(BaseSettings):
     # Blank until a webhook endpoint is registered in the Resend dashboard;
     # handle_resend_webhook rejects every event as unverified until it's set.
     resend_webhook_secret: str = ""
+
+    # Sender-domain separation (Email Communications System doc: marketing
+    # mail sharing one sending reputation with security/billing mail risks
+    # dragging down deliverability for password resets if marketing ever
+    # gets flagged as spam). zoikolocal.com is the real domain to use, per
+    # the founder (2026-08-22) - but Resend's own domain-verification step
+    # (adding real DKIM/SPF/DMARC DNS records it generates and waiting for
+    # them to propagate) has NOT been done yet, so this stays False until
+    # that's confirmed. While False, every category below falls back to
+    # email_from_address (today's single working address) - flipping this
+    # true before DNS is actually verified would make every category email
+    # start bouncing, not just marketing's.
+    email_domain_verified: bool = False
+    email_from_address_security: str = "security@zoikolocal.com"
+    email_from_address_billing: str = "billing@zoikolocal.com"
+    email_from_address_marketing: str = "marketing@zoikolocal.com"
+    email_from_address_notifications: str = "notifications@zoikolocal.com"
 
     # Web Push (integrations/notifications/webpush.py) - browser push
     # notifications, since no native iOS/Android app exists. Self-generated

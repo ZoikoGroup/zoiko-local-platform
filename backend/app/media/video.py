@@ -278,6 +278,7 @@ async def list_rooms(
             "ended_at": s.ended_at,
             "recording_in_progress": media_service.is_recording_in_progress(s),
             "recording_url": media_service.get_recording_download_url(s),
+            "recording_failed": s.recording_url == media_service.RECORDING_FAILED_MARKER,
             "participant_minutes": media_service.get_participant_minutes(db, s.id),
             "confidential": s.confidential,
             **media_service.get_call_quality_summary(db, s.id),

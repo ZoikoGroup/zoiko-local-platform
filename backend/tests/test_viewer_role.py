@@ -41,7 +41,7 @@ def _add_viewer(client, owner_headers, email: str) -> str:
 def _stub_buy_number(monkeypatch):
     monkeypatch.setattr(
         "app.numbering.numbers.service.telecom.buy_number",
-        lambda e164: {"sid": "PN_fake_sid", "phone_number": e164, "capabilities": {}},
+        lambda e164, bundle_sid=None: {"sid": "PN_fake_sid", "phone_number": e164, "capabilities": {}},
     )
 
 

@@ -8,7 +8,9 @@ outcome state (no bare `invoice.status = "PAID"`-style shortcuts - see
 
 What's real here: every step calls the actual route/service code path
 that a real customer or staff action would trigger - signup, consent,
-plan change, number reserve, Stripe webhook-driven purchase completion,
+plan change, number reserve, checkout-session-driven purchase completion
+(Architecture doc §9 - a number is provisioned immediately at checkout
+time, no separate payment round trip; real gap fixed 2026-08-22),
 inbound/outbound calling, AI summarization, the real rating->invoice->
 payment billing cycle (staff maker-checker), reconciliation, cancellation,
 number release.
@@ -24,10 +26,6 @@ discipline the rest of this test suite already uses everywhere:
   autouse mock_zoikonex_sync fixture (a real self-hosted ZoikoNex instance
   isn't reachable in this environment - see docs/zoikonex-defect-packet-
   2026-08-13.md). Not re-mocked here; this test just inherits it.
-- Stripe - the hosted Checkout page itself can't be driven headlessly by
-  any automated test; this simulates the webhook it produces on
-  completion (checkout.session.completed), the same real, signature-
-  verified path production actually receives from Stripe.
 
 A voicemail row is seeded directly (recording_url pointing at a fake
 object) rather than driven through a real Twilio <Record> callback chain -
@@ -59,16 +57,15 @@ usage -> number release/refund where applicable):
   billing.service.run_billing_cycle, and GET /billing/invoices) and
   verified below.
 - number release/refund where applicable: the golden path's own number
-  purchase succeeds, so it only exercises the "release" half - the
-  "refund" half is a genuinely different scenario (payment succeeded,
-  provisioning failed afterward) and is covered in the second test below,
-  test_refund_fires_when_post_payment_provisioning_fails.
+  purchase succeeds, so it only exercises the "release" half. The
+  "failure" half - carrier rejects provisioning - is a genuinely
+  different scenario, covered in the second test below,
+  test_customer_is_notified_when_provisioning_fails. Note: since nothing
+  is charged until the account's next real invoice (no payment happens
+  at checkout time at all anymore), there is no "refund" concept for
+  this failure mode the way there used to be under the old Stripe-first
+  flow - only a customer notification that the order wasn't fulfilled.
 """
-import hashlib
-import hmac
-import json
-import time
-
 from twilio.request_validator import RequestValidator
 
 from app.core.config import settings
@@ -91,16 +88,6 @@ def _signup_and_login(client, email: str) -> tuple[str, str]:
 
 def _twilio_signature(url: str, params: dict) -> str:
     return RequestValidator(settings.twilio_auth_token).compute_signature(url, params)
-
-
-def _stripe_webhook_body_and_signature(secret: str, event_type: str, session_object: dict) -> tuple[bytes, str]:
-    body = json.dumps(
-        {"id": "evt_e2e_test", "object": "event", "type": event_type, "data": {"object": session_object}}
-    ).encode()
-    timestamp = str(int(time.time()))
-    signed_payload = f"{timestamp}.{body.decode()}"
-    signature = hmac.new(secret.encode(), signed_payload.encode(), hashlib.sha256).hexdigest()
-    return body, f"t={timestamp},v1={signature}"
 
 
 def _create_and_login_staff(db_session, client, email: str, role):
@@ -138,24 +125,19 @@ def test_golden_path_signup_through_number_release(client, db_session, monkeypat
     )
     assert reserve_response.status_code == 201, reserve_response.text
 
-    # 5. Payment authorization + compliant number provisioning - a real
-    # Stripe Checkout page can't be driven headlessly, so this simulates
-    # the signature-verified webhook it actually sends on completion (the
-    # same path test_stripe_payment_webhook_completes_the_purchase covers
-    # in isolation) rather than calling /numbers/purchase directly.
+    # 5. Compliant number provisioning - Architecture doc §9: numbers no
+    # longer go through a separate Stripe Checkout/webhook round trip
+    # (real gap fixed 2026-08-22) - the checkout-session endpoint
+    # provisions immediately. This account's first number on a paid
+    # "starter" plan is included, so this is the $0 path.
     monkeypatch.setattr(
         "app.numbering.numbers.service.telecom.buy_number",
-        lambda e164: {"sid": "PN_e2e_fake_sid", "phone_number": e164, "capabilities": {}},
+        lambda e164, bundle_sid=None: {"sid": "PN_e2e_fake_sid", "phone_number": e164, "capabilities": {}},
     )
-    monkeypatch.setattr("app.core.config.settings.stripe_payments_webhook_secret", "whsec_e2e_test")
-    webhook_body, webhook_signature = _stripe_webhook_body_and_signature(
-        "whsec_e2e_test", "checkout.session.completed",
-        {"id": "cs_e2e_test", "metadata": {"e164": "+15550091234", "account_id": account_id}},
-    )
-    purchase_webhook_response = client.post(
-        "/numbers/payments/webhook", content=webhook_body, headers={"Stripe-Signature": webhook_signature},
-    )
-    assert purchase_webhook_response.status_code == 204
+    purchase_response = client.post("/numbers/+15550091234/checkout-session", headers=headers)
+    assert purchase_response.status_code == 200, purchase_response.text
+    assert purchase_response.json()["included"] is True
+    assert purchase_response.json()["number"]["status"] == "active"
 
     numbers = client.get("/numbers", headers=headers).json()
     purchased_number = next(n for n in numbers if n["e164"] == "+15550091234")
@@ -363,21 +345,23 @@ def test_golden_path_signup_through_number_release(client, db_session, monkeypat
     assert {e["event_type"] for e in final_usage} == {"call_seconds", "ai_summary"}
 
 
-def test_refund_fires_when_post_payment_provisioning_fails(client, db_session, monkeypatch):
-    """The golden path above only exercises "number release" (the happy
-    path - purchase succeeds, customer later cancels/releases it). This is
-    the other real outcome the acceptance chain's "number release/refund
-    where applicable" line asks for: the customer paid via Stripe, but
-    provisioning failed afterward (e.g. a carrier-side rejection) - the
-    codebase has always auto-refunded this via complete_number_purchase_
-    from_checkout's ReservationExpiredError/NumberQuotaExceededError/
-    BillingSuspendedError/EmergencyDisclosureRequiredError/TelecomError
-    branches, but the customer had no notification a refund happened until
-    notify_credit_or_refund_processed was wired in - verified here."""
+def test_customer_is_notified_when_provisioning_fails(client, db_session, monkeypatch):
+    """The golden path above only exercises the happy path (purchase
+    succeeds, customer later cancels/releases it). This is the other real
+    outcome the acceptance chain's "number release/refund where
+    applicable" line asks for: a carrier-side rejection during
+    provisioning. Architecture doc §9 (real gap fixed 2026-08-22): a
+    number is provisioned immediately at checkout time with no payment
+    collected upfront at all (cost is recorded as a pending charge and
+    billed alongside the plan fee later) - so a failure here has nothing
+    to refund, unlike the old Stripe-charges-then-provisions flow this
+    test used to cover. purchase_number's TelecomError branch reverts the
+    number to RESERVED and notifies the customer via notify_number_order_
+    not_approved - verified here."""
     from app.integrations.telecom.twilio import TelecomError
     from app.numbering.numbers.models import PhoneNumber, PhoneNumberStatus
 
-    def _reject_purchase(e164: str):
+    def _reject_purchase(e164: str, bundle_sid=None):
         raise TelecomError("carrier rejected this number")
 
     token, account_id = _signup_and_login(client, "e2erefund@example.com")
@@ -392,54 +376,33 @@ def test_refund_fires_when_post_payment_provisioning_fails(client, db_session, m
     )
     assert reserve_response.status_code == 201, reserve_response.text
 
-    # Payment succeeds (real, signature-verified Stripe webhook path - same
-    # as the golden path above), but the carrier rejects the actual number
-    # purchase afterward - a genuine, already-handled post-payment failure
-    # mode, not a shortcut.
+    # The carrier rejects the actual number purchase - a genuine,
+    # already-handled post-checkout failure mode, not a shortcut.
     monkeypatch.setattr("app.numbering.numbers.service.telecom.buy_number", _reject_purchase)
-    refund_calls: list[str] = []
-    monkeypatch.setattr(
-        "app.integrations.billing.stripe_checkout.refund_payment",
-        lambda payment_intent_id: refund_calls.append(payment_intent_id)
-        or {"id": "re_e2e_test", "status": "succeeded", "amount": 499, "currency": "usd"},
-    )
-    monkeypatch.setattr("app.core.config.settings.stripe_payments_webhook_secret", "whsec_e2e_refund")
-    webhook_body, webhook_signature = _stripe_webhook_body_and_signature(
-        "whsec_e2e_refund", "checkout.session.completed",
-        {
-            "id": "cs_e2e_refund_test", "payment_intent": "pi_e2e_refund_test",
-            "metadata": {"e164": "+15550091999", "account_id": account_id},
-        },
-    )
-    webhook_response = client.post(
-        "/numbers/payments/webhook", content=webhook_body, headers={"Stripe-Signature": webhook_signature},
-    )
-    assert webhook_response.status_code == 204
+    checkout_response = client.post("/numbers/+15550091999/checkout-session", headers=headers)
+    assert checkout_response.status_code == 502, checkout_response.text
 
-    # The refund actually ran (real Stripe function called with the real
-    # payment_intent_id from the webhook, not a fabricated one).
-    assert refund_calls == ["pi_e2e_refund_test"]
-
-    # The number was NOT left ACTIVE or dangling - reverted, so it's
-    # neither owned by the customer nor blocking anyone else from trying.
+    # The number was NOT left ACTIVE or dangling - reverted to RESERVED,
+    # so it's neither owned by the customer nor blocking anyone else from
+    # trying (see purchase_number's TelecomError branch).
     number = db_session.query(PhoneNumber).filter(PhoneNumber.e164 == "+15550091999").first()
-    assert number.status != PhoneNumberStatus.ACTIVE
+    assert number.status == PhoneNumberStatus.RESERVED
 
     # The customer actually got told - real NotificationDelivery row, not
-    # just a silent refund_payment call with no evidence trail.
-    refund_email = (
+    # a silent failure with no evidence trail.
+    failure_email = (
         db_session.query(NotificationDelivery)
         .filter(
             NotificationDelivery.account_id == account_id,
-            NotificationDelivery.event_name == "billing.credit_or_refund_processed",
+            NotificationDelivery.event_name == "number.order_not_approved",
         )
         .first()
     )
-    assert refund_email is not None
+    assert failure_email is not None
     # Not SUPPRESSED (this test's fresh account has no bounce/opt-out on
     # file - a SUPPRESSED status here would mean the pipeline wrongly
     # skipped sending). SENT vs FAILED depends on whether this dev
     # sandbox's Resend key/domain is actually deliverable right now - a
     # real environmental fact this test doesn't control, not something to
     # paper over by asserting SENT unconditionally.
-    assert refund_email.status != NotificationDeliveryStatus.SUPPRESSED
+    assert failure_email.status != NotificationDeliveryStatus.SUPPRESSED

@@ -4,6 +4,7 @@ import base64
 import re
 import unicodedata
 from datetime import datetime, time, timezone
+from html import escape as _escape_html
 from zoneinfo import ZoneInfo
 
 from jose import JWTError, jwt
@@ -262,6 +263,86 @@ def unsubscribe_via_token(db: Session, token: str) -> tuple[bool, str]:
     return True, f"You've been unsubscribed from {label} at {recipient_email}."
 
 
+# Real gap fixed 2026-08-22: every category sent from one shared address,
+# so marketing mail ever getting flagged as spam could drag down
+# deliverability for password-reset emails too, since they share the same
+# sending reputation (Email Communications System doc). Grouped by
+# reputation risk, not by NotificationTemplate.domain 1:1 - AUTH/TRUST/
+# COMP/DEVICE are all "this protects your account" mail, BILL is its own
+# high-trust category, MKTG/PART are the actual deliverability risk this
+# finding was about, and everything else is ordinary product/operational
+# mail. Anything not listed here (a future domain value) falls through to
+# "notifications" rather than raising - a missing mapping should never be
+# why an email fails to send.
+_SECURITY_TEMPLATE_DOMAINS = {"AUTH", "TRUST", "COMP", "DEVICE"}
+_BILLING_TEMPLATE_DOMAINS = {"BILL"}
+_MARKETING_TEMPLATE_DOMAINS = {"MKTG", "PART"}
+
+
+def _resolve_from_address(template_domain: str | None) -> str:
+    """See email_domain_verified's docstring in core.config - stays on
+    today's single working address until zoikolocal.com's Resend DNS
+    verification is actually confirmed, so this mapping activating never
+    itself causes a delivery outage."""
+    if not settings.email_domain_verified:
+        return settings.email_from_address
+    if template_domain in _SECURITY_TEMPLATE_DOMAINS:
+        return settings.email_from_address_security
+    if template_domain in _BILLING_TEMPLATE_DOMAINS:
+        return settings.email_from_address_billing
+    if template_domain in _MARKETING_TEMPLATE_DOMAINS:
+        return settings.email_from_address_marketing
+    return settings.email_from_address_notifications
+
+
+def _render_html_email(subject: str, body_text: str, unsubscribe_url: str | None = None) -> str:
+    """Real gap fixed 2026-08-22: every transactional email (including
+    security ones like password resets) went out as unstyled plain text -
+    the Email Communications System doc treats this as a launch blocker.
+    One shared, neutral wrapper applied at the single send_notification
+    choke point closes this for all ~200 seeded templates at once,
+    without touching any of their actual copy (that wording is Product/
+    Legal's call, not this pass's - see body_template's own content,
+    which is unchanged). Deliberately unbranded (no logo, no color
+    beyond neutral grays) - there's no established brand palette
+    anywhere in this codebase to draw from, and inventing one here would
+    be a design decision, not a code fix."""
+    paragraphs = "".join(
+        f'<p style="margin:0 0 16px 0;">{_escape_html(line).replace(chr(10), "<br>")}</p>'
+        for line in body_text.split("\n\n")
+        if line.strip()
+    )
+    footer_link = (
+        f'<a href="{_escape_html(unsubscribe_url)}" style="color:#666666;">Unsubscribe</a>'
+        if unsubscribe_url
+        else ""
+    )
+    return f"""<!doctype html>
+<html>
+<body style="margin:0;padding:24px;background-color:#f4f4f5;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
+    <tr>
+      <td align="center">
+        <table role="presentation" width="100%" style="max-width:520px;" cellpadding="0" cellspacing="0">
+          <tr>
+            <td style="background-color:#ffffff;border:1px solid #e4e4e7;border-radius:8px;padding:32px;">
+              <h1 style="margin:0 0 20px 0;font-size:18px;color:#18181b;">{_escape_html(subject)}</h1>
+              <div style="font-size:14px;line-height:1.6;color:#3f3f46;">{paragraphs}</div>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:16px 8px;font-size:12px;color:#888888;">
+              Zoiko Local{f" &middot; {footer_link}" if footer_link else ""}
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>"""
+
+
 def send_notification(
     db: Session,
     *,
@@ -333,6 +414,7 @@ def send_notification(
     else:
         outgoing_body = body
         email_headers = None
+        unsubscribe_url = None
         if not is_exempt:
             # RFC 8058 one-click unsubscribe (doc §4.1/§11, A-23 BLOCKER) -
             # both the body link (for clients with no one-click support)
@@ -351,7 +433,9 @@ def send_notification(
             }
         try:
             delivery.provider_message_id = send_email(
-                to=recipient_email, subject=subject, body=outgoing_body, headers=email_headers
+                to=recipient_email, subject=subject, body=outgoing_body, headers=email_headers,
+                html=_render_html_email(subject, body, unsubscribe_url),
+                from_address=_resolve_from_address(template.domain),
             )
         except EmailError as e:
             delivery.status = NotificationDeliveryStatus.FAILED
@@ -1344,11 +1428,14 @@ def notify_credit_or_refund_processed(
     db: Session, *, account_id: str, account_email: str, adjustment_type: str, amount: str, currency: str,
     reference: str, reason: str,
 ) -> None:
-    """'billing.credit_or_refund_processed' was seeded but no refund path
-    (the automatic post-payment-fulfillment-failure refund in
-    complete_number_purchase_from_checkout, or the staff-triggered
-    refund_zoikonex_payment/credit-note actions) ever called it - a
-    customer whose payment was refunded had no way to know it happened."""
+    """'billing.credit_or_refund_processed' notification template - call
+    this from any future refund/credit-note flow (e.g. a staff-triggered
+    ZoikoNex refund) so a customer whose payment was adjusted actually
+    finds out. No caller as of 2026-08-22 - the one real refund path that
+    used to call this (a number-purchase-fulfillment-failure refund) no
+    longer exists, since numbers no longer collect payment via Stripe at
+    purchase time (see app.numbering.numbers.service.create_number_
+    purchase_checkout_session)."""
     send_notification(
         db, event_name="billing.credit_or_refund_processed", account_id=account_id, recipient_email=account_email,
         context={

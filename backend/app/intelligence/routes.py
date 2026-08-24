@@ -109,7 +109,7 @@ def summarize_video_session(
         raise HTTPException(status_code=402, detail=str(e)) from e
     except KillSwitchTrippedError as e:
         raise HTTPException(status_code=503, detail=str(e)) from e
-    except (StorageError, TranscriptionError, LLMError) as e:
+    except (StorageError, TranscriptionError, LLMError, service.AudioExtractionError) as e:
         raise HTTPException(status_code=502, detail=str(e)) from e
     return _summary_response(record)
 

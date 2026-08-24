@@ -24,6 +24,10 @@ import {
   getIvrMenu,
   setIvrMenu,
   clearIvrMenu,
+  listMyEligibilityCases,
+  submitEligibilityDocument,
+  submitEligibilityBundle,
+  syncEligibilityBundleStatus,
   ApiError,
   type ComplianceRule,
   type MyPhoneNumber,
@@ -33,6 +37,7 @@ import {
   type TeamMember,
   type PortingRequest,
   type IVROption,
+  type NumberEligibilityCase,
 } from "@/lib/api";
 import { getToken } from "@/lib/auth";
 
@@ -117,6 +122,7 @@ export default function NumbersPage() {
   const [routingTimezone, setRoutingTimezone] = useState("UTC");
   const [routingReceptionist, setRoutingReceptionist] = useState(false);
   const [routingEscalationUserId, setRoutingEscalationUserId] = useState("");
+  const [routingEscalationPhoneNumber, setRoutingEscalationPhoneNumber] = useState("");
   const [routingWhatsapp, setRoutingWhatsapp] = useState(false);
   const [routingSms, setRoutingSms] = useState(false);
   const [routingBusy, setRoutingBusy] = useState(false);
@@ -159,6 +165,19 @@ export default function NumbersPage() {
   const [purchaseBusy, setPurchaseBusy] = useState(false);
   const [purchaseError, setPurchaseError] = useState<string | null>(null);
   const [purchaseQuotaExceeded, setPurchaseQuotaExceeded] = useState(false);
+  // Real Twilio Regulatory Bundle flow (added 2026-08-22) - some countries
+  // (e.g. UK local numbers) require a real Twilio-reviewed identity bundle
+  // before purchase, distinct from the account-level KYC compliance step
+  // above. Surfaced only when a checkout attempt actually hits it.
+  const [eligibilityCase, setEligibilityCase] = useState<NumberEligibilityCase | null>(null);
+  const [eligibilityDocumentType, setEligibilityDocumentType] = useState("government_issued_document");
+  const [eligibilityFile, setEligibilityFile] = useState<File | null>(null);
+  const [eligibilityFirstName, setEligibilityFirstName] = useState("");
+  const [eligibilityLastName, setEligibilityLastName] = useState("");
+  const [eligibilityEmail, setEligibilityEmail] = useState("");
+  const [eligibilityPhone, setEligibilityPhone] = useState("");
+  const [eligibilityBusy, setEligibilityBusy] = useState(false);
+  const [eligibilityError, setEligibilityError] = useState<string | null>(null);
   const [emergencyAcknowledged, setEmergencyAcknowledged] = useState(false);
 
   const [portingRequests, setPortingRequests] = useState<PortingRequest[]>([]);
@@ -210,7 +229,8 @@ export default function NumbersPage() {
   // not this redirect, so this just reflects that outcome to the customer
   // and refreshes the list to pick up the (by-then-likely-already-active)
   // number.
-  const [checkoutResult, setCheckoutResult] = useState<"success" | "cancelled" | "included" | null>(null);
+  const [checkoutResult, setCheckoutResult] = useState<"success" | "cancelled" | "included" | "pending" | null>(null);
+  const [pendingChargeAmount, setPendingChargeAmount] = useState<number | null>(null);
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     const checkout = params.get("checkout");
@@ -341,6 +361,19 @@ export default function NumbersPage() {
 
   async function handlePurchase() {
     if (!token || !reservedNumber || !emergencyAcknowledged) return;
+    // Same confirm-before-irreversible-action pattern as Cancel below -
+    // a real charge (or a real pending charge on the next invoice) is
+    // about to happen, so the customer gets one clear "are you sure"
+    // showing the exact number and cost before it does.
+    const rate =
+      numberRates.find((r) => r.country === reservedNumber.country && r.number_type === reservedNumber.number_type) ??
+      numberRates.find((r) => r.number_type === reservedNumber.number_type);
+    const costLine =
+      rate && rate.recurring_price_cents > 0
+        ? `This costs ${formatMonthlyFee(rate)} (or free if it's included with your plan).`
+        : "This is free if it's your first number on a paid plan.";
+    const confirmed = window.confirm(`Buy ${reservedNumber.e164}?\n\n${costLine}`);
+    if (!confirmed) return;
     setPurchaseBusy(true);
     setPurchaseError(null);
     setPurchaseQuotaExceeded(false);
@@ -357,18 +390,35 @@ export default function NumbersPage() {
         handleStartOver();
         return;
       }
-      // Real Stripe Checkout (test mode) - redirects to Stripe's own
-      // hosted payment page. The number only actually activates once
-      // Stripe confirms payment via the backend's webhook; this tab
-      // navigates away, so nothing more happens here on success.
-      window.location.href = session.url as string;
+      // Architecture doc §9: a non-included number is now provisioned
+      // immediately (no Stripe redirect) - its cost is recorded on the
+      // account and appears as a line item on the next real invoice
+      // alongside the plan fee, instead of a separate one-time payment
+      // page. Real gap fixed 2026-08-22 (this used to redirect to
+      // session.url, which no longer exists).
+      await loadMyNumbers();
+      setPendingChargeAmount(session.pending_charge_amount_minor_units);
+      setCheckoutResult("pending");
+      handleStartOver();
+      return;
     } catch (err) {
       if (err instanceof ApiError && err.status === 403) {
         setPurchaseError(
-          "This number's country needs an approved identity verification case before it can be purchased — " +
-            "your case is still pending staff review."
+          "This number's country needs an approved identity verification case before it can be purchased."
         );
         await loadMyNumbers();
+        // Real Twilio Regulatory Bundle case (see backend's
+        // NumberEligibilityRequiredError) - the backend auto-opens this
+        // the first time a checkout attempt hits an active eligibility
+        // rule for this number's country. Fetch it so the customer can
+        // actually act on it instead of hitting a dead-end error.
+        try {
+          const cases = await listMyEligibilityCases(token);
+          const match = cases.find((c) => c.phone_number_id === reservedNumber.id);
+          if (match) setEligibilityCase(match);
+        } catch {
+          // Non-fatal - the generic error message above still applies.
+        }
       } else if (err instanceof ApiError && err.status === 409) {
         setPurchaseError(`${err.message} — go back and reserve a number again.`);
       } else if (err instanceof ApiError && err.status === 402) {
@@ -390,6 +440,54 @@ export default function NumbersPage() {
     }
   }
 
+  async function handleUploadEligibilityDocument() {
+    if (!token || !eligibilityCase || !eligibilityFile) return;
+    setEligibilityBusy(true);
+    setEligibilityError(null);
+    try {
+      const updated = await submitEligibilityDocument(token, eligibilityCase.id, eligibilityDocumentType, eligibilityFile);
+      setEligibilityCase(updated);
+      setEligibilityFile(null);
+    } catch (err) {
+      setEligibilityError(err instanceof ApiError ? err.message : "Couldn't upload this document.");
+    } finally {
+      setEligibilityBusy(false);
+    }
+  }
+
+  async function handleSubmitEligibilityBundle() {
+    if (!token || !eligibilityCase) return;
+    setEligibilityBusy(true);
+    setEligibilityError(null);
+    try {
+      const updated = await submitEligibilityBundle(token, eligibilityCase.id, {
+        first_name: eligibilityFirstName,
+        last_name: eligibilityLastName,
+        email: eligibilityEmail,
+        phone_number: eligibilityPhone,
+      });
+      setEligibilityCase(updated);
+    } catch (err) {
+      setEligibilityError(err instanceof ApiError ? err.message : "Couldn't submit this for review.");
+    } finally {
+      setEligibilityBusy(false);
+    }
+  }
+
+  async function handleCheckEligibilityBundleStatus() {
+    if (!token || !eligibilityCase) return;
+    setEligibilityBusy(true);
+    setEligibilityError(null);
+    try {
+      const updated = await syncEligibilityBundleStatus(token, eligibilityCase.id);
+      setEligibilityCase(updated);
+    } catch (err) {
+      setEligibilityError(err instanceof ApiError ? err.message : "Couldn't check the review status.");
+    } finally {
+      setEligibilityBusy(false);
+    }
+  }
+
   function handleStartOver() {
     setStep("search");
     setSearchResults([]);
@@ -403,6 +501,13 @@ export default function NumbersPage() {
     setPurchaseError(null);
     setPurchaseQuotaExceeded(false);
     setEmergencyAcknowledged(false);
+    setEligibilityCase(null);
+    setEligibilityFile(null);
+    setEligibilityFirstName("");
+    setEligibilityLastName("");
+    setEligibilityEmail("");
+    setEligibilityPhone("");
+    setEligibilityError(null);
   }
 
   async function handleConfirmSuspend(e164: string) {
@@ -434,6 +539,7 @@ export default function NumbersPage() {
     setRoutingTimezone(number.business_hours_timezone || "UTC");
     setRoutingReceptionist(number.ai_receptionist_enabled);
     setRoutingEscalationUserId(number.escalation_user_id ?? "");
+    setRoutingEscalationPhoneNumber(number.escalation_phone_number ?? "");
     setRoutingWhatsapp(number.whatsapp_enabled);
     setRoutingSms(number.sms_enabled);
     setSmsCaseBlockedE164(null);
@@ -532,6 +638,7 @@ export default function NumbersPage() {
         business_hours_timezone: routingTimezone || "UTC",
         ai_receptionist_enabled: routingReceptionist,
         escalation_user_id: routingEscalationUserId || null,
+        escalation_phone_number: routingEscalationPhoneNumber || null,
         whatsapp_enabled: routingWhatsapp,
         sms_enabled: routingSms,
       });
@@ -562,6 +669,16 @@ export default function NumbersPage() {
 
   async function handleCancel(e164: string) {
     if (!token) return;
+    // Real gap fixed 2026-08-22: Cancel releases the number back to the
+    // provider immediately - a genuinely irreversible action (confirmed
+    // live: the same number could not be re-purchased minutes later,
+    // Twilio had already pulled it from the available pool). A single
+    // accidental click used to have no way to back out of.
+    const confirmed = window.confirm(
+      `Cancel ${e164}?\n\nThis permanently releases the number - you will NOT be able to get it back, ` +
+        `even if you change your mind right after. If you're not sure, click Cancel on this dialog first.`
+    );
+    if (!confirmed) return;
     setActionBusyE164(e164);
     setActionError(null);
     try {
@@ -593,6 +710,14 @@ export default function NumbersPage() {
       {checkoutResult === "included" && (
         <p className="text-sm text-emerald-800 bg-emerald-50 border border-emerald-200 rounded-lg px-3 py-2">
           Your first number is included with your plan — no payment needed. It&apos;s active below.
+        </p>
+      )}
+      {checkoutResult === "pending" && (
+        <p className="text-sm text-emerald-800 bg-emerald-50 border border-emerald-200 rounded-lg px-3 py-2">
+          Your number is active below.
+          {pendingChargeAmount != null && (
+            <> This will add ${(pendingChargeAmount / 100).toFixed(2)} to your next invoice, alongside your plan fee.</>
+          )}
         </p>
       )}
       {checkoutResult === "cancelled" && (
@@ -805,6 +930,17 @@ export default function NumbersPage() {
                     </select>
                     <p className="text-xs text-slate-400 mt-1">
                       Only a nominated team member triggers live escalation for urgent receptionist calls.
+                    </p>
+                    <input
+                      type="tel"
+                      value={routingEscalationPhoneNumber}
+                      onChange={(e) => setRoutingEscalationPhoneNumber(e.target.value)}
+                      placeholder="+1 555 555 1234"
+                      className="mt-2 w-full rounded-lg border border-slate-300 px-3 py-1.5 text-sm"
+                    />
+                    <p className="text-xs text-slate-400 mt-1">
+                      Number to actually dial for an urgent escalation. If left blank, falls back to the
+                      forwarding number above (only works if forwarding is also on).
                     </p>
                   </div>
 
@@ -1140,8 +1276,8 @@ export default function NumbersPage() {
           </div>
           <p className="text-xs text-slate-400">
             Your first number is included free with a paid plan. If it isn&apos;t included — or this number type
-            costs more than the included allowance — you&apos;ll be redirected to Stripe&apos;s secure payment page
-            to pay the difference (test mode — no real charge either way).
+            costs more than the included allowance — the number activates immediately and the cost is added to
+            your next invoice alongside your plan fee. No separate payment page.
           </p>
 
           <div className="bg-amber-50 border border-amber-200 rounded-lg p-3 space-y-2">
@@ -1175,6 +1311,126 @@ export default function NumbersPage() {
                 </>
               )}
             </p>
+          )}
+
+          {eligibilityCase && (
+            <div className="border border-indigo-200 bg-indigo-50 rounded-lg p-4 space-y-3">
+              <h4 className="text-sm font-semibold text-slate-900">
+                Identity verification required for {eligibilityCase.country}
+              </h4>
+              <p className="text-xs text-slate-600">
+                This country requires a real, Twilio-reviewed identity bundle before the number can be
+                activated - a government ID or passport, plus your name/email/phone.
+              </p>
+
+              {eligibilityError && <p className="text-xs text-red-600">{eligibilityError}</p>}
+
+              {!eligibilityCase.twilio_bundle_sid ? (
+                <>
+                  <div className="space-y-2">
+                    <label className="block text-xs font-medium text-slate-500">Document type</label>
+                    <select
+                      value={eligibilityDocumentType}
+                      onChange={(e) => setEligibilityDocumentType(e.target.value)}
+                      className="w-full rounded-lg border border-slate-300 px-3 py-1.5 text-sm"
+                    >
+                      <option value="government_issued_document">Government-issued ID</option>
+                      <option value="passport">Passport</option>
+                    </select>
+                    <input
+                      type="file"
+                      accept="application/pdf,image/jpeg,image/png"
+                      onChange={(e) => setEligibilityFile(e.target.files?.[0] ?? null)}
+                      className="w-full text-sm"
+                    />
+                    <button
+                      onClick={handleUploadEligibilityDocument}
+                      disabled={eligibilityBusy || !eligibilityFile}
+                      className="bg-slate-700 hover:bg-slate-800 disabled:opacity-60 text-white text-xs font-medium rounded-lg px-3 py-1.5"
+                    >
+                      {eligibilityBusy ? "Uploading..." : "Upload document"}
+                    </button>
+                    {eligibilityCase.documents.length > 0 && (
+                      <p className="text-xs text-emerald-700">
+                        {eligibilityCase.documents.length} document(s) uploaded.
+                      </p>
+                    )}
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-2">
+                    <input
+                      type="text"
+                      placeholder="First name"
+                      value={eligibilityFirstName}
+                      onChange={(e) => setEligibilityFirstName(e.target.value)}
+                      className="rounded-lg border border-slate-300 px-3 py-1.5 text-sm"
+                    />
+                    <input
+                      type="text"
+                      placeholder="Last name"
+                      value={eligibilityLastName}
+                      onChange={(e) => setEligibilityLastName(e.target.value)}
+                      className="rounded-lg border border-slate-300 px-3 py-1.5 text-sm"
+                    />
+                    <input
+                      type="email"
+                      placeholder="Email"
+                      value={eligibilityEmail}
+                      onChange={(e) => setEligibilityEmail(e.target.value)}
+                      className="rounded-lg border border-slate-300 px-3 py-1.5 text-sm"
+                    />
+                    <input
+                      type="tel"
+                      placeholder="Real mobile phone number"
+                      value={eligibilityPhone}
+                      onChange={(e) => setEligibilityPhone(e.target.value)}
+                      className="rounded-lg border border-slate-300 px-3 py-1.5 text-sm"
+                    />
+                  </div>
+                  <button
+                    onClick={handleSubmitEligibilityBundle}
+                    disabled={
+                      eligibilityBusy ||
+                      eligibilityCase.documents.length === 0 ||
+                      !eligibilityFirstName ||
+                      !eligibilityLastName ||
+                      !eligibilityEmail ||
+                      !eligibilityPhone
+                    }
+                    className="bg-indigo-600 hover:bg-indigo-700 disabled:opacity-60 text-white text-xs font-medium rounded-lg px-3 py-1.5"
+                  >
+                    {eligibilityBusy ? "Submitting..." : "Submit for review"}
+                  </button>
+                </>
+              ) : (
+                <>
+                  <p className="text-xs text-slate-700">
+                    Review status: <span className="font-medium">{eligibilityCase.twilio_bundle_status}</span>
+                    {eligibilityCase.twilio_bundle_rejection_reason && (
+                      <> — {eligibilityCase.twilio_bundle_rejection_reason}</>
+                    )}
+                  </p>
+                  <div className="flex items-center gap-2">
+                    <button
+                      onClick={handleCheckEligibilityBundleStatus}
+                      disabled={eligibilityBusy}
+                      className="bg-slate-700 hover:bg-slate-800 disabled:opacity-60 text-white text-xs font-medium rounded-lg px-3 py-1.5"
+                    >
+                      {eligibilityBusy ? "Checking..." : "Check status"}
+                    </button>
+                    {eligibilityCase.status === "approved" && (
+                      <button
+                        onClick={handlePurchase}
+                        disabled={purchaseBusy}
+                        className="bg-indigo-600 hover:bg-indigo-700 disabled:opacity-60 text-white text-xs font-medium rounded-lg px-3 py-1.5"
+                      >
+                        {purchaseBusy ? "Processing..." : "Retry purchase"}
+                      </button>
+                    )}
+                  </div>
+                </>
+              )}
+            </div>
           )}
 
           <div className="flex items-center gap-3">

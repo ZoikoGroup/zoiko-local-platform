@@ -3,8 +3,13 @@ FROM python:3.10-slim
 WORKDIR /app
 
 # psycopg2-binary ships its own libpq, so no build-essential needed here -
-# curl is just for the container healthcheck below.
-RUN apt-get update && apt-get install -y --no-install-recommends curl \
+# curl is just for the container healthcheck below. ffmpeg strips a video
+# recording down to its audio track before sending it to Groq for
+# transcription (intelligence.service._extract_audio) - confirmed live
+# (2026-08-21) that sending the raw video file directly hit Groq's 25MB
+# free-tier upload cap and got a dropped connection instead of a clean
+# error for anything longer than a few minutes.
+RUN apt-get update && apt-get install -y --no-install-recommends curl ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .

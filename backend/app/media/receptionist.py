@@ -55,14 +55,21 @@ class EditReceptionistCallSummaryRequest(BaseModel):
 def _finish_capture_and_respond(request: Request, db: Session, call: ReceptionistCall, owner: PhoneNumber) -> Response:
     """Shared close-out for /respond and /respond-followup once the message
     is as complete as it's going to get. Escalation requires a nominated
-    team member (escalation_user_id), not just a forwarding_number - that
-    field is also used for plain business-hours call forwarding, unrelated
-    to receptionist urgency. A genuinely urgent call is forwarded
+    team member (escalation_user_id) AND a real number to actually dial
+    them on (escalation_phone_number) - prefers that dedicated field, falls
+    back to forwarding_number for numbers configured before it existed.
+    Confirmed live (2026-08-22): dialing forwarding_number unconditionally
+    used to be the ONLY option, which meant a business running AI
+    Receptionist as its primary mode (forwarding off) had no way to set an
+    escalation destination without forwarding_number's mere presence also
+    flipping should_forward_call() to true and hijacking every inbound
+    call into always-forward mode. A genuinely urgent call is forwarded
     immediately, never delayed behind the callback menu below."""
+    escalation_number = owner.escalation_phone_number or owner.forwarding_number
     should_escalate = (
         call.urgency == ReceptionistUrgency.HIGH
         and bool(owner.escalation_user_id)
-        and bool(owner.forwarding_number)
+        and bool(escalation_number)
     )
 
     if should_escalate:
@@ -70,7 +77,7 @@ def _finish_capture_and_respond(request: Request, db: Session, call: Receptionis
         status_callback_url = str(request.base_url) + "media/voice/status-callback"
         twiml = telecom.build_receptionist_reply_response(
             "Thanks — this sounds urgent, connecting you to someone now.",
-            forward_to=owner.forwarding_number,
+            forward_to=escalation_number,
             status_callback_url=status_callback_url,
         )
         return Response(content=twiml, media_type="application/xml")

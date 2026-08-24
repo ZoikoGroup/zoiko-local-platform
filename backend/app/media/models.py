@@ -126,6 +126,20 @@ class VideoSession(Base):
     # event back to this session once the file finishes processing.
     recording_egress_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
     recording_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    # The actual S3 object key the recording was uploaded under - human-
+    # readable (account name + date/day/time), NOT derived from room_name
+    # (a random "zl-<uuid hex>" internal id, unfit for a filename a human
+    # ever sees). Set once at start_video_recording time, before LiveKit's
+    # egress even begins (the key must be given to it upfront) - stored
+    # here so get_recording_download_url doesn't need to re-derive it.
+    recording_object_key: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    # Set the moment recording_egress_id is set (see start_video_recording) -
+    # the only way to detect a lost egress_ended webhook (LiveKit outage,
+    # dropped delivery): nothing else marks time passing on an in-progress
+    # recording. See sweep_stale_video_recordings, which uses this to stop
+    # "Recording processing..." from showing forever when the webhook never
+    # arrives at all.
+    recording_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 

@@ -394,6 +394,94 @@ def test_high_urgency_does_not_escalate_without_a_nominated_team_member(client, 
     assert calls[0]["escalated"] is False
 
 
+def test_escalation_uses_dedicated_phone_number_without_hijacking_calls_into_forwarding(client, db_session):
+    """Confirmed live (2026-08-22): escalation used to dial forwarding_number
+    unconditionally, so an AI-Receptionist-primary number (forwarding off)
+    had no way to configure an escalation destination without
+    forwarding_number's mere presence also flipping should_forward_call()
+    to true and hijacking every inbound call into always-forward mode.
+    This proves escalation_phone_number lets escalation work with
+    forwarding_number left unset entirely."""
+    token, account_id = _signup_and_login(client, "receptionistdedicated@example.com")
+    me = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"})
+    owner_user_id = me.json()["id"]
+
+    number = PhoneNumber(
+        e164="+15550055555", country="US", status=PhoneNumberStatus.ACTIVE, account_id=account_id,
+        ai_receptionist_enabled=True, escalation_user_id=owner_user_id,
+        escalation_phone_number="+15551119999",
+    )
+    db_session.add(number)
+    db_session.commit()
+
+    from app.media.service import should_forward_call
+    assert should_forward_call(number) is False
+
+    client.post(
+        "/compliance/consent",
+        json={"consent_type": "ai_processing"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    url = "http://testserver/media/receptionist/respond"
+    params = {
+        "CallSid": "CArecep5", "To": "+15550055555", "From": "+15559995555",
+        "SpeechResult": (
+            "Hi my name is Taylor Kim from Beta Corp, our production system is down "
+            "and this is extremely urgent, please call me back right away"
+        ),
+    }
+    signature = _twilio_signature(url, params)
+    response = client.post("/media/receptionist/respond", data=params, headers={"X-Twilio-Signature": signature})
+    assert response.status_code == 200
+    assert "<Dial" in response.text
+    assert "+15551119999" in response.text
+
+    calls_response = client.get(
+        "/media/receptionist/calls", headers={"Authorization": f"Bearer {token}"}
+    )
+    calls = calls_response.json()
+    assert len(calls) == 1
+    assert calls[0]["escalated"] is True
+
+
+def test_escalation_falls_back_to_forwarding_number_when_dedicated_field_unset(client, db_session):
+    """Backward compatibility: a number configured before escalation_phone_number
+    existed (forwarding_number set, escalation_phone_number left null) must
+    keep escalating the same way it always did."""
+    token, account_id = _signup_and_login(client, "receptionistlegacyesc@example.com")
+    me = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"})
+    owner_user_id = me.json()["id"]
+
+    number = PhoneNumber(
+        e164="+15550066666", country="US", status=PhoneNumberStatus.ACTIVE, account_id=account_id,
+        ai_receptionist_enabled=True, forwarding_number="+15551118888", escalation_user_id=owner_user_id,
+    )
+    db_session.add(number)
+    db_session.commit()
+    assert number.escalation_phone_number is None
+
+    client.post(
+        "/compliance/consent",
+        json={"consent_type": "ai_processing"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    url = "http://testserver/media/receptionist/respond"
+    params = {
+        "CallSid": "CArecep6", "To": "+15550066666", "From": "+15559996666",
+        "SpeechResult": (
+            "Hi my name is Morgan Diaz from Gamma Corp, our production system is down "
+            "and this is extremely urgent, please call me back right away"
+        ),
+    }
+    signature = _twilio_signature(url, params)
+    response = client.post("/media/receptionist/respond", data=params, headers={"X-Twilio-Signature": signature})
+    assert response.status_code == 200
+    assert "<Dial" in response.text
+    assert "+15551118888" in response.text
+
+
 def test_receptionist_calls_requires_auth(client):
     assert client.get("/media/receptionist/calls").status_code == 401
 

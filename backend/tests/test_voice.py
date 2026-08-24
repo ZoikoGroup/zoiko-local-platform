@@ -327,6 +327,121 @@ def test_get_call_rejects_a_call_sid_that_does_not_exist(client, db_session):
     assert response.status_code == 403
 
 
+def test_routing_config_persists_dedicated_escalation_phone_number(client, db_session):
+    token = _signup_and_login(client, "voiceescalationfield@example.com")
+    account_id = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"}).json()["account_id"]
+    number = PhoneNumber(
+        e164="+15550001010", country="US", status=PhoneNumberStatus.ACTIVE, account_id=account_id
+    )
+    db_session.add(number)
+    db_session.commit()
+
+    routing_response = client.put(
+        "/numbers/+15550001010/routing",
+        json={"ai_receptionist_enabled": True, "escalation_phone_number": "+15559998877"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert routing_response.status_code == 200
+    assert routing_response.json()["escalation_phone_number"] == "+15559998877"
+
+    get_response = client.get("/numbers", headers={"Authorization": f"Bearer {token}"})
+    numbers = get_response.json()
+    assert numbers[0]["escalation_phone_number"] == "+15559998877"
+
+
+def test_forward_fallback_goes_to_ai_receptionist_when_forwarding_is_missed(client, db_session):
+    """Confirmed live (2026-08-22): a number with BOTH forwarding and AI
+    Receptionist enabled used to get plain voicemail on a missed forwarded
+    call - AI never got a chance to catch what the human missed. This
+    proves forward-fallback now offers the AI Receptionist greeting
+    instead of going straight to voicemail."""
+    token = _signup_and_login(client, "voicefallbackai@example.com")
+    account_id = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"}).json()["account_id"]
+    number = PhoneNumber(
+        e164="+15550002222", country="US", status=PhoneNumberStatus.ACTIVE, account_id=account_id
+    )
+    db_session.add(number)
+    db_session.commit()
+
+    client.put(
+        "/numbers/+15550002222/routing",
+        json={"forwarding_number": "+15551112222", "ai_receptionist_enabled": True},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    fallback_url = "http://testserver/media/voice/forward-fallback"
+    fallback_params = {
+        "To": "+15550002222", "From": "+15559990000", "CallSid": "CAfallback1", "DialCallStatus": "no-answer",
+    }
+    signature = _twilio_signature(fallback_url, fallback_params)
+    response = client.post(
+        "/media/voice/forward-fallback", data=fallback_params, headers={"X-Twilio-Signature": signature}
+    )
+    assert response.status_code == 200
+    assert "<Gather" in response.text
+    assert "media/receptionist/respond" in response.text
+    assert "<Record" not in response.text
+
+
+def test_forward_fallback_goes_to_voicemail_without_ai_receptionist(client, db_session):
+    """A number with forwarding but AI Receptionist off keeps the original
+    overflow-to-voicemail behavior - this is a regression guard, not a new
+    requirement."""
+    token = _signup_and_login(client, "voicefallbackvm@example.com")
+    account_id = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"}).json()["account_id"]
+    number = PhoneNumber(
+        e164="+15550003333", country="US", status=PhoneNumberStatus.ACTIVE, account_id=account_id
+    )
+    db_session.add(number)
+    db_session.commit()
+
+    client.put(
+        "/numbers/+15550003333/routing",
+        json={"forwarding_number": "+15551112222"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    fallback_url = "http://testserver/media/voice/forward-fallback"
+    fallback_params = {
+        "To": "+15550003333", "From": "+15559990000", "CallSid": "CAfallback2", "DialCallStatus": "no-answer",
+    }
+    signature = _twilio_signature(fallback_url, fallback_params)
+    response = client.post(
+        "/media/voice/forward-fallback", data=fallback_params, headers={"X-Twilio-Signature": signature}
+    )
+    assert response.status_code == 200
+    assert "<Record" in response.text
+    assert "media/receptionist/respond" not in response.text
+
+
+def test_forward_fallback_does_nothing_when_call_was_answered(client, db_session):
+    token = _signup_and_login(client, "voicefallbackok@example.com")
+    account_id = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"}).json()["account_id"]
+    number = PhoneNumber(
+        e164="+15550004444", country="US", status=PhoneNumberStatus.ACTIVE, account_id=account_id
+    )
+    db_session.add(number)
+    db_session.commit()
+
+    client.put(
+        "/numbers/+15550004444/routing",
+        json={"forwarding_number": "+15551112222", "ai_receptionist_enabled": True},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    fallback_url = "http://testserver/media/voice/forward-fallback"
+    fallback_params = {
+        "To": "+15550004444", "From": "+15559990000", "CallSid": "CAfallback3", "DialCallStatus": "completed",
+    }
+    signature = _twilio_signature(fallback_url, fallback_params)
+    response = client.post(
+        "/media/voice/forward-fallback", data=fallback_params, headers={"X-Twilio-Signature": signature}
+    )
+    assert response.status_code == 200
+    assert "<Gather" not in response.text
+    assert "<Record" not in response.text
+
+
 def test_get_call_succeeds_for_the_owning_account(client, db_session, monkeypatch):
     token, account_id = _signup_and_login_with_account(client, "getcallowner2@example.com")
     call = _seed_call_record(db_session, account_id, call_sid="CAidortest0000000000000000000002")

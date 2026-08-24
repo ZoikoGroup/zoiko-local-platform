@@ -34,10 +34,16 @@ def test_run_billing_cycle_happy_path_bills_and_captures(db_session):
 
     result = service.run_billing_cycle(db_session, account.id, actor="test-actor")
 
-    catalog_entry = service.get_active_price_catalog_entry(db_session, "starter")
+    # amount_minor_units now reflects ZoikoNex's own authoritative invoice
+    # total (issue_invoice's total_minor_units - the conftest fake always
+    # returns 1999), not just the bare plan-fee catalog price - real
+    # correctness fix, see run_billing_cycle's docstring on
+    # payment_amount_minor_units. Deliberately NOT catalog_entry.
+    # amount_minor_units (1299 for "starter") - asserting against that
+    # would silently pass even if the fix were never wired in.
     assert result["billed"] is True
     assert result["plan_code"] == "starter"
-    assert result["amount_minor_units"] == catalog_entry.amount_minor_units
+    assert result["amount_minor_units"] == 1999
     assert result["invoice_status"] == "ISSUED"
     assert result["payment_status"] == "captured"
     assert result["captured"] is True
@@ -201,6 +207,93 @@ def test_run_billing_cycle_includes_a_real_tax_decision_on_the_line_item(db_sess
     # docstring) - this asserts the VALUE actually reaches the line item
     # call, not that a specific tax amount was charged.
     assert captured["tax_amount_minor_units"] == 0
+
+
+def test_run_billing_cycle_adds_pending_number_charges_as_line_items_on_the_same_invoice(db_session, monkeypatch):
+    """Architecture doc §9: a number purchase's cost becomes a line item on
+    the SAME invoice as the plan fee - real gap fixed 2026-08-22 (numbers
+    used to charge via a completely separate, disconnected Stripe
+    checkout). See app.billing.service.record_pending_number_charge and
+    the pending-charge loop inside run_billing_cycle."""
+    from app.billing.models import PendingAccountChargeStatus
+
+    account, _sub = _synced_paid_subscription(db_session, "Billing Cycle Pending Charge Co")
+    charge = service.record_pending_number_charge(
+        db_session, account.id, charge_type="number_purchase", phone_number_id=None,
+        description="Phone number purchase - +15550019999", amount_minor_units=499, currency_code="USD",
+    )
+
+    line_item_calls = []
+    monkeypatch.setattr(
+        service.zoikonex_adapter, "add_invoice_line_item",
+        lambda invoice_id, **kwargs: line_item_calls.append(kwargs) or {"line_item_id": "zn-line-item-test"},
+    )
+
+    result = service.run_billing_cycle(db_session, account.id, actor="test-actor")
+
+    assert result["billed"] is True
+    line_keys = [c["line_key"] for c in line_item_calls]
+    assert "plan-fee" in line_keys
+    assert f"pending-charge-{charge.id}" in line_keys
+
+    db_session.refresh(charge)
+    assert charge.status == PendingAccountChargeStatus.INVOICED
+    assert charge.invoiced_at is not None
+    assert charge.zoikonex_invoice_id is not None
+    assert charge.zoikonex_line_item_id == "zn-line-item-test"
+
+
+def test_run_billing_cycle_does_not_double_add_pending_charges_on_rerun(db_session, monkeypatch):
+    from app.billing.models import PendingAccountCharge, PendingAccountChargeStatus
+
+    account, _sub = _synced_paid_subscription(db_session, "Billing Cycle Pending Rerun Co")
+    service.record_pending_number_charge(
+        db_session, account.id, charge_type="number_purchase", phone_number_id=None,
+        description="Phone number purchase - +15550018888", amount_minor_units=499, currency_code="USD",
+    )
+
+    line_item_calls = []
+    monkeypatch.setattr(
+        service.zoikonex_adapter, "add_invoice_line_item",
+        lambda invoice_id, **kwargs: line_item_calls.append(kwargs) or {"line_item_id": "zn-line-item-test"},
+    )
+
+    service.run_billing_cycle(db_session, account.id, actor="test-actor")
+    assert len(line_item_calls) == 2  # plan-fee + the one pending charge
+
+    # Simulate this period's invoice having already been issued, so a
+    # retry/re-run correctly takes the "not first run" branch.
+    monkeypatch.setattr(
+        service.zoikonex_adapter, "get_invoice",
+        lambda invoice_id: {"invoice_id": invoice_id, "status": "ISSUED", "total_minor_units": 1999},
+    )
+    service.run_billing_cycle(db_session, account.id, actor="test-actor")
+    assert len(line_item_calls) == 2  # unchanged - no re-add on the second call
+
+    charge = db_session.query(PendingAccountCharge).filter(PendingAccountCharge.account_id == account.id).one()
+    assert charge.status == PendingAccountChargeStatus.INVOICED
+
+
+def test_run_billing_cycle_skips_pending_charges_from_other_accounts(db_session, monkeypatch):
+    """Basic account-scoping guard: a PendingAccountCharge belonging to a
+    different account must never leak onto this account's invoice."""
+    account, _sub = _synced_paid_subscription(db_session, "Billing Cycle Own Charges Co")
+    other_account, _other_sub = _synced_paid_subscription(db_session, "Billing Cycle Other Account Co")
+    service.record_pending_number_charge(
+        db_session, other_account.id, charge_type="number_purchase", phone_number_id=None,
+        description="Phone number purchase - +15550017777", amount_minor_units=499, currency_code="USD",
+    )
+
+    line_item_calls = []
+    monkeypatch.setattr(
+        service.zoikonex_adapter, "add_invoice_line_item",
+        lambda invoice_id, **kwargs: line_item_calls.append(kwargs) or {"line_item_id": "zn-line-item-test"},
+    )
+
+    service.run_billing_cycle(db_session, account.id, actor="test-actor")
+
+    line_keys = [c["line_key"] for c in line_item_calls]
+    assert line_keys == ["plan-fee"]  # no pending-charge-* line for the OTHER account's charge
 
 
 # --- Price catalog (Commercial Billing Operating Standard P0-1) ---
