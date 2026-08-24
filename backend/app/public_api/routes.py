@@ -2,7 +2,6 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.orm import Session
 
 from app.billing.schemas import UsageSummaryResponse
-from app.billing.service import BillingSuspendedError
 from app.billing import service as billing_service
 from app.contacts import service as contacts_service
 from app.core.database import get_db
@@ -131,8 +130,8 @@ def place_call(
         )
     except media_service.CallAuthorizationError as e:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e)) from e
-    except BillingSuspendedError as e:
-        raise HTTPException(status_code=status.HTTP_402_PAYMENT_REQUIRED, detail=str(e)) from e
+    # BillingSuspendedError no longer caught here - subclasses
+    # EntitlementError, handled by the global entitlement_error_handler.
     except risk_service.DestinationBlockedError as e:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e)) from e
     except risk_service.VelocityLimitExceededError as e:

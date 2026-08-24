@@ -22,6 +22,7 @@ import {
   type WaitingGuest,
 } from "@/lib/api";
 import { getToken } from "@/lib/auth";
+import MeetingRoom, { createParticipantTile, type ReactionEvent } from "@/components/MeetingRoom";
 
 type CallState = "idle" | "lobby" | "connecting" | "in-call";
 type RecordingState = "idle" | "busy" | "consent_required" | "active";
@@ -52,7 +53,6 @@ export default function VideoPage() {
   const [cameraOn, setCameraOn] = useState(true);
   const [micOn, setMicOn] = useState(true);
   const [screenSharing, setScreenSharing] = useState(false);
-  const [participantCount, setParticipantCount] = useState(0);
   const [participants, setParticipants] = useState<{ identity: string; name: string }[]>([]);
   const [inviteLinkCopied, setInviteLinkCopied] = useState(false);
   const [waitingGuests, setWaitingGuests] = useState<WaitingGuest[]>([]);
@@ -87,6 +87,7 @@ export default function VideoPage() {
   const [chatInput, setChatInput] = useState("");
   const [unreadChatCount, setUnreadChatCount] = useState(0);
   const [connectionQuality, setConnectionQuality] = useState<"excellent" | "good" | "poor" | null>(null);
+  const [reactions, setReactions] = useState<ReactionEvent[]>([]);
 
   const roomRef = useRef<Room | null>(null);
   const localVideoRef = useRef<HTMLVideoElement>(null);
@@ -105,16 +106,7 @@ export default function VideoPage() {
   function getOrCreateTile(identity: string, name: string): HTMLDivElement {
     const existing = participantTiles.current.get(identity);
     if (existing) return existing;
-
-    const tile = document.createElement("div");
-    tile.className =
-      "relative aspect-video bg-black rounded-lg overflow-hidden [&>video]:w-full [&>video]:h-full [&>video]:object-cover [&>audio]:hidden";
-    const label = document.createElement("span");
-    label.className =
-      "absolute bottom-2 left-2 text-xs text-white/80 bg-black/40 rounded px-2 py-0.5 pointer-events-none";
-    label.textContent = name;
-    tile.appendChild(label);
-
+    const tile = createParticipantTile(identity, name);
     remoteContainerRef.current?.appendChild(tile);
     participantTiles.current.set(identity, tile);
     return tile;
@@ -126,7 +118,6 @@ export default function VideoPage() {
     setParticipants([]);
   }
 
-  const chatEndRef = useRef<HTMLDivElement>(null);
   const chatOpenRef = useRef(false);
 
   // Guards against an older, slower request's result landing after a newer
@@ -238,11 +229,6 @@ export default function VideoPage() {
   useEffect(() => {
     chatOpenRef.current = chatOpen;
   }, [chatOpen]);
-
-  useEffect(() => {
-    if (!chatOpen) return;
-    chatEndRef.current?.scrollIntoView({ block: "end" });
-  }, [chatMessages, chatOpen]);
 
   // Same timing issue as the camera effect above - the screen-share preview
   // element only renders once screenSharing is true, so attach after.
@@ -410,11 +396,10 @@ export default function VideoPage() {
         }
       });
       room.on(RoomEvent.ParticipantConnected, (participant) => {
-        setParticipantCount(room.remoteParticipants.size);
+        getOrCreateTile(participant.identity, participant.name || participant.identity);
         setParticipants((prev) => [...prev, { identity: participant.identity, name: participant.name || participant.identity }]);
       });
       room.on(RoomEvent.ParticipantDisconnected, (participant) => {
-        setParticipantCount(room.remoteParticipants.size);
         setParticipants((prev) => prev.filter((p) => p.identity !== participant.identity));
         participantTiles.current.get(participant.identity)?.remove();
         participantTiles.current.delete(participant.identity);
@@ -427,19 +412,23 @@ export default function VideoPage() {
         });
       });
       room.on(RoomEvent.DataReceived, (payload, participant) => {
-        let text: string;
+        let parsed: { type?: string; text?: string; emoji?: string };
         try {
-          const parsed = JSON.parse(CHAT_DECODER.decode(payload));
-          if (parsed?.type !== "chat" || typeof parsed.text !== "string") return;
-          text = parsed.text;
+          parsed = JSON.parse(CHAT_DECODER.decode(payload));
         } catch {
           return;
         }
-        setChatMessages((prev) => [
-          ...prev,
-          { id: `${Date.now()}-${Math.random()}`, senderName: participant?.name || "Guest", isLocal: false, text, ts: Date.now() },
-        ]);
-        if (!chatOpenRef.current) setUnreadChatCount((c) => c + 1);
+        if (parsed.type === "chat" && typeof parsed.text === "string") {
+          setChatMessages((prev) => [
+            ...prev,
+            { id: `${Date.now()}-${Math.random()}`, senderName: participant?.name || "Guest", isLocal: false, text: parsed.text as string, ts: Date.now() },
+          ]);
+          if (!chatOpenRef.current) setUnreadChatCount((c) => c + 1);
+        } else if (parsed.type === "reaction" && typeof parsed.emoji === "string") {
+          const id = `${Date.now()}-${Math.random()}`;
+          setReactions((prev) => [...prev, { id, identity: participant?.identity ?? "unknown", emoji: parsed.emoji as string }]);
+          setTimeout(() => setReactions((prev) => prev.filter((r) => r.id !== id)), 2500);
+        }
       });
       room.on(RoomEvent.ConnectionQualityChanged, (quality, participant) => {
         if (!participant.isLocal) return;
@@ -475,9 +464,16 @@ export default function VideoPage() {
       setCameraOn(useCamera);
       setMicOn(useMic);
 
+      // Participants already in the room when we connect don't fire
+      // ParticipantConnected (that only fires for joins after us) - without
+      // this, someone already on the call with both camera and mic off
+      // would never get a tile at all.
+      const already = Array.from(room.remoteParticipants.values());
+      already.forEach((p) => getOrCreateTile(p.identity, p.name || p.identity));
+      setParticipants(already.map((p) => ({ identity: p.identity, name: p.name || p.identity })));
+
       setRoomName(targetRoomName);
       setRoomConfidential(isConfidential);
-      setParticipantCount(room.remoteParticipants.size);
       setCallState("in-call");
     } catch (err) {
       roomRef.current?.disconnect();
@@ -499,6 +495,15 @@ export default function VideoPage() {
       { id: `${Date.now()}-${Math.random()}`, senderName: "You", isLocal: true, text, ts: Date.now() },
     ]);
     setChatInput("");
+  }
+
+  function handleSendReaction(emoji: string) {
+    const room = roomRef.current;
+    if (!room) return;
+    room.localParticipant.publishData(CHAT_ENCODER.encode(JSON.stringify({ type: "reaction", emoji })), { reliable: true });
+    const id = `${Date.now()}-${Math.random()}`;
+    setReactions((prev) => [...prev, { id, identity: "local", emoji }]);
+    setTimeout(() => setReactions((prev) => prev.filter((r) => r.id !== id)), 2500);
   }
 
   async function handleCopyInviteLink() {
@@ -556,6 +561,7 @@ export default function VideoPage() {
     setChatOpen(false);
     setUnreadChatCount(0);
     setConnectionQuality(null);
+    setReactions([]);
     try {
       await endVideoRoom(token, endingRoomName);
     } catch {
@@ -867,9 +873,34 @@ export default function VideoPage() {
       )}
 
       {callState === "in-call" && (
-        <div className="bg-slate-900 rounded-xl border border-slate-800 p-4 space-y-3">
-          <div className="flex items-center justify-between text-xs text-slate-400 px-1">
-            <div className="flex items-center gap-2">
+        <MeetingRoom
+          displayName={lobbyDisplayName}
+          micOn={micOn}
+          cameraOn={cameraOn}
+          onToggleMic={handleToggleMic}
+          onToggleCamera={handleToggleCamera}
+          localVideoRef={localVideoRef}
+          remoteContainerRef={remoteContainerRef}
+          participants={participants}
+          connectionQuality={connectionQuality}
+          reactions={reactions}
+          onSendReaction={handleSendReaction}
+          chatOpen={chatOpen}
+          onToggleChat={() => {
+            setChatOpen((v) => !v);
+            setUnreadChatCount(0);
+          }}
+          unreadChatCount={unreadChatCount}
+          chatMessages={chatMessages}
+          chatInput={chatInput}
+          onChatInputChange={setChatInput}
+          onSendChat={handleSendChatMessage}
+          onLeave={handleEndCall}
+          leaveLabel="Leave & end call"
+          recordingBadge={recordingState === "active"}
+          confidentialBadge={roomConfidential}
+          topLeft={
+            <>
               <span className="font-mono">{roomName}</span>
               <button
                 onClick={handleCopyInviteLink}
@@ -878,228 +909,21 @@ export default function VideoPage() {
               >
                 {inviteLinkCopied ? "Link copied!" : "Copy invite link"}
               </button>
-              {roomConfidential && (
-                <span className="flex items-center gap-1 text-indigo-300 bg-indigo-950/60 border border-indigo-900 rounded-full px-2 py-0.5 text-[11px] font-medium">
-                  Confidential Mode: Active
-                </span>
-              )}
-            </div>
-            <div className="flex items-center gap-3">
-              {recordingState === "active" && (
-                <span className="flex items-center gap-1.5 text-red-400">
-                  <span className="w-1.5 h-1.5 rounded-full bg-red-500 animate-pulse" />
-                  Recording
-                </span>
-              )}
-              <span>{participantCount} other participant{participantCount === 1 ? "" : "s"}</span>
-            </div>
-          </div>
-
-          {recordingState === "consent_required" && (
-            <div className="text-xs bg-amber-950 text-amber-400 rounded-lg px-3 py-2 flex items-center justify-between gap-3">
-              <span>Recording this call needs your consent first.</span>
-              <button onClick={handleGrantConsentAndRecord} className="font-medium underline shrink-0">
-                Grant consent &amp; record
-              </button>
-            </div>
-          )}
-          {recordingError && (
-            <p className="text-xs text-red-400 bg-red-950/50 rounded-lg px-3 py-2">{recordingError}</p>
-          )}
-
-          {waitingGuests.length > 0 && (
-            <div className="bg-indigo-950/50 border border-indigo-900 rounded-lg px-3 py-2 space-y-2">
-              <p className="text-xs font-medium text-indigo-300">
-                {waitingGuests.length} {waitingGuests.length === 1 ? "person" : "people"} waiting to join
-              </p>
-              <ul className="space-y-1.5">
-                {waitingGuests.map((guest) => (
-                  <li key={guest.id} className="flex items-center justify-between gap-3 text-sm">
-                    <span className="text-slate-200 truncate">{guest.display_name}</span>
-                    <div className="flex items-center gap-2 shrink-0">
-                      <button
-                        onClick={() => handleAdmitGuest(guest.id)}
-                        disabled={admittingGuestId === guest.id}
-                        className="text-xs font-medium rounded-lg px-2.5 py-1 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-60 text-white"
-                      >
-                        Admit
-                      </button>
-                      <button
-                        onClick={() => handleDenyGuest(guest.id)}
-                        disabled={admittingGuestId === guest.id}
-                        className="text-xs font-medium rounded-lg px-2.5 py-1 bg-slate-800 hover:bg-slate-700 disabled:opacity-60 text-slate-300"
-                      >
-                        Deny
-                      </button>
-                    </div>
-                  </li>
-                ))}
-              </ul>
-            </div>
-          )}
-
-          <div className="flex gap-3 items-stretch">
-            <div className="flex-1 min-w-0 space-y-3">
-              {screenSharing && (
-                <div className="relative aspect-video bg-black rounded-lg overflow-hidden">
-                  <video ref={localScreenVideoRef} autoPlay muted playsInline className="w-full h-full object-contain" />
-                  <span className="absolute bottom-2 left-2 text-xs text-white/80 bg-black/40 rounded px-2 py-0.5">
-                    Your screen
-                  </span>
-                </div>
-              )}
-
-              {/* auto-fit grid, not a fixed 2-column split - a fixed split works
-                  for 1:1 but squeezes every remote tile into a single narrow
-                  column once a 3rd+ participant joins (up to MAX_PARTICIPANTS=50
-                  per app.integrations.video.livekit). display:contents on the
-                  remote container lets each participant tile appended into it
-                  imperatively (see getOrCreateTile) land directly in this grid
-                  as its own sibling cell, sharing one unified auto-fit layout
-                  instead of a fixed side column. max-h + overflow caps how tall
-                  the grid gets once a call has many participants. */}
-              <div
-                className="grid gap-3 max-h-[60vh] overflow-y-auto pr-1"
-                style={{ gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))" }}
-              >
-                <div className="relative aspect-video bg-black rounded-lg overflow-hidden">
-                  <video ref={localVideoRef} autoPlay muted playsInline className="w-full h-full object-cover" />
-                  <span className="absolute bottom-2 left-2 flex items-center gap-1.5 text-xs text-white/80 bg-black/40 rounded px-2 py-0.5">
-                    <span
-                      title={connectionQuality ? `Connection: ${connectionQuality}` : undefined}
-                      className={`w-1.5 h-1.5 rounded-full ${
-                        connectionQuality === "excellent"
-                          ? "bg-emerald-400"
-                          : connectionQuality === "good"
-                            ? "bg-amber-400"
-                            : connectionQuality === "poor"
-                              ? "bg-red-500"
-                              : "bg-slate-500"
-                      }`}
-                    />
-                    You
-                  </span>
-                </div>
-                <div ref={remoteContainerRef} className="contents" />
-              </div>
-            </div>
-
-            {chatOpen && (
-              <div className="w-64 shrink-0 flex flex-col bg-slate-950 border border-slate-800 rounded-lg">
-                <div className="px-3 py-2 border-b border-slate-800 text-xs font-medium text-slate-300">In-call chat</div>
-                <div className="flex-1 min-h-[200px] max-h-[320px] overflow-y-auto px-3 py-2 space-y-2">
-                  {chatMessages.length === 0 ? (
-                    <p className="text-xs text-slate-500">No messages yet.</p>
-                  ) : (
-                    chatMessages.map((m) => (
-                      <div key={m.id} className="text-sm">
-                        <span className={`text-xs font-medium ${m.isLocal ? "text-indigo-400" : "text-slate-400"}`}>
-                          {m.senderName}
-                        </span>
-                        <p className="text-slate-200 break-words">{m.text}</p>
-                      </div>
-                    ))
-                  )}
-                  <div ref={chatEndRef} />
-                </div>
-                <form onSubmit={handleSendChatMessage} className="flex items-center gap-1.5 p-2 border-t border-slate-800">
-                  <input
-                    value={chatInput}
-                    onChange={(e) => setChatInput(e.target.value)}
-                    placeholder="Message everyone"
-                    className="flex-1 min-w-0 text-sm rounded-lg bg-slate-800 border border-slate-700 text-white px-2.5 py-1.5 placeholder:text-slate-500 focus:outline-none focus:ring-2 focus:ring-indigo-500/40"
-                  />
-                  <button
-                    type="submit"
-                    disabled={!chatInput.trim()}
-                    className="text-xs font-medium rounded-lg px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-40 text-white"
-                  >
-                    Send
-                  </button>
-                </form>
-              </div>
-            )}
-          </div>
-
-          {participants.length > 0 && (
-            <div className="flex flex-wrap gap-2 px-1">
-              {participants.map((p) => (
-                <span
-                  key={p.identity}
-                  className="text-xs text-slate-300 bg-slate-800 rounded-full px-2.5 py-1"
-                >
-                  {p.name}
-                </span>
-              ))}
-            </div>
-          )}
-
-          <div className="flex items-center justify-center gap-3 pt-2">
-            <button
-              onClick={handleToggleMic}
-              className={`text-xs font-medium rounded-lg px-3 py-2 ${
-                micOn ? "bg-slate-800 text-white" : "bg-red-700 text-white"
-              }`}
-            >
-              {micOn ? "Mute" : "Unmute"}
-            </button>
-            <button
-              onClick={handleToggleCamera}
-              className={`text-xs font-medium rounded-lg px-3 py-2 ${
-                cameraOn ? "bg-slate-800 text-white" : "bg-red-700 text-white"
-              }`}
-            >
-              {cameraOn ? "Stop Video" : "Start Video"}
-            </button>
-            <button
-              onClick={handleToggleScreenShare}
-              className={`text-xs font-medium rounded-lg px-3 py-2 ${
-                screenSharing ? "bg-emerald-700 text-white" : "bg-slate-800 text-white"
-              }`}
-            >
-              {screenSharing ? "Stop Sharing" : "Share Screen"}
-            </button>
-            <button
-              onClick={() => {
-                setChatOpen((v) => !v);
-                setUnreadChatCount(0);
-              }}
-              className={`relative text-xs font-medium rounded-lg px-3 py-2 ${
-                chatOpen ? "bg-emerald-700 text-white" : "bg-slate-800 text-white"
-              }`}
-            >
-              Chat
-              {unreadChatCount > 0 && (
-                <span className="absolute -top-1.5 -right-1.5 flex items-center justify-center w-4 h-4 rounded-full bg-red-500 text-white text-[10px] font-bold">
-                  {unreadChatCount > 9 ? "9+" : unreadChatCount}
-                </span>
-              )}
-            </button>
-            {recordingState !== "active" && !roomConfidential && (
-              <button
-                onClick={handleStartRecording}
-                disabled={recordingState === "busy"}
-                className="text-xs font-medium rounded-lg px-3 py-2 bg-slate-800 text-white disabled:opacity-60"
-              >
-                {recordingState === "busy" ? "Starting..." : "Record"}
-              </button>
-            )}
-            {recordingState === "active" && (
-              <button
-                onClick={handleStopRecording}
-                className="text-xs font-medium rounded-lg px-3 py-2 bg-red-700 hover:bg-red-600 text-white"
-              >
-                Stop Recording
-              </button>
-            )}
-            <button
-              onClick={handleEndCall}
-              className="text-xs font-medium rounded-lg px-4 py-2 bg-red-700 hover:bg-red-600 text-white"
-            >
-              Leave &amp; End Call
-            </button>
-          </div>
-        </div>
+            </>
+          }
+          screenSharing={screenSharing}
+          onToggleScreenShare={handleToggleScreenShare}
+          localScreenVideoRef={localScreenVideoRef}
+          recordingState={recordingState}
+          onStartRecording={!roomConfidential ? handleStartRecording : undefined}
+          onStopRecording={handleStopRecording}
+          onGrantConsentAndRecord={handleGrantConsentAndRecord}
+          recordingError={recordingError}
+          waitingGuests={waitingGuests}
+          onAdmitGuest={handleAdmitGuest}
+          onDenyGuest={handleDenyGuest}
+          admittingGuestId={admittingGuestId}
+        />
       )}
 
       <div className="bg-white rounded-xl border border-slate-200 p-6 space-y-4">

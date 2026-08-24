@@ -452,6 +452,7 @@ def test_canceled_account_is_blocked_from_outbound_calling(client, monkeypatch):
         headers=headers,
     )
     assert response.status_code == 402
+    assert response.json()["code"] == "SUBSCRIPTION_SUSPENDED"
 
 
 def test_usage_summary_route_returns_zeroed_resources_for_a_fresh_account(client):
@@ -460,9 +461,15 @@ def test_usage_summary_route_returns_zeroed_resources_for_a_fresh_account(client
     assert response.status_code == 200
     body = response.json()
     assert body["plan_code"] == "free_trial"
+    assert body["is_suspended"] is False
+    assert body["ai_receptionist_enabled"] is False
     resources = {r["resource"]: r for r in body["resources"]}
     assert resources["voice_minutes"]["used"] == 0
     assert resources["voice_minutes"]["limit"] == 500
+    assert resources["numbers"]["used"] == 0
+    assert resources["numbers"]["limit"] == 1  # free_trial's max_numbers
+    assert resources["seats"]["used"] == 1  # the signed-up owner
+    assert resources["seats"]["limit"] == 5  # free_trial's max_team_seats
 
 
 def test_number_purchase_blocked_once_plan_number_quota_is_reached(client, monkeypatch):
@@ -481,6 +488,7 @@ def test_number_purchase_blocked_once_plan_number_quota_is_reached(client, monke
     over_limit = _reserve_and_purchase(client, headers, "+15550022222")
     assert over_limit.status_code == 402, over_limit.text
     assert "plan allows up to" in over_limit.json()["detail"]
+    assert over_limit.json()["code"] == "RESOURCE_OVER_LIMIT"
 
 
 def test_number_purchase_succeeds_after_upgrading_plan(client, monkeypatch):

@@ -17,6 +17,18 @@ class PlanResponse(BaseModel):
     trial_days: int
 
 
+class PublicSupportedCountryResponse(BaseModel):
+    """Deliberately thinner than SupportedCountryResponse (numbering.numbers.
+    schemas) - this backs the public, unauthenticated /billing/public/countries
+    endpoint, so market_status/legal_signoff fields (internal rollout state)
+    aren't leaked to the open internet; the route itself already filters to
+    PAID_OPEN only."""
+    model_config = ConfigDict(from_attributes=True)
+
+    code: str
+    name: str
+
+
 class AIReceptionistAddonRateResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -114,6 +126,8 @@ class UsageSummaryResponse(BaseModel):
     current_period_start: datetime
     current_period_end: datetime
     ai_receptionist_addon_enabled: bool
+    is_suspended: bool
+    ai_receptionist_enabled: bool
     resources: list[UsageResourceSummary]
 
 

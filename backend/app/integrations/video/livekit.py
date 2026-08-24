@@ -112,6 +112,14 @@ async def end_room(room_name: str) -> None:
             with trace_provider_call("livekit", "end_room"):
                 await client.room.delete_room(livekit_api.DeleteRoomRequest(room=room_name))
         except livekit_api.TwirpError as e:
+            # A room LiveKit has already torn down server-side (it idles out
+            # on its own after everyone leaves) is not a failure to "end" -
+            # ending an already-gone room is exactly the state we wanted.
+            # Confirmed live: a stale ACTIVE VideoSession row whose real
+            # room no longer exists on LiveKit's side previously made this
+            # unrecoverable without direct database access.
+            if e.code == "not_found":
+                return
             raise VideoError(str(e)) from e
         finally:
             await client.aclose()
@@ -183,6 +191,15 @@ async def stop_room_recording(egress_id: str) -> None:
         with trace_provider_call("livekit", "stop_room_recording"):
             await client.egress.stop_egress(livekit_api.StopEgressRequest(egress_id=egress_id))
     except livekit_api.TwirpError as e:
+        # An egress LiveKit already finished on its own (the room ended, or
+        # the recording completed) before our webhook told us so is not a
+        # failure to stop it - "already stopped" is exactly the outcome
+        # being asked for. Confirmed live: is_recording_in_progress can be
+        # true in our DB (recording_url not attached yet) while LiveKit's
+        # own egress status is already EGRESS_COMPLETE, previously making
+        # end_video_session unrecoverable for that session.
+        if e.code == "failed_precondition":
+            return
         raise VideoError(str(e)) from e
     finally:
         await client.aclose()

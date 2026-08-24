@@ -1719,6 +1719,13 @@ def configure_routing(
             "is required before enabling SMS on this number"
         )
 
+    if ai_receptionist_enabled and not number.ai_receptionist_enabled and not (
+        billing_service.is_ai_receptionist_enabled_for_account(db, user.account_id)
+    ):
+        raise billing_service.AiReceptionistNotEntitledError(
+            "Your plan doesn't include AI Receptionist - upgrade or add the AI Receptionist add-on to enable it."
+        )
+
     try:
         ZoneInfo(business_hours_timezone)
     except ZoneInfoNotFoundError as e:

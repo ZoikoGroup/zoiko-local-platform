@@ -19,6 +19,7 @@ from app.billing.schemas import (
     IssueDebitNoteRequest,
     PlanResponse,
     PriceCatalogEntryResponse,
+    PublicSupportedCountryResponse,
     RefundPaymentRequest,
     RejectBillingActionRequest,
     ResolveReconciliationExceptionRequest,
@@ -35,8 +36,11 @@ from app.billing.schemas import (
 )
 from app.core.database import get_db
 from app.core.deps import get_current_staff, get_current_user, require_admin, require_capability
+from app.core.rate_limit import limiter
 from app.integrations.billing import zoikonex as zoikonex_adapter
 from app.numbering.identity.models import User
+from app.numbering.numbers.models import MarketActivationStatus
+from app.numbering.numbers import service as numbers_service
 from app.ops.service import KillSwitchTrippedError
 from app.staff.models import PlatformStaff
 
@@ -64,6 +68,40 @@ def get_price_catalog_entry(
     billing_period defaults MONTHLY - annual pricing (added later) is opt-in
     via the query param, not a breaking change to existing callers."""
     return service.get_active_price_catalog_entry(db, plan_code, billing_period=BillingPeriod(billing_period))
+
+
+@router.get("/public/plans", response_model=list[PlanResponse])
+@limiter.limit("60/minute")
+def list_public_plans(request: Request, db: Session = Depends(get_db)):
+    """Unauthenticated mirror of GET /plans above - powers the public
+    marketing pricing page (no visitor account exists yet to authenticate
+    with). Same service call, no auth dependency. Rate-limited since this
+    is now reachable by anyone on the internet, not just logged-in users."""
+    return service.list_plans(db)
+
+
+@router.get("/public/plans/{plan_code}/price", response_model=PriceCatalogEntryResponse | None)
+@limiter.limit("60/minute")
+def get_public_plan_price(
+    request: Request, plan_code: str, billing_period: str = "monthly", db: Session = Depends(get_db),
+):
+    """Unauthenticated mirror of GET /price-catalog/{plan_code} above - same
+    reasoning as list_public_plans. Commercial values must come from the
+    versioned catalog even on the public marketing page, never be
+    hardcoded in the frontend."""
+    return service.get_active_price_catalog_entry(db, plan_code, billing_period=BillingPeriod(billing_period))
+
+
+@router.get("/public/countries", response_model=list[PublicSupportedCountryResponse])
+@limiter.limit("60/minute")
+def list_public_countries(request: Request, db: Session = Depends(get_db)):
+    """Unauthenticated, and deliberately filtered to PAID_OPEN only - unlike
+    GET /numbers/countries (authenticated, returns every market_status for
+    the dashboard's own use), a logged-out visitor should only see markets
+    that are actually real and sellable today, not internal-test/closed
+    ones still being rolled out."""
+    countries = numbers_service.list_supported_countries(db)
+    return [c for c in countries if c.market_status == MarketActivationStatus.PAID_OPEN]
 
 
 @router.get("/ai-receptionist-addon-rate", response_model=AIReceptionistAddonRateResponse | None)

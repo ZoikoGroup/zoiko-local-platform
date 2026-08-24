@@ -18,6 +18,7 @@ from app.contacts.routes import router as contacts_router
 from app.core.config import settings
 from app.core.database import engine
 from app.core.error_logging import ErrorLoggingMiddleware
+from app.core.errors import EntitlementError
 from app.core.logging import configure_logging
 from app.crm.routes import router as crm_router
 from app.core.rate_limit import limiter
@@ -90,6 +91,16 @@ async def database_unavailable_handler(request: Request, exc: DBAPIError) -> JSO
     shortly, not "your request was invalid."
     """
     return JSONResponse(status_code=503, content={"detail": "Service temporarily unavailable - please try again shortly."})
+
+
+@app.exception_handler(EntitlementError)
+async def entitlement_error_handler(request: Request, exc: EntitlementError) -> JSONResponse:
+    """Single conversion point for commercial/entitlement domain errors -
+    replaces the ~12 previously-duplicated per-route try/except blocks that
+    each mapped one of these exceptions to HTTPException(detail=str(e))
+    with no machine-readable code. Additive to the response body (`detail`
+    unchanged, `code` new) - no existing client breaks."""
+    return JSONResponse(status_code=exc.status_code, content={"detail": exc.message, "code": exc.code})
 
 # Fail fast rather than boot insecurely - see app/core/startup_checks.py.
 assert_jwt_secret_is_configured(settings.environment, settings.jwt_secret_key)
