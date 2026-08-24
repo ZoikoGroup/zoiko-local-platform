@@ -1,5 +1,6 @@
 import logging
 
+from app.core.config import settings
 from app.notifications.service import (
     SmsTemplateMissingError,
     notify_api_client_created,
@@ -735,6 +736,139 @@ def test_critical_email_has_no_unsubscribe_headers(db_session, monkeypatch):
     )
     assert delivery.status == "sent"
     assert sent[0]["headers"] is None
+
+
+def test_transactional_email_sends_styled_html_alongside_plain_text(db_session, monkeypatch):
+    """Real gap fixed 2026-08-22: every email went out as unstyled plain
+    text, including security emails - the Email Communications System doc
+    treats this as a launch blocker. This proves send_notification now
+    passes a real HTML alternative through to send_email, with a genuine
+    clickable unsubscribe link embedded in it (not just plain-text URL)."""
+    from app.notifications.service import send_notification
+
+    from app.numbering.identity.models import Account, AccountType
+
+    monkeypatch.setattr("app.core.config.settings.resend_api_key", "")
+    sent = []
+    monkeypatch.setattr("app.notifications.service.send_email", lambda **kw: sent.append(kw))
+
+    account = Account(name="HTML Email Co", account_type=AccountType.INDIVIDUAL)
+    db_session.add(account)
+    db_session.flush()
+    db_session.commit()
+
+    delivery = send_notification(
+        db_session, event_name="number.activated", account_id=account.id,
+        recipient_email="x@example.com",
+        context={
+            "e164": "+15550001111", "number_formatted": "+15550001111",
+            "organization_name": "HTML Email Co", "user_display_name": "x@example.com",
+        },
+    )
+    assert delivery.status == "sent"
+    html = sent[0]["html"]
+    assert html is not None
+    assert "<html>" in html
+    assert sent[0]["subject"] in html
+    assert '<a href="' in html
+    assert "Unsubscribe" in html
+
+
+def test_critical_email_html_has_no_unsubscribe_link(db_session, monkeypatch):
+    from app.notifications.service import send_notification
+
+    from app.numbering.identity.models import Account, AccountType
+
+    monkeypatch.setattr("app.core.config.settings.resend_api_key", "")
+    sent = []
+    monkeypatch.setattr("app.notifications.service.send_email", lambda **kw: sent.append(kw))
+
+    account = Account(name="Critical HTML Co", account_type=AccountType.INDIVIDUAL)
+    db_session.add(account)
+    db_session.flush()
+    db_session.commit()
+
+    delivery = send_notification(
+        db_session, event_name="number.suspended", account_id=account.id,
+        recipient_email="x@example.com", context={"e164": "+15550001111", "reason_line": ""},
+    )
+    assert delivery.status == "sent"
+    assert "Unsubscribe" not in sent[0]["html"]
+
+
+def test_render_html_email_escapes_untrusted_body_content():
+    """context values (e.g. an account name) flow into the email body
+    unescaped in the plain-text template - the HTML render must escape
+    them itself rather than trust the caller, since a malicious account
+    name like an org name containing markup must not become live HTML in
+    a rendered email."""
+    from app.notifications.service import _render_html_email
+
+    html = _render_html_email("Test subject", "Hello <script>alert(1)</script> friend")
+    assert "<script>" not in html
+    assert "&lt;script&gt;" in html
+
+
+def test_resolve_from_address_defaults_to_single_address_until_domain_verified(monkeypatch):
+    """Real gap fixed 2026-08-22: all email shared one sending address/
+    domain, risking marketing mail's reputation dragging down password-
+    reset deliverability. zoikolocal.com is the real domain (founder,
+    2026-08-22) but its Resend DNS verification hasn't been confirmed yet
+    - the per-category mapping must stay inert (fall back to today's
+    single working address) until email_domain_verified is flipped on, so
+    wiring this in never itself causes emails to start bouncing."""
+    from app.notifications.service import _resolve_from_address
+
+    monkeypatch.setattr("app.core.config.settings.email_domain_verified", False)
+    assert _resolve_from_address("AUTH") == settings.email_from_address
+    assert _resolve_from_address("BILL") == settings.email_from_address
+    assert _resolve_from_address("MKTG") == settings.email_from_address
+    assert _resolve_from_address(None) == settings.email_from_address
+
+
+def test_resolve_from_address_routes_by_category_once_domain_verified(monkeypatch):
+    from app.notifications.service import _resolve_from_address
+
+    monkeypatch.setattr("app.core.config.settings.email_domain_verified", True)
+    assert _resolve_from_address("AUTH") == settings.email_from_address_security
+    assert _resolve_from_address("TRUST") == settings.email_from_address_security
+    assert _resolve_from_address("COMP") == settings.email_from_address_security
+    assert _resolve_from_address("DEVICE") == settings.email_from_address_security
+    assert _resolve_from_address("BILL") == settings.email_from_address_billing
+    assert _resolve_from_address("MKTG") == settings.email_from_address_marketing
+    assert _resolve_from_address("PART") == settings.email_from_address_marketing
+    # Unmapped/unknown domain values fall through to "notifications" rather
+    # than raising - a missing mapping should never be why an email fails.
+    assert _resolve_from_address("NUM") == settings.email_from_address_notifications
+    assert _resolve_from_address(None) == settings.email_from_address_notifications
+
+
+def test_send_notification_uses_billing_address_once_domain_verified(db_session, monkeypatch):
+    from app.notifications.service import send_notification
+
+    from app.numbering.identity.models import Account, AccountType
+
+    monkeypatch.setattr("app.core.config.settings.resend_api_key", "")
+    monkeypatch.setattr("app.core.config.settings.email_domain_verified", True)
+    sent = []
+    monkeypatch.setattr("app.notifications.service.send_email", lambda **kw: sent.append(kw))
+
+    account = Account(name="Billing Domain Co", account_type=AccountType.INDIVIDUAL)
+    db_session.add(account)
+    db_session.flush()
+    db_session.commit()
+
+    delivery = send_notification(
+        db_session, event_name="billing.plan_started", account_id=account.id,
+        recipient_email="x@example.com",
+        context={
+            "user_display_name": "x@example.com", "organization_name": "Billing Domain Co",
+            "subscription_plan_name": "Pro", "subscription_billing_interval": "monthly",
+            "subscription_next_billing_date": "2026-09-22",
+        },
+    )
+    assert delivery.status == "sent"
+    assert sent[0]["from_address"] == settings.email_from_address_billing
 
 
 def test_email_is_held_during_quiet_hours(db_session, monkeypatch):

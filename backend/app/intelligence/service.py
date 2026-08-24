@@ -1,4 +1,7 @@
+import subprocess
+import tempfile
 from datetime import datetime, timezone
+from pathlib import Path
 
 import sqlalchemy as sa
 from sqlalchemy.orm import Session
@@ -7,6 +10,7 @@ from app.audit.service import log_event
 from app.billing import service as billing_service
 from app.consent.models import GLOBAL_JURISDICTION, ConsentType
 from app.consent.service import has_active_consent
+from app.core.config import settings
 from app.events.service import publish_ai_summary_completed, publish_transcript_completed
 from app.integrations.cache.redis import cache_delete, cache_get, cache_set
 from app.integrations.embeddings.cohere import EmbeddingError, generate_embedding
@@ -24,7 +28,7 @@ from app.numbering.numbers.service import NumberConflictError, assert_number_acc
 from app.numbering.numbers.models import PhoneNumber
 from app.ops.models import KillSwitchScope
 from app.ops.service import assert_kill_switch_not_active
-from app.retention.service import PURGED_MARKER
+from app.retention.service import PURGED_MARKER, RECORDING_FAILED_MARKER
 from app.risk.service import is_ai_receptionist_trial_cap_exceeded
 from app.usage import service as usage_service
 
@@ -68,14 +72,74 @@ def _download_and_transcribe(recording_url: str) -> str:
     return transcribe_audio(audio_bytes)
 
 
-def _download_and_transcribe_video(room_name: str) -> str:
+class AudioExtractionError(Exception):
+    """Raised when ffmpeg itself is missing or fails on a real video file -
+    distinct from TranscriptionError, which is Groq's own API failing."""
+
+
+def _extract_audio(video_bytes: bytes) -> bytes:
+    """Strips a recording down to just its audio track, encoded small
+    (16kHz mono MP3 - plenty for speech, a fraction of the original video's
+    size) before it ever reaches Groq. Confirmed live (2026-08-21): sending
+    a raw video file directly used to work (Whisper accepts mp4 natively),
+    but a 43MB recording hit Groq's 25MB free-tier upload cap and got a
+    dropped connection instead of a clean error - anything longer than a
+    few minutes of video was silently unsummarizable. Audio-only shrinks
+    the same content by roughly an order of magnitude, keeping most real
+    calls under the limit without needing a paid Groq tier.
+
+    The input is written to a real temp file rather than piped in -
+    confirmed live (2026-08-21) that piping the raw MP4 via stdin silently
+    produced a near-empty result: MP4 stores its stream metadata (the moov
+    atom) at the END of the file for a non-"faststart" encode (LiveKit's
+    egress output isn't faststart), which ffmpeg can only locate by
+    seeking - impossible on a pipe, possible on a real file. The output
+    side has no such requirement (MP3 is a plain streamable format), so
+    that half stays piped rather than needing a second temp file."""
+    # delete=False + explicit close before running ffmpeg, not a plain
+    # `with NamedTemporaryFile() as tmp` - on Windows, a second process
+    # cannot open a file whose original handle is still held open, so
+    # ffmpeg would fail to read it while Python's handle stayed alive
+    # inside the `with` block. Cleaned up manually in `finally` instead.
+    tmp = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
+    try:
+        tmp.write(video_bytes)
+        tmp.close()
+        result = subprocess.run(
+            [
+                settings.ffmpeg_path, "-y", "-i", tmp.name, "-vn",
+                "-acodec", "libmp3lame", "-ar", "16000", "-ac", "1", "-f", "mp3", "pipe:1",
+            ],
+            capture_output=True, timeout=120, check=True,
+        )
+    except FileNotFoundError as e:
+        raise AudioExtractionError(
+            "ffmpeg is not installed or not on PATH - see Dockerfile/FFMPEG_PATH"
+        ) from e
+    except subprocess.TimeoutExpired as e:
+        raise AudioExtractionError("ffmpeg audio extraction timed out") from e
+    except subprocess.CalledProcessError as e:
+        raise AudioExtractionError(f"ffmpeg audio extraction failed: {e.stderr.decode(errors='replace')[-500:]}") from e
+    finally:
+        Path(tmp.name).unlink(missing_ok=True)
+    return result.stdout
+
+
+def _download_and_transcribe_video(room_name: str, object_key: str) -> str:
     """Video recordings live in object storage as the room's egress output,
     not behind a Twilio-authenticated URL like calls/voicemail - fetched by
-    bucket key instead, and handed to Whisper with a video content-type
-    (Groq's transcription endpoint accepts mp4 directly, no audio
-    extraction step needed)."""
-    audio_bytes = download_object(f"recordings/{room_name}.mp4")
-    return transcribe_audio(audio_bytes, filename=f"{room_name}.mp4", content_type="video/mp4")
+    bucket key instead. Audio is extracted before handing it to Whisper
+    (see _extract_audio's docstring for why).
+
+    object_key is the session's real recording_object_key (see media.
+    service.start_video_recording) - NOT reconstructed from room_name,
+    which stopped being the real key once recordings moved to human-
+    readable filenames (account name + date/day/time). Confirmed live
+    (2026-08-21): this call site was missed in that change and was fetching
+    a key that never existed for any recording made since."""
+    video_bytes = download_object(object_key)
+    audio_bytes = _extract_audio(video_bytes)
+    return transcribe_audio(audio_bytes, filename=f"{room_name}.mp3", content_type="audio/mpeg")
 
 
 def _analyze_and_store(
@@ -272,16 +336,17 @@ def summarize_video_session(db: Session, user: User, room_name: str) -> Conversa
         raise SummaryAuthorizationError(f"{room_name} is not a video session owned by your account")
     if user.role == UserRole.MEMBER and session.host_user_id != user.id:
         raise SummaryAuthorizationError(f"{room_name} was not hosted by you")
-    if not session.recording_url or session.recording_url == PURGED_MARKER:
+    if not session.recording_url or session.recording_url in (PURGED_MARKER, RECORDING_FAILED_MARKER):
         raise NotRecordedError(f"{room_name} has no finished recording yet — it may still be in progress")
 
     _require_consent(db, user.account_id, "video calls", GLOBAL_JURISDICTION)
+    object_key = session.recording_object_key or f"recordings/{session.room_name}.mp4"
 
     return _run_ai_job(
         db, account_id=user.account_id, source_type=SummarySourceType.VIDEO, source_id=session.id,
         work_fn=lambda: _analyze_and_store(
             db, account_id=user.account_id, source_type=SummarySourceType.VIDEO, source_id=session.id,
-            transcript=_download_and_transcribe_video(session.room_name),
+            transcript=_download_and_transcribe_video(session.room_name, object_key),
         ),
     )
 

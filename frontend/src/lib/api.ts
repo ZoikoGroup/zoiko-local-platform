@@ -934,6 +934,7 @@ export type MyPhoneNumber = {
   business_hours_timezone: string;
   ai_receptionist_enabled: boolean;
   escalation_user_id: string | null;
+  escalation_phone_number: string | null;
   call_flow_id: string | null;
   whatsapp_enabled: boolean;
   sms_enabled: boolean;
@@ -1044,10 +1045,79 @@ export type CheckoutSession = {
   url: string | null;
   included: boolean;
   number: MyPhoneNumber | null;
+  pending_charge_amount_minor_units: number | null;
 };
 
 export function createNumberCheckoutSession(token: string, e164: string): Promise<CheckoutSession> {
   return request<CheckoutSession>(`/numbers/${encodeURIComponent(e164)}/checkout-session`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export type NumberEligibilityDocument = {
+  document_type: string;
+  storage_key: string;
+  filename: string;
+  content_type: string;
+  uploaded_at: string;
+};
+
+export type NumberEligibilityCase = {
+  id: string;
+  phone_number_id: string;
+  account_id: string;
+  country: string;
+  number_type: string;
+  status: string;
+  evidence: Record<string, unknown>[];
+  review_notes: string | null;
+  expires_at: string | null;
+  created_at: string;
+  resolved_at: string | null;
+  documents: NumberEligibilityDocument[];
+  twilio_bundle_sid: string | null;
+  twilio_bundle_status: string | null;
+  twilio_bundle_rejection_reason: string | null;
+};
+
+export function listMyEligibilityCases(token: string): Promise<NumberEligibilityCase[]> {
+  return request<NumberEligibilityCase[]>("/numbers/eligibility-cases", {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export function submitEligibilityDocument(
+  token: string,
+  caseId: string,
+  documentType: string,
+  file: File
+): Promise<NumberEligibilityCase> {
+  const formData = new FormData();
+  formData.append("document_type", documentType);
+  formData.append("file", file);
+  return request<NumberEligibilityCase>(`/numbers/eligibility-cases/${caseId}/documents`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+    body: formData,
+  });
+}
+
+export function submitEligibilityBundle(
+  token: string,
+  caseId: string,
+  endUserAttributes: { first_name: string; last_name: string; email: string; phone_number: string },
+  endUserType: string = "individual"
+): Promise<NumberEligibilityCase> {
+  return request<NumberEligibilityCase>(`/numbers/eligibility-cases/${caseId}/submit-bundle`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ end_user_attributes: endUserAttributes, end_user_type: endUserType }),
+  });
+}
+
+export function syncEligibilityBundleStatus(token: string, caseId: string): Promise<NumberEligibilityCase> {
+  return request<NumberEligibilityCase>(`/numbers/eligibility-cases/${caseId}/sync-bundle-status`, {
     method: "POST",
     headers: { Authorization: `Bearer ${token}` },
   });
@@ -1078,6 +1148,7 @@ export function configureRouting(
     business_hours_timezone?: string;
     ai_receptionist_enabled?: boolean;
     escalation_user_id?: string | null;
+    escalation_phone_number?: string | null;
     whatsapp_enabled?: boolean;
     sms_enabled?: boolean;
   }
@@ -1266,6 +1337,7 @@ export type VideoRoom = {
   started_at: string | null;
   ended_at: string | null;
   recording_in_progress: boolean;
+  recording_failed: boolean;
   recording_url: string | null;
   participant_minutes: number;
   confidential: boolean;

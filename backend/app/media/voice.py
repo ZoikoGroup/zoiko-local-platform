@@ -93,6 +93,16 @@ class OutboundCallRequest(BaseModel):
     message: str = "This is a call from Zoiko Local."
 
 
+def _ai_receptionist_greeting_twiml(request: Request) -> str:
+    action_url = str(request.base_url) + "media/receptionist/respond"
+    return telecom.build_gather_response(
+        "Thanks for calling. You're speaking with an automated assistant, not a person. "
+        "Please tell us your name, company, the reason for your call, and whether "
+        "it's urgent, after the tone.",
+        action_url,
+    )
+
+
 def _default_call_twiml(request: Request, db: Session, owner, to_number: str) -> str:
     """The number's normal (non-IVR) call handling: ring group/forwarding,
     then AI receptionist, then voicemail, then "unrecognized number." Used
@@ -119,13 +129,7 @@ def _default_call_twiml(request: Request, db: Session, owner, to_number: str) ->
             destinations, fallback_action_url, status_callback_url, recording_callback_url
         )
     elif owner is not None and owner.ai_receptionist_enabled:
-        action_url = str(request.base_url) + "media/receptionist/respond"
-        return telecom.build_gather_response(
-            "Thanks for calling. You're speaking with an automated assistant, not a person. "
-            "Please tell us your name, company, the reason for your call, and whether "
-            "it's urgent, after the tone.",
-            action_url,
-        )
+        return _ai_receptionist_greeting_twiml(request)
     elif owner is not None:
         callback_url = str(request.base_url) + "media/voicemail/recording-complete"
         return telecom.build_record_response(callback_url)
@@ -341,13 +345,23 @@ async def forward_fallback(request: Request, db: Session = Depends(get_db)):
     URL once the dial resolves (see telecom.build_ring_group_response).
     `DialCallStatus` is "completed" for a call that was actually answered
     and has now ended normally - nothing further to do there. Any other
-    status (no-answer, busy, failed) means nobody picked up, so the
-    caller is routed to voicemail instead of just hearing silence -
-    "overflow handling" (Architecture doc Phase 2), previously missing
-    for both the single-forwarding-number and ring-group cases."""
+    status (no-answer, busy, failed) means nobody picked up.
+
+    Confirmed live (2026-08-22): a customer with BOTH forwarding and AI
+    Receptionist configured got plain voicemail here regardless - AI never
+    got a chance to catch what the human missed, even though the whole
+    point of turning both on is "try a person first, let AI handle it if
+    they don't answer." Falls through to the AI Receptionist greeting when
+    it's enabled for this number; only a number with neither forwarding
+    fully covered nor AI Receptionist on falls all the way to voicemail -
+    "overflow handling" (Architecture doc Phase 2)."""
     params = await media_service.verify_twilio_webhook(request)
     if params.get("DialCallStatus") == "completed":
         return Response(content=telecom.build_empty_response(), media_type="application/xml")
+
+    owner = media_service.find_number_owner(db, params.get("To", ""))
+    if owner is not None and owner.ai_receptionist_enabled:
+        return Response(content=_ai_receptionist_greeting_twiml(request), media_type="application/xml")
 
     callback_url = str(request.base_url) + "media/voicemail/recording-complete"
     twiml = telecom.build_record_response(callback_url)

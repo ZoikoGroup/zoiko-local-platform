@@ -166,6 +166,17 @@ class PhoneNumber(Base):
     escalation_user_id: Mapped[str | None] = mapped_column(
         UUID(as_uuid=False), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
     )
+    # The actual number dialed to reach escalation_user_id. Deliberately its
+    # own field, NOT forwarding_number - confirmed live (2026-08-22) that
+    # receptionist.py used to dial forwarding_number for escalation, which
+    # meant setting an escalation destination on an AI-Receptionist-primary
+    # number (forwarding off) had no way to specify one without forwarding_
+    # number's mere presence ALSO flipping should_forward_call() to true and
+    # hijacking every inbound call into always-forward mode - the business
+    # could not have "AI answers everything, but ring a human for urgent
+    # ones" at all. NULL means no escalation number configured, same as
+    # NULL escalation_user_id already meant no escalation at all.
+    escalation_phone_number: Mapped[str | None] = mapped_column(String(20), nullable=True)
 
     # Architecture doc Phase 2 "enhanced business routing" - IVR-style menu
     # ("press 1 for sales, 2 for support"). Non-null/non-empty means the
@@ -378,17 +389,22 @@ class NumberEligibilityCase(Base):
     provider submission and expiry. Reject incomplete cases without
     charging recurring rental." One case per requested number (not per
     account - see NumberEligibilityRule's docstring for why this is
-    distinct from app.compliance.models.ComplianceCase). Evidence here is
-    lightweight structured metadata the customer/staff exchange, not a
-    file-upload feature - extend to real document storage the same way
-    ComplianceCase does (app.integrations.storage.s3) if/when a specific
-    market's eligibility profile actually needs it; deliberately not built
-    for this first pass since no active rule exists yet to need it.
+    distinct from app.compliance.models.ComplianceCase).
     "Reject incomplete cases without charging recurring rental" is
     satisfied structurally: next_renewal_at is only ever set once a number
     reaches ACTIVE (see app.numbering.numbers.service.purchase_number),
     which can't happen while a case here is anything but APPROVED.
-    """
+
+    Real gap closed 2026-08-22 (UK is the first country that actually needs
+    this): `documents` + the `twilio_*` fields extend this to real document
+    storage the same way ComplianceCase does
+    (app.integrations.storage.s3), plus genuine submission to Twilio's own
+    Regulatory Bundle review (see app.integrations.telecom.twilio's
+    create_regulatory_end_user/upload_supporting_document/
+    create_regulatory_bundle/submit_bundle_for_review/get_bundle_status) -
+    Twilio requires its own reviewed bundle before it will activate a
+    restricted number type, independent of whatever our own `evidence`/
+    `status` fields say."""
 
     __tablename__ = "number_eligibility_cases"
 
@@ -411,3 +427,11 @@ class NumberEligibilityCase(Base):
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Same shape as ComplianceCase.documents - server-generated storage_key,
+    # never client input (see submit_number_eligibility_document).
+    documents: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    twilio_end_user_sid: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    twilio_supporting_document_sid: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    twilio_bundle_sid: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    twilio_bundle_status: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    twilio_bundle_rejection_reason: Mapped[str | None] = mapped_column(String(500), nullable=True)

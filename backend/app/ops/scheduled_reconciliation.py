@@ -8,11 +8,11 @@ render.yaml's zoiko-local-daily-reconciliation cron service):
 Not wired into the FastAPI app itself - owns its own DB session, same
 pattern as app.events.consumer. Deliberately a thin script: it only calls
 existing, already-tested service functions (run_zoikonex_reconciliation,
-list_due_renewals, expire_overdue_cases, purge_expired_recordings) and logs
-a summary; it contains no reconciliation logic of its own. Exits 1 if this
-run found new exceptions, numbers overdue for renewal, or any purge
-failures, so cron/host alerting can key off the exit code without parsing
-log output.
+list_due_renewals, expire_overdue_cases, purge_expired_recordings,
+sweep_stale_video_recordings) and logs a summary; it contains no
+reconciliation logic of its own. Exits 1 if this run found new exceptions,
+numbers overdue for renewal, or any purge failures, so cron/host alerting
+can key off the exit code without parsing log output.
 
 expire_overdue_cases and purge_expired_recordings both existed with no
 scheduler calling them (see their own docstrings) - this is that scheduler.
@@ -26,6 +26,7 @@ import sys
 from app.billing.service import run_zoikonex_reconciliation
 from app.compliance.service import expire_overdue_cases
 from app.core.database import SessionLocal
+from app.media.service import sweep_stale_video_recordings
 from app.numbering.numbers.service import list_due_renewals
 from app.retention.service import purge_expired_recordings
 
@@ -69,6 +70,9 @@ def main() -> int:
         )
         if total_failed > 0:
             exit_code = 1
+
+        swept = sweep_stale_video_recordings(db)
+        logger.info("stale_video_recordings_swept count=%d", swept["swept"])
     except Exception:
         logger.exception("scheduled_reconciliation run failed")
         exit_code = 1

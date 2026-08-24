@@ -30,7 +30,7 @@ def _stub_buy_number(monkeypatch):
     # per test.
     monkeypatch.setattr(
         "app.numbering.numbers.service.telecom.buy_number",
-        lambda e164: {"sid": f"PN_fake_{e164}", "phone_number": e164, "capabilities": {}},
+        lambda e164, bundle_sid=None: {"sid": f"PN_fake_{e164}", "phone_number": e164, "capabilities": {}},
     )
 
 

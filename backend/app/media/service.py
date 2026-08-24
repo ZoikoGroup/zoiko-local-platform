@@ -1,4 +1,6 @@
+import asyncio
 import math
+import re
 import uuid
 from datetime import datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -58,9 +60,15 @@ from app.numbering.numbers.service import (
 )
 from app.ops.models import KillSwitchScope
 from app.ops.service import assert_kill_switch_not_active
-from app.retention.service import PURGED_MARKER
+from app.retention.service import PURGED_MARKER, RECORDING_FAILED_MARKER
 from app.risk import service as risk_service
 from app.usage import service as usage_service
+
+# Generous upper bound on any real meeting length + LiveKit's own upload/
+# processing time - only exists to catch a genuinely lost webhook (LiveKit
+# outage, dropped delivery), not to time out recordings that are still
+# legitimately in progress.
+RECORDING_STALE_AFTER_MINUTES = 120
 
 
 class CallAuthorizationError(Exception):
@@ -700,6 +708,23 @@ def is_recording_in_progress(session: VideoSession) -> bool:
     return session.recording_egress_id is not None and session.recording_url is None
 
 
+def _build_recording_object_key(db: Session, session: VideoSession, started_at: datetime) -> str:
+    """Human-readable S3 key - account name + date/day/time - instead of
+    the internal random room_name ("zl-<uuid hex>"), which is fine as a
+    LiveKit/DB identifier but meaningless to a human looking at recording
+    filenames in the bucket. A short suffix off the session id is appended
+    to guarantee uniqueness even if two recordings from the same account
+    started in the same second (timestamp resolution is whole seconds)."""
+    from app.numbering.identity.models import Account
+
+    account = db.query(Account).filter(Account.id == session.account_id).first()
+    raw_name = account.name if account is not None else "account"
+    slug = re.sub(r"[^a-zA-Z0-9]+", "-", raw_name).strip("-").lower() or "account"
+    timestamp = started_at.strftime("%Y-%m-%d-%A-%H-%M-%S")
+    suffix = session.id.replace("-", "")[:8]
+    return f"recordings/{slug}-{timestamp}-{suffix}.mp4"
+
+
 async def start_video_recording(db: Session, user: User, room_name: str) -> VideoSession:
     session = _find_account_video_session(db, user.account_id, room_name)
     if user.role == UserRole.MEMBER and session.host_user_id != user.id:
@@ -718,9 +743,13 @@ async def start_video_recording(db: Session, user: User, room_name: str) -> Vide
             "grant it via POST /compliance/consent first"
         )
 
-    egress_id = await video.start_room_recording(room_name)
+    started_at = datetime.now(timezone.utc)
+    object_key = _build_recording_object_key(db, session, started_at)
+    egress_id = await video.start_room_recording(room_name, object_key)
     session.recording_egress_id = egress_id
     session.recording_url = None
+    session.recording_object_key = object_key
+    session.recording_started_at = started_at
     db.commit()
     db.refresh(session)
     _invalidate_video_sessions_cache(user.account_id)
@@ -999,8 +1028,10 @@ def _video_sessions_cache_key(account_id: str) -> str:
 # Invalidated at every VideoSession field mutation that list_account_video_
 # sessions' serialized output actually reflects: create_video_session,
 # end_video_session, start_video_recording, handle_video_webhook_event's
-# room_finished transition, and _handle_egress_ended (attaches recording_url,
-# which is what makes "Play recording"/"Summarize with AI" appear).
+# room_finished transition, _handle_egress_ended (attaches recording_url,
+# which is what makes "Play recording"/"Summarize with AI" appear), and
+# sweep_stale_video_recordings (clears a stuck in-progress state when the
+# egress_ended webhook never arrives at all).
 _VIDEO_SESSIONS_CACHE_TTL_SECONDS = 15
 
 
@@ -1153,11 +1184,17 @@ def get_recording_download_url(session: VideoSession) -> str | None:
     stored in recording_url 403s/UnauthorizedAccess's in a browser. Generate
     a fresh short-lived signed URL each time instead of ever serving that
     stored URL directly. Returns None if there's no recording, or it's
-    already been purged by retention policy."""
-    if not session.recording_url or session.recording_url == PURGED_MARKER:
+    already been purged by retention policy, or the recording failed.
+
+    Uses recording_object_key (the actual key it was uploaded under) rather
+    than reconstructing one from room_name - sessions recorded before
+    recording_object_key existed fall back to the old room_name-based
+    scheme, since that's genuinely what those older files are keyed by."""
+    if not session.recording_url or session.recording_url in (PURGED_MARKER, RECORDING_FAILED_MARKER):
         return None
+    key = session.recording_object_key or f"recordings/{session.room_name}.mp4"
     try:
-        return generate_presigned_url(f"recordings/{session.room_name}.mp4")
+        return generate_presigned_url(key)
     except StorageError:
         return None
 
@@ -1265,11 +1302,84 @@ def _handle_egress_ended(db: Session, event) -> None:
             metadata={"room_name": session.room_name, "egress_status": egress_info.status},
         )
     else:
+        # Previously left recording_egress_id set with recording_url still
+        # None - is_recording_in_progress stayed True forever (a real,
+        # confirmed bug: blocked starting a new recording in the same call
+        # with a wrong "already being recorded" error, and the frontend
+        # showed "Recording processing..." with no way to tell the customer
+        # anything actually went wrong). Clearing egress_id and setting the
+        # marker resolves both at once.
+        session.recording_egress_id = None
+        session.recording_url = RECORDING_FAILED_MARKER
+        db.commit()
+        _invalidate_video_sessions_cache(session.account_id)
         log_event(
             db, actor_id=session.account_id, action="video.recording_failed",
             target_type="video_session", target_id=session.id,
             metadata={"room_name": session.room_name, "egress_status": egress_info.status, "error": egress_info.error},
         )
+
+
+def sweep_stale_video_recordings(db: Session) -> dict[str, int]:
+    """Catches the other half of the stuck-recording bug _handle_egress_ended
+    fixes: a genuinely LOST egress_ended webhook (LiveKit outage, our own
+    backend restarting mid-delivery, dropped delivery) never calls that
+    function at all, so nothing would otherwise ever clear
+    recording_egress_id. Same daily-scheduled-sweep pattern as
+    compliance.service.expire_overdue_cases/retention.service.
+    purge_expired_recordings - meant to run periodically, not on every
+    request.
+
+    Confirmed live (2026-08-21): a lost webhook does NOT mean the recording
+    failed - two real recordings completed successfully on LiveKit's side
+    (real files uploaded) purely because our own backend happened to be
+    mid-restart the moment the webhook tried to deliver. Blindly marking
+    every stale row RECORDING_FAILED_MARKER on elapsed time alone would
+    have permanently hidden those real recordings from the customer (the
+    marker overwrites recording_url, nothing ever reconciles it back).
+    Actively asks LiveKit for the true status via get_egress_status first -
+    only recovers/fails based on what LiveKit actually reports, and leaves
+    a row untouched (retried on the next sweep) if that check itself fails,
+    rather than guessing."""
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(minutes=RECORDING_STALE_AFTER_MINUTES)
+    stale = (
+        db.query(VideoSession)
+        .filter(
+            VideoSession.recording_egress_id.isnot(None),
+            VideoSession.recording_url.is_(None),
+            VideoSession.recording_started_at.isnot(None),
+            VideoSession.recording_started_at < cutoff,
+        )
+        .all()
+    )
+    swept = 0
+    for session in stale:
+        try:
+            info = asyncio.run(video.get_egress_status(session.recording_egress_id))
+        except video.VideoError:
+            continue  # LiveKit itself unreachable right now - retry next sweep, don't guess
+
+        if info is not None and info["status"] in (0, 1, 2):
+            continue  # still genuinely in progress (STARTING/ACTIVE/ENDING) - leave it alone
+
+        if info is not None and info["location"]:
+            session.recording_url = info["location"]
+            action, reason = "video.recording_completed", "recovered from LiveKit after a lost webhook"
+        else:
+            session.recording_url = RECORDING_FAILED_MARKER
+            action = "video.recording_failed"
+            reason = "egress_ended webhook never arrived and LiveKit reports no recoverable file"
+        session.recording_egress_id = None
+        db.commit()
+        swept += 1
+        _invalidate_video_sessions_cache(session.account_id)
+        log_event(
+            db, actor_id=session.account_id, action=action,
+            target_type="video_session", target_id=session.id,
+            metadata={"room_name": session.room_name, "reason": reason},
+        )
+    return {"swept": swept}
 
 
 def capture_receptionist_call(

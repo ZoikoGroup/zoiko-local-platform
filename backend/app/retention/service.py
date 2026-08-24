@@ -17,6 +17,12 @@ from app.retention.models import ArtifactType, RetentionPolicy
 DEFAULT_RETENTION_DAYS = 90
 
 PURGED_MARKER = "[deleted - retention policy]"
+# A failed/lost video egress used to leave recording_egress_id set forever
+# with recording_url still None - see media.service.sweep_stale_video_
+# recordings and _handle_egress_ended, both of which set this marker.
+# Defined here (not in media.service) to avoid a circular import - media.
+# service already imports PURGED_MARKER from this module.
+RECORDING_FAILED_MARKER = "[recording failed]"
 
 
 def get_retention_days(db: Session, account_id: str, artifact_type: ArtifactType) -> int:
@@ -164,13 +170,20 @@ def _purge_call_recordings(db: Session, now: datetime) -> tuple[int, int]:
 
 def _purge_video_recordings(db: Session, now: datetime) -> tuple[int, int]:
     purged = failed = 0
-    for session in db.query(VideoSession).filter(VideoSession.recording_url.isnot(None)).all():
+    query = db.query(VideoSession).filter(
+        VideoSession.recording_url.isnot(None), VideoSession.recording_url != RECORDING_FAILED_MARKER,
+    )
+    for session in query.all():
         retention_days = get_retention_days(db, session.account_id, ArtifactType.VIDEO_RECORDING)
         reference_time = session.ended_at or session.started_at or session.created_at
         if reference_time >= now - timedelta(days=retention_days):
             continue
+        # recording_object_key is the actual key it was uploaded under -
+        # older sessions predating that column fall back to the room_name-
+        # based scheme, since that's genuinely what those files are keyed by.
+        object_key = session.recording_object_key or f"recordings/{session.room_name}.mp4"
         try:
-            delete_object(f"recordings/{session.room_name}.mp4")
+            delete_object(object_key)
         except StorageError as e:
             log_event(
                 db, actor_id=session.account_id, action="retention.purge_failed",

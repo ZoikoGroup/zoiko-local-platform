@@ -181,6 +181,61 @@ class PriceCatalogEntry(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
+class PendingAccountChargeStatus(str, enum.Enum):
+    PENDING = "pending"
+    INVOICED = "invoiced"
+
+
+class PendingAccountCharge(Base):
+    """Architecture doc §9: "Zoiko Local creates or updates plan, seat,
+    number, and add-on entitlement events; ZoikoNex converts them into
+    billing schedules" - a number purchase is meant to become a line item
+    on the SAME ZoikoNex invoice as the plan fee, not a separate charge on
+    a different rail. This table is the holding area between "a number
+    was purchased and provisioned" and "the next run_billing_cycle for
+    this account picked it up and added it as a real invoice line item" -
+    see app.billing.service.run_billing_cycle and record_pending_number_
+    charge.
+
+    charge_type is a plain string, not an enum, deliberately - "number
+    purchase" is the only real user of this table today, but it's meant
+    to be the general "one-off account charge awaiting the next invoice"
+    mechanism (a future add-on purchase is a likely second user), and
+    locking it to a one-member enum now just means an immediate migration
+    the next time it's reused.
+
+    Deliberately NOT app.usage.models.UsageEvent: that table syncs into
+    ZoikoNex's separate rating/charging service (rate_usage_in_zoikonex),
+    not the invoicing service add_invoice_line_item posts into - reusing
+    it would just move the "two disconnected charges" problem elsewhere
+    instead of fixing it."""
+
+    __tablename__ = "pending_account_charges"
+
+    id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=new_uuid)
+    account_id: Mapped[str] = mapped_column(
+        UUID(as_uuid=False), ForeignKey("accounts.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    charge_type: Mapped[str] = mapped_column(String(30), nullable=False)
+    # SET NULL, not CASCADE - if the PhoneNumber row is ever hard-deleted,
+    # the charge record (was it invoiced, for how much) must survive as an
+    # audit trail; only the traceability link back to the number is lost.
+    phone_number_id: Mapped[str | None] = mapped_column(
+        UUID(as_uuid=False), ForeignKey("phone_numbers.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    description: Mapped[str] = mapped_column(String(255), nullable=False)
+    amount_minor_units: Mapped[int] = mapped_column(Integer, nullable=False)
+    currency_code: Mapped[str] = mapped_column(String(3), nullable=False, default="USD")
+    status: Mapped[PendingAccountChargeStatus] = mapped_column(
+        Enum(PendingAccountChargeStatus, name="pending_account_charge_status_enum"),
+        nullable=False, default=PendingAccountChargeStatus.PENDING, index=True,
+    )
+    invoiced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    zoikonex_invoice_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    zoikonex_line_item_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
 class AIReceptionistAddonRate(Base):
     """Pricing doc §5.3's `AIUsageRate` object (ai_product, included
     quantity, overage unit rate, workspace/account scope, effective

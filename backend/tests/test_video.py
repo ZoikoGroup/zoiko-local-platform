@@ -78,6 +78,23 @@ def _egress_ended_webhook_body_and_token_legacy_file_field(
     return body, token
 
 
+def _egress_ended_failed_webhook_body_and_token(egress_id: str, room_name: str) -> tuple[bytes, str]:
+    """A genuinely failed egress - no file_results, no file - matching a
+    real LiveKit failure (S3 error, egress worker crash), not a success."""
+    egress_info = egress_pb.EgressInfo(
+        egress_id=egress_id, room_name=room_name, status=egress_pb.EgressStatus.EGRESS_FAILED,
+        error="simulated failure",
+    )
+    body = MessageToJson(webhook_pb.WebhookEvent(event="egress_ended", egress_info=egress_info)).encode()
+    digest = base64.b64encode(hashlib.sha256(body).digest()).decode()
+    token = (
+        livekit_api.AccessToken(settings.livekit_api_key, settings.livekit_api_secret)
+        .with_sha256(digest)
+        .to_jwt()
+    )
+    return body, token
+
+
 def _signup_and_login(client, email: str) -> str:
     client.post(
         "/auth/signup",
@@ -304,7 +321,7 @@ def test_start_recording_fails_cleanly_when_storage_is_not_configured(client, mo
     client.post(f"/media/video/rooms/{room_name}/end", headers=headers)
 
 
-async def _fake_start_recording(room_name):
+async def _fake_start_recording(room_name, object_key):
     return "EG_fake_egress_id"
 
 
@@ -364,6 +381,50 @@ def test_start_recording_succeeds_with_consent(client, monkeypatch):
     list_response = client.get("/media/video/rooms", headers=headers)
     matching = next(r for r in list_response.json() if r["room_name"] == room_name)
     assert matching["recording_in_progress"] is True
+
+    client.post(f"/media/video/rooms/{room_name}/end", headers=headers)
+
+
+@pytest.mark.live
+def test_start_recording_builds_a_human_readable_object_key(client, db_session, monkeypatch):
+    """Regression test: recordings used to be stored under the internal
+    random room_name ("zl-<uuid hex>.mp4") - meaningless to a human browsing
+    the bucket. The real key must be built from the account's name and the
+    real start date/day/time instead, with LiveKit's start call receiving
+    that same key (not deriving its own)."""
+    import re
+
+    captured = {}
+
+    async def _capture_start_recording(room_name, object_key):
+        captured["object_key"] = object_key
+        return "EG_keytest_egress_id"
+
+    monkeypatch.setattr("app.media.service.video.start_room_recording", _capture_start_recording)
+    monkeypatch.setattr("app.media.service.video.stop_room_recording", _fake_stop_recording())
+
+    token = _signup_and_login(client, "videorecordobjectkey@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    client.post("/compliance/consent", json={"consent_type": "ai_processing"}, headers=headers)
+    room_name = client.post("/media/video/rooms", headers=headers).json()["room_name"]
+
+    response = client.post(f"/media/video/rooms/{room_name}/recording/start", headers=headers)
+    assert response.status_code == 200, response.text
+
+    # "video-test-co" from the real signup account name "Video Test Co",
+    # then a real ISO date, full weekday name, and 24h time - not the raw
+    # room_name anywhere in it.
+    assert re.match(
+        r"^recordings/video-test-co-\d{4}-\d{2}-\d{2}-[A-Za-z]+-\d{2}-\d{2}-\d{2}-[0-9a-f]{8}\.mp4$",
+        captured["object_key"],
+    ), captured["object_key"]
+    assert room_name not in captured["object_key"]
+
+    from app.media.models import VideoSession
+
+    session = db_session.query(VideoSession).filter(VideoSession.room_name == room_name).first()
+    assert session.recording_object_key == captured["object_key"]
+    assert session.recording_started_at is not None
 
     client.post(f"/media/video/rooms/{room_name}/end", headers=headers)
 
@@ -471,6 +532,170 @@ def test_webhook_egress_ended_attaches_recording_url_from_legacy_file_field(clie
     assert session.recording_url == "https://example.com/recordings/legacy.mp4"
 
     client.post(f"/media/video/rooms/{room_name}/end", headers=headers)
+
+
+def test_webhook_egress_ended_failure_clears_stuck_recording_state(client, db_session):
+    """Regression test for a real bug: a failed egress used to leave
+    recording_egress_id set with recording_url still None forever -
+    is_recording_in_progress stayed True permanently, blocking a new
+    recording with a wrong "already being recorded" error and showing
+    "Recording processing..." in the UI with no way to tell the customer
+    anything went wrong. The failure webhook must resolve both."""
+    from app.media.models import VideoSession
+    from app.media.service import RECORDING_FAILED_MARKER
+
+    token = _signup_and_login(client, "videorecordfailedwebhook@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    room_name = client.post("/media/video/rooms", headers=headers).json()["room_name"]
+
+    session = db_session.query(VideoSession).filter(VideoSession.room_name == room_name).first()
+    session.recording_egress_id = "EG_failed_test_id"
+    db_session.commit()
+
+    body, auth_token = _egress_ended_failed_webhook_body_and_token("EG_failed_test_id", room_name)
+    webhook_response = client.post(
+        "/media/video/webhook", content=body, headers={"Authorization": auth_token}
+    )
+    assert webhook_response.status_code == 204
+
+    db_session.refresh(session)
+    assert session.recording_egress_id is None
+    assert session.recording_url == RECORDING_FAILED_MARKER
+
+    list_response = client.get("/media/video/rooms", headers=headers)
+    matching = next(r for r in list_response.json() if r["room_name"] == room_name)
+    assert matching["recording_in_progress"] is False
+    assert matching["recording_failed"] is True
+    assert matching["recording_url"] is None  # never served as a real download link
+
+    client.post(f"/media/video/rooms/{room_name}/end", headers=headers)
+
+
+def test_sweep_stale_video_recordings_clears_a_lost_webhook_with_no_recoverable_file(
+    client, db_session, monkeypatch,
+):
+    """The other half of the same bug: the egress_ended webhook is never
+    guaranteed to arrive at all (LiveKit outage, dropped delivery) - nothing
+    else would ever clear a recording stuck this way without the sweep.
+    LiveKit itself has no record of this egress_id, so there's genuinely
+    nothing to recover - only then is it safe to mark it failed."""
+    from datetime import datetime, timedelta, timezone
+
+    from app.media.models import VideoSession
+    from app.media.service import RECORDING_FAILED_MARKER, sweep_stale_video_recordings
+
+    async def _fake_get_egress_status(egress_id):
+        return None
+
+    monkeypatch.setattr("app.media.service.video.get_egress_status", _fake_get_egress_status)
+
+    token = _signup_and_login(client, "videorecordstalesweep@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    room_name = client.post("/media/video/rooms", headers=headers).json()["room_name"]
+
+    session = db_session.query(VideoSession).filter(VideoSession.room_name == room_name).first()
+    session.recording_egress_id = "EG_stale_test_id"
+    session.recording_started_at = datetime.now(timezone.utc) - timedelta(hours=3)
+    db_session.commit()
+
+    result = sweep_stale_video_recordings(db_session)
+    assert result["swept"] >= 1
+
+    db_session.refresh(session)
+    assert session.recording_egress_id is None
+    assert session.recording_url == RECORDING_FAILED_MARKER
+
+
+def test_sweep_stale_video_recordings_recovers_a_lost_webhook_that_actually_succeeded(
+    client, db_session, monkeypatch,
+):
+    """Regression test for a real incident: a lost webhook does NOT mean
+    the recording failed - LiveKit can report EGRESS_COMPLETE with a real
+    uploaded file even though our backend never heard about it (confirmed
+    live, 2026-08-21, caused by our own backend restarting mid-delivery).
+    The sweep must recover the real file, not blindly mark it failed."""
+    from datetime import datetime, timedelta, timezone
+
+    from app.media.models import VideoSession
+    from app.media.service import sweep_stale_video_recordings
+
+    async def _fake_get_egress_status(egress_id):
+        return {"status": 3, "location": "https://example.com/recordings/recovered.mp4", "error": ""}
+
+    monkeypatch.setattr("app.media.service.video.get_egress_status", _fake_get_egress_status)
+
+    token = _signup_and_login(client, "videorecordstalesweeprecover@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    room_name = client.post("/media/video/rooms", headers=headers).json()["room_name"]
+
+    session = db_session.query(VideoSession).filter(VideoSession.room_name == room_name).first()
+    session.recording_egress_id = "EG_recoverable_test_id"
+    session.recording_started_at = datetime.now(timezone.utc) - timedelta(hours=3)
+    db_session.commit()
+
+    result = sweep_stale_video_recordings(db_session)
+    assert result["swept"] >= 1
+
+    db_session.refresh(session)
+    assert session.recording_egress_id is None
+    assert session.recording_url == "https://example.com/recordings/recovered.mp4"
+
+
+def test_sweep_stale_video_recordings_does_not_touch_a_recent_in_progress_recording(client, db_session):
+    """A recording that started 5 minutes ago is still legitimately in
+    progress - the sweep must not treat every in-progress recording as
+    stale, only ones well past any real call length."""
+    from datetime import datetime, timedelta, timezone
+
+    from app.media.models import VideoSession
+    from app.media.service import sweep_stale_video_recordings
+
+    token = _signup_and_login(client, "videorecordfreshinprogress@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    room_name = client.post("/media/video/rooms", headers=headers).json()["room_name"]
+
+    session = db_session.query(VideoSession).filter(VideoSession.room_name == room_name).first()
+    session.recording_egress_id = "EG_fresh_test_id"
+    session.recording_started_at = datetime.now(timezone.utc) - timedelta(minutes=5)
+    db_session.commit()
+
+    sweep_stale_video_recordings(db_session)
+
+    db_session.refresh(session)
+    assert session.recording_egress_id == "EG_fresh_test_id"  # untouched
+    assert session.recording_url is None
+
+
+def test_sweep_stale_video_recordings_leaves_a_genuinely_long_running_egress_alone(
+    client, db_session, monkeypatch,
+):
+    """Past the timeout is only a hint something might be wrong - if LiveKit
+    itself still reports the egress as STARTING/ACTIVE/ENDING, it's a real,
+    unusually long call, not a lost webhook. Must not be interrupted."""
+    from datetime import datetime, timedelta, timezone
+
+    from app.media.models import VideoSession
+    from app.media.service import sweep_stale_video_recordings
+
+    async def _fake_get_egress_status(egress_id):
+        return {"status": 1, "location": None, "error": ""}  # EGRESS_ACTIVE
+
+    monkeypatch.setattr("app.media.service.video.get_egress_status", _fake_get_egress_status)
+
+    token = _signup_and_login(client, "videorecordstillactivesweep@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    room_name = client.post("/media/video/rooms", headers=headers).json()["room_name"]
+
+    session = db_session.query(VideoSession).filter(VideoSession.room_name == room_name).first()
+    session.recording_egress_id = "EG_still_active_test_id"
+    session.recording_started_at = datetime.now(timezone.utc) - timedelta(hours=3)
+    db_session.commit()
+
+    sweep_stale_video_recordings(db_session)
+
+    db_session.refresh(session)
+    assert session.recording_egress_id == "EG_still_active_test_id"  # untouched
+    assert session.recording_url is None
 
 
 @pytest.mark.live

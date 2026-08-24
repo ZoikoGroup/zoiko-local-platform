@@ -91,11 +91,17 @@ def create_checkout_session(
 
 def refund_payment(payment_intent_id: str) -> dict:
     """Issues a full refund against a completed Checkout Session's
-    PaymentIntent - called when a payment succeeds but number fulfillment
-    then fails for a genuine reason (quota/billing/disclosure/telecom),
-    see app.numbering.numbers.service.complete_number_purchase_from_checkout.
-    Confirmed the restricted "One-time payments" key scope includes refund
-    creation (verified against the real test account, not assumed)."""
+    PaymentIntent. Confirmed the restricted "One-time payments" key scope
+    includes refund creation (verified against the real test account, not
+    assumed).
+
+    No caller in this codebase as of 2026-08-22: number purchases now go
+    through app.numbering.numbers.service.create_number_purchase_checkout_
+    session, which no longer collects payment via Stripe at all (see that
+    function's docstring - a number's cost is recorded as a pending charge
+    and invoiced alongside the plan fee via ZoikoNex instead, per
+    Architecture doc §9). Left in place rather than deleted, since this
+    module is still referenced by ops health checks."""
     if not settings.stripe_payments_secret_key:
         raise PaymentError("Stripe payments secret key is not configured")
 
@@ -107,11 +113,6 @@ def refund_payment(payment_intent_id: str) -> dict:
                 )
         except stripe.error.StripeError as e:
             raise PaymentError(f"Stripe refund failed: {e}") from e
-        # amount/currency: the real refunded figure per Stripe's own
-        # response - callers need this instead of assuming a flat constant
-        # now that checkout amounts vary by NumberRate (country/number_type
-        # and inclusion-threshold surcharges), see
-        # app.numbering.numbers.service._refund_and_notify_failed_purchase.
         return {"id": refund.id, "status": refund.status, "amount": refund.amount, "currency": refund.currency}
 
     return with_failover(_breaker, _primary, None, PaymentError)

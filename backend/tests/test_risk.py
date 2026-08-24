@@ -849,7 +849,7 @@ def test_number_purchase_steps_up_trial_account_to_paid_normal(client, db_sessio
 
     monkeypatch.setattr(
         "app.numbering.numbers.service.telecom.buy_number",
-        lambda e164: {"sid": "PN_fake_riskstepup", "phone_number": e164, "capabilities": {}},
+        lambda e164, bundle_sid=None: {"sid": "PN_fake_riskstepup", "phone_number": e164, "capabilities": {}},
     )
     token = _signup_and_login(client, "riskpaidstepup1@example.com")
     headers = {"Authorization": f"Bearer {token}"}
@@ -877,7 +877,7 @@ def test_purchase_does_not_downgrade_an_account_under_review(client, db_session,
 
     monkeypatch.setattr(
         "app.numbering.numbers.service.telecom.buy_number",
-        lambda e164: {"sid": "PN_fake_riskstepup2", "phone_number": e164, "capabilities": {}},
+        lambda e164, bundle_sid=None: {"sid": "PN_fake_riskstepup2", "phone_number": e164, "capabilities": {}},
     )
     token = _signup_and_login(client, "riskpaidstepup2@example.com")
     headers = {"Authorization": f"Bearer {token}"}

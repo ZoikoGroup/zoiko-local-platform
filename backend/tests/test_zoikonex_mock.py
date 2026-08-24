@@ -225,7 +225,7 @@ def _suspend(db_session, account_id: str):
 def test_outbound_call_is_blocked_when_billing_suspended(client, db_session, monkeypatch):
     monkeypatch.setattr(
         "app.numbering.numbers.service.telecom.buy_number",
-        lambda e164: {"sid": "PN_fake_zoikonex_outbound", "phone_number": e164, "capabilities": {}},
+        lambda e164, bundle_sid=None: {"sid": "PN_fake_zoikonex_outbound", "phone_number": e164, "capabilities": {}},
     )
     token = _signup_and_login(client, "zoikonexoutbound1@example.com")
     headers = {"Authorization": f"Bearer {token}"}
@@ -422,6 +422,15 @@ def test_reconciliation_route_returns_matching_counts(client, db_session):
 def test_reconciliation_run_finds_no_exceptions_when_everything_synced(db_session):
     from app.usage.service import record_usage_event
 
+    # unsynced_subscriptions/unsynced_usage_events are full system-wide
+    # counts each run (unlike exceptions_found below, which only opens a
+    # NEW exception for drift it hasn't already recorded) - a baseline
+    # snapshot is needed here too now that real, genuinely-unsynced
+    # accounts exist in the shared dev DB from real end-to-end purchase
+    # testing (2026-08-22) - this dev DB is no longer the clean-baseline
+    # assumption this test originally documented.
+    baseline = service.run_zoikonex_reconciliation(db_session)
+
     account = _make_account(db_session, "Clean Reconciliation Co")
     service.get_or_create_subscription(db_session, account.id)
     record_usage_event(
@@ -432,14 +441,10 @@ def test_reconciliation_run_finds_no_exceptions_when_everything_synced(db_sessio
     run = service.run_zoikonex_reconciliation(db_session)
 
     # Subscriptions/usage events created by THIS test are fully synced -
-    # unlike exceptions_found below, these two counters aren't polluted by
-    # the shared dev DB's pre-existing call history, since this dev DB has
-    # no pre-existing subscription/usage-sync drift (only real leftover
-    # calls from manual end-to-end testing, which the carrier-evidence leg
-    # now legitimately flags - see the baseline-absorb pattern in the
-    # tests below for why exceptions_found isn't asserted == 0 here).
-    assert run.unsynced_subscriptions == 0
-    assert run.unsynced_usage_events == 0
+    # relative to the baseline snapshot above, this run must find no NEW
+    # drift.
+    assert run.unsynced_subscriptions == baseline.unsynced_subscriptions
+    assert run.unsynced_usage_events == baseline.unsynced_usage_events
 
 
 def test_reconciliation_run_detects_usage_event_missing_sync(db_session):
@@ -765,7 +770,12 @@ def test_wholesale_summary_route_returns_data_for_any_staff_role(client, db_sess
 
 
 def test_reconciliation_run_detects_subscription_missing_zoikonex_ref(db_session):
-    service.run_zoikonex_reconciliation(db_session)  # absorb pre-existing drift, see comment above
+    # unsynced_subscriptions is a full system-wide count each run (unlike
+    # exceptions_found, which dedupes against already-open exceptions) - a
+    # real baseline snapshot, not just an "absorb" call, is needed now
+    # that genuinely-unsynced accounts exist in the shared dev DB from
+    # real end-to-end purchase testing (2026-08-22).
+    baseline = service.run_zoikonex_reconciliation(db_session)
 
     account = _make_account(db_session, "Drifted Subscription Co")
     now = datetime.now(timezone.utc)
@@ -780,7 +790,7 @@ def test_reconciliation_run_detects_subscription_missing_zoikonex_ref(db_session
 
     run = service.run_zoikonex_reconciliation(db_session)
 
-    assert run.unsynced_subscriptions == 1
+    assert run.unsynced_subscriptions == baseline.unsynced_subscriptions + 1
     assert run.exceptions_found == 1
 
     exceptions = service.list_zoikonex_reconciliation_exceptions(db_session, resolved=False)

@@ -32,7 +32,7 @@ def _reserve(client, headers, e164: str, country: str = "US", number_type: str =
 def _stub_buy_number(monkeypatch):
     monkeypatch.setattr(
         "app.numbering.numbers.service.telecom.buy_number",
-        lambda e164: {"sid": "PN_fake_sid", "phone_number": e164, "capabilities": {}},
+        lambda e164, bundle_sid=None: {"sid": "PN_fake_sid", "phone_number": e164, "capabilities": {}},
     )
 
 
@@ -264,9 +264,18 @@ def test_seed_market_release_registry_covers_every_supported_country(client, db_
         headers={"Authorization": f"Bearer {staff_token}"},
     )
     assert response.status_code == 200, response.text
+    # seed_market_release_registry deliberately never touches a country
+    # that already has a rule (see its own docstring) - GB genuinely has
+    # one now (a real, active Twilio Regulatory Bundle requirement,
+    # 2026-08-22), so the response itself only contains newly-created
+    # rows. "Covers every supported country" means every country ends up
+    # WITH a rule (new or pre-existing), not that every country appears
+    # in this one response.
     seeded_countries = {r["country"] for r in response.json()}
+    covered_countries = {r.country for r in numbers_service.list_number_eligibility_rules(db_session)}
     supported_countries = {c.code for c in numbers_service.list_supported_countries(db_session)}
-    assert seeded_countries == supported_countries
+    assert covered_countries == supported_countries
+    assert seeded_countries <= supported_countries
     for rule in response.json():
         assert rule["number_type"] == "local"
         assert rule["emergency_calling_supported"] is False

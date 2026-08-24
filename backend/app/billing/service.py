@@ -12,6 +12,8 @@ from app.billing.models import (
     BillingActionType,
     BillingPeriod,
     CatalogEntryStatus,
+    PendingAccountCharge,
+    PendingAccountChargeStatus,
     Plan,
     PriceCatalogEntry,
     Subscription,
@@ -1476,6 +1478,27 @@ def _assert_direct_commercial_account(db: Session, account_id: str) -> None:
         )
 
 
+def record_pending_number_charge(
+    db: Session, account_id: str, *, charge_type: str, phone_number_id: str | None,
+    description: str, amount_minor_units: int, currency_code: str,
+) -> PendingAccountCharge:
+    """Architecture doc §9: a number purchase is an entitlement event that
+    should become a line item on the account's next real ZoikoNex invoice,
+    not a separate charge on a different rail. Called synchronously at
+    number-purchase time (app.numbering.numbers.service.
+    create_number_purchase_checkout_session) - the number is provisioned
+    immediately either way; this just records what it owes so
+    run_billing_cycle's next run picks it up (see the pending-charge loop
+    in that function, right after the plan-fee line item)."""
+    charge = PendingAccountCharge(
+        account_id=account_id, charge_type=charge_type, phone_number_id=phone_number_id,
+        description=description, amount_minor_units=amount_minor_units, currency_code=currency_code,
+    )
+    db.add(charge)
+    db.commit()
+    return charge
+
+
 def run_billing_cycle(db: Session, account_id: str, *, actor: str) -> dict:
     """Architecture doc §9's rating -> invoice -> payment pipeline, priced
     from PriceCatalogEntry (Commercial Billing Operating Standard P0-1 -
@@ -1606,10 +1629,50 @@ def run_billing_cycle(db: Session, account_id: str, *, actor: str) -> dict:
             tax_amount_minor_units=tax.get("tax_amount_minor_units"),
             line_key="plan-fee",
         )
+        line_item_total_minor_units = amount_minor_units
+        tax_total_minor_units = tax.get("tax_amount_minor_units") or 0
+
+        # Architecture doc §9: a number purchase is an entitlement event
+        # that becomes a line item on THIS SAME invoice, not a separate
+        # charge - see record_pending_number_charge. Every row here was
+        # accrued since the last time this branch ran (status == PENDING
+        # already means "never invoiced"), so no date filtering is needed.
+        pending_charges = (
+            db.query(PendingAccountCharge)
+            .filter(
+                PendingAccountCharge.account_id == account_id,
+                PendingAccountCharge.status == PendingAccountChargeStatus.PENDING,
+            )
+            .order_by(PendingAccountCharge.created_at.asc())
+            .all()
+        )
+        for charge in pending_charges:
+            charge_tax = zoikonex_adapter.determine_tax_for_invoice_line(
+                invoice_id=invoice["invoice_id"], taxable_amount_minor_units=charge.amount_minor_units,
+                currency_code=charge.currency_code,
+            )
+            line_item = zoikonex_adapter.add_invoice_line_item(
+                invoice["invoice_id"], description=charge.description,
+                amount_minor_units=charge.amount_minor_units,
+                tax_amount_minor_units=charge_tax.get("tax_amount_minor_units"),
+                line_key=f"pending-charge-{charge.id}",
+            )
+            charge.status = PendingAccountChargeStatus.INVOICED
+            charge.invoiced_at = datetime.now(timezone.utc)
+            charge.zoikonex_invoice_id = invoice["invoice_id"]
+            charge.zoikonex_line_item_id = line_item["line_item_id"]
+            line_item_total_minor_units += charge.amount_minor_units
+            tax_total_minor_units += charge_tax.get("tax_amount_minor_units") or 0
+
         issued = zoikonex_adapter.issue_invoice(invoice["invoice_id"])
+        # ZoikoNex's own invoice total is authoritative (it's the system of
+        # record for invoicing per doc §9) - falls back to the hand-summed
+        # Python total only if that field is ever missing, so this never
+        # regresses today's behavior.
+        payment_amount_minor_units = issued.get("total_minor_units") or line_item_total_minor_units
 
         if owner is not None:
-            tax_amount_minor_units = tax.get("tax_amount_minor_units") or 0
+            tax_amount_minor_units = tax_total_minor_units
             try:
                 # A notification failure here must not abort the function:
                 # the invoice is already issued at ZoikoNex (a real,
@@ -1624,15 +1687,16 @@ def run_billing_cycle(db: Session, account_id: str, *, actor: str) -> dict:
                     db, account_id=account_id, account_email=owner.email,
                     invoice_reference=invoice["invoice_id"],
                     billing_period=f"{sub.current_period_start.date()} to {sub.current_period_end.date()}",
-                    subtotal=f"{amount_minor_units / 100:.2f}",
+                    subtotal=f"{line_item_total_minor_units / 100:.2f}",
                     tax=f"{tax_amount_minor_units / 100:.2f}",
-                    total=f"{(amount_minor_units + tax_amount_minor_units) / 100:.2f}",
+                    total=f"{(line_item_total_minor_units + tax_amount_minor_units) / 100:.2f}",
                     currency=currency_code,
                 )
             except Exception:
                 pass
     else:
         issued = {"status": live_invoice["status"]}
+        payment_amount_minor_units = live_invoice.get("total_minor_units") or amount_minor_units
     try:
         zoikonex_adapter.close_bill_cycle(bill_cycle["bill_cycle_id"])
         bill_cycle_closed, bill_cycle_close_error = True, None
@@ -1660,12 +1724,12 @@ def run_billing_cycle(db: Session, account_id: str, *, actor: str) -> dict:
     db.commit()
 
     intent = zoikonex_adapter.create_payment_intent(
-        sub, invoice["invoice_id"], amount_minor_units=amount_minor_units, currency_code=currency_code,
+        sub, invoice["invoice_id"], amount_minor_units=payment_amount_minor_units, currency_code=currency_code,
     )
     zoikonex_adapter.authorise_payment_intent(intent["payment_intent_id"])
 
     result = {
-        "billed": True, "plan_code": plan.plan_code, "amount_minor_units": amount_minor_units,
+        "billed": True, "plan_code": plan.plan_code, "amount_minor_units": payment_amount_minor_units,
         "invoice_id": invoice["invoice_id"], "payment_intent_id": intent["payment_intent_id"],
         "invoice_status": issued["status"], "payment_status": "authorised", "captured": False,
         "capture_error": None, "bill_cycle_closed": bill_cycle_closed, "bill_cycle_close_error": bill_cycle_close_error,

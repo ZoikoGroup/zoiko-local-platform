@@ -262,7 +262,7 @@ def release_number(phone_number_sid: str) -> None:
     with_failover(_breaker, _primary, secondary_fn, TelecomError)
 
 
-def buy_number(phone_number: str) -> dict:
+def buy_number(phone_number: str, *, bundle_sid: str | None = None) -> dict:
     """Written directly against the documented IncomingPhoneNumbers create
     contract. Confirmed live against a real Twilio trial account.
 
@@ -271,8 +271,14 @@ def buy_number(phone_number: str) -> dict:
     /media/voice/incoming at all) plus a status-callback URL for the final
     completed/duration event, both only when a public base URL is configured
     (nothing to point at otherwise, e.g. before ngrok is running in dev).
-    """
+
+    bundle_sid: a Twilio-approved Regulatory Bundle (see
+    get_bundle_status/submit_bundle_for_review below) - required by Twilio
+    itself for restricted number types in countries like the UK; omitted
+    entirely for number types/countries that don't need one (e.g. US)."""
     kwargs = {"phone_number": phone_number}
+    if bundle_sid:
+        kwargs["bundle_sid"] = bundle_sid
     if settings.public_base_url:
         kwargs["voice_url"] = f"{settings.public_base_url}/media/voice/incoming"
         kwargs["voice_method"] = "POST"
@@ -295,6 +301,110 @@ def buy_number(phone_number: str) -> dict:
     # operation (search, calls, SMS) still fails over normally - remove this
     # override once Vonage's account is confirmed able to purchase numbers.
     return with_failover(_breaker, _primary, None, TelecomError)
+
+
+# --- Regulatory Compliance (real Twilio-reviewed identity bundles required
+# for restricted number types/countries, e.g. UK local numbers) ---
+# No secondary/failover provider for any of these - Vonage has no
+# equivalent concept, an architectural gap like buy_number's own Vonage
+# skip above, not a misconfiguration.
+
+def get_regulation_requirements(iso_country: str, number_type: str, end_user_type: str) -> list[dict]:
+    """What Twilio actually requires before it'll approve a bundle for this
+    country/number_type/end_user_type - confirmed live (2026-08-22) this is
+    real, per-country data (UK individuals need a government ID or passport
+    plus name/email/phone; other countries/types differ), not something to
+    hardcode per country in our own code."""
+    try:
+        with trace_provider_call("twilio", "get_regulation_requirements"):
+            regulations = _client().numbers.v2.regulatory_compliance.regulations.list(
+                iso_country=iso_country, number_type=number_type, end_user_type=end_user_type, limit=5,
+            )
+    except TwilioException as e:
+        raise TelecomError(_clean_twilio_error_message(e)) from e
+    return [r.requirements for r in regulations]
+
+
+def create_regulatory_end_user(*, friendly_name: str, end_user_type: str, attributes: dict) -> dict:
+    try:
+        with trace_provider_call("twilio", "create_regulatory_end_user"):
+            end_user = _client().numbers.v2.regulatory_compliance.end_users.create(
+                friendly_name=friendly_name, type=end_user_type, attributes=attributes,
+            )
+    except TwilioException as e:
+        raise TelecomError(_clean_twilio_error_message(e)) from e
+    return {"sid": end_user.sid, "type": end_user.type}
+
+
+def upload_supporting_document(
+    *, friendly_name: str, document_type: str, attributes: dict, file_bytes: bytes, content_type: str
+) -> dict:
+    """The Python SDK's SupportingDocuments.create() only sends JSON
+    (friendly_name/type/attributes) - it has no parameter for the actual ID
+    scan. Twilio's real REST API accepts the file as a multipart part
+    alongside those same fields, so this calls the HTTP API directly
+    (same escape hatch buy_number's own module docstring implies is fine
+    when the SDK doesn't cover something) rather than force-fitting it
+    through the SDK's incomplete wrapper."""
+    if not (settings.twilio_account_sid and settings.twilio_auth_token):
+        raise TelecomError("Twilio credentials are not configured")
+    try:
+        with trace_provider_call("twilio", "upload_supporting_document"):
+            response = httpx.post(
+                "https://numbers.twilio.com/v2/RegulatoryCompliance/SupportingDocuments",
+                auth=(settings.twilio_account_sid, settings.twilio_auth_token),
+                data={"FriendlyName": friendly_name, "Type": document_type, "Attributes": json.dumps(attributes)},
+                files={"File": ("document", file_bytes, content_type)},
+                timeout=30.0,
+            )
+            response.raise_for_status()
+    except httpx.HTTPError as e:
+        raise TelecomError(f"Twilio supporting document upload failed: {e}") from e
+    result = response.json()
+    return {"sid": result["sid"], "type": result["type"]}
+
+
+def create_regulatory_bundle(
+    *, friendly_name: str, email: str, iso_country: str, end_user_type: str, number_type: str
+) -> dict:
+    try:
+        with trace_provider_call("twilio", "create_regulatory_bundle"):
+            bundle = _client().numbers.v2.regulatory_compliance.bundles.create(
+                friendly_name=friendly_name, email=email, iso_country=iso_country,
+                end_user_type=end_user_type, number_type=number_type,
+            )
+    except TwilioException as e:
+        raise TelecomError(_clean_twilio_error_message(e)) from e
+    return {"sid": bundle.sid, "status": bundle.status}
+
+
+def create_bundle_item_assignment(bundle_sid: str, object_sid: str) -> dict:
+    try:
+        with trace_provider_call("twilio", "create_bundle_item_assignment"):
+            assignment = _client().numbers.v2.regulatory_compliance.bundles(bundle_sid).item_assignments.create(
+                object_sid=object_sid,
+            )
+    except TwilioException as e:
+        raise TelecomError(_clean_twilio_error_message(e)) from e
+    return {"sid": assignment.sid}
+
+
+def submit_bundle_for_review(bundle_sid: str) -> dict:
+    try:
+        with trace_provider_call("twilio", "submit_bundle_for_review"):
+            bundle = _client().numbers.v2.regulatory_compliance.bundles(bundle_sid).update(status="pending-review")
+    except TwilioException as e:
+        raise TelecomError(_clean_twilio_error_message(e)) from e
+    return {"sid": bundle.sid, "status": bundle.status}
+
+
+def get_bundle_status(bundle_sid: str) -> dict:
+    try:
+        with trace_provider_call("twilio", "get_bundle_status"):
+            bundle = _client().numbers.v2.regulatory_compliance.bundles(bundle_sid).fetch()
+    except TwilioException as e:
+        raise TelecomError(_clean_twilio_error_message(e)) from e
+    return {"sid": bundle.sid, "status": bundle.status, "rejection_reason": getattr(bundle, "rejection_reason", None)}
 
 
 def place_call(

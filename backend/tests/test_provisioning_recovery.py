@@ -78,7 +78,7 @@ def test_retry_provisioning_activates_the_number_on_success(client, db_session, 
 
     monkeypatch.setattr(
         "app.numbering.numbers.service.telecom.buy_number",
-        lambda e164: {"sid": "PN_recovered_sid", "phone_number": e164, "capabilities": {}},
+        lambda e164, bundle_sid=None: {"sid": "PN_recovered_sid", "phone_number": e164, "capabilities": {}},
     )
 
     staff_token = _create_and_login_staff(db_session, client, "recoverystaff3@zoikolocal.com")
@@ -95,7 +95,7 @@ def test_retry_provisioning_reverts_to_reserved_on_provider_failure(client, db_s
 
     from app.integrations.telecom.twilio import TelecomError
 
-    def _fail(e164):
+    def _fail(e164, bundle_sid=None):
         raise TelecomError("provider still down")
 
     monkeypatch.setattr("app.numbering.numbers.service.telecom.buy_number", _fail)
@@ -145,7 +145,7 @@ def test_release_stuck_provisioning_reverts_to_reserved_without_calling_the_prov
     _, account_id = _signup_and_login(client, "recoveryowner7@example.com")
     number = _seed_stuck_number(db_session, account_id, e164="+15550027777")
 
-    def _unexpected_call(e164):
+    def _unexpected_call(e164, bundle_sid=None):
         raise AssertionError("release must not call the provider at all")
 
     monkeypatch.setattr("app.numbering.numbers.service.telecom.buy_number", _unexpected_call)

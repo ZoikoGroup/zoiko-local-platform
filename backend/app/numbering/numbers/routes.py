@@ -1,12 +1,11 @@
 import logging
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
 from sqlalchemy.orm import Session
 
 from app.billing.service import BillingSuspendedError, NumberQuotaExceededError
 from app.core.database import get_db
 from app.core.deps import get_current_user, require_admin, require_writer
-from app.integrations.billing import stripe_checkout
 from app.integrations.telecom.twilio import TelecomError
 from app.numbering.identity.models import User
 from app.ops.service import KillSwitchTrippedError
@@ -25,6 +24,7 @@ from app.numbering.numbers.schemas import (
     RoutingConfigRequest,
     SetIVRMenuRequest,
     SetRingGroupRequest,
+    SubmitEligibilityBundleRequest,
     SubmitNumberEligibilityEvidenceRequest,
     SupportedCountryResponse,
     SuspendNumberRequest,
@@ -35,7 +35,10 @@ from app.numbering.numbers.service import (
     InvalidAreaCodeError,
     MarketNotActivatedError,
     NumberConflictError,
+    NumberDocumentTooLargeError,
+    NumberDocumentTypeUnsupportedError,
     NumberEligibilityCaseNotFoundError,
+    NumberEligibilityDocumentRequiredError,
     NumberEligibilityRequiredError,
     TestAccountRestrictedError,
     UnsupportedCountryError,
@@ -158,23 +161,92 @@ def submit_eligibility_evidence(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
 
 
+@router.post("/eligibility-cases/{case_id}/documents", response_model=NumberEligibilityCaseResponse)
+async def submit_eligibility_document(
+    case_id: str,
+    document_type: str = Form(...),
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin),
+):
+    """Real supporting-document upload (government ID, passport, etc.) for
+    a number-eligibility case - our own copy, stored the same way
+    compliance/routes.py's document upload does. See submit_eligibility_
+    bundle below for actually submitting this to Twilio's real review."""
+    data = await file.read()
+    try:
+        return service.submit_number_eligibility_document(
+            db, case_id, account_id=current_user.account_id, document_type=document_type,
+            filename=file.filename or "document", content_type=file.content_type or "application/octet-stream",
+            data=data, actor=current_user.id,
+        )
+    except NumberEligibilityCaseNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
+    except (NumberDocumentTypeUnsupportedError, NumberDocumentTooLargeError) as e:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e)) from e
+
+
+@router.post("/eligibility-cases/{case_id}/submit-bundle", response_model=NumberEligibilityCaseResponse)
+def submit_eligibility_bundle(
+    case_id: str,
+    payload: SubmitEligibilityBundleRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin),
+):
+    """Submits this case's most recently uploaded document, plus the given
+    identity attributes, as a real Regulatory Bundle to Twilio for review
+    - genuinely creates real Twilio resources (EndUser, SupportingDocument,
+    Bundle), not a mock."""
+    try:
+        return service.submit_number_eligibility_bundle(
+            db, case_id, account_id=current_user.account_id, end_user_attributes=payload.end_user_attributes,
+            end_user_type=payload.end_user_type, actor=current_user.id,
+        )
+    except NumberEligibilityCaseNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
+    except NumberEligibilityDocumentRequiredError as e:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e)) from e
+    except TelecomError as e:
+        raise HTTPException(status_code=502, detail=str(e)) from e
+
+
+@router.post("/eligibility-cases/{case_id}/sync-bundle-status", response_model=NumberEligibilityCaseResponse)
+def sync_eligibility_bundle_status(
+    case_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin),
+):
+    """On-demand check against Twilio's real bundle review status - see
+    service.sync_number_eligibility_bundle_status's docstring for why this
+    is poll-on-request rather than a webhook."""
+    try:
+        return service.sync_number_eligibility_bundle_status(
+            db, case_id, account_id=current_user.account_id, actor=current_user.id,
+        )
+    except NumberEligibilityCaseNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
+    except NumberEligibilityDocumentRequiredError as e:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e)) from e
+    except TelecomError as e:
+        raise HTTPException(status_code=502, detail=str(e)) from e
+
+
 @router.post("/{e164}/checkout-session", response_model=CheckoutSessionResponse)
 def create_checkout_session(
     e164: str,
     db: Session = Depends(get_db),
     current_user: User = Depends(require_admin),
 ):
-    """Real Stripe Checkout (test mode) - the customer-facing way to buy a
-    number now goes through here instead of calling POST /purchase
-    directly. Commercial Billing Operating Standard doc's canonical chain
-    (eligibility before any charge) - quota/billing-suspended/emergency-
-    disclosure/KYC/eligibility are all checked here, BEFORE Stripe is ever
-    contacted, so a customer who still needs documents is never charged
-    while waiting on them (see service.create_number_purchase_checkout_
-    session's docstring). POST /purchase still exists and still runs
-    unchanged - it's what the payment webhook below calls once Stripe
-    confirms payment, and what a retry after case approval uses for an
-    already-paid number stuck in COMPLIANCE_PENDING."""
+    """The customer-facing way to buy a number goes through here instead of
+    calling POST /purchase directly. Commercial Billing Operating Standard
+    doc's canonical chain (eligibility before any charge) - quota/billing-
+    suspended/emergency-disclosure/KYC/eligibility are all checked here.
+    Architecture doc §9: a number's cost is now recorded as a pending
+    charge and provisioned immediately - see service.create_number_
+    purchase_checkout_session's docstring for why this no longer redirects
+    to a standalone Stripe Checkout. POST /purchase still exists unchanged
+    - it's what a retry after case approval uses for an already-eligible
+    number stuck in COMPLIANCE_PENDING."""
     try:
         return service.create_number_purchase_checkout_session(db, current_user.account_id, e164)
     except NumberConflictError as e:
@@ -189,49 +261,15 @@ def create_checkout_session(
         raise HTTPException(status_code=status.HTTP_402_PAYMENT_REQUIRED, detail=str(e)) from e
     except (ComplianceRequiredError, EmergencyDisclosureRequiredError, NumberEligibilityRequiredError) as e:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e)) from e
-    except stripe_checkout.PaymentError as e:
-        raise HTTPException(status_code=502, detail=str(e)) from e
     except TelecomError as e:
         # Included-first-number path calls purchase_number() (and therefore
-        # the telecom provider) synchronously, before Stripe is ever
-        # involved - unlike search_numbers's route, this had no handler for
-        # a provider failure here at all, so it crashed as an unhandled 500
-        # instead of a clean customer-facing error (confirmed live: primary
-        # hit a Twilio trial-account number cap, failover to Vonage then
-        # hit a 401 - Vonage account not yet authorized to purchase).
+        # the telecom provider) synchronously - unlike search_numbers's
+        # route, this had no handler for a provider failure here at all,
+        # so it crashed as an unhandled 500 instead of a clean customer-
+        # facing error (confirmed live: primary hit a Twilio trial-account
+        # number cap, failover to Vonage then hit a 401 - Vonage account
+        # not yet authorized to purchase).
         raise _telecom_error_response(e) from e
-
-
-@router.post("/payments/webhook", status_code=status.HTTP_204_NO_CONTENT)
-async def stripe_payment_webhook(request: Request, db: Session = Depends(get_db)):
-    """Real inbound Stripe -> Zoiko Local webhook. Unauthenticated by user
-    session (Stripe isn't one of our users) - trust comes entirely from
-    the Stripe-Signature header, same posture as the Stripe Identity
-    webhook at compliance/routes.py and the ZoikoNex webhook at
-    billing/routes.py."""
-    body = await request.body()
-    signature = request.headers.get("Stripe-Signature")
-
-    try:
-        event = stripe_checkout.construct_webhook_event(body, signature)
-    except stripe_checkout.PaymentError as e:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e)) from e
-
-    if event["type"] == "checkout.session.completed":
-        session = event["data"]["object"]
-        # StripeObject supports dict-style [] / in but not .get() - see
-        # this route's test coverage for the AttributeError that using
-        # .get() here would raise.
-        metadata = session["metadata"] if "metadata" in session else {}
-        e164 = metadata["e164"] if "e164" in metadata else None
-        account_id = metadata["account_id"] if "account_id" in metadata else None
-        payment_intent_id = session["payment_intent"] if "payment_intent" in session else None
-        if e164 and account_id:
-            service.complete_number_purchase_from_checkout(
-                db, e164=e164, account_id=account_id, payment_intent_id=payment_intent_id
-            )
-
-    return None
 
 
 @router.get("", response_model=list[PhoneNumberResponse])
@@ -313,6 +351,7 @@ def configure_routing(
             payload.business_hours_end, payload.business_hours_timezone,
             payload.ai_receptionist_enabled, payload.escalation_user_id,
             payload.whatsapp_enabled, payload.sms_enabled,
+            payload.escalation_phone_number,
         )
     except NumberConflictError as e:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e

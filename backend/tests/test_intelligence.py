@@ -470,6 +470,7 @@ def test_summarize_video_session_success_path(client, db_session, monkeypatch):
     assert consent_response.status_code == 200
 
     monkeypatch.setattr("app.intelligence.service.download_object", lambda key: b"fake-video-bytes")
+    monkeypatch.setattr("app.intelligence.service._extract_audio", lambda video_bytes: b"fake-audio-bytes")
     monkeypatch.setattr(
         "app.intelligence.service.transcribe_audio",
         lambda audio_bytes, filename=None, content_type=None: "Let's review the Q3 roadmap on this call.",
@@ -487,6 +488,95 @@ def test_summarize_video_session_success_path(client, db_session, monkeypatch):
     assert body["model_version"]
     assert body["urgency"] in ("low", "medium", "high")
     assert isinstance(body["action_items"], list)
+
+
+def test_summarize_video_session_uses_the_real_stored_object_key(client, db_session, monkeypatch):
+    """Regression test for a real bug: recordings moved to human-readable
+    S3 keys (account name + date/day/time, see media.service.
+    start_video_recording) but this call site kept guessing
+    "recordings/{room_name}.mp4" - which stopped being the real key and
+    started 404ing (NoSuchKey) for every recording made since. Must use
+    session.recording_object_key when it's set, not room_name."""
+    token, account_id = _signup_and_login(client, "intelvidobjectkey@example.com", "Intel Video Key Co")
+    me = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"}).json()
+    session = _make_video_session(db_session, account_id, me["id"], room_name="zl-test-objectkey")
+    session.recording_object_key = "recordings/intel-video-key-co-2026-08-21-Friday-11-00-00-deadbeef.mp4"
+    db_session.commit()
+
+    client.post(
+        "/compliance/consent", json={"consent_type": "ai_processing"}, headers={"Authorization": f"Bearer {token}"}
+    )
+
+    captured = {}
+
+    def _capture_download(key):
+        captured["key"] = key
+        return b"fake-video-bytes"
+
+    monkeypatch.setattr("app.intelligence.service.download_object", _capture_download)
+    monkeypatch.setattr("app.intelligence.service._extract_audio", lambda video_bytes: b"fake-audio-bytes")
+    monkeypatch.setattr(
+        "app.intelligence.service.transcribe_audio",
+        lambda audio_bytes, filename=None, content_type=None: "A real transcript.",
+    )
+
+    response = client.post(
+        f"/intelligence/video-sessions/{session.room_name}/summarize",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert response.status_code == 201, response.text
+    assert captured["key"] == "recordings/intel-video-key-co-2026-08-21-Friday-11-00-00-deadbeef.mp4"
+
+
+@pytest.mark.live
+def test_extract_audio_shrinks_a_real_video_to_a_small_audio_file():
+    """Regression test for a real incident: sending a raw video recording
+    straight to Groq's transcription endpoint hit their 25MB free-tier
+    upload cap on anything longer than a few minutes, and Groq dropped the
+    connection instead of returning a clean error. Audio-only shrinks the
+    same content by roughly two orders of magnitude. Uses a real ffmpeg-
+    generated synthetic clip (silent audio + a color test pattern), not a
+    mock - this is exercising the real subprocess call, not the app's own
+    logic around it."""
+    import subprocess
+
+    from app.core.config import settings
+    from app.intelligence.service import _extract_audio
+
+    video_bytes = subprocess.run(
+        [
+            settings.ffmpeg_path, "-y",
+            "-f", "lavfi", "-i", "testsrc=duration=2:size=320x240:rate=10",
+            "-f", "lavfi", "-i", "anullsrc=r=16000:cl=mono:duration=2",
+            "-c:v", "libx264", "-c:a", "aac", "-f", "mp4", "-movflags", "frag_keyframe+empty_moov", "pipe:1",
+        ],
+        capture_output=True, timeout=30, check=True,
+    ).stdout
+
+    audio_bytes = _extract_audio(video_bytes)
+    assert len(audio_bytes) > 0
+    assert len(audio_bytes) < len(video_bytes)
+
+
+def test_extract_audio_raises_a_clean_error_on_input_that_is_not_a_real_video():
+    """ffmpeg itself must fail on garbage input - this must surface as our
+    own AudioExtractionError, not an uncaught CalledProcessError."""
+    from app.intelligence.service import AudioExtractionError, _extract_audio
+
+    with pytest.raises(AudioExtractionError):
+        _extract_audio(b"this is not a real video file")
+
+
+def test_extract_audio_raises_a_clean_error_when_ffmpeg_is_missing(monkeypatch):
+    """Same posture as every other Provider Gateway "not configured"
+    check - a missing binary must fail cleanly, not with a raw
+    FileNotFoundError bubbling out of subprocess.run."""
+    from app.intelligence.service import AudioExtractionError, _extract_audio
+
+    monkeypatch.setattr("app.intelligence.service.settings.ffmpeg_path", "ffmpeg-does-not-exist-anywhere")
+
+    with pytest.raises(AudioExtractionError, match="not installed"):
+        _extract_audio(b"irrelevant")
 
 
 def _seed_summary(

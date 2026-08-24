@@ -10,6 +10,7 @@ class RoutingConfigRequest(BaseModel):
     business_hours_timezone: str = "UTC"
     ai_receptionist_enabled: bool = False
     escalation_user_id: str | None = None
+    escalation_phone_number: str | None = None
     whatsapp_enabled: bool = False
     sms_enabled: bool = False
 
@@ -87,6 +88,7 @@ class PhoneNumberResponse(BaseModel):
     business_hours_timezone: str
     ai_receptionist_enabled: bool
     escalation_user_id: str | None
+    escalation_phone_number: str | None
     call_flow_id: str | None
     whatsapp_enabled: bool
     sms_enabled: bool
@@ -109,18 +111,22 @@ class PhoneNumberResponse(BaseModel):
 
 
 class CheckoutSessionResponse(BaseModel):
-    """id/url are set for a real Stripe Checkout (a paid number). included=True
-    is the Global Plans, Pricing & Commercial Launch Standard doc's "first
-    standard local number is included with each paid user" path - no Stripe
-    session is created at all, the number is purchased/provisioned
-    immediately, and `number` carries the now-ACTIVE (or COMPLIANCE_PENDING,
-    if a KYC case opened) row so the frontend has something to show instead
-    of a redirect URL that doesn't exist."""
+    """Architecture doc §9: a number's cost is a line item on the account's
+    next real ZoikoNex invoice (alongside the plan fee), not a standalone
+    Stripe Checkout - id/url are always None now (kept on the response
+    shape for backward compatibility with older frontend builds, not
+    because either is ever populated again). included=True is the Global
+    Plans, Pricing & Commercial Launch Standard doc's "first standard
+    local number is included with each paid user" path - no charge at
+    all. Otherwise `pending_charge_amount_minor_units` is set: the number
+    is purchased/provisioned immediately either way, and `number` carries
+    the now-ACTIVE (or COMPLIANCE_PENDING, if a KYC case opened) row."""
 
     id: str | None = None
     url: str | None = None
     included: bool = False
     number: PhoneNumberResponse | None = None
+    pending_charge_amount_minor_units: int | None = None
 
 
 class SupportedCountryResponse(BaseModel):
@@ -193,10 +199,19 @@ class NumberEligibilityCaseResponse(BaseModel):
     expires_at: datetime | None
     created_at: datetime
     resolved_at: datetime | None
+    documents: list
+    twilio_bundle_sid: str | None
+    twilio_bundle_status: str | None
+    twilio_bundle_rejection_reason: str | None
 
 
 class SubmitNumberEligibilityEvidenceRequest(BaseModel):
     evidence: list[dict]
+
+
+class SubmitEligibilityBundleRequest(BaseModel):
+    end_user_attributes: dict
+    end_user_type: str = "individual"
 
 
 class ResolveNumberEligibilityCaseRequest(BaseModel):

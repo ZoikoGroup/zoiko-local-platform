@@ -129,20 +129,50 @@ export default function VideoPage() {
   const chatEndRef = useRef<HTMLDivElement>(null);
   const chatOpenRef = useRef(false);
 
+  // Guards against an older, slower request's result landing after a newer
+  // one already resolved (React StrictMode double-invokes effects in dev,
+  // and handleEndCall calls this on top of the mount-time load) - without
+  // this, an out-of-order failure could overwrite loadError with an error
+  // banner even though a later, successful call already populated real
+  // data, showing both the error message and the real list at once.
+  const loadRoomsRequestId = useRef(0);
+
   const loadRooms = useCallback(() => {
     if (!token) return;
+    const requestId = ++loadRoomsRequestId.current;
     return listVideoRooms(token)
       .then((data) => {
+        if (requestId !== loadRoomsRequestId.current) return;
         setRooms(data);
         setLoadError(null);
       })
-      .catch(() => setLoadError("Couldn't load your video call history."))
-      .finally(() => setLoading(false));
+      .catch(() => {
+        if (requestId !== loadRoomsRequestId.current) return;
+        setLoadError("Couldn't load your video call history.");
+      })
+      .finally(() => {
+        if (requestId !== loadRoomsRequestId.current) return;
+        setLoading(false);
+      });
   }, [token]);
 
   useEffect(() => {
     loadRooms();
   }, [loadRooms]);
+
+  // Real gap fixed 2026-08-22: loadRooms only ever ran once, right when a
+  // call ended - at that exact instant the recording obviously isn't done
+  // yet (LiveKit still has to compose and upload the file), so "Recording
+  // processing..." stuck on screen forever even once the backend had the
+  // real recording_url seconds/minutes later, because nothing ever asked
+  // again. Polls only while at least one row is actually pending, and
+  // stops itself the moment none are - never runs at all on a normal
+  // history view with nothing in progress.
+  useEffect(() => {
+    if (!rooms.some((r) => r.recording_in_progress)) return;
+    const interval = setInterval(loadRooms, 4000);
+    return () => clearInterval(interval);
+  }, [rooms, loadRooms]);
 
   useEffect(() => {
     lobbyVideoStreamRef.current = lobbyVideoStream;
@@ -365,6 +395,19 @@ export default function VideoPage() {
       });
       room.on(RoomEvent.TrackUnsubscribed, (track) => {
         track.detach().forEach((el) => el.remove());
+      });
+      // Regression fix: turning the camera off then back on mid-call (or
+      // switching camera device) publishes a brand-new LocalVideoTrack -
+      // the mount-time effect below only attaches once, right after
+      // connecting, so a track published later than that was never wired
+      // to the <video> element. Camera hardware turns on (browser's camera
+      // light, LiveKit's own state) but the preview stays blank. This
+      // covers every (re)publish, not just the first one.
+      room.on(RoomEvent.LocalTrackPublished, (publication) => {
+        if (publication.source === Track.Source.Camera && publication.videoTrack) {
+          const videoEl = localVideoRef.current;
+          if (videoEl) publication.videoTrack.attach(videoEl);
+        }
       });
       room.on(RoomEvent.ParticipantConnected, (participant) => {
         setParticipantCount(room.remoteParticipants.size);
@@ -1116,6 +1159,9 @@ export default function VideoPage() {
                     )}
                     {r.recording_in_progress && (
                       <span className="text-xs font-medium text-red-600">Recording processing…</span>
+                    )}
+                    {r.recording_failed && (
+                      <span className="text-xs font-medium text-slate-400">Recording failed</span>
                     )}
                     <span
                       className={`text-xs font-medium rounded-full px-2 py-0.5 capitalize ${
