@@ -15,6 +15,14 @@ but 4ec152435b05 had already run against this real database (adding those
 already-applied migration's file doesn't retroactively undo what it did to
 a real database - this migration is the actual DROP, confirmed live via
 `alembic check` after the merge (which is exactly what caught this drift).
+
+Guarded with checkfirst=True (2026-08-24): a database that never had the
+old, pre-edit version of 4ec152435b05 run against it (any fresh database
+migrating from scratch - confirmed live against a brand-new Neon instance)
+never had these 3 columns to begin with, so an unconditional drop_column
+fails with UndefinedColumn. Only databases that ran the old 4ec152435b05
+(this repo's shared local dev DB) actually need this drop; everyone else
+needs it to be a no-op.
 """
 from typing import Sequence, Union
 
@@ -30,9 +38,17 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    op.drop_column('ai_usage_rates', 'addon_monthly_price_cents')
-    op.drop_column('ai_usage_rates', 'addon_included_minutes')
-    op.drop_column('subscriptions', 'ai_receptionist_addon_active')
+    bind = op.get_bind()
+    inspector = sa.inspect(bind)
+    ai_usage_rates_columns = {c['name'] for c in inspector.get_columns('ai_usage_rates')}
+    subscriptions_columns = {c['name'] for c in inspector.get_columns('subscriptions')}
+
+    if 'addon_monthly_price_cents' in ai_usage_rates_columns:
+        op.drop_column('ai_usage_rates', 'addon_monthly_price_cents')
+    if 'addon_included_minutes' in ai_usage_rates_columns:
+        op.drop_column('ai_usage_rates', 'addon_included_minutes')
+    if 'ai_receptionist_addon_active' in subscriptions_columns:
+        op.drop_column('subscriptions', 'ai_receptionist_addon_active')
 
 
 def downgrade() -> None:
