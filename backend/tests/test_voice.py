@@ -234,8 +234,13 @@ def test_recording_callback_attaches_recording_to_the_call(client, db_session):
 
 
 def test_incoming_call_goes_to_voicemail_outside_business_hours(client, db_session):
+    from app.billing import service as billing_service
+
     token = _signup_and_login(client, "voicehours@example.com")
     account_id = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"}).json()["account_id"]
+    # routing.business_hours is Business+ (ZL-COM-ENT-001) - a fresh signup's
+    # default free_trial plan grants no business-hours capability.
+    billing_service.change_plan(db_session, account_id, "business", actor="test-setup")
     number = PhoneNumber(
         e164="+15550009999", country="US", status=PhoneNumberStatus.ACTIVE, account_id=account_id
     )
@@ -270,6 +275,36 @@ def test_incoming_call_goes_to_voicemail_outside_business_hours(client, db_sessi
     assert response.status_code == 200
     assert "<Record" in response.text
     assert "<Dial" not in response.text
+
+
+def test_free_trial_account_cannot_set_business_hours(client, db_session):
+    """ZL-COM-ENT-001 §7 matrix: business-hours routing is Business+ only -
+    configuring hours at all (not just leaving them unset) is the gated
+    capability, so a free_trial account must be denied with a real
+    entitlement code."""
+    token = _signup_and_login(client, "voicehoursdenied@example.com")
+    account_id = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"}).json()["account_id"]
+    number = PhoneNumber(
+        e164="+15550009998", country="US", status=PhoneNumberStatus.ACTIVE, account_id=account_id
+    )
+    db_session.add(number)
+    db_session.commit()
+
+    denied = client.put(
+        "/numbers/+15550009998/routing",
+        json={
+            "forwarding_number": "+15551112222",
+            "business_hours_start": "09:00:00",
+            "business_hours_end": "17:00:00",
+            "business_hours_timezone": "UTC",
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert denied.status_code == 402, denied.text
+    body = denied.json()["detail"]
+    assert body["code"] == "ENTITLEMENT_REQUIRED"
+    assert body["entitlement"] == "routing.business_hours"
+    assert body["current_plan"] == "free_trial"
 
 
 def _signup_and_login_with_account(client, email: str) -> tuple[str, str]:
@@ -328,8 +363,14 @@ def test_get_call_rejects_a_call_sid_that_does_not_exist(client, db_session):
 
 
 def test_routing_config_persists_dedicated_escalation_phone_number(client, db_session):
+    from app.billing import service as billing_service
+
     token = _signup_and_login(client, "voiceescalationfield@example.com")
     account_id = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"}).json()["account_id"]
+    # Real gap fix (ZL-COM-ENT-001): ai_receptionist.enabled is now Pro+
+    # (or Starter/Business with the add-on) - see billing_service.
+    # has_ai_receptionist_capability.
+    billing_service.change_plan(db_session, account_id, "pro", actor="test-setup")
     number = PhoneNumber(
         e164="+15550001010", country="US", status=PhoneNumberStatus.ACTIVE, account_id=account_id
     )
@@ -396,8 +437,11 @@ def test_forward_fallback_goes_to_ai_receptionist_when_forwarding_is_missed(clie
     call - AI never got a chance to catch what the human missed. This
     proves forward-fallback now offers the AI Receptionist greeting
     instead of going straight to voicemail."""
+    from app.billing import service as billing_service
+
     token = _signup_and_login(client, "voicefallbackai@example.com")
     account_id = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"}).json()["account_id"]
+    billing_service.change_plan(db_session, account_id, "pro", actor="test-setup")
     number = PhoneNumber(
         e164="+15550002222", country="US", status=PhoneNumberStatus.ACTIVE, account_id=account_id
     )
@@ -464,8 +508,11 @@ def test_forward_fallback_goes_to_voicemail_without_ai_receptionist(client, db_s
 
 
 def test_forward_fallback_does_nothing_when_call_was_answered(client, db_session):
+    from app.billing import service as billing_service
+
     token = _signup_and_login(client, "voicefallbackok@example.com")
     account_id = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"}).json()["account_id"]
+    billing_service.change_plan(db_session, account_id, "pro", actor="test-setup")
     number = PhoneNumber(
         e164="+15550004444", country="US", status=PhoneNumberStatus.ACTIVE, account_id=account_id
     )

@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
+from app.billing.service import EntitlementRequiredError
 from app.core.database import get_db
 from app.core.deps import require_admin
 from app.numbering.identity import service
@@ -29,6 +30,11 @@ def add_member(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     # SeatQuotaExceededError no longer caught here - subclasses
     # EntitlementError, handled by the global entitlement_error_handler.
+    except EntitlementRequiredError as e:
+        raise HTTPException(
+            status_code=status.HTTP_402_PAYMENT_REQUIRED,
+            detail={"code": "ENTITLEMENT_REQUIRED", "entitlement": e.key, "current_plan": e.plan_code},
+        )
     return member
 
 

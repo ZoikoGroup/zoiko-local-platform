@@ -1223,6 +1223,21 @@ def create_number_purchase_checkout_session(db: Session, account_id: str, e164: 
     rate = usage_service.get_number_rate(db, number.country, number.number_type)
     rate_cents = rate.recurring_price_cents if rate is not None else NUMBER_PURCHASE_PRICE_CENTS
 
+    # Real bug fix: is_first_number_included's count-then-act check had no
+    # lock on anything account-scoped, only on the individual PhoneNumber
+    # row being purchased (see reserve_number's own SELECT...FOR UPDATE,
+    # which protects a DIFFERENT race - two purchasers racing for the SAME
+    # e164). Two concurrent checkouts for two DIFFERENT e164s on the same
+    # account could both read included_count < seat_count as true before
+    # either committed, and both take the zero-surcharge path below -
+    # granting two free numbers instead of one. Locking the Account row
+    # here serializes concurrent purchases for the SAME account (this
+    # lock is released at purchase_number's own commit just below, in
+    # every branch, once the number's status becomes one
+    # get_included_number_ids counts) - it does not serialize purchases
+    # across DIFFERENT accounts, which never contended in the first place.
+    db.query(Account).filter(Account.id == account_id).with_for_update().first()
+
     if billing_service.is_first_number_included(db, account_id, exclude_number_id=number.id):
         surcharge_cents = max(0, rate_cents - NUMBER_INCLUSION_THRESHOLD_CENTS)
         if surcharge_cents == 0:
@@ -1736,6 +1751,18 @@ def configure_routing(
         if nominee is None:
             raise NumberConflictError(f"No team member with id {escalation_user_id} on this account")
 
+    # ZL-COM-ENT-001 §7 matrix: "Business-hours & team routing: No (Starter)
+    # / Yes (Business+)" - configuring business hours at all (not just
+    # enabling the feature flag) is the Business+ capability. Checked only
+    # when hours are actually being SET (not on every save with hours left
+    # None) so a Starter account clearing/leaving hours unset is unaffected.
+    if (business_hours_start is not None or business_hours_end is not None) and not billing_service.has_entitlement(
+        db, user.account_id, "routing.business_hours"
+    ):
+        raise billing_service.EntitlementRequiredError(
+            "routing.business_hours", billing_service.get_or_create_subscription(db, user.account_id).plan_code
+        )
+
     number.forwarding_number = forwarding_number
     number.business_hours_start = business_hours_start
     number.business_hours_end = business_hours_end
@@ -1781,6 +1808,16 @@ def set_ring_group(db: Session, user: User, e164: str, destinations: list[str]) 
 
     if len(destinations) > MAX_RING_GROUP_SIZE:
         raise RingGroupTooLargeError(f"A ring group may have up to {MAX_RING_GROUP_SIZE} destinations")
+
+    # ZL-COM-ENT-001 §7 matrix: "Shared call handling: No (Starter) / Yes
+    # (Business+)" - a single destination is just personal forwarding
+    # (already available to every plan via forwarding_number); 2+
+    # destinations ringing simultaneously is the actual "shared handling"
+    # capability being gated here.
+    if len(destinations) > 1 and not billing_service.has_entitlement(db, user.account_id, "routing.shared_handling"):
+        raise billing_service.EntitlementRequiredError(
+            "routing.shared_handling", billing_service.get_or_create_subscription(db, user.account_id).plan_code
+        )
 
     db.query(RingGroupDestination).filter(RingGroupDestination.phone_number_id == number.id).delete()
     rows = [

@@ -342,24 +342,6 @@ def update_call_status(db: Session, provider_call_sid: str, status: str, duratio
             idempotency_key=f"call_seconds:{provider_call_sid}",
             disposition=status,
         )
-        # AI Receptionist minutes (Global Plans, Pricing & Commercial Launch
-        # Standard doc §5.3) - only for calls that actually reached the AI
-        # receptionist. A ReceptionistCall row only exists once the Gather
-        # verb captured real caller speech (see media.receptionist's
-        # /respond handler / capture_receptionist_call below), so a call
-        # that rang through to forwarding/voicemail/hangup instead never
-        # creates one and can't be over-counted here.
-        if db.query(ReceptionistCall).filter(ReceptionistCall.call_sid == provider_call_sid).first() is not None:
-            usage_service.record_usage_event(
-                db,
-                account_id=call.account_id,
-                event_type="ai_receptionist_minutes",
-                quantity=math.ceil((duration or 0) / 60),
-                unit="minutes",
-                country_band=country_band,
-                idempotency_key=f"ai_receptionist_minutes:{provider_call_sid}",
-            )
-
         # AI Receptionist minute metering (Pricing doc §5.3) - only for
         # calls the receptionist actually handled. Whole-call duration, same
         # caveat as call_seconds above: every TwiML leg, not narrowly
@@ -377,7 +359,7 @@ def update_call_status(db: Session, provider_call_sid: str, status: str, duratio
                 db,
                 account_id=call.account_id,
                 event_type="ai_receptionist_minutes",
-                quantity=(duration or 0) / 60,
+                quantity=math.ceil((duration or 0) / 60),
                 unit="minutes",
                 country_band=country_band,
                 idempotency_key=f"ai_receptionist_minutes:{provider_call_sid}",

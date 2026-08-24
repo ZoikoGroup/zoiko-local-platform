@@ -334,15 +334,21 @@ def _fake_stop_recording(sink: list | None = None):
 
 
 @pytest.mark.live
-def test_member_cannot_start_recording_on_a_room_they_did_not_host(client, monkeypatch):
+def test_member_cannot_start_recording_on_a_room_they_did_not_host(client, db_session, monkeypatch):
     """Same host-only restriction as ending a room (Member scoping) -
     recording is the more sensitive of the two actions, so it must not be
     open to any account Member regardless of who hosted the call."""
     monkeypatch.setattr("app.media.service.video.start_room_recording", _fake_start_recording)
     monkeypatch.setattr("app.media.service.video.stop_room_recording", _fake_stop_recording())
 
+    from app.billing import service as billing_service
+
     owner_token = _signup_and_login(client, "videorecordhostowner@example.com")
     owner_headers = {"Authorization": f"Bearer {owner_token}"}
+    owner_account_id = client.get("/auth/me", headers=owner_headers).json()["account_id"]
+    # team.members.enabled is Business+ (ZL-COM-ENT-001) - a fresh signup's
+    # default free_trial plan grants no team capability.
+    billing_service.change_plan(db_session, owner_account_id, "business", actor="test-setup")
     client.post("/compliance/consent", json={"consent_type": "ai_processing"}, headers=owner_headers)
     room_name = client.post("/media/video/rooms", headers=owner_headers).json()["room_name"]
 
@@ -889,14 +895,20 @@ def test_usage_endpoint_sums_across_all_of_an_accounts_sessions(client, db_sessi
 
 
 @pytest.mark.live
-def test_group_video_call_issues_join_tokens_to_more_than_two_team_members(client):
+def test_group_video_call_issues_join_tokens_to_more_than_two_team_members(client, db_session):
     """Roadmap §8 'Video Calling - Phase 1 Standard' targets up to
     MAX_PARTICIPANTS=8 (app.integrations.video.livekit) - this only verified
     1:1 rooms live before. Confirms a real LiveKit room actually accepts join
     tokens for a 3rd and 4th distinct identity on the same room, not just a
     host and one other."""
+    from app.billing import service as billing_service
+
     owner_token = _signup_and_login(client, "groupvideoowner@example.com")
     owner_headers = {"Authorization": f"Bearer {owner_token}"}
+    owner_account_id = client.get("/auth/me", headers=owner_headers).json()["account_id"]
+    # team.members.enabled is Business+ (ZL-COM-ENT-001) - a fresh signup's
+    # default free_trial plan grants no team capability.
+    billing_service.change_plan(db_session, owner_account_id, "business", actor="test-setup")
 
     for email in ("groupvideomember1@example.com", "groupvideomember2@example.com"):
         add_response = client.post(

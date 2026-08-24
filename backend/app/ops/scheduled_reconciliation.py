@@ -20,6 +20,15 @@ Nothing new was built for it; this reuses the one daily job slot that
 already existed for reconciliation/renewals. expire_overdue_kill_switches
 (Commercial Billing Operating Standard doc §U2 "time-bounded overrides")
 was added to this same slot when kill switches gained an expires_at.
+
+flush_pending_outbox_events (real gap fix) existed with no scheduler
+either - it was only reachable via a manual staff endpoint
+(POST /ops/event-outbox/flush), so a row could sit unpublished
+indefinitely if nobody happened to trigger it. Drained in a loop (its own
+batch_size defaults to 100) up to _MAX_OUTBOX_FLUSH_BATCHES per run - a
+safety cap against one bad run spending unbounded time on the outbox, not
+a claim that backlog beyond that cap is expected; genuinely exceeding it
+would show up in the checked/published counts logged below.
 """
 
 import logging
@@ -28,10 +37,13 @@ import sys
 from app.billing.service import run_zoikonex_reconciliation
 from app.compliance.service import expire_overdue_cases
 from app.core.database import SessionLocal
+from app.events.service import flush_pending_outbox_events
 from app.media.service import sweep_stale_video_recordings
 from app.numbering.numbers.service import list_due_renewals
 from app.ops.service import expire_overdue_kill_switches
 from app.retention.service import purge_expired_recordings
+
+_MAX_OUTBOX_FLUSH_BATCHES = 50
 
 logger = logging.getLogger("zoiko.ops.reconciliation")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -82,6 +94,17 @@ def main() -> int:
 
         swept = sweep_stale_video_recordings(db)
         logger.info("stale_video_recordings_swept count=%d", swept["swept"])
+
+        outbox_published = outbox_failed = 0
+        for _ in range(_MAX_OUTBOX_FLUSH_BATCHES):
+            result = flush_pending_outbox_events(db)
+            outbox_published += result["published"]
+            outbox_failed += result["failed"]
+            if result["checked"] == 0:
+                break
+        logger.info("event_outbox_flushed published=%d failed=%d", outbox_published, outbox_failed)
+        if outbox_failed > 0:
+            exit_code = 1
     except Exception:
         logger.exception("scheduled_reconciliation run failed")
         exit_code = 1

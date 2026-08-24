@@ -445,6 +445,71 @@ def test_escalation_uses_dedicated_phone_number_without_hijacking_calls_into_for
     assert calls[0]["escalated"] is True
 
 
+def test_escalation_dial_is_recorded_when_ai_processing_consent_is_on_file(client, db_session):
+    """Real gap fix: an escalated (human-handoff) call is a live two-way
+    conversation with no other capture mechanism of its own - unlike the
+    pre-escalation Gather utterance (already on the ReceptionistCall row)
+    or a plain forwarded call (already recorded via build_ring_group_
+    response). build_receptionist_reply_response previously never set
+    record= on its Dial at all, so the one call category with the least
+    room for missing a detail - an urgent human handoff - was the one
+    that was never recorded, consent or not. Same AI_PROCESSING consent
+    gate as should_record_forwarded_call, so this must be recorded once
+    that consent is on file."""
+    token, account_id = _signup_and_login(client, "receptionistrecorded1@example.com")
+    me = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"})
+    owner_user_id = me.json()["id"]
+
+    number = PhoneNumber(
+        e164="+15550044444", country="US", status=PhoneNumberStatus.ACTIVE, account_id=account_id,
+        ai_receptionist_enabled=True, escalation_user_id=owner_user_id,
+        escalation_phone_number="+15551118888",
+    )
+    db_session.add(number)
+    db_session.commit()
+
+    client.post(
+        "/compliance/consent",
+        json={"consent_type": "ai_processing"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    url = "http://testserver/media/receptionist/respond"
+    params = {
+        "CallSid": "CArecrecorded1", "To": "+15550044444", "From": "+15559994444",
+        "SpeechResult": (
+            "Hi my name is Sam from Acme, our production system is down "
+            "and this is extremely urgent, please call me back right away"
+        ),
+    }
+    signature = _twilio_signature(url, params)
+    response = client.post("/media/receptionist/respond", data=params, headers={"X-Twilio-Signature": signature})
+    assert response.status_code == 200
+    assert 'record="record-from-answer-dual"' in response.text
+    assert "media/voice/recording-callback" in response.text
+
+
+def test_build_receptionist_reply_response_omits_record_without_a_callback_url():
+    """Same fix as above, opposite direction: no recording_callback_url
+    must mean no record= at all - recording is opt-in, not a default that
+    only widens what's possible once a callback URL happens to be passed.
+    Unit-tested directly against the TwiML builder (not the full webhook
+    flow) because escalation and recording share the same AI_PROCESSING
+    consent gate in practice - there's no way to reach the escalation
+    branch at all without the same consent that would also enable
+    recording, so this is the only way to isolate the builder's own
+    record= wiring from that consent coupling."""
+    from app.integrations.telecom import twilio as telecom
+
+    twiml = telecom.build_receptionist_reply_response(
+        "Thanks, connecting you now.", forward_to="+15551117777",
+        status_callback_url="http://testserver/media/voice/status-callback",
+        recording_callback_url=None,
+    )
+    assert "<Dial" in twiml
+    assert "record=" not in twiml
+
+
 def test_escalation_falls_back_to_forwarding_number_when_dedicated_field_unset(client, db_session):
     """Backward compatibility: a number configured before escalation_phone_number
     existed (forwarding_number set, escalation_phone_number left null) must
@@ -505,8 +570,13 @@ def _capture_a_call(client, db_session, account_id: str, *, e164: str, call_sid:
 
 
 def test_assign_receptionist_call_routes_it_to_a_team_member(client, db_session):
+    from app.billing import service as billing_service
+
     owner_token, account_id = _signup_and_login(client, "receptionistroute1@example.com")
     owner_headers = {"Authorization": f"Bearer {owner_token}"}
+    # team.members.enabled is Business+ (ZL-COM-ENT-001) - a fresh signup's
+    # default free_trial plan grants no team capability.
+    billing_service.change_plan(db_session, account_id, "business", actor="test-setup")
     _capture_a_call(client, db_session, account_id, e164="+15550055555", call_sid="CArecroute1")
 
     client.post(
@@ -715,6 +785,67 @@ def test_call_ending_records_ai_receptionist_minutes_usage_event(client, db_sess
     assert event.account_id == account_id
     assert event.quantity == 3  # ceil(125s / 60) = 3 minutes
     assert event.estimated_cost_cents == 3 * 39
+
+
+def test_ai_receptionist_minutes_bills_zero_for_a_non_billable_disposition(client, db_session):
+    """Real bug fix: update_call_status used to write TWO ai_receptionist_
+    minutes usage events sharing the same idempotency key - a naive one
+    (plain math.ceil(duration/60), no disposition) and a disposition-aware
+    one (0 for a non-billable disposition, real duration_seconds tracking).
+    record_usage_event no-ops on a duplicate key, so whichever ran first
+    always won - the naive one, since it was written first in the
+    function - meaning the disposition-aware billing logic never actually
+    took effect: even a NO-ANSWER/FAILED/BUSY/CANCELED receptionist call
+    got billed its full raw duration. Confirms a NO-ANSWER call now bills
+    0 minutes despite a nonzero CallDuration."""
+    from app.usage.models import UsageEvent
+
+    _, account_id = _signup_and_login(client, "receptionistusage3@example.com")
+    number = PhoneNumber(
+        e164="+15550088888", country="US", status=PhoneNumberStatus.ACTIVE, account_id=account_id,
+        ai_receptionist_enabled=True,
+    )
+    db_session.add(number)
+    db_session.commit()
+
+    incoming_url = "http://testserver/media/voice/incoming"
+    incoming_params = {"To": "+15550088888", "From": "+15559990000", "CallSid": "CArecnoanswer1", "CallStatus": "ringing"}
+    client.post(
+        "/media/voice/incoming", data=incoming_params,
+        headers={"X-Twilio-Signature": _twilio_signature(incoming_url, incoming_params)},
+    )
+
+    respond_url = "http://testserver/media/receptionist/respond"
+    respond_params = {
+        "CallSid": "CArecnoanswer1", "To": "+15550088888", "From": "+15559990000",
+        "SpeechResult": "Hi, calling about a quote, please call back.",
+    }
+    client.post(
+        "/media/receptionist/respond", data=respond_params,
+        headers={"X-Twilio-Signature": _twilio_signature(respond_url, respond_params)},
+    )
+
+    status_url = "http://testserver/media/voice/status-callback"
+    status_params = {"CallSid": "CArecnoanswer1", "CallStatus": "no-answer", "CallDuration": "125"}
+    client.post(
+        "/media/voice/status-callback", data=status_params,
+        headers={"X-Twilio-Signature": _twilio_signature(status_url, status_params)},
+    )
+
+    event = (
+        db_session.query(UsageEvent)
+        .filter(UsageEvent.event_type == "ai_receptionist_minutes")
+        .order_by(UsageEvent.created_at.desc())
+        .first()
+    )
+    assert event is not None
+    assert event.quantity == 0  # non-billable disposition, despite a 125s raw duration
+    assert event.disposition == "no-answer"
+
+    from app.media.models import ReceptionistCall
+
+    call = db_session.query(ReceptionistCall).filter(ReceptionistCall.call_sid == "CArecnoanswer1").first()
+    assert call.duration_seconds == 125  # still tracked, even though it wasn't billed
 
 
 def test_call_not_reaching_receptionist_does_not_record_ai_minutes(client, db_session):

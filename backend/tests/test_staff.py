@@ -116,6 +116,11 @@ def test_staff_can_list_accounts_with_owner_and_counts(client, db_session):
     owner_token = client.post(
         "/auth/login", json={"email": "overviewowner@example.com", "password": "supersecret123"}
     ).json()["access_token"]
+    # Real gap fix (ZL-COM-ENT-001): adding a team member now requires
+    # team.members.enabled (Business+).
+    from app.billing import service as billing_service
+
+    billing_service.change_plan(db_session, account_id, "business", actor="test-setup")
     client.post(
         "/team/members",
         json={"email": "overviewteammate@example.com", "password": "supersecret123", "role": "member"},

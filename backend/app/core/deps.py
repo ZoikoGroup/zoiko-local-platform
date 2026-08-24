@@ -210,6 +210,48 @@ def get_api_key_account_id(
     return key.account_id
 
 
+def require_entitlement(key: str):
+    """ZL-COM-ENT-001 §23: "RBAC and commercial entitlement are independent
+    authorization dimensions... ALLOW requires both." Composes as its own
+    Depends() alongside require_admin/require_writer, never fused into one
+    guard - same separation this file already keeps between role checks
+    and app.staff's data-driven require_capability. Use on any customer
+    JWT-authenticated route; see require_entitlement_for_api_key below for
+    the /public/v1 (raw API key) equivalent."""
+
+    def _dependency(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> User:
+        from app.billing.service import get_or_create_subscription, has_entitlement
+
+        if not has_entitlement(db, current_user.account_id, key):
+            sub = get_or_create_subscription(db, current_user.account_id)
+            raise HTTPException(
+                status_code=status.HTTP_402_PAYMENT_REQUIRED,
+                detail={"code": "ENTITLEMENT_REQUIRED", "entitlement": key, "current_plan": sub.plan_code},
+            )
+        return current_user
+
+    return _dependency
+
+
+def require_entitlement_for_api_key(key: str):
+    """Same as require_entitlement above, but for the /public/v1 surface,
+    which authenticates via get_api_key_account_id (a raw API key, no User
+    object) rather than a customer JWT."""
+
+    def _dependency(account_id: str = Depends(get_api_key_account_id), db: Session = Depends(get_db)) -> str:
+        from app.billing.service import get_or_create_subscription, has_entitlement
+
+        if not has_entitlement(db, account_id, key):
+            sub = get_or_create_subscription(db, account_id)
+            raise HTTPException(
+                status_code=status.HTTP_402_PAYMENT_REQUIRED,
+                detail={"code": "ENTITLEMENT_REQUIRED", "entitlement": key, "current_plan": sub.plan_code},
+            )
+        return account_id
+
+    return _dependency
+
+
 def require_capability(capability: str):
     """Data-driven segregation of duties (Commercial Billing Operating
     Standard doc's "formal RBAC/segregation-of-duties matrix" ask) - see

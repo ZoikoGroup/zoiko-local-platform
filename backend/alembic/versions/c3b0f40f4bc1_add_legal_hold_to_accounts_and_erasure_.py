@@ -30,8 +30,14 @@ def upgrade() -> None:
     op.add_column("accounts", sa.Column("legal_hold", sa.Boolean(), nullable=False, server_default="false"))
     op.add_column("accounts", sa.Column("legal_hold_reference", sa.String(length=100), nullable=True))
 
+    # Real bug fix (confirmed live against a fresh migration run): don't
+    # explicitly .create() this enum AND pass it to op.create_table below -
+    # create_table's own column-type handling creates the enum too, as a
+    # side effect of building the table, but with checkfirst=False, so it
+    # fails with DuplicateObject against the one just explicitly created
+    # here. create_table alone is sufficient (same pattern every other
+    # migration in this repo that introduces a brand-new enum uses).
     erasure_status_enum = postgresql.ENUM("PENDING", "COMPLETED", "REJECTED", name="erasure_request_status_enum")
-    erasure_status_enum.create(op.get_bind(), checkfirst=True)
 
     op.create_table(
         "erasure_requests",

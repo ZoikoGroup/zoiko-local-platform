@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
-from app.core.deps import get_current_user, require_writer
+from app.core.deps import get_current_user, require_entitlement, require_writer
 from app.numbering.identity.models import User
 from app.routing import service
 from app.routing.schemas import (
@@ -25,6 +25,7 @@ def create_call_flow(
     payload: CreateCallFlowRequest,
     db: Session = Depends(get_db),
     current_user: User = Depends(require_writer),
+    _entitlement: User = Depends(require_entitlement("routing.advanced")),
 ):
     flow = service.create_flow(db, current_user.account_id, payload.name, current_user.id)
     return {"id": flow.id, "name": flow.name, "created_at": flow.created_at, "has_draft": True,
@@ -89,6 +90,7 @@ def publish_call_flow(
     call_flow_id: str,
     db: Session = Depends(get_db),
     current_user: User = Depends(require_writer),
+    _entitlement: User = Depends(require_entitlement("routing.advanced")),
 ):
     try:
         published, errors, version = service.publish_flow(db, current_user.account_id, call_flow_id, current_user.id)

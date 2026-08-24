@@ -459,9 +459,15 @@ def test_cannot_resolve_an_already_resolved_dispute(client, db_session, monkeypa
     assert second_attempt.status_code == 409
 
 
-def test_usage_requires_admin(client):
+def test_usage_requires_admin(client, db_session):
+    from app.billing import service as billing_service
+
     owner_token = _signup_and_login(client, "usagememberowner@example.com")
     owner_headers = {"Authorization": f"Bearer {owner_token}"}
+    # Real gap fix (ZL-COM-ENT-001): adding a team member now requires
+    # team.members.enabled (Business+).
+    owner_account_id = client.get("/auth/me", headers=owner_headers).json()["account_id"]
+    billing_service.change_plan(db_session, owner_account_id, "business", actor="test-setup")
     client.post(
         "/team/members",
         json={"email": "usagemembermember@example.com", "password": "supersecret123", "role": "member"},

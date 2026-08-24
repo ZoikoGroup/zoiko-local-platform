@@ -3,6 +3,7 @@ import logging
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
 from sqlalchemy.orm import Session
 
+from app.billing.service import EntitlementRequiredError
 from app.core.database import get_db
 from app.core.deps import get_current_user, require_admin, require_writer
 from app.integrations.telecom.twilio import TelecomError
@@ -358,6 +359,11 @@ def configure_routing(
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e
     except ComplianceRequiredError as e:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e)) from e
+    except EntitlementRequiredError as e:
+        raise HTTPException(
+            status_code=status.HTTP_402_PAYMENT_REQUIRED,
+            detail={"code": "ENTITLEMENT_REQUIRED", "entitlement": e.key, "current_plan": e.plan_code},
+        ) from e
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e)) from e
 
@@ -375,6 +381,11 @@ def set_ring_group(
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e
     except service.RingGroupTooLargeError as e:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e)) from e
+    except EntitlementRequiredError as e:
+        raise HTTPException(
+            status_code=status.HTTP_402_PAYMENT_REQUIRED,
+            detail={"code": "ENTITLEMENT_REQUIRED", "entitlement": e.key, "current_plan": e.plan_code},
+        ) from e
 
 
 @router.get("/{e164}/ring-group", response_model=list[RingGroupDestinationResponse])

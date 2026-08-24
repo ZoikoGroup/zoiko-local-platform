@@ -87,10 +87,18 @@ def test_disconnecting_a_crm_notifies_the_owner(client, db_session, monkeypatch)
     assert matches[0]["status"] == "sent"
 
 
-def test_member_cannot_get_a_hubspot_authorize_url(client):
+def test_member_cannot_get_a_hubspot_authorize_url(client, db_session):
     """RBAC now lives on the real authorize endpoints, not the dead mock
     /crm/connect path."""
+    from app.billing import service as billing_service
+
     owner_token = _signup_and_login(client, "crm-owner4@example.com")
+    # Real gap fix (ZL-COM-ENT-001): adding a team member now requires
+    # team.members.enabled (Business+).
+    owner_account_id = client.get(
+        "/auth/me", headers={"Authorization": f"Bearer {owner_token}"}
+    ).json()["account_id"]
+    billing_service.change_plan(db_session, owner_account_id, "business", actor="test-setup")
     client.post(
         "/team/members",
         json={"email": "crm-member4@example.com", "password": "supersecret123", "role": "member"},

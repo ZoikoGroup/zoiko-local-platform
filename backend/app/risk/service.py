@@ -56,6 +56,21 @@ _DEFAULT_WEIGHTS = {
     RiskSignalType.GEOGRAPHIC_DISPERSION: 25,
     RiskSignalType.SPEND_LIMIT_EXCEEDED: 35,
     RiskSignalType.CONCURRENT_CALL_LIMIT_EXCEEDED: 20,
+    # Real gap fix: these 5 signal types (added to the enum by 9c1f4a0d2e77,
+    # e7c2b6f184a9, 98ac3783df0b) were being recorded by record_risk_signal
+    # but had no weight here and no FraudRule row - get_signal_weight
+    # silently returned 0 for every one of them, so they could never
+    # contribute to compute_account_risk_score or open_fraud_case_if_needed,
+    # regardless of how many fired. Same "no active row -> conservative
+    # built-in default" fallback design as the five signals above, not a
+    # staff-tunable FraudRule row (same precedent as SPEND_LIMIT_EXCEEDED/
+    # CONCURRENT_CALL_LIMIT_EXCEEDED, which were also left as code-only
+    # defaults - see 7a2e5c918bf4's migration comment).
+    RiskSignalType.ACCOUNT_TAKEOVER_INDICATOR: 40,  # established account, never-seen fingerprint - high confidence
+    RiskSignalType.CALLER_ID_CHANGE_PATTERN: 30,  # probing for a CLI that passes spam detection
+    RiskSignalType.REPEATED_NUMBER_ACQUISITION: 25,  # same shape/severity as VELOCITY_EXCEEDED
+    RiskSignalType.DEVICE_FINGERPRINT_ABUSE: 20,  # real false-positive risk (shared office network/device)
+    RiskSignalType.AI_RECEPTIONIST_TRIAL_CAP_EXCEEDED: 15,  # resource-cap signal, not itself evidence of fraud
 }
 MAX_RISK_SCORE = 100
 AUTO_SUSPEND_THRESHOLD = 100

@@ -223,7 +223,7 @@ export default function NumbersPage() {
     if (!token) return;
     listNumberRates(token).then(setNumberRates).catch(() => {});
   }, [token]);
-
+ 
   // Stripe redirects the browser back here after Checkout (success or
   // cancel) - the number itself only activates via the backend's webhook,
   // not this redirect, so this just reflects that outcome to the customer
