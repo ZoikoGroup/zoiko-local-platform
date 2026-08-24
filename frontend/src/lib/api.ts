@@ -1731,6 +1731,34 @@ export function getPriceCatalogEntry(
   );
 }
 
+export type PublicSupportedCountry = {
+  code: string;
+  name: string;
+};
+
+// Unauthenticated mirrors of listPlans/getPriceCatalogEntry above, for the
+// public /pricing marketing page - no visitor account exists yet to send a
+// token with. Same response shapes, real catalog-driven data (never
+// hardcoded), just without an Authorization header.
+export function listPublicPlans(): Promise<Plan[]> {
+  return request<Plan[]>("/billing/public/plans");
+}
+
+export function getPublicPlanPrice(
+  planCode: string,
+  billingPeriod: BillingPeriod = "monthly"
+): Promise<PriceCatalogEntry | null> {
+  return request<PriceCatalogEntry | null>(
+    `/billing/public/plans/${planCode}/price?billing_period=${billingPeriod}`
+  );
+}
+
+// Filtered server-side to markets that are actually PAID_OPEN today - see
+// backend app.billing.routes.list_public_countries.
+export function listPublicCountries(): Promise<PublicSupportedCountry[]> {
+  return request<PublicSupportedCountry[]>("/billing/public/countries");
+}
+
 export function getUsageSummary(token: string): Promise<UsageSummary> {
   return request<UsageSummary>("/billing/usage-summary", {
     headers: { Authorization: `Bearer ${token}` },

@@ -14,7 +14,6 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.orm import Session
 
-from app.billing.service import BillingSuspendedError
 from app.core.database import get_db
 from app.core.deps import get_current_user, require_writer
 from app.integrations.telecom import twilio as telecom
@@ -257,8 +256,8 @@ async def outbound_call(
         )
     except media_service.CallAuthorizationError as e:
         raise HTTPException(status_code=403, detail=str(e)) from e
-    except BillingSuspendedError as e:
-        raise HTTPException(status_code=402, detail=str(e)) from e
+    # BillingSuspendedError no longer caught here - subclasses
+    # EntitlementError, handled by the global entitlement_error_handler.
     except risk_service.DestinationBlockedError as e:
         raise HTTPException(status_code=403, detail=str(e)) from e
     except risk_service.VelocityLimitExceededError as e:

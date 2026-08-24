@@ -7,7 +7,6 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-from app.billing.service import BillingSuspendedError
 from app.core.database import get_db
 from app.core.deps import get_current_staff, get_current_user, require_writer
 from app.integrations.llm.groq import LLMError
@@ -59,8 +58,8 @@ def summarize_voicemail(
         raise HTTPException(status_code=403, detail=str(e)) from e
     except service.ConsentRequiredError as e:
         raise HTTPException(status_code=403, detail=str(e)) from e
-    except BillingSuspendedError as e:
-        raise HTTPException(status_code=402, detail=str(e)) from e
+    # BillingSuspendedError no longer caught here - subclasses
+    # EntitlementError, handled by the global entitlement_error_handler.
     except KillSwitchTrippedError as e:
         raise HTTPException(status_code=503, detail=str(e)) from e
     except (TelecomError, TranscriptionError, LLMError) as e:
@@ -82,8 +81,8 @@ def summarize_call(
         raise HTTPException(status_code=403, detail=str(e)) from e
     except service.NotRecordedError as e:
         raise HTTPException(status_code=409, detail=str(e)) from e
-    except BillingSuspendedError as e:
-        raise HTTPException(status_code=402, detail=str(e)) from e
+    # BillingSuspendedError no longer caught here - subclasses
+    # EntitlementError, handled by the global entitlement_error_handler.
     except KillSwitchTrippedError as e:
         raise HTTPException(status_code=503, detail=str(e)) from e
     except (TelecomError, TranscriptionError, LLMError) as e:
@@ -105,8 +104,8 @@ def summarize_video_session(
         raise HTTPException(status_code=403, detail=str(e)) from e
     except service.NotRecordedError as e:
         raise HTTPException(status_code=409, detail=str(e)) from e
-    except BillingSuspendedError as e:
-        raise HTTPException(status_code=402, detail=str(e)) from e
+    # BillingSuspendedError no longer caught here - subclasses
+    # EntitlementError, handled by the global entitlement_error_handler.
     except KillSwitchTrippedError as e:
         raise HTTPException(status_code=503, detail=str(e)) from e
     except (StorageError, TranscriptionError, LLMError, service.AudioExtractionError) as e:

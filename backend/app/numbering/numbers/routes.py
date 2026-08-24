@@ -3,7 +3,6 @@ import logging
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
 from sqlalchemy.orm import Session
 
-from app.billing.service import BillingSuspendedError, NumberQuotaExceededError
 from app.core.database import get_db
 from app.core.deps import get_current_user, require_admin, require_writer
 from app.integrations.telecom.twilio import TelecomError
@@ -123,8 +122,10 @@ def purchase_number(
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e
     except MarketNotActivatedError as e:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e)) from e
-    except (NumberQuotaExceededError, BillingSuspendedError) as e:
-        raise HTTPException(status_code=status.HTTP_402_PAYMENT_REQUIRED, detail=str(e)) from e
+    # NumberQuotaExceededError/BillingSuspendedError no longer caught here -
+    # both subclass EntitlementError and are handled by the global
+    # entitlement_error_handler in app.main, which already returns 402 plus
+    # a machine-readable code.
     except (ComplianceRequiredError, EmergencyDisclosureRequiredError, NumberEligibilityRequiredError) as e:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e)) from e
     except TelecomError as e:
@@ -257,8 +258,8 @@ def create_checkout_session(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e)) from e
     except service.NonCommercialAccountError as e:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e)) from e
-    except (NumberQuotaExceededError, BillingSuspendedError) as e:
-        raise HTTPException(status_code=status.HTTP_402_PAYMENT_REQUIRED, detail=str(e)) from e
+    # NumberQuotaExceededError/BillingSuspendedError - see the comment at
+    # the /purchase route above; handled by the global entitlement handler.
     except (ComplianceRequiredError, EmergencyDisclosureRequiredError, NumberEligibilityRequiredError) as e:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e)) from e
     except TelecomError as e:

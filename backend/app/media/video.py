@@ -10,7 +10,6 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from app.billing.service import BillingSuspendedError
 from app.core.config import settings
 from app.core.database import get_db
 from app.core.deps import get_current_user, require_writer
@@ -52,8 +51,8 @@ async def create_room(
         session = await media_service.create_video_session(
             db, current_user.account_id, current_user.id, confidential=body.confidential
         )
-    except BillingSuspendedError as e:
-        raise HTTPException(status_code=402, detail=str(e)) from e
+    # BillingSuspendedError no longer caught here - subclasses
+    # EntitlementError, handled by the global entitlement_error_handler.
     except VideoError as e:
         raise HTTPException(status_code=502, detail=str(e)) from e
     return {

@@ -25,6 +25,7 @@ from app.billing.models import (
     ZoikoNexSyncEventType,
 )
 from app.core.config import settings
+from app.core.errors import EntitlementError
 # publish_subscription_plan_changed deliberately not imported here anymore -
 # change_plan() below replaced that fire-and-forget call with
 # publish_event_durably (see its own comment at the call site).
@@ -85,16 +86,29 @@ class PlanNotFoundError(Exception):
     """Raised when a plan_code doesn't match any seeded Plan row."""
 
 
-class NumberQuotaExceededError(Exception):
+class NumberQuotaExceededError(EntitlementError):
     """Raised when purchasing another number would exceed the account's
     plan's max_numbers - a Phase-1-local entitlement gate (Architecture
     doc §5's "Subscription and Entitlement" service), independent of
     ZoikoNex, which doesn't exist yet."""
+    code = "RESOURCE_OVER_LIMIT"
+    status_code = 402
 
 
-class SeatQuotaExceededError(Exception):
+class SeatQuotaExceededError(EntitlementError):
     """Raised when adding another team member would exceed the account's
     plan's max_team_seats."""
+    code = "RESOURCE_OVER_LIMIT"
+    status_code = 402
+
+
+class AiReceptionistNotEntitledError(EntitlementError):
+    """Raised by configure_routing when a customer tries to enable the
+    per-number ai_receptionist_enabled toggle without their plan/add-on
+    actually granting AI Receptionist - previously that toggle had no
+    entitlement check at all (a Starter account could enable it for free)."""
+    code = "ADDON_REQUIRED"
+    status_code = 402
 
 
 _PLANS_CACHE_KEY = "billing:plans"
@@ -575,16 +589,11 @@ def change_plan(
     return sub
 
 
-def assert_number_quota_available(db: Session, account_id: str, *, exclude_number_id: str | None = None) -> None:
-    """exclude_number_id excludes the number currently being (re-)purchased
-    from its own count - a retry of a number already sitting in
-    COMPLIANCE_PENDING for this same account (e.g. after a compliance case
-    gets approved) isn't an ADDITIONAL number, so it must not count against
-    the quota a second time and block its own retry."""
+def _count_owned_or_in_flight_numbers(db: Session, account_id: str, *, exclude_number_id: str | None = None) -> int:
+    """Shared by assert_number_quota_available (raises) and get_usage_summary
+    (reports) so the two can never disagree on what counts as "owned"."""
     from app.numbering.numbers.models import PhoneNumber, PhoneNumberStatus
 
-    sub = get_or_create_subscription(db, account_id)
-    plan = get_plan(db, sub.plan_code)
     query = db.query(PhoneNumber).filter(
         PhoneNumber.account_id == account_id,
         PhoneNumber.status.in_([
@@ -597,7 +606,18 @@ def assert_number_quota_available(db: Session, account_id: str, *, exclude_numbe
     )
     if exclude_number_id is not None:
         query = query.filter(PhoneNumber.id != exclude_number_id)
-    owned_or_in_flight = query.count()
+    return query.count()
+
+
+def assert_number_quota_available(db: Session, account_id: str, *, exclude_number_id: str | None = None) -> None:
+    """exclude_number_id excludes the number currently being (re-)purchased
+    from its own count - a retry of a number already sitting in
+    COMPLIANCE_PENDING for this same account (e.g. after a compliance case
+    gets approved) isn't an ADDITIONAL number, so it must not count against
+    the quota a second time and block its own retry."""
+    sub = get_or_create_subscription(db, account_id)
+    plan = get_plan(db, sub.plan_code)
+    owned_or_in_flight = _count_owned_or_in_flight_numbers(db, account_id, exclude_number_id=exclude_number_id)
     if owned_or_in_flight >= plan.max_numbers:
         raise NumberQuotaExceededError(
             f"Your {plan.name} plan allows up to {plan.max_numbers} number(s) - "
@@ -710,12 +730,14 @@ class ZoikoNexRefNotFoundError(Exception):
     that doesn't match any local Subscription."""
 
 
-class BillingSuspendedError(Exception):
+class BillingSuspendedError(EntitlementError):
     """Raised when an account's grace period has expired with unresolved
     PAST_DUE status - Architecture doc §9 "Graceful degradation": outbound
     calling, video, new purchases, and AI features may pause after dunning
     thresholds. Deliberately never raised for inbound calls or existing
     number ownership - see assert_billing_not_suspended's docstring."""
+    code = "SUBSCRIPTION_SUSPENDED"
+    status_code = 402
 
 
 class TestAccountRestrictedError(Exception):
@@ -848,6 +870,16 @@ def handle_zoikonex_payment_webhook(
         db, sub, event_type, actor="zoikonex_webhook",
         action="subscription.payment_event_received", external_event_id=external_event_id,
     )
+
+
+def _is_billing_suspended(sub: Subscription, now: datetime) -> bool:
+    """Shared by assert_billing_not_suspended (raises) and get_usage_summary
+    (reports) so the two can never disagree on what "suspended" means."""
+    if sub.status == SubscriptionStatus.CANCELED:
+        return True
+    if sub.status != SubscriptionStatus.PAST_DUE or sub.grace_period_ends_at is None:
+        return False
+    return now > sub.grace_period_ends_at
 
 
 def assert_billing_not_suspended(db: Session, account_id: str) -> None:
@@ -1882,6 +1914,19 @@ def get_active_ai_receptionist_addon_rate(db: Session) -> AIReceptionistAddonRat
     return db.query(AIReceptionistAddonRate).order_by(AIReceptionistAddonRate.created_at.desc()).first()
 
 
+def is_ai_receptionist_enabled_for_account(db: Session, account_id: str) -> bool:
+    """Single source of truth for "does this account's plan/add-on grant AI
+    Receptionist at all" - previously every caller that needed this
+    combined plan.included_ai_receptionist_minutes and
+    sub.ai_receptionist_addon_enabled itself (get_usage_summary did; the
+    per-number ai_receptionist_enabled toggle in configure_routing didn't
+    check either at all). Reused by configure_routing's entitlement gate
+    and get_usage_summary's snapshot below."""
+    sub = get_or_create_subscription(db, account_id)
+    plan = get_plan(db, sub.plan_code)
+    return plan.included_ai_receptionist_minutes > 0 or sub.ai_receptionist_addon_enabled
+
+
 def set_ai_receptionist_addon(db: Session, account_id: str, *, enabled: bool, actor: str) -> Subscription:
     """Pricing doc §5.3 "$29.00 per workspace/month" - a subscription-level
     toggle, not a plan change (see change_plan for that), so this doesn't
@@ -1911,11 +1956,14 @@ def get_usage_summary(db: Session, account_id: str) -> dict:
     only, not hard-enforced (unlike number/seat counts), since blocking an
     in-progress call or AI generation on a usage cap is a materially bigger
     and riskier change than gating a discrete purchase/invite action."""
+    from app.numbering.identity.models import User
     from app.usage.models import UsageEvent
     from sqlalchemy import func as sa_func
 
     sub = get_or_create_subscription(db, account_id)
     plan = get_plan(db, sub.plan_code)
+    now = _db_now(db)
+    seat_count = db.query(User).filter(User.account_id == account_id).count()
 
     totals = dict(
         db.query(UsageEvent.event_type, sa_func.coalesce(sa_func.sum(UsageEvent.quantity), 0))
@@ -1957,10 +2005,22 @@ def get_usage_summary(db: Session, account_id: str) -> dict:
         "current_period_start": sub.current_period_start,
         "current_period_end": sub.current_period_end,
         "ai_receptionist_addon_enabled": sub.ai_receptionist_addon_enabled,
+        # Entitlement-snapshot fields (Commercial Entitlement Governance doc) -
+        # single source of truth shared with assert_billing_not_suspended /
+        # is_ai_receptionist_enabled_for_account so this can never disagree
+        # with what actually gets blocked elsewhere.
+        "is_suspended": _is_billing_suspended(sub, now),
+        "ai_receptionist_enabled": plan.included_ai_receptionist_minutes > 0 or sub.ai_receptionist_addon_enabled,
         "resources": [
             {"resource": "voice_minutes", "used": round(voice_minutes_used, 1), "limit": plan.monthly_voice_minutes},
             {"resource": "video_minutes", "used": round(video_minutes_used, 1), "limit": plan.monthly_video_minutes},
             {"resource": "ai_summaries", "used": int(ai_summaries_used), "limit": plan.monthly_ai_summaries},
+            {
+                "resource": "numbers",
+                "used": _count_owned_or_in_flight_numbers(db, account_id),
+                "limit": plan.max_numbers,
+            },
+            {"resource": "seats", "used": seat_count, "limit": plan.max_team_seats},
             {
                 "resource": "ai_receptionist_minutes",
                 "used": round(ai_receptionist_minutes_used, 1),

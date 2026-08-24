@@ -336,6 +336,14 @@ def test_routing_config_persists_dedicated_escalation_phone_number(client, db_se
     db_session.add(number)
     db_session.commit()
 
+    # AI Receptionist is plan/add-on gated (billing.service.
+    # is_ai_receptionist_enabled_for_account) - a fresh signup's default
+    # trial plan grants neither, so enable the add-on first.
+    client.put(
+        "/billing/subscription/ai-receptionist-addon", json={"enabled": True},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
     routing_response = client.put(
         "/numbers/+15550001010/routing",
         json={"ai_receptionist_enabled": True, "escalation_phone_number": "+15559998877"},
@@ -347,6 +355,39 @@ def test_routing_config_persists_dedicated_escalation_phone_number(client, db_se
     get_response = client.get("/numbers", headers={"Authorization": f"Bearer {token}"})
     numbers = get_response.json()
     assert numbers[0]["escalation_phone_number"] == "+15559998877"
+
+
+def test_enabling_ai_receptionist_is_blocked_without_plan_or_addon_entitlement(client, db_session):
+    """A fresh signup's default trial plan grants no AI Receptionist
+    minutes and has the add-on off - configure_routing must reject turning
+    the per-number toggle on rather than silently allowing a free feature."""
+    token = _signup_and_login(client, "voiceaidenied@example.com")
+    account_id = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"}).json()["account_id"]
+    number = PhoneNumber(
+        e164="+15550004444", country="US", status=PhoneNumberStatus.ACTIVE, account_id=account_id
+    )
+    db_session.add(number)
+    db_session.commit()
+
+    denied = client.put(
+        "/numbers/+15550004444/routing",
+        json={"ai_receptionist_enabled": True},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert denied.status_code == 402, denied.text
+    assert denied.json()["code"] == "ADDON_REQUIRED"
+
+    client.put(
+        "/billing/subscription/ai-receptionist-addon", json={"enabled": True},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    allowed = client.put(
+        "/numbers/+15550004444/routing",
+        json={"ai_receptionist_enabled": True},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert allowed.status_code == 200, allowed.text
+    assert allowed.json()["ai_receptionist_enabled"] is True
 
 
 def test_forward_fallback_goes_to_ai_receptionist_when_forwarding_is_missed(client, db_session):
@@ -362,6 +403,14 @@ def test_forward_fallback_goes_to_ai_receptionist_when_forwarding_is_missed(clie
     )
     db_session.add(number)
     db_session.commit()
+
+    # AI Receptionist is plan/add-on gated (billing.service.
+    # is_ai_receptionist_enabled_for_account) - a fresh signup's default
+    # trial plan grants neither, so enable the add-on first.
+    client.put(
+        "/billing/subscription/ai-receptionist-addon", json={"enabled": True},
+        headers={"Authorization": f"Bearer {token}"},
+    )
 
     client.put(
         "/numbers/+15550002222/routing",
