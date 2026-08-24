@@ -137,9 +137,7 @@ export default function ChoosePlanPage() {
     <div className="min-h-screen bg-slate-50">
       <div className="max-w-5xl mx-auto px-6 py-12">
         <div className="flex items-center gap-2 mb-10">
-          <div className="w-9 h-9 rounded-lg bg-indigo-600 text-white flex items-center justify-center font-bold">
-            Z
-          </div>
+          <img src="/logo-icon.svg" alt="Zoiko Local" className="w-9 h-9 rounded-lg" />
           <div className="font-semibold text-slate-900">Zoiko Local</div>
         </div>
 

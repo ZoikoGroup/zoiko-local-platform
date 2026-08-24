@@ -326,9 +326,7 @@ export default function GuestJoinPage() {
     <main className="min-h-screen bg-slate-950 flex items-center justify-center p-6">
       <div className="w-full max-w-2xl">
         <div className="flex items-center gap-2 justify-center mb-6">
-          <div className="w-8 h-8 rounded-lg bg-indigo-600 text-white flex items-center justify-center font-bold text-sm">
-            Z
-          </div>
+          <img src="/logo-icon.svg" alt="Zoiko Local" className="w-8 h-8 rounded-lg" />
           <h1 className="font-semibold text-white">Zoiko Local</h1>
         </div>
 

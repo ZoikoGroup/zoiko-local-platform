@@ -23,9 +23,7 @@ export default function AuthLayout({
         <div className="absolute inset-0 opacity-10 bg-[radial-gradient(circle_at_top_right,white,transparent_60%)]" />
 
         <div className="relative flex items-center gap-2">
-          <div className="w-9 h-9 rounded-lg bg-white/15 backdrop-blur flex items-center justify-center font-bold">
-            Z
-          </div>
+          <img src="/logo-icon.svg" alt="Zoiko Local" className="w-9 h-9 rounded-lg" />
           <div>
             <div className="font-semibold leading-tight">Zoiko Local</div>
             <div className="text-xs text-indigo-200 leading-tight">Communications Platform</div>
@@ -60,9 +58,7 @@ export default function AuthLayout({
       <main className="flex-1 flex items-center justify-center p-6 sm:p-10">
         <div className="w-full max-w-sm">
           <div className="lg:hidden flex items-center gap-2 mb-8 justify-center">
-            <div className="w-9 h-9 rounded-lg bg-indigo-600 text-white flex items-center justify-center font-bold">
-              Z
-            </div>
+            <img src="/logo-icon.svg" alt="Zoiko Local" className="w-9 h-9 rounded-lg" />
             <div>
               <div className="font-semibold text-slate-900 leading-tight">Zoiko Local</div>
               <div className="text-xs text-slate-500 leading-tight">Communications Platform</div>

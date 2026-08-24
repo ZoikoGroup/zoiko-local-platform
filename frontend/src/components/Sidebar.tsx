@@ -11,9 +11,7 @@ export default function Sidebar() {
   return (
     <aside className="w-64 shrink-0 bg-slate-950 text-slate-300 flex flex-col">
       <div className="flex items-center gap-2 px-5 py-5 border-b border-white/10">
-        <div className="w-9 h-9 rounded-lg bg-indigo-600 text-white flex items-center justify-center font-bold shadow-sm shadow-indigo-500/30">
-          Z
-        </div>
+        <img src="/logo-icon.svg" alt="Zoiko Local" className="w-9 h-9 rounded-lg shadow-sm shadow-indigo-500/30" />
         <div>
           <div className="font-semibold text-white leading-tight">Zoiko Local</div>
           <div className="text-xs text-slate-400 leading-tight">Communications Platform</div>
