@@ -448,6 +448,10 @@ def publish_retention_policy_set(account_id: str, *, artifact_type: str, retenti
     )
 
 
+def publish_retention_erasure_requested(account_id: str, *, request_id: str) -> None:
+    publish_event("zoiko.retention", "retention.erasure_requested", account_id, {"request_id": request_id})
+
+
 def publish_retention_recording_purged(account_id: str | None, *, artifact_type: str, target_id: str) -> None:
     publish_event(
         "zoiko.retention", "retention.recording_purged", account_id,

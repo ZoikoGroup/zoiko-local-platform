@@ -7,6 +7,7 @@ import {
   listPlans,
   getSubscription,
   changeSubscriptionPlan,
+  createPlanChangeCheckoutSession,
   setAIReceptionistAddon,
   cancelSubscription,
   getPriceCatalogEntry,
@@ -170,6 +171,18 @@ export default function BillingPage() {
     setChangingPlan(planCode);
     setPlanError(null);
     try {
+      const entry = prices[planCode];
+      const requiresPayment = !!entry && !entry.is_placeholder && entry.amount_minor_units > 0;
+      if (requiresPayment) {
+        // Real money changes hands here - redirect to Stripe's hosted
+        // Checkout page instead of switching the plan locally. The plan
+        // itself only changes once Stripe confirms payment via the
+        // /billing/stripe/checkout-webhook backend route, not on this
+        // click - so we navigate away and never reach loadPlanAndUsage.
+        const session = await createPlanChangeCheckoutSession(token, planCode, billingPeriod);
+        window.location.href = session.url;
+        return;
+      }
       await changeSubscriptionPlan(token, planCode, billingPeriod);
       await loadPlanAndUsage();
       setConfirmingPlan(null);

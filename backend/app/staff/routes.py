@@ -46,6 +46,7 @@ from app.staff.models import PlatformStaff, PlatformStaffRole
 from app.staff.schemas import (
     AccessMatrixEntryResponse,
     AccountOverviewResponse,
+    SetAccountTestFlagRequest,
     StaffLoginRequest,
     StaffTokenResponse,
     UpdateAccountBillingClassificationRequest,
@@ -115,6 +116,28 @@ def update_account_billing_classification(
     try:
         service.update_account_billing_classification(
             db, account_id, billing_classification=classification, billing_source=source, actor=staff.id,
+        )
+    except service.AccountNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
+
+    return service.get_account_overview(db, account_id)
+
+
+@router.put("/accounts/{account_id}/test-flag", response_model=AccountOverviewResponse)
+def set_account_test_flag(
+    account_id: str,
+    payload: SetAccountTestFlagRequest,
+    db: Session = Depends(get_db),
+    staff: PlatformStaff = Depends(require_capability("accounts.manage_test_flag")),
+):
+    """Flags/unflags an account is_test - lets it bypass the CONTROLLED_BETA/
+    INTERNAL_TEST market-activation gate for testing purchases, at the cost
+    of also being blocked from real Stripe/ZoikoNex billing while flagged.
+    SUPER_ADMIN-only (see the accounts.manage_test_flag grant) - a
+    platform-wide decision, not a routine support action."""
+    try:
+        service.set_account_test_flag(
+            db, account_id, is_test=payload.is_test, actor=staff.id, reason=payload.reason,
         )
     except service.AccountNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e

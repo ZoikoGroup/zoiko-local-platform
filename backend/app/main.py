@@ -1,3 +1,4 @@
+import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
@@ -16,7 +17,7 @@ from app.compliance.routes import router as compliance_router
 from app.consent.routes import router as consent_router
 from app.contacts.routes import router as contacts_router
 from app.core.config import settings
-from app.core.database import engine
+from app.core.database import SessionLocal, engine
 from app.core.error_logging import ErrorLoggingMiddleware
 from app.core.errors import EntitlementError
 from app.core.logging import configure_logging
@@ -48,16 +49,31 @@ from app.retention.routes import router as retention_router
 from app.risk.routes import router as risk_router
 from app.routing.routes import router as call_flows_router
 from app.staff.routes import router as staff_router
+from app.staff.service import bootstrap_initial_super_admin
 from app.usage.routes import router as usage_router
 from app.webhooks.routes import router as webhooks_router
 
 # Runs once at import time (not per app-instance), before any FastAPI app
 # exists - configure_logging() itself has nothing to do with app.state.
 configure_logging()
+_startup_logger = logging.getLogger("zoiko.startup")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Idempotent (see bootstrap_initial_super_admin's own docstring) - safe
+    # to attempt on every boot. Wrapped defensively so a transient DB
+    # hiccup at startup (seen for real against this project's Neon
+    # instance) delays staff bootstrap by one restart instead of crash-
+    # looping the whole API over a non-critical, self-healing step.
+    try:
+        db = SessionLocal()
+        try:
+            bootstrap_initial_super_admin(db)
+        finally:
+            db.close()
+    except Exception:
+        _startup_logger.exception("initial super admin bootstrap failed - will retry next boot")
     yield
     shutdown_telemetry()
 

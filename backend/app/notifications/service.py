@@ -945,6 +945,50 @@ def notify_number_verification_required(
     )
 
 
+def notify_number_eligibility_approved(
+    db: Session, *, account_id: str, account_email: str, country: str, number_type: str
+) -> None:
+    """Twilio approved the customer's Regulatory Bundle submission - the
+    eligibility case that had been blocking purchase (COMPLIANCE_PENDING)
+    is now APPROVED, so the customer can go back and complete the
+    purchase. Companion to notify_number_verification_required's "please
+    submit documents" - this is the "you're clear now" half that was
+    missing (both the on-demand sync route and the scheduled reconciliation
+    sweep call this on approval, so it fires however the status change was
+    discovered)."""
+    send_notification(
+        db,
+        event_name="number.eligibility_case_approved",
+        account_id=account_id,
+        recipient_email=account_email,
+        context={
+            "user_display_name": account_email,
+            "case_country": country,
+            "case_number_type": number_type,
+        },
+    )
+
+
+def notify_number_eligibility_rejected(
+    db: Session, *, account_id: str, account_email: str, country: str, number_type: str, rejection_reason: str
+) -> None:
+    """Twilio rejected the submitted bundle - the customer needs to correct
+    and resubmit, not just wait. See notify_number_eligibility_approved's
+    docstring for why this exists alongside it."""
+    send_notification(
+        db,
+        event_name="number.eligibility_case_rejected",
+        account_id=account_id,
+        recipient_email=account_email,
+        context={
+            "user_display_name": account_email,
+            "case_country": country,
+            "case_number_type": number_type,
+            "case_rejection_reason": rejection_reason or "No reason provided by the review",
+        },
+    )
+
+
 def notify_number_released(db: Session, *, account_id: str, account_email: str, e164: str) -> None:
     send_notification(
         db,

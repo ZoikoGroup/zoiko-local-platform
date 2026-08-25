@@ -25,6 +25,8 @@ from app.usage import service as usage_service
 from app.notifications.service import (
     notify_number_activated,
     notify_number_assigned,
+    notify_number_eligibility_approved,
+    notify_number_eligibility_rejected,
     notify_number_order_not_approved,
     notify_number_released,
     notify_number_suspended,
@@ -348,6 +350,19 @@ class NumberEligibilityDocumentRequiredError(Exception):
     real supporting document, there's nothing to submit without one."""
 
 
+class NumberEligibilityBundleAlreadySubmittedError(Exception):
+    """Raised when submit_number_eligibility_bundle is called again while a
+    previously-submitted bundle is still with Twilio, or once the case is
+    already approved. Without this guard a double-click or a retried
+    request after a slow response would create a second EndUser/
+    SupportingDocument/Bundle in Twilio and overwrite the case's
+    twilio_bundle_sid pointer - orphaning the first bundle in Twilio and,
+    if it had already been approved but not yet synced locally, silently
+    discarding that approval in favor of a brand-new unreviewed bundle.
+    Only a rejected bundle may be resubmitted (the outcome notification
+    itself tells the customer to "resubmit from your dashboard")."""
+
+
 _ALLOWED_ELIGIBILITY_DOCUMENT_CONTENT_TYPES = {"application/pdf", "image/jpeg", "image/png"}
 _MAX_ELIGIBILITY_DOCUMENT_SIZE_BYTES = 10 * 1024 * 1024
 
@@ -588,6 +603,15 @@ def submit_number_eligibility_bundle(
         raise NumberEligibilityDocumentRequiredError(
             "Upload a supporting document before submitting this case for review"
         )
+    if case.status == NumberEligibilityCaseStatus.APPROVED:
+        raise NumberEligibilityBundleAlreadySubmittedError(
+            "This eligibility case is already approved - there's nothing to resubmit."
+        )
+    if case.twilio_bundle_sid and case.twilio_bundle_status != "twilio-rejected":
+        raise NumberEligibilityBundleAlreadySubmittedError(
+            "A bundle for this case was already submitted and is still with Twilio for review. "
+            "Use sync-bundle-status to check its outcome instead of submitting again."
+        )
     latest_doc = case.documents[-1]
 
     owner = db.query(User).filter(User.account_id == account_id, User.role == UserRole.OWNER).first()
@@ -606,10 +630,15 @@ def submit_number_eligibility_bundle(
         file_bytes=file_bytes, content_type=latest_doc["content_type"],
     )
 
+    status_callback = (
+        f"{settings.public_base_url}/numbers/eligibility-cases/bundle-status-callback"
+        if settings.public_base_url else None
+    )
     bundle = telecom.create_regulatory_bundle(
         friendly_name=f"Zoiko Local {case.country} {case.number_type} - {case.id}",
         email=email,
         iso_country=case.country, end_user_type=end_user_type, number_type=case.number_type,
+        status_callback=status_callback,
     )
     telecom.create_bundle_item_assignment(bundle["sid"], end_user["sid"])
     telecom.create_bundle_item_assignment(bundle["sid"], supporting_document["sid"])
@@ -629,23 +658,15 @@ def submit_number_eligibility_bundle(
     return case
 
 
-def sync_number_eligibility_bundle_status(db: Session, case_id: str, *, account_id: str, actor: str) -> NumberEligibilityCase:
-    """On-demand check, not a webhook - Twilio's bundle review isn't
-    instant, and depending on a webhook here would tie this to the same
-    fragile local ngrok tunnel that already caused a real lost-webhook
-    incident elsewhere in this project (see the video-recording sweep's
-    own docstring) for an event that fires rarely enough this is simpler
-    and just as reliable. Flipping to APPROVED here flows through the
-    SAME NumberEligibilityCaseStatus.APPROVED status purchase_number
-    already checks via has_approved_eligibility_case - no separate
-    purchase-gate code needed for the Twilio-approval path."""
-    case = _get_eligibility_case(db, case_id)
-    if case.account_id != account_id:
-        raise NumberEligibilityCaseNotFoundError(f"No eligibility case with id {case_id}")
-    if not case.twilio_bundle_sid:
-        raise NumberEligibilityDocumentRequiredError("This case hasn't been submitted to Twilio for review yet")
-
-    result = telecom.get_bundle_status(case.twilio_bundle_sid)
+def _apply_bundle_status_result(
+    db: Session, case: NumberEligibilityCase, result: dict, *, actor: str,
+) -> NumberEligibilityCase:
+    """Shared by both the customer-triggered on-demand check
+    (sync_number_eligibility_bundle_status) and the scheduled sweep
+    (sync_all_pending_eligibility_cases) - one place that flips the case's
+    status and sends the matching outcome notification, so both call
+    sites behave identically regardless of which one happened to notice
+    Twilio's decision first."""
     before_status = case.status
     case.twilio_bundle_status = result["status"]
     case.twilio_bundle_rejection_reason = result.get("rejection_reason")
@@ -663,7 +684,109 @@ def sync_number_eligibility_bundle_status(db: Session, case_id: str, *, account_
         target=f"number_eligibility_case:{case.id}",
         before={"status": before_status}, after={"status": case.status, "twilio_bundle_status": result["status"]},
     )
+
+    if case.status != before_status and case.status in (
+        NumberEligibilityCaseStatus.APPROVED, NumberEligibilityCaseStatus.REJECTED,
+    ):
+        owner = db.query(User).filter(User.account_id == case.account_id, User.role == UserRole.OWNER).first()
+        if owner is not None:
+            if case.status == NumberEligibilityCaseStatus.APPROVED:
+                notify_number_eligibility_approved(
+                    db, account_id=case.account_id, account_email=owner.email,
+                    country=case.country, number_type=case.number_type,
+                )
+            else:
+                notify_number_eligibility_rejected(
+                    db, account_id=case.account_id, account_email=owner.email,
+                    country=case.country, number_type=case.number_type,
+                    rejection_reason=case.review_notes or "",
+                )
     return case
+
+
+def sync_number_eligibility_bundle_status(db: Session, case_id: str, *, account_id: str, actor: str) -> NumberEligibilityCase:
+    """On-demand check, not a webhook - Twilio's bundle review isn't
+    instant, and depending on a webhook here would tie this to the same
+    fragile local ngrok tunnel that already caused a real lost-webhook
+    incident elsewhere in this project (see the video-recording sweep's
+    own docstring) for an event that fires rarely enough this is simpler
+    and just as reliable. Flipping to APPROVED here flows through the
+    SAME NumberEligibilityCaseStatus.APPROVED status purchase_number
+    already checks via has_approved_eligibility_case - no separate
+    purchase-gate code needed for the Twilio-approval path.
+
+    This is the customer-triggered path (dashboard "check status" button).
+    sync_all_pending_eligibility_cases below is the same check run on a
+    schedule, so an approval/rejection isn't missed just because nobody
+    happened to click the button."""
+    case = _get_eligibility_case(db, case_id)
+    if case.account_id != account_id:
+        raise NumberEligibilityCaseNotFoundError(f"No eligibility case with id {case_id}")
+    if not case.twilio_bundle_sid:
+        raise NumberEligibilityDocumentRequiredError("This case hasn't been submitted to Twilio for review yet")
+
+    result = telecom.get_bundle_status(case.twilio_bundle_sid)
+    return _apply_bundle_status_result(db, case, result, actor=actor)
+
+
+def sync_all_pending_eligibility_cases(db: Session) -> dict:
+    """Scheduled-job counterpart to the on-demand sync above - called from
+    app.ops.scheduled_reconciliation so an approval/rejection is picked up
+    even if the customer never comes back to click "check status."
+    Deliberately still polling rather than a webhook (see
+    sync_number_eligibility_bundle_status's docstring for why) - this just
+    automates the same on-demand check instead of depending on the
+    customer to trigger it. One Twilio call failure for one case must not
+    abort the whole sweep, so each case is isolated in its own try/except."""
+    cases = (
+        db.query(NumberEligibilityCase)
+        .filter(
+            NumberEligibilityCase.status == NumberEligibilityCaseStatus.PENDING,
+            NumberEligibilityCase.twilio_bundle_sid.isnot(None),
+        )
+        .all()
+    )
+    checked = 0
+    approved = 0
+    rejected = 0
+    failed = 0
+    for case in cases:
+        checked += 1
+        try:
+            result = telecom.get_bundle_status(case.twilio_bundle_sid)
+            updated = _apply_bundle_status_result(db, case, result, actor="scheduled_reconciliation")
+            if updated.status == NumberEligibilityCaseStatus.APPROVED:
+                approved += 1
+            elif updated.status == NumberEligibilityCaseStatus.REJECTED:
+                rejected += 1
+        except telecom.TelecomError:
+            failed += 1
+    return {"checked": checked, "approved": approved, "rejected": rejected, "still_pending": checked - approved - rejected - failed, "failed": failed}
+
+
+def handle_bundle_status_webhook(
+    db: Session, *, bundle_sid: str, status: str, failure_reason: str | None,
+) -> NumberEligibilityCase | None:
+    """Twilio's real-time BundleSid/Status/FailureReason push (see
+    telecom.create_regulatory_bundle's status_callback param) - the fast
+    path that updates a case the moment Twilio's review team decides,
+    instead of waiting for the customer to click "check status" or for
+    sync_all_pending_eligibility_cases' daily sweep to notice. Deliberately
+    NOT the only path: this project has a real prior incident with lost
+    webhooks over a fragile local tunnel (see
+    sync_number_eligibility_bundle_status's docstring), so the on-demand
+    check and the daily sweep both stay in place as a reliable fallback for
+    whatever this webhook misses. All three converge on the same
+    _apply_bundle_status_result, so it doesn't matter which one notices
+    first. Returns None (never raises) for a bundle_sid this environment
+    doesn't recognize - e.g. a stale callback after a case was deleted, or
+    a misdirected retry - so the webhook route can still answer Twilio
+    with 2xx and it stops retrying."""
+    case = db.query(NumberEligibilityCase).filter(NumberEligibilityCase.twilio_bundle_sid == bundle_sid).first()
+    if case is None:
+        return None
+    result = {"sid": bundle_sid, "status": status, "rejection_reason": failure_reason}
+    return _apply_bundle_status_result(db, case, result, actor="twilio_bundle_status_webhook")
 
 
 def approve_number_eligibility_case(db: Session, case_id: str, *, actor: str, notes: str | None = None) -> NumberEligibilityCase:

@@ -30,12 +30,18 @@ class AccountOverviewResponse(BaseModel):
     number_count: int
     billing_classification: str
     billing_source: str
+    is_test: bool
     created_at: datetime
 
 
 class UpdateAccountBillingClassificationRequest(BaseModel):
     billing_classification: str
     billing_source: str
+
+
+class SetAccountTestFlagRequest(BaseModel):
+    is_test: bool
+    reason: str
 
 
 class AccessMatrixEntryResponse(BaseModel):

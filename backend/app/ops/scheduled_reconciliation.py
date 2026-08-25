@@ -27,7 +27,7 @@ from app.billing.service import run_zoikonex_reconciliation
 from app.compliance.service import expire_overdue_cases
 from app.core.database import SessionLocal
 from app.media.service import sweep_stale_video_recordings
-from app.numbering.numbers.service import list_due_renewals
+from app.numbering.numbers.service import list_due_renewals, sync_all_pending_eligibility_cases
 from app.retention.service import purge_expired_recordings
 
 logger = logging.getLogger("zoiko.ops.reconciliation")
@@ -73,6 +73,19 @@ def main() -> int:
 
         swept = sweep_stale_video_recordings(db)
         logger.info("stale_video_recordings_swept count=%d", swept["swept"])
+
+        # sync_number_eligibility_bundle_status only fires when a customer
+        # clicks "check status" - this is the automated fallback (see that
+        # function's docstring) so a Twilio approval/rejection is never
+        # missed just because nobody came back to check.
+        eligibility = sync_all_pending_eligibility_cases(db)
+        logger.info(
+            "eligibility_cases_synced checked=%d approved=%d rejected=%d still_pending=%d failed=%d",
+            eligibility["checked"], eligibility["approved"], eligibility["rejected"],
+            eligibility["still_pending"], eligibility["failed"],
+        )
+        if eligibility["failed"] > 0:
+            exit_code = 1
     except Exception:
         logger.exception("scheduled_reconciliation run failed")
         exit_code = 1

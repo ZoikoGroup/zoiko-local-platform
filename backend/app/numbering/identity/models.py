@@ -96,6 +96,19 @@ class Account(Base):
         Enum(AccountRiskState, name="account_risk_state_enum"),
         nullable=False, default=AccountRiskState.TRIAL_LOW,
     )
+    # Legal/litigation hold - set by staff (accounts.manage_legal_hold
+    # capability, SUPER_ADMIN only, migration c3b0f40f4bc1) whenever this
+    # account's data must not be destroyed pending a legal matter. Enforced
+    # at the one place data destruction is actually requested through this
+    # app: app.retention.service.create_erasure_request/resolve_erasure_
+    # request refuse to erasure-request (or complete an erasure of) an
+    # account while this is True. Independent of is_test above - a legal
+    # hold is a litigation/investigation concern, not a billing one.
+    legal_hold: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # Free-text reference to the matter/case this hold is tied to (e.g. a
+    # legal case number) - nullable since a hold can be placed before a
+    # formal reference exists yet.
+    legal_hold_reference: Mapped[str | None] = mapped_column(String(100), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     users: Mapped[list["User"]] = relationship(

@@ -15,6 +15,8 @@ from app.billing.models import (
     PendingAccountCharge,
     PendingAccountChargeStatus,
     Plan,
+    PlanChangeCheckoutSession,
+    PlanChangeCheckoutSessionStatus,
     PriceCatalogEntry,
     Subscription,
     SubscriptionStatus,
@@ -176,6 +178,19 @@ def get_plan(db: Session, plan_code: str) -> Plan:
     if plan is None:
         raise PlanNotFoundError(f"No such plan: {plan_code!r}")
     return plan
+
+
+class PriceUnavailableForCheckoutError(Exception):
+    """Raised when a plan has no real, non-placeholder ACTIVE price to
+    charge - refusing to create a Stripe Checkout Session for an invented
+    or placeholder amount (Production Readiness Standard doc: "no charge
+    without an active price book")."""
+
+
+class PlanChangeCheckoutSessionNotFoundError(Exception):
+    """Raised when a Stripe webhook references a checkout session id this
+    system never created - either a forged/unrelated event or a record
+    that predates this feature."""
 
 
 class PriceCatalogEntryExistsError(Exception):
@@ -587,6 +602,77 @@ def change_plan(
             new_plan=plan.name,
         )
     return sub
+
+
+def create_plan_change_checkout_session(
+    db: Session, account_id: str, plan_code: str, *, billing_period: BillingPeriod, actor: str,
+) -> dict:
+    """Customer-facing entry point for a plan upgrade going forward -
+    change_plan() above is no longer called directly from a customer
+    request (see billing/routes.py's change_plan route docstring for why
+    it's kept for staff/internal use). Real money must be collected before
+    the target plan's entitlements apply (Production Readiness Standard
+    doc: "A payment-success UI is not the same as an authoritative paid
+    invoice" - this system was skipping that distinction entirely for
+    subscriptions, unlike numbers/ZoikoNex which at least record a pending
+    charge). Returns the Stripe-hosted Checkout Session {id, url} the
+    frontend must redirect the browser to; the plan itself only changes
+    once handle_stripe_checkout_completed processes the resulting webhook."""
+    plan = get_plan(db, plan_code)  # raises PlanNotFoundError for an invalid code
+
+    price = get_active_price_catalog_entry(db, plan_code, billing_period=billing_period)
+    if price is None or price.is_placeholder:
+        raise PriceUnavailableForCheckoutError(
+            f"No real, non-placeholder ACTIVE price is configured for {plan_code}/{billing_period.value}"
+        )
+
+    record = PlanChangeCheckoutSession(
+        account_id=account_id, plan_code=plan.plan_code, billing_period=billing_period,
+        stripe_session_id="",  # filled in below once Stripe returns the real session id
+    )
+    db.add(record)
+    db.flush()  # assigns record.id without committing yet - needed for the metadata below
+
+    from app.integrations.billing import stripe_checkout
+
+    interval = "year" if billing_period == BillingPeriod.ANNUAL else "month"
+    session = stripe_checkout.create_subscription_checkout_session(
+        plan_name=plan.name, amount_cents=price.amount_minor_units, currency=price.currency_code.lower(),
+        interval=interval,
+        success_url=f"{settings.frontend_base_url}/dashboard/billing?checkout=success",
+        cancel_url=f"{settings.frontend_base_url}/dashboard/billing?checkout=cancel",
+        metadata={"checkout_record_id": record.id, "account_id": account_id, "plan_code": plan.plan_code},
+    )
+    record.stripe_session_id = session["id"]
+    db.commit()
+
+    log_event(
+        db, actor=actor, action="subscription.plan_change_checkout_created",
+        target=f"subscription_checkout:{record.id}",
+        after={"plan_code": plan.plan_code, "billing_period": billing_period.value, "stripe_session_id": session["id"]},
+    )
+    return session
+
+
+def handle_stripe_checkout_completed(db: Session, *, checkout_record_id: str) -> Subscription:
+    """Called from the Stripe webhook once a subscription Checkout Session's
+    payment actually succeeds. Idempotent on PlanChangeCheckoutSession.status
+    - Stripe retries webhook delivery, so a second delivery of the same
+    completed event must not re-apply (or double-notify) the plan change."""
+    record = db.query(PlanChangeCheckoutSession).filter(PlanChangeCheckoutSession.id == checkout_record_id).first()
+    if record is None:
+        raise PlanChangeCheckoutSessionNotFoundError(f"No checkout session record {checkout_record_id!r}")
+
+    if record.status == PlanChangeCheckoutSessionStatus.COMPLETED:
+        return get_or_create_subscription(db, record.account_id)
+
+    record.status = PlanChangeCheckoutSessionStatus.COMPLETED
+    record.completed_at = datetime.now(timezone.utc)
+    db.commit()
+
+    return change_plan(
+        db, record.account_id, record.plan_code, actor="stripe_checkout_webhook", billing_period=record.billing_period,
+    )
 
 
 def _count_owned_or_in_flight_numbers(db: Session, account_id: str, *, exclude_number_id: str | None = None) -> int:
@@ -1587,7 +1673,7 @@ def run_billing_cycle(db: Session, account_id: str, *, actor: str) -> dict:
         # with nothing left to ever bill again.
         return {"billed": False, "reason": "subscription is canceled"}
     plan = get_plan(db, sub.plan_code)
-    catalog_entry = get_active_price_catalog_entry(db, plan.plan_code)
+    catalog_entry = get_active_price_catalog_entry(db, plan.plan_code, billing_period=sub.billing_period)
 
     if catalog_entry is None or catalog_entry.amount_minor_units <= 0:
         return {"billed": False, "reason": f"plan {plan.plan_code!r} has no price catalog entry to bill"}
@@ -1617,7 +1703,10 @@ def run_billing_cycle(db: Session, account_id: str, *, actor: str) -> dict:
             "(no account_id) - check ZoikoNex connectivity and retry."
         )
 
-    zoikonex_adapter.register_plan_in_catalog(db, plan, amount_minor_units=amount_minor_units, currency_code=currency_code)
+    zoikonex_adapter.register_plan_in_catalog(
+        db, plan, amount_minor_units=amount_minor_units, currency_code=currency_code,
+        billing_period=sub.billing_period.value.upper(),
+    )
 
     bill_cycle = zoikonex_adapter.open_bill_cycle(sub)
     invoice = zoikonex_adapter.create_invoice(sub, bill_cycle["bill_cycle_id"], currency_code=currency_code)
@@ -1656,7 +1745,7 @@ def run_billing_cycle(db: Session, account_id: str, *, actor: str) -> dict:
         description_suffix = " (TEST PLACEHOLDER PRICE, not a real charge)" if catalog_entry.is_placeholder else ""
         zoikonex_adapter.add_invoice_line_item(
             invoice["invoice_id"],
-            description=f"{plan.name} - monthly subscription{description_suffix}",
+            description=f"{plan.name} - {sub.billing_period.value} subscription{description_suffix}",
             amount_minor_units=amount_minor_units,
             tax_amount_minor_units=tax.get("tax_amount_minor_units"),
             line_key="plan-fee",
@@ -1782,7 +1871,7 @@ def run_billing_cycle(db: Session, account_id: str, *, actor: str) -> dict:
                 notify_payment_succeeded(
                     db, account_id=account_id, account_email=owner.email,
                     total=f"{amount_minor_units / 100:.2f}", currency=currency_code,
-                    description=f"{plan.name} plan - monthly subscription",
+                    description=f"{plan.name} plan - {sub.billing_period.value} subscription",
                     payment_date=_db_now(db).date().isoformat(),
                     payment_method_masked="on file with ZoikoNex",
                 )

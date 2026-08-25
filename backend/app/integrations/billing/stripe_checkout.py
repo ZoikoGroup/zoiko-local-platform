@@ -89,6 +89,48 @@ def create_checkout_session(
     return with_failover(_breaker, _primary, None, PaymentError)
 
 
+def create_subscription_checkout_session(
+    *, plan_name: str, amount_cents: int, currency: str, interval: str,
+    success_url: str, cancel_url: str, metadata: dict,
+) -> dict:
+    """Creates a Stripe-hosted Checkout Session in recurring "subscription"
+    mode for a Zoiko Local plan upgrade - distinct from create_checkout_session
+    above (one-time "payment" mode, used for numbers). A plan upgrade must
+    not take effect until this session actually completes (see
+    app.billing.service.create_plan_change_checkout_session's docstring) -
+    "interval" is Stripe's own vocabulary ("month"/"year"), mapped from our
+    BillingPeriod at the call site."""
+    if not settings.stripe_payments_secret_key:
+        raise PaymentError("Stripe payments secret key is not configured")
+
+    def _primary() -> dict:
+        try:
+            with trace_provider_call("stripe_payments", "create_subscription_checkout_session"):
+                session = stripe.checkout.Session.create(
+                    api_key=settings.stripe_payments_secret_key,
+                    mode="subscription",
+                    line_items=[
+                        {
+                            "price_data": {
+                                "currency": currency,
+                                "unit_amount": amount_cents,
+                                "recurring": {"interval": interval},
+                                "product_data": {"name": f"Zoiko Local {plan_name}"},
+                            },
+                            "quantity": 1,
+                        }
+                    ],
+                    success_url=success_url,
+                    cancel_url=cancel_url,
+                    metadata=metadata,
+                )
+        except stripe.error.StripeError as e:
+            raise PaymentError(f"Stripe create subscription checkout session failed: {e}") from e
+        return {"id": session.id, "url": session.url}
+
+    return with_failover(_breaker, _primary, None, PaymentError)
+
+
 def refund_payment(payment_intent_id: str) -> dict:
     """Issues a full refund against a completed Checkout Session's
     PaymentIntent. Confirmed the restricted "One-time payments" key scope

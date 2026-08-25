@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import {
   listStaffAccounts,
   searchStaffNumbers,
+  setAccountTestFlag,
   ApiError,
   type AccountOverview,
   type StaffNumberSearchResult,
@@ -22,6 +23,8 @@ export default function StaffAccountsPage() {
   const [numberResults, setNumberResults] = useState<StaffNumberSearchResult[] | null>(null);
   const [numberSearching, setNumberSearching] = useState(false);
   const [numberSearchError, setNumberSearchError] = useState<string | null>(null);
+
+  const [togglingTestFlagId, setTogglingTestFlagId] = useState<string | null>(null);
 
   useEffect(() => {
     if (ready && !token) router.replace("/staff/login");
@@ -60,6 +63,31 @@ export default function StaffAccountsPage() {
       setNumberSearchError(err instanceof ApiError ? err.message : "Search failed.");
     } finally {
       setNumberSearching(false);
+    }
+  }
+
+  async function handleToggleTestFlag(account: AccountOverview) {
+    if (!token) return;
+    const nextValue = !account.is_test;
+    const reason = window.prompt(
+      nextValue
+        ? `Reason for flagging "${account.name}" as a test account (bypasses market activation, blocks real billing):`
+        : `Reason for removing the test flag from "${account.name}":`
+    );
+    if (!reason) return;
+    setTogglingTestFlagId(account.id);
+    setError(null);
+    try {
+      await setAccountTestFlag(token, account.id, nextValue, reason);
+      await loadAccounts();
+    } catch (err) {
+      setError(
+        err instanceof ApiError && err.status === 403
+          ? "Only a Super Admin can change an account's test flag."
+          : "Couldn't update the test flag."
+      );
+    } finally {
+      setTogglingTestFlagId(null);
     }
   }
 
@@ -141,6 +169,7 @@ export default function StaffAccountsPage() {
               <th className="px-4 py-2.5 font-medium">Type</th>
               <th className="px-4 py-2.5 font-medium">Members</th>
               <th className="px-4 py-2.5 font-medium">Numbers</th>
+              <th className="px-4 py-2.5 font-medium">Test account</th>
               <th className="px-4 py-2.5 font-medium">Created</th>
             </tr>
           </thead>
@@ -152,6 +181,21 @@ export default function StaffAccountsPage() {
                 <td className="px-4 py-2.5 text-slate-400 capitalize">{a.account_type}</td>
                 <td className="px-4 py-2.5 text-slate-200">{a.member_count}</td>
                 <td className="px-4 py-2.5 text-slate-200">{a.number_count}</td>
+                <td className="px-4 py-2.5">
+                  <button
+                    type="button"
+                    onClick={() => handleToggleTestFlag(a)}
+                    disabled={togglingTestFlagId === a.id}
+                    className={`text-xs font-medium rounded-lg px-2.5 py-1 disabled:opacity-50 ${
+                      a.is_test
+                        ? "bg-amber-950/50 border border-amber-800 text-amber-300 hover:bg-amber-950"
+                        : "bg-slate-800 border border-slate-700 text-slate-400 hover:bg-slate-700"
+                    }`}
+                    title="Bypasses market activation for this account; blocks real Stripe/ZoikoNex billing while flagged."
+                  >
+                    {togglingTestFlagId === a.id ? "..." : a.is_test ? "Test" : "Off"}
+                  </button>
+                </td>
                 <td className="px-4 py-2.5 text-slate-400">
                   {new Date(a.created_at).toLocaleDateString()}
                 </td>

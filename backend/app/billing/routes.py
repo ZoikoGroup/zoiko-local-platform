@@ -17,6 +17,7 @@ from app.billing.schemas import (
     DebitNoteResponse,
     IssueCreditNoteRequest,
     IssueDebitNoteRequest,
+    PlanChangeCheckoutSessionResponse,
     PlanResponse,
     PriceCatalogEntryResponse,
     PublicSupportedCountryResponse,
@@ -37,6 +38,7 @@ from app.billing.schemas import (
 from app.core.database import get_db
 from app.core.deps import get_current_staff, get_current_user, require_admin, require_capability
 from app.core.rate_limit import limiter
+from app.integrations.billing import stripe_checkout
 from app.integrations.billing import zoikonex as zoikonex_adapter
 from app.numbering.identity.models import User
 from app.numbering.numbers.models import MarketActivationStatus
@@ -179,10 +181,14 @@ def change_plan(
     current_user: User = Depends(require_admin),
 ):
     """Owner/Admin only, matching every other account-wide commercial
-    decision in this app. Purely local plan reassignment - no real payment
-    is collected or processed anywhere in this system; it changes which
-    entitlement limits apply and syncs the change to the MOCK ZoikoNex
-    adapter (see app.integrations.billing.zoikonex's docstring)."""
+    decision in this app. Kept for staff/internal use (e.g. a comped
+    upgrade, or restoring a plan after a support-approved correction) -
+    the customer-facing upgrade path is now POST /subscription/plan/
+    checkout-session below, which requires real Stripe payment before this
+    same change_plan logic ever runs. Calling this route directly still
+    changes entitlements immediately with no payment collected, by design,
+    for exactly those internal cases - it is deliberately not exposed as
+    a button in the customer dashboard."""
     try:
         return service.change_plan(
             db, current_user.account_id, payload.plan_code, actor=current_user.id,
@@ -190,6 +196,57 @@ def change_plan(
         )
     except service.PlanNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
+
+
+@router.post("/subscription/plan/checkout-session", response_model=PlanChangeCheckoutSessionResponse)
+def create_plan_change_checkout_session(
+    payload: ChangePlanRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin),
+):
+    """The customer-facing way to upgrade a plan goes through here, not
+    PUT /subscription/plan directly - Production Readiness Standard doc:
+    "A payment-success UI is not the same as an authoritative paid
+    invoice." The frontend must redirect the browser to the returned
+    `url`; the plan itself only changes once Stripe confirms payment via
+    POST /stripe/checkout-webhook below."""
+    try:
+        return service.create_plan_change_checkout_session(
+            db, current_user.account_id, payload.plan_code, actor=current_user.id,
+            billing_period=BillingPeriod(payload.billing_period),
+        )
+    except service.PlanNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
+    except service.PriceUnavailableForCheckoutError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e
+    except stripe_checkout.PaymentError as e:
+        raise HTTPException(status_code=502, detail=str(e)) from e
+
+
+@router.post("/stripe/checkout-webhook", status_code=status.HTTP_204_NO_CONTENT)
+async def stripe_checkout_webhook(request: Request, db: Session = Depends(get_db)):
+    """Real inbound Stripe -> Zoiko Local payment-completion webhook for
+    subscription plan upgrades. Unauthenticated by user session (Stripe
+    isn't one of our users) - trust comes entirely from the Stripe-
+    Signature HMAC, same posture as the ZoikoNex and Stripe Identity
+    webhooks elsewhere in this codebase."""
+    body = await request.body()
+    signature = request.headers.get("Stripe-Signature")
+
+    try:
+        event = stripe_checkout.construct_webhook_event(body, signature)
+    except stripe_checkout.PaymentError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e)) from e
+
+    if event["type"] == "checkout.session.completed":
+        checkout_record_id = event["data"]["object"].get("metadata", {}).get("checkout_record_id")
+        if not checkout_record_id:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Missing checkout_record_id metadata")
+        try:
+            service.handle_stripe_checkout_completed(db, checkout_record_id=checkout_record_id)
+        except service.PlanChangeCheckoutSessionNotFoundError as e:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
+    return None
 
 
 @router.post("/subscription/cancel", response_model=SubscriptionResponse)

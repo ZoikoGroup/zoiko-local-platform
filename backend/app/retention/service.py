@@ -3,13 +3,18 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy.orm import Session
 
 from app.audit.service import log_event
-from app.events.service import publish_retention_policy_set, publish_retention_recording_purged
+from app.events.service import (
+    publish_retention_erasure_requested,
+    publish_retention_policy_set,
+    publish_retention_recording_purged,
+)
 from app.integrations.cache.redis import cache_delete, cache_get, cache_set
 from app.integrations.storage.s3 import StorageError, delete_object
 from app.integrations.telecom import twilio as telecom
 from app.integrations.telecom.twilio import TelecomError
 from app.media.models import CallRecord, VideoSession, Voicemail
-from app.retention.models import ArtifactType, RetentionPolicy
+from app.numbering.identity.models import Account
+from app.retention.models import ArtifactType, ErasureRequest, ErasureRequestStatus, RetentionPolicy
 
 # Safety-net fallback when no policy row exists at all (shouldn't normally
 # happen once the migration seeds global defaults, but never leave retention
@@ -228,3 +233,123 @@ def purge_expired_recordings(db: Session) -> dict[str, dict[str, int]]:
         "call_recording": {"purged": call_purged, "failed": call_failed},
         "video_recording": {"purged": video_purged, "failed": video_failed},
     }
+
+
+class LegalHoldActiveError(Exception):
+    """Raised when an erasure request is created (or resolved to COMPLETED)
+    against an account with accounts.legal_hold set - an account under
+    litigation/investigation hold must not have its data erasure-requested
+    away. This is the actual enforcement this whole feature exists for."""
+
+
+class ErasureRequestNotFoundError(Exception):
+    """Raised when an erasure request id doesn't exist."""
+
+
+class ErasureRequestNotPendingError(Exception):
+    """Raised when trying to resolve an erasure request that isn't
+    currently PENDING - a request can only be resolved once."""
+
+
+def create_erasure_request(
+    db: Session, account_id: str, *, requested_by: str, notes: str | None = None
+) -> ErasureRequest:
+    """Customer (or staff, on a customer's behalf) asks that this account's
+    data be erased. Blocked outright while the account is under legal hold
+    (see LegalHoldActiveError) - a real litigation/investigation hold must
+    never be quietly bypassed by a self-service deletion request."""
+    account = db.query(Account).filter(Account.id == account_id).first()
+    if account is None:
+        raise ValueError(f"No such account: {account_id!r}")
+    if account.legal_hold:
+        raise LegalHoldActiveError(
+            f"Account {account_id} is under legal hold ({account.legal_hold_reference or 'no reference'}) "
+            "and cannot have an erasure request opened against it."
+        )
+
+    request = ErasureRequest(account_id=account_id, requested_by=requested_by, notes=notes)
+    db.add(request)
+    db.commit()
+    db.refresh(request)
+    log_event(
+        db, actor=requested_by, action="retention.erasure_request_created",
+        target=f"erasure_request:{request.id}", account_id=account_id,
+        after={"status": request.status.value, "notes": notes},
+    )
+    publish_retention_erasure_requested(account_id, request_id=request.id)
+    return request
+
+
+def list_erasure_requests(db: Session, *, status: ErasureRequestStatus | None = None) -> list[ErasureRequest]:
+    """Staff-facing list, across every account - same posture as
+    compliance's list_all_cases (listing isn't the sensitive action here,
+    resolving is - see resolve_erasure_request)."""
+    query = db.query(ErasureRequest)
+    if status is not None:
+        query = query.filter(ErasureRequest.status == status)
+    return query.order_by(ErasureRequest.created_at.desc()).all()
+
+
+def list_erasure_requests_for_account(db: Session, account_id: str) -> list[ErasureRequest]:
+    """Customer-facing - own account only."""
+    return (
+        db.query(ErasureRequest)
+        .filter(ErasureRequest.account_id == account_id)
+        .order_by(ErasureRequest.created_at.desc())
+        .all()
+    )
+
+
+def resolve_erasure_request(
+    db: Session, request_id: str, *, status: ErasureRequestStatus, resolved_by: str,
+    resolution_notes: str | None = None,
+) -> ErasureRequest:
+    """Marks a PENDING erasure request COMPLETED or REJECTED. Only a
+    PENDING request can be resolved (see ErasureRequestNotPendingError) -
+    there is no re-resolving an already-decided request.
+
+    IMPORTANT SCOPE BOUNDARY: marking a request COMPLETED does NOT trigger
+    any automated PII-scrubbing/data-deletion across the schema (numbers,
+    call records, billing, etc.) - it only records that a human resolved
+    the request through whatever real deletion process they used outside
+    this system. Building that automated deletion pipeline is a separate,
+    much larger piece of work than tracking the request lifecycle, same
+    scoping boundary this codebase draws elsewhere (see e.g. usage.service.
+    record_usage_event's ai_receptionist_minutes docstring: "meters usage
+    only, does not enforce billing" - this is that same kind of narrow,
+    explicitly-documented scope).
+
+    Re-checks legal_hold at resolution time (not just at creation time) for
+    a transition to COMPLETED - a hold could have been placed after the
+    request was submitted. REJECTED is always allowed regardless of hold
+    status, since rejecting an erasure request never destroys data."""
+    request = db.query(ErasureRequest).filter(ErasureRequest.id == request_id).first()
+    if request is None:
+        raise ErasureRequestNotFoundError(f"No such erasure request: {request_id!r}")
+    if request.status != ErasureRequestStatus.PENDING:
+        raise ErasureRequestNotPendingError(
+            f"Erasure request {request_id} is already {request.status.value}, cannot resolve again."
+        )
+
+    if status == ErasureRequestStatus.COMPLETED:
+        account = db.query(Account).filter(Account.id == request.account_id).first()
+        if account is not None and account.legal_hold:
+            raise LegalHoldActiveError(
+                f"Account {request.account_id} is under legal hold "
+                f"({account.legal_hold_reference or 'no reference'}) and this erasure request cannot be "
+                "completed while the hold is active."
+            )
+
+    before = {"status": request.status.value}
+    request.status = status
+    request.resolved_by = resolved_by
+    request.resolution_notes = resolution_notes
+    request.resolved_at = datetime.now(timezone.utc)
+    db.commit()
+    db.refresh(request)
+    log_event(
+        db, actor=resolved_by, action="retention.erasure_request_resolved",
+        target=f"erasure_request:{request.id}", account_id=request.account_id,
+        before=before, after={"status": status.value, "resolution_notes": resolution_notes},
+    )
+    return request

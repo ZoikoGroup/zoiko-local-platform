@@ -551,3 +551,37 @@ class BillingActionRequest(Base):
     result: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+
+
+class PlanChangeCheckoutSessionStatus(str, enum.Enum):
+    PENDING = "pending"
+    COMPLETED = "completed"
+
+
+class PlanChangeCheckoutSession(Base):
+    """A customer-initiated plan upgrade must not grant the target plan's
+    entitlements until Stripe confirms real payment (Production Readiness
+    Standard doc: "A payment-success UI is not the same as an authoritative
+    paid invoice" / Global Pricing doc: "Stripe live payments" is a P0
+    blocker). Previously PUT /subscription/plan applied a plan change
+    immediately with zero payment collection - this table is the holding
+    record between "customer asked to upgrade" and "Stripe confirmed the
+    charge," so the webhook has something idempotent to complete against
+    (same role ZoikoNexSyncEvent.external_event_id plays for the ZoikoNex
+    webhook, just keyed on the Stripe Checkout Session id instead)."""
+
+    __tablename__ = "plan_change_checkout_sessions"
+
+    id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=new_uuid)
+    account_id: Mapped[str] = mapped_column(String(50), ForeignKey("accounts.id"), nullable=False, index=True)
+    plan_code: Mapped[str] = mapped_column(String(50), nullable=False)
+    billing_period: Mapped[BillingPeriod] = mapped_column(
+        Enum(BillingPeriod, name="billing_period_enum"), nullable=False,
+    )
+    stripe_session_id: Mapped[str] = mapped_column(String(255), nullable=False, unique=True, index=True)
+    status: Mapped[PlanChangeCheckoutSessionStatus] = mapped_column(
+        Enum(PlanChangeCheckoutSessionStatus, name="plan_change_checkout_session_status_enum"),
+        nullable=False, default=PlanChangeCheckoutSessionStatus.PENDING,
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

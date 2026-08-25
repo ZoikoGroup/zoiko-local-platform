@@ -41,6 +41,16 @@ class Settings(BaseSettings):
     # default) means no rotation in progress - only jwt_secret_key is valid.
     jwt_secret_key_previous: str = ""
     environment: str = "development"
+    # First-boot staff bootstrap (see app.staff.service.bootstrap_initial_super_admin,
+    # called once from main.py's lifespan startup) - the ONLY way to create the
+    # first SUPER_ADMIN staff account outside development, since app.seed
+    # refuses to run there on purpose (it hardcodes checked-into-repo demo
+    # credentials). Both must be set for bootstrap to do anything; either
+    # blank means "no staff account will be auto-created," not an error -
+    # a deployment that provisions staff some other way shouldn't be forced
+    # to set these. No-ops permanently once any platform_staff row exists.
+    initial_super_admin_email: str = ""
+    initial_super_admin_password: str = ""
     # Comma-separated allowed CORS origins - the deployed frontend's real
     # origin(s) in production, localhost for dev. A literal "*" is rejected in
     # main.py's startup check when allow_credentials=True is also set (the

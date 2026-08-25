@@ -455,12 +455,26 @@ export type AccountOverview = {
   owner_email: string | null;
   member_count: number;
   number_count: number;
+  is_test: boolean;
   created_at: string;
 };
 
 export function listStaffAccounts(token: string): Promise<AccountOverview[]> {
   return request<AccountOverview[]>("/staff/accounts", {
     headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+// is_test bypasses the CONTROLLED_BETA/INTERNAL_TEST market-activation gate
+// for this account, at the cost of also blocking real Stripe/ZoikoNex
+// billing while flagged - SUPER_ADMIN-only (accounts.manage_test_flag).
+export function setAccountTestFlag(
+  token: string, accountId: string, isTest: boolean, reason: string
+): Promise<AccountOverview> {
+  return request<AccountOverview>(`/staff/accounts/${accountId}/test-flag`, {
+    method: "PUT",
+    headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ is_test: isTest, reason }),
   });
 }
 
@@ -1697,6 +1711,23 @@ export function changeSubscriptionPlan(
 ): Promise<Subscription> {
   return request<Subscription>("/billing/subscription/plan", {
     method: "PUT",
+    headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ plan_code: planCode, billing_period: billingPeriod }),
+  });
+}
+
+export interface PlanChangeCheckoutSession {
+  id: string;
+  url: string;
+}
+
+export function createPlanChangeCheckoutSession(
+  token: string,
+  planCode: string,
+  billingPeriod: BillingPeriod = "monthly"
+): Promise<PlanChangeCheckoutSession> {
+  return request<PlanChangeCheckoutSession>("/billing/subscription/plan/checkout-session", {
+    method: "POST",
     headers: { Authorization: `Bearer ${token}` },
     body: JSON.stringify({ plan_code: planCode, billing_period: billingPeriod }),
   });

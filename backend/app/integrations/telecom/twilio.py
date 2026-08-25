@@ -365,14 +365,25 @@ def upload_supporting_document(
 
 
 def create_regulatory_bundle(
-    *, friendly_name: str, email: str, iso_country: str, end_user_type: str, number_type: str
+    *, friendly_name: str, email: str, iso_country: str, end_user_type: str, number_type: str,
+    status_callback: str | None = None,
 ) -> dict:
+    """status_callback: when set, Twilio POSTs BundleSid/Status/FailureReason
+    to this URL the moment its own review team approves or rejects the
+    bundle - a real-time push instead of waiting for the customer to click
+    "check status" or for the daily reconciliation sweep to notice. Passed
+    only when a public URL is actually configured (same conditional pattern
+    as buy_number's voice_url above) - there's nothing to point Twilio at
+    otherwise, e.g. before ngrok is running in dev."""
+    kwargs = {
+        "friendly_name": friendly_name, "email": email, "iso_country": iso_country,
+        "end_user_type": end_user_type, "number_type": number_type,
+    }
+    if status_callback:
+        kwargs["status_callback"] = status_callback
     try:
         with trace_provider_call("twilio", "create_regulatory_bundle"):
-            bundle = _client().numbers.v2.regulatory_compliance.bundles.create(
-                friendly_name=friendly_name, email=email, iso_country=iso_country,
-                end_user_type=end_user_type, number_type=number_type,
-            )
+            bundle = _client().numbers.v2.regulatory_compliance.bundles.create(**kwargs)
     except TwilioException as e:
         raise TelecomError(_clean_twilio_error_message(e)) from e
     return {"sid": bundle.sid, "status": bundle.status}

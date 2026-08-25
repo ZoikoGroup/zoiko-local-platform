@@ -224,6 +224,30 @@ export default function NumbersPage() {
     listNumberRates(token).then(setNumberRates).catch(() => {});
   }, [token]);
 
+  // Real-time complement to the backend's Twilio Bundle status webhook -
+  // without this, a customer sitting on this page has no way to see
+  // Twilio's approval/rejection land except by clicking "Check status" or
+  // reloading. Polls only while a bundle is actually outstanding (submitted,
+  // not yet resolved) and stops the moment it resolves either way. Errors
+  // are swallowed silently - a transient poll failure isn't worth
+  // interrupting the customer over; the manual "Check status" button still
+  // surfaces a real error if something is genuinely wrong.
+  useEffect(() => {
+    if (!token || !eligibilityCase) return;
+    if (!eligibilityCase.twilio_bundle_sid || eligibilityCase.status !== "pending") return;
+    const caseId = eligibilityCase.id;
+    const interval = setInterval(() => {
+      syncEligibilityBundleStatus(token, caseId).then(setEligibilityCase).catch(() => {});
+    }, 20000);
+    return () => clearInterval(interval);
+    // Deliberately depend on the primitive fields, not the eligibilityCase
+    // object itself - depending on the object would tear down and restart
+    // this interval on every single poll tick (each tick calls
+    // setEligibilityCase with a new object reference), instead of only
+    // when the case actually changes identity/resolves.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [token, eligibilityCase?.id, eligibilityCase?.status, eligibilityCase?.twilio_bundle_sid]);
+
   // Stripe redirects the browser back here after Checkout (success or
   // cancel) - the number itself only activates via the backend's webhook,
   // not this redirect, so this just reflects that outcome to the customer
@@ -1325,7 +1349,17 @@ export default function NumbersPage() {
 
               {eligibilityError && <p className="text-xs text-red-600">{eligibilityError}</p>}
 
-              {!eligibilityCase.twilio_bundle_sid ? (
+              {eligibilityCase.status === "rejected" && (
+                <p className="text-xs text-red-700 bg-red-50 rounded-lg px-3 py-2">
+                  Twilio rejected this submission
+                  {eligibilityCase.twilio_bundle_rejection_reason && (
+                    <> — {eligibilityCase.twilio_bundle_rejection_reason}</>
+                  )}
+                  . Correct the details below and resubmit.
+                </p>
+              )}
+
+              {!eligibilityCase.twilio_bundle_sid || eligibilityCase.status === "rejected" ? (
                 <>
                   <div className="space-y-2">
                     <label className="block text-xs font-medium text-slate-500">Document type</label>
@@ -1399,7 +1433,11 @@ export default function NumbersPage() {
                     }
                     className="bg-indigo-600 hover:bg-indigo-700 disabled:opacity-60 text-white text-xs font-medium rounded-lg px-3 py-1.5"
                   >
-                    {eligibilityBusy ? "Submitting..." : "Submit for review"}
+                    {eligibilityBusy
+                      ? "Submitting..."
+                      : eligibilityCase.status === "rejected"
+                        ? "Resubmit for review"
+                        : "Submit for review"}
                   </button>
                 </>
               ) : (

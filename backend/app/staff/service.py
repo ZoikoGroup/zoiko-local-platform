@@ -39,6 +39,36 @@ def create_staff(db: Session, email: str, password: str, role: PlatformStaffRole
     return staff
 
 
+def bootstrap_initial_super_admin(db: Session) -> PlatformStaff | None:
+    """Called once from main.py's lifespan startup, every boot. app.seed
+    refuses to run outside development on purpose (it hardcodes real
+    checked-into-repo demo credentials) - which left production/staging
+    with genuinely no way to create the first staff account at all
+    (platform_staff has no public signup route by design, see routes.py's
+    top-of-file comment). This is that missing bootstrap: idempotent
+    (no-ops the instant any staff row exists, so it's safe to call on
+    every restart) and driven entirely by operator-supplied env vars
+    (INITIAL_SUPER_ADMIN_EMAIL/_PASSWORD) rather than a hardcoded
+    password, so it can run in any environment without becoming a
+    standing backdoor. Returns None (does nothing) if either env var is
+    unset, or if a staff account already exists."""
+    if db.query(PlatformStaff).first() is not None:
+        return None
+    from app.core.config import settings
+
+    email = settings.initial_super_admin_email
+    password = settings.initial_super_admin_password
+    if not email or not password:
+        return None
+
+    staff = create_staff(db, email=email, password=password, role=PlatformStaffRole.SUPER_ADMIN)
+    log_event(
+        db, actor="system_bootstrap", action="staff.bootstrapped", target=f"platform_staff:{staff.id}",
+        after={"email": email, "role": PlatformStaffRole.SUPER_ADMIN.value},
+    )
+    return staff
+
+
 def authenticate_staff(db: Session, email: str, password: str) -> PlatformStaff | None:
     staff = db.query(PlatformStaff).filter(PlatformStaff.email == email).first()
     if not staff or not staff.is_active or not verify_password(password, staff.hashed_password):
@@ -75,6 +105,7 @@ def list_accounts_overview(db: Session) -> list[dict]:
             "number_count": number_counts.get(account.id, 0),
             "billing_classification": account.billing_classification,
             "billing_source": account.billing_source,
+            "is_test": account.is_test,
             "created_at": account.created_at,
         }
         for account in accounts
@@ -102,6 +133,7 @@ def get_account_overview(db: Session, account_id: str) -> dict:
         "number_count": db.query(PhoneNumber).filter(PhoneNumber.account_id == account_id).count(),
         "billing_classification": account.billing_classification,
         "billing_source": account.billing_source,
+        "is_test": account.is_test,
         "created_at": account.created_at,
     }
 
@@ -130,6 +162,31 @@ def update_account_billing_classification(
     )
     publish_account_billing_classification_updated(
         account_id, billing_classification=billing_classification.value, billing_source=billing_source.value,
+    )
+    return account
+
+
+def set_account_test_flag(db: Session, account_id: str, *, is_test: bool, actor: str, reason: str) -> Account:
+    """Backs the accounts.manage_test_flag capability (granted in migration
+    db8d0f0b2e05, which shipped no route/service function for it - this is
+    that missing piece). is_test bypasses the CONTROLLED_BETA/INTERNAL_TEST
+    market-activation gate (see app.numbering.numbers.service.
+    _assert_market_activated) and blocks real ZoikoNex/Stripe billing (see
+    app.billing.service.assert_not_test_account) - a platform-wide decision
+    a SUPER_ADMIN makes deliberately, not a routine support toggle, so
+    `reason` is mandatory for the audit trail (same bar as
+    set_market_activation_status's reason)."""
+    account = db.query(Account).filter(Account.id == account_id).first()
+    if account is None:
+        raise AccountNotFoundError(f"No such account: {account_id!r}")
+
+    before = account.is_test
+    account.is_test = is_test
+    db.commit()
+    db.refresh(account)
+    log_event(
+        db, actor=actor, action="account.test_flag_updated", target=f"account:{account.id}",
+        reason=reason, before={"is_test": before}, after={"is_test": is_test},
     )
     return account
 

@@ -205,7 +205,7 @@ def _request(method: str, base_url: str, path: str, *, _allow_404: bool = False,
 # --- Plan catalog registration (product-catalogue-commercial) ---
 
 def register_plan_in_catalog(
-    db: Session, plan, *, amount_minor_units: int, currency_code: str = "USD"
+    db: Session, plan, *, amount_minor_units: int, currency_code: str = "USD", billing_period: str = "MONTHLY"
 ) -> dict:
     """One-time registration of a Zoiko Local Plan as a ZoikoNex
     Product + Offer + PriceRule - idempotent (a plan already carrying
@@ -222,6 +222,20 @@ def register_plan_in_catalog(
     NULL) for a plan before it will pick up the new price, since a
     PriceRule change is a commercial decision, not something this function
     does silently on every call.
+
+    Known limitation: the cached product_id/offer_id/price_rule_id live on
+    Plan itself (one triple per plan_code, not per billing_period), so
+    whichever billing_period first registers a plan "wins" that plan's
+    ZoikoNex PriceRule for every subscriber of every period from then on -
+    a monthly subscriber registering first would leave an annual
+    subscriber's ZoikoNex-side product catalog permanently labeled
+    MONTHLY. This does NOT affect what a customer is actually charged -
+    run_billing_cycle adds an explicit invoice line item at the real,
+    period-correct amount_minor_units regardless of what's registered here
+    - it only affects ZoikoNex's own catalog metadata accuracy. Giving
+    Plan a real per-period registration (e.g. one product/offer/price_rule
+    triple per billing_period) is a bigger schema change than passing this
+    parameter through, and is intentionally not done in this pass.
     """
     if plan.zoikonex_product_id:
         return {
@@ -271,7 +285,7 @@ def register_plan_in_catalog(
             "amount_minor_units": amount_minor_units,
             "currency_code": currency_code,
             "charge_structure": "RECURRING",
-            "billing_period": "MONTHLY",
+            "billing_period": billing_period,
             "catalog_version_id": "v1",
         },
     )
