@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import Link from "next/link";
 import { getPublicStatus, ApiError, type PublicStatus } from "@/lib/api";
+import Logo from "@/components/Logo";
 
 function Dot({ status }: { status: "operational" | "degraded" }) {
   return (
@@ -50,7 +51,7 @@ export default function StatusPage() {
     <main className="min-h-screen bg-slate-50 flex flex-col items-center px-6 py-16">
       <div className="w-full max-w-xl space-y-6">
         <div className="flex items-center gap-2 justify-center">
-          <img src="/logo-icon.svg" alt="Zoiko Local" className="w-8 h-8 rounded-lg" />
+          <Logo size={32} />
           <span className="font-semibold text-slate-900">Zoiko Local</span>
         </div>
 

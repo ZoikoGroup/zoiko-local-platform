@@ -12,6 +12,7 @@ import {
   type BillingPeriod,
 } from "@/lib/api";
 import { getToken } from "@/lib/auth";
+import Logo from "@/components/Logo";
 
 // Global Plans, Pricing & Commercial Launch Standard doc §8.2 - Enterprise
 // is sales-led, never a self-serve "switch to this plan" action.
@@ -137,7 +138,7 @@ export default function ChoosePlanPage() {
     <div className="min-h-screen bg-slate-50">
       <div className="max-w-5xl mx-auto px-6 py-12">
         <div className="flex items-center gap-2 mb-10">
-          <img src="/logo-icon.svg" alt="Zoiko Local" className="w-9 h-9 rounded-lg" />
+          <Logo size={36} />
           <div className="font-semibold text-slate-900">Zoiko Local</div>
         </div>
 

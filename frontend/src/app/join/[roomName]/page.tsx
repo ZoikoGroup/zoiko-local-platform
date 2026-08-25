@@ -5,6 +5,7 @@ import { useParams } from "next/navigation";
 import { Room, RoomEvent, Track } from "livekit-client";
 import { guestJoinVideoRoom, checkGuestWaitingStatus, ApiError } from "@/lib/api";
 import MeetingRoom, { createParticipantTile, type ReactionEvent } from "@/components/MeetingRoom";
+import Logo from "@/components/Logo";
 
 type CallState = "lobby" | "requesting" | "waiting" | "in-call" | "ended" | "denied" | "expired" | "not-found";
 type DeviceStatus = "idle" | "requesting" | "ready" | "blocked";
@@ -326,7 +327,7 @@ export default function GuestJoinPage() {
     <main className="min-h-screen bg-slate-950 flex items-center justify-center p-6">
       <div className="w-full max-w-2xl">
         <div className="flex items-center gap-2 justify-center mb-6">
-          <img src="/logo-icon.svg" alt="Zoiko Local" className="w-8 h-8 rounded-lg" />
+          <Logo size={32} />
           <h1 className="font-semibold text-white">Zoiko Local</h1>
         </div>
 
