@@ -1053,7 +1053,7 @@ export default function NumbersPage() {
               id="search-country"
               value={countryCode}
               onChange={(e) => setCountryCode(e.target.value)}
-              className="rounded-lg border border-slate-300 px-3 py-2 text-sm"
+              className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900"
             >
               {countries.map((c) => (
                 <option key={c.code} value={c.code}>
@@ -1068,7 +1068,7 @@ export default function NumbersPage() {
               id="search-type"
               value={numberType}
               onChange={(e) => setNumberType(e.target.value)}
-              className="rounded-lg border border-slate-300 px-3 py-2 text-sm"
+              className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900"
             >
               {Object.entries(NUMBER_TYPE_LABELS).map(([value, label]) => (
                 <option key={value} value={value}>
