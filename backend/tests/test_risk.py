@@ -24,6 +24,25 @@ def _signup_and_login(client, email: str) -> str:
     return response.json()["access_token"]
 
 
+def _clear_billing_trial_gate(db_session, account_id: str) -> None:
+    """app.core.deps.require_paid_or_read_only blocks write actions
+    (placing a call, buying a number, opening a compliance case) for a
+    TRIALING-status account. Deliberately a direct DB status flip, not a
+    real PUT /billing/subscription/plan call: that endpoint's service
+    function has a genuine side effect beyond billing - it also promotes
+    AccountRiskState (see risk.service's plan-change hook) - and this
+    file's tests need to control AccountRiskState (TRIAL_LOW vs
+    PAID_NORMAL vs TRIAL_VERIFIED) independently and precisely via their
+    own explicit setup (_promote_to_paid_normal below) or assertions, not
+    have it silently pre-empted by clearing the billing gate."""
+    from app.billing.models import SubscriptionStatus
+    from app.billing.service import get_or_create_subscription
+
+    sub = get_or_create_subscription(db_session, account_id)
+    sub.status = SubscriptionStatus.ACTIVE
+    db_session.commit()
+
+
 def _create_staff_and_login(client, db_session, email: str, role):
     from app.staff import service as staff_service
 
@@ -127,6 +146,7 @@ def test_outbound_call_to_blocked_destination_is_rejected(client, db_session):
 
     token = _signup_and_login(client, "riskblocked@example.com")
     account_id = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"}).json()["account_id"]
+    _clear_billing_trial_gate(db_session, account_id)
     _active_number(db_session, account_id, "+15550009999")
 
     response = client.post(
@@ -146,6 +166,7 @@ def test_outbound_call_velocity_limit_is_enforced(client, db_session, monkeypatc
 
     token = _signup_and_login(client, "riskvelocity@example.com")
     account_id = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"}).json()["account_id"]
+    _clear_billing_trial_gate(db_session, account_id)
     _active_number(db_session, account_id, "+15550008888")
     _promote_to_paid_normal(db_session, account_id)
     headers = {"Authorization": f"Bearer {token}"}
@@ -271,6 +292,7 @@ def test_outbound_call_geographic_dispersion_limit_is_enforced(client, db_sessio
 
     token = _signup_and_login(client, "riskdispersion@example.com")
     account_id = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"}).json()["account_id"]
+    _clear_billing_trial_gate(db_session, account_id)
     _active_number(db_session, account_id, "+15550007777")
     _promote_to_paid_normal(db_session, account_id)
     headers = {"Authorization": f"Bearer {token}"}
@@ -659,6 +681,7 @@ def test_outbound_call_endpoint_accepts_an_optional_fingerprint_header(client, d
     )
     token = _signup_and_login(client, "callfingerprint@example.com")
     account_id = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"}).json()["account_id"]
+    _clear_billing_trial_gate(db_session, account_id)
     _active_number(db_session, account_id, "+15550007000")
 
     response = client.post(
@@ -737,6 +760,11 @@ def test_concurrent_call_limit_blocks_a_second_in_flight_call_for_a_trial_accoun
     )
     token = _signup_and_login(client, "riskconcurrent1@example.com")
     account_id = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"}).json()["account_id"]
+    # Clears the billing-trial gate (a separate concept from this test's
+    # TRIAL_LOW risk state - see _clear_billing_trial_gate's docstring)
+    # without promoting risk_state away from TRIAL_LOW, which this test
+    # depends on for its concurrent-call limit of 1.
+    _clear_billing_trial_gate(db_session, account_id)
     _active_number(db_session, account_id, "+15550009090")
     headers = {"Authorization": f"Bearer {token}"}
 
@@ -762,6 +790,7 @@ def test_concurrent_call_limit_allows_up_to_the_paid_normal_tier(client, db_sess
 
     token = _signup_and_login(client, "riskconcurrent2@example.com")
     account_id = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"}).json()["account_id"]
+    _clear_billing_trial_gate(db_session, account_id)
     _active_number(db_session, account_id, "+15550009091")
     _promote_to_paid_normal(db_session, account_id)
     headers = {"Authorization": f"Bearer {token}"}
@@ -789,6 +818,7 @@ def test_completed_call_frees_up_the_concurrent_call_slot(client, db_session, mo
     )
     token = _signup_and_login(client, "riskconcurrent3@example.com")
     account_id = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"}).json()["account_id"]
+    _clear_billing_trial_gate(db_session, account_id)
     _active_number(db_session, account_id, "+15550009092")
     headers = {"Authorization": f"Bearer {token}"}
 
@@ -825,6 +855,11 @@ def test_kyc_approval_steps_up_trial_low_to_trial_verified(client, db_session):
     token = _signup_and_login(client, "risktrialverified1@example.com")
     headers = {"Authorization": f"Bearer {token}"}
     account_id = client.get("/auth/me", headers=headers).json()["account_id"]
+    # Clears the billing-trial gate so POST /compliance/cases below isn't
+    # blocked, without promoting risk_state away from TRIAL_LOW - this
+    # test's whole point is proving KYC approval is what steps it up to
+    # TRIAL_VERIFIED, so it must still start at TRIAL_LOW.
+    _clear_billing_trial_gate(db_session, account_id)
 
     case_response = client.post(
         "/compliance/cases", json={"jurisdiction": "GB", "requirement_type": "kyc_individual"}, headers=headers
@@ -854,6 +889,11 @@ def test_number_purchase_steps_up_trial_account_to_paid_normal(client, db_sessio
     token = _signup_and_login(client, "riskpaidstepup1@example.com")
     headers = {"Authorization": f"Bearer {token}"}
     account_id = client.get("/auth/me", headers=headers).json()["account_id"]
+    # Clears the billing-trial gate so the reserve/purchase calls below
+    # aren't blocked, without promoting risk_state away from TRIAL_LOW -
+    # this test's whole point is proving the purchase itself is what steps
+    # it up to PAID_NORMAL, so it must still start at TRIAL_LOW.
+    _clear_billing_trial_gate(db_session, account_id)
     client.post("/compliance/consent", json={"consent_type": "emergency_calling_acknowledged"}, headers=headers)
 
     # AU (not one of the shared dev DB's seeded KYC-rule countries -
@@ -882,6 +922,7 @@ def test_purchase_does_not_downgrade_an_account_under_review(client, db_session,
     token = _signup_and_login(client, "riskpaidstepup2@example.com")
     headers = {"Authorization": f"Bearer {token}"}
     account_id = client.get("/auth/me", headers=headers).json()["account_id"]
+    _clear_billing_trial_gate(db_session, account_id)
     client.post("/compliance/consent", json={"consent_type": "emergency_calling_acknowledged"}, headers=headers)
 
     reserve = client.post(

@@ -33,7 +33,18 @@ def _signup_and_login(client, email: str) -> str:
         },
     )
     response = client.post("/auth/login", json={"email": email, "password": "supersecret123"})
-    return response.json()["access_token"]
+    token = response.json()["access_token"]
+    # A fresh signup defaults to the free trial - app.core.deps.
+    # require_paid_or_read_only now blocks write actions (placing a call,
+    # opening/resolving a usage dispute) for a TRIALING account, and this
+    # file's tests are about usage-metering mechanics, not trial-gating,
+    # so upgrade to a real paid plan here rather than adding this to every
+    # individual test.
+    client.put(
+        "/billing/subscription/plan", json={"plan_code": "starter", "billing_period": "monthly"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    return token
 
 
 def _place_outbound_call(client, db_session, monkeypatch, token, account_id, e164, to, call_sid):

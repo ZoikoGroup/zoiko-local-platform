@@ -15,13 +15,25 @@ def _signup_and_login(client, email: str, account_type: str = "individual") -> s
     )
     response = client.post("/auth/login", json={"email": email, "password": "supersecret123"})
     token = response.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
     # Baseline for every test account here - the emergency-calling
     # disclosure gate is tested explicitly in its own tests below.
     client.post(
         "/compliance/consent",
         json={"consent_type": "emergency_calling_acknowledged"},
-        headers={"Authorization": f"Bearer {token}"},
+        headers=headers,
     )
+    # A fresh signup defaults to the free trial - app.core.deps.
+    # require_paid_or_read_only now blocks write actions (number
+    # reserve/purchase) for a TRIALING account. This file's tests are
+    # about compliance/eligibility/reservation mechanics, not trial-
+    # gating or quota limits (no test here asserts on free_trial's
+    # max_numbers=1 - that's covered in test_billing.py instead), so
+    # upgrade to a real paid plan here rather than adding this to every
+    # individual test. The one test that specifically needs to stay on
+    # free_trial (test_renewal_does_not_exempt_a_free_trial_accounts_
+    # number) explicitly downgrades back after calling this.
+    client.put("/billing/subscription/plan", json={"plan_code": "starter", "billing_period": "monthly"}, headers=headers)
     return token
 
 
@@ -529,6 +541,7 @@ def test_purchase_is_blocked_without_the_emergency_calling_disclosure_acknowledg
         "/auth/login", json={"email": "nodisclosure@example.com", "password": "supersecret123"}
     ).json()["access_token"]
     headers = {"Authorization": f"Bearer {token}"}
+    client.put("/billing/subscription/plan", json={"plan_code": "starter", "billing_period": "monthly"}, headers=headers)
 
     _reserve(client, headers, "+15550009911")
     response = client.post("/numbers/purchase", json={"e164": "+15550009911"}, headers=headers)
@@ -550,6 +563,7 @@ def test_purchase_succeeds_once_emergency_calling_disclosure_is_acknowledged(cli
         "/auth/login", json={"email": "disclosureok@example.com", "password": "supersecret123"}
     ).json()["access_token"]
     headers = {"Authorization": f"Bearer {token}"}
+    client.put("/billing/subscription/plan", json={"plan_code": "starter", "billing_period": "monthly"}, headers=headers)
 
     _reserve(client, headers, "+15550009922")
     blocked = client.post("/numbers/purchase", json={"e164": "+15550009922"}, headers=headers)
@@ -1142,7 +1156,12 @@ def test_renewal_does_not_exempt_a_free_trial_accounts_number(client, db_session
     from app.usage.models import UsageEvent
 
     token = _signup_and_login(client, "renewalcharge2@example.com")
-    account_id = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"}).json()["account_id"]
+    headers = {"Authorization": f"Bearer {token}"}
+    # _signup_and_login now upgrades to starter by default (see its own
+    # docstring) - this test is specifically about free_trial's lack of an
+    # included number, so it explicitly reverts back to it here.
+    client.put("/billing/subscription/plan", json={"plan_code": "free_trial", "billing_period": "monthly"}, headers=headers)
+    account_id = client.get("/auth/me", headers=headers).json()["account_id"]
 
     now = datetime.now(timezone.utc)
     only_number = PhoneNumber(

@@ -13,7 +13,17 @@ def _signup_and_login(client, email: str) -> str:
         "/auth/signup",
         json={"account_name": "IVR Test Co", "account_type": "business", "email": email, "password": "supersecret123"},
     )
-    return client.post("/auth/login", json={"email": email, "password": "supersecret123"}).json()["access_token"]
+    token = client.post("/auth/login", json={"email": email, "password": "supersecret123"}).json()["access_token"]
+    # A fresh signup defaults to the free trial - app.core.deps.
+    # require_paid_or_read_only now blocks write actions (setting an IVR
+    # menu) for a TRIALING account, and this file's tests are about IVR
+    # mechanics, not trial-gating, so upgrade to a real paid plan here
+    # rather than adding this to every individual test.
+    client.put(
+        "/billing/subscription/plan", json={"plan_code": "starter", "billing_period": "monthly"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    return token
 
 
 def _make_active_number(client, db_session, token, e164: str) -> str:

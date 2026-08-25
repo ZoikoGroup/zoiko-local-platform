@@ -21,6 +21,18 @@ from app.numbering.identity.models import User
 
 router = APIRouter(prefix="/media/video", tags=["video"])
 
+# Split from `router` deliberately - guest-token/guest-waiting-status carry
+# no customer auth at all (an external guest with a shared link, no Zoiko
+# account - see their own docstrings), and the LiveKit webhook carries a
+# LiveKit-signed token instead of a customer JWT. Mounting `router`'s
+# routes with a router-wide `dependencies=[Depends(require_paid_or_read_
+# only)]` (app.main, trial-account gating) would force every route in the
+# SAME APIRouter through Depends(get_current_user) as a dependency-
+# resolution prerequisite - breaking all three of these regardless of
+# method, since FastAPI resolves the full dependency tree before a route's
+# own logic (including the "return early on GET" branch) ever runs.
+public_router = APIRouter(prefix="/media/video", tags=["video"])
+
 
 class JoinTokenRequest(BaseModel):
     display_name: str
@@ -103,7 +115,7 @@ async def report_call_quality(
     return {"recorded": True}
 
 
-@router.post("/rooms/{room_name}/guest-token")
+@public_router.post("/rooms/{room_name}/guest-token")
 @limiter.limit("10/minute")
 async def guest_join_room(
     request: Request,
@@ -124,7 +136,7 @@ async def guest_join_room(
     return {"waiting_id": waiting_guest.id}
 
 
-@router.get("/rooms/{room_name}/waiting/{waiting_id}")
+@public_router.get("/rooms/{room_name}/waiting/{waiting_id}")
 @limiter.limit("60/minute")
 async def guest_waiting_status(
     request: Request,
@@ -248,7 +260,7 @@ async def stop_recording(
     return {"room_name": session.room_name, "recording": False}
 
 
-@router.post("/webhook")
+@public_router.post("/webhook")
 async def livekit_webhook(request: Request, db: Session = Depends(get_db)):
     """Requires the webhook URL to be configured in the LiveKit Cloud project
     dashboard, pointing at this route — that's a one-time dashboard setting,

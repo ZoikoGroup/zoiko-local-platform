@@ -22,6 +22,15 @@ def _signup_and_login(client, email: str, account_type: str = "individual") -> s
         json={"consent_type": "emergency_calling_acknowledged"},
         headers={"Authorization": f"Bearer {token}"},
     )
+    # A fresh signup defaults to the free trial - app.core.deps.
+    # require_paid_or_read_only now blocks write actions for a TRIALING
+    # account, which would mask the role-based 403s this file's tests are
+    # actually checking (Viewer role vs Owner/Admin) - upgrade to a real
+    # paid plan here so the only gate left in play is the role check.
+    client.put(
+        "/billing/subscription/plan", json={"plan_code": "starter", "billing_period": "monthly"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
     return token
 
 

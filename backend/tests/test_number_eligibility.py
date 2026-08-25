@@ -18,6 +18,15 @@ def _signup_and_login(client, email: str) -> str:
         json={"consent_type": "emergency_calling_acknowledged"},
         headers={"Authorization": f"Bearer {token}"},
     )
+    # A fresh signup defaults to the free trial - app.core.deps.
+    # require_paid_or_read_only now blocks write actions (reserve/purchase)
+    # for a TRIALING account, and this file's tests are about eligibility-
+    # rule mechanics, not trial-gating, so upgrade to a real paid plan here
+    # rather than adding this to every individual test.
+    client.put(
+        "/billing/subscription/plan", json={"plan_code": "starter", "billing_period": "monthly"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
     return token
 
 
