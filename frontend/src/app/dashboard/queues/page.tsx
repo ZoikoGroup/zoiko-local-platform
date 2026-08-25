@@ -180,7 +180,7 @@ export default function QueuesPage() {
               value={newName}
               onChange={(e) => setNewName(e.target.value)}
               placeholder="e.g. Support"
-              className="rounded-lg border border-slate-300 px-3 py-2 text-sm placeholder:text-slate-400"
+              className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 placeholder:text-slate-400"
             />
             <div>
               <label className="block text-xs font-medium text-slate-500 mb-1">Max wait (seconds)</label>
@@ -190,7 +190,7 @@ export default function QueuesPage() {
                 max={1800}
                 value={newMaxWait}
                 onChange={(e) => setNewMaxWait(Number(e.target.value))}
-                className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"
+                className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900"
               />
             </div>
             <div>
@@ -201,7 +201,7 @@ export default function QueuesPage() {
                 max={600}
                 value={newWrapUp}
                 onChange={(e) => setNewWrapUp(Number(e.target.value))}
-                className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"
+                className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900"
               />
             </div>
           </div>
@@ -268,7 +268,7 @@ export default function QueuesPage() {
                     type="number"
                     defaultValue={queue.max_wait_seconds}
                     onBlur={(e) => handleUpdate(queue.id, { max_wait_seconds: Number(e.target.value) })}
-                    className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"
+                    className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900"
                   />
                 </div>
                 <div>
@@ -277,7 +277,7 @@ export default function QueuesPage() {
                     type="number"
                     defaultValue={queue.wrap_up_seconds}
                     onBlur={(e) => handleUpdate(queue.id, { wrap_up_seconds: Number(e.target.value) })}
-                    className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"
+                    className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900"
                   />
                 </div>
               </div>
@@ -306,7 +306,7 @@ export default function QueuesPage() {
                   <select
                     value={selectedMemberByQueue[queue.id] ?? ""}
                     onChange={(e) => setSelectedMemberByQueue((prev) => ({ ...prev, [queue.id]: e.target.value }))}
-                    className="flex-1 rounded-lg border border-slate-300 px-3 py-2 text-xs"
+                    className="flex-1 rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs text-slate-900"
                   >
                     <option value="">Add an agent...</option>
                     {nonMembers.map((m) => (

@@ -187,7 +187,7 @@ export default function ContactsPage() {
                 required
                 value={form.name}
                 onChange={(e) => setForm((f) => ({ ...f, name: e.target.value }))}
-                className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"
+                className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900"
               />
             </div>
             <div>
@@ -197,7 +197,7 @@ export default function ContactsPage() {
                 value={form.phone_number}
                 onChange={(e) => setForm((f) => ({ ...f, phone_number: e.target.value }))}
                 placeholder="+15551234567"
-                className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm font-mono placeholder:text-slate-400"
+                className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-mono text-slate-900 placeholder:text-slate-400"
               />
             </div>
             <div>
@@ -206,7 +206,7 @@ export default function ContactsPage() {
                 type="email"
                 value={form.email}
                 onChange={(e) => setForm((f) => ({ ...f, email: e.target.value }))}
-                className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"
+                className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900"
               />
             </div>
             <div>
@@ -214,7 +214,7 @@ export default function ContactsPage() {
               <input
                 value={form.notes}
                 onChange={(e) => setForm((f) => ({ ...f, notes: e.target.value }))}
-                className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"
+                className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900"
               />
             </div>
           </div>
@@ -245,7 +245,7 @@ export default function ContactsPage() {
           value={search}
           onChange={(e) => setSearch(e.target.value)}
           placeholder="Search by name or number..."
-          className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm placeholder:text-slate-400"
+          className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 placeholder:text-slate-400"
         />
 
         {loading && <p className="text-sm text-slate-500">Loading...</p>}

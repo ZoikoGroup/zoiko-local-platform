@@ -263,7 +263,7 @@ export default function CallFlowsPage() {
                 value={newFlowName}
                 onChange={(e) => setNewFlowName(e.target.value)}
                 placeholder="e.g. Main Support Line"
-                className="flex-1 rounded-lg border border-slate-300 px-3 py-2 text-sm placeholder:text-slate-400"
+                className="flex-1 rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 placeholder:text-slate-400"
               />
               <button
                 type="submit"
@@ -317,7 +317,7 @@ export default function CallFlowsPage() {
               onChange={(e) => setEntryNodeId(e.target.value)}
               disabled={!canWrite}
               placeholder="id of the first node a caller hits"
-              className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm font-mono placeholder:text-slate-400 disabled:bg-slate-50"
+              className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-mono text-slate-900 placeholder:text-slate-400 disabled:bg-slate-50"
             />
           </div>
 
@@ -331,7 +331,7 @@ export default function CallFlowsPage() {
                       value={node.id}
                       onChange={(e) => updateNode(index, { id: e.target.value })}
                       disabled={!canWrite}
-                      className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm font-mono disabled:bg-slate-50"
+                      className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-mono text-slate-900 disabled:bg-slate-50"
                     />
                   </div>
                   <div>
@@ -340,7 +340,7 @@ export default function CallFlowsPage() {
                       value={node.type}
                       onChange={(e) => updateNode(index, { type: e.target.value as CallFlowNode["type"] })}
                       disabled={!canWrite}
-                      className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm disabled:bg-slate-50"
+                      className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 disabled:bg-slate-50"
                     >
                       {NODE_TYPES.map((t) => (
                         <option key={t.value} value={t.value}>
@@ -360,7 +360,7 @@ export default function CallFlowsPage() {
                         onChange={(e) => updateNode(index, { prompt: e.target.value })}
                         disabled={!canWrite}
                         placeholder="Press 1 for sales, 2 for support."
-                        className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm disabled:bg-slate-50"
+                        className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 disabled:bg-slate-50"
                       />
                     </div>
                     <div className="space-y-1">
@@ -375,7 +375,7 @@ export default function CallFlowsPage() {
                             onChange={(e) => updateMenuOption(index, digit, e.target.value)}
                             disabled={!canWrite}
                             placeholder="target node id"
-                            className="flex-1 rounded-lg border border-slate-300 px-3 py-2 text-sm font-mono disabled:bg-slate-50"
+                            className="flex-1 rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-mono text-slate-900 disabled:bg-slate-50"
                           />
                           {canWrite && (
                             <button
@@ -401,7 +401,7 @@ export default function CallFlowsPage() {
                           onChange={(e) => updateNode(index, { invalid_node_id: e.target.value || null })}
                           disabled={!canWrite}
                           placeholder="default: repeat this menu"
-                          className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm font-mono placeholder:text-slate-400 disabled:bg-slate-50"
+                          className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-mono text-slate-900 placeholder:text-slate-400 disabled:bg-slate-50"
                         />
                       </div>
                       <div>
@@ -411,7 +411,7 @@ export default function CallFlowsPage() {
                           onChange={(e) => updateNode(index, { timeout_node_id: e.target.value || null })}
                           disabled={!canWrite}
                           placeholder="default: repeat this menu"
-                          className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm font-mono placeholder:text-slate-400 disabled:bg-slate-50"
+                          className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-mono text-slate-900 placeholder:text-slate-400 disabled:bg-slate-50"
                         />
                       </div>
                     </div>
@@ -427,7 +427,7 @@ export default function CallFlowsPage() {
                         onChange={(e) => updateNode(index, { start: e.target.value })}
                         disabled={!canWrite}
                         placeholder="09:00:00"
-                        className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm font-mono disabled:bg-slate-50"
+                        className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-mono text-slate-900 disabled:bg-slate-50"
                       />
                     </div>
                     <div>
@@ -437,7 +437,7 @@ export default function CallFlowsPage() {
                         onChange={(e) => updateNode(index, { end: e.target.value })}
                         disabled={!canWrite}
                         placeholder="17:00:00"
-                        className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm font-mono disabled:bg-slate-50"
+                        className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-mono text-slate-900 disabled:bg-slate-50"
                       />
                     </div>
                     <div>
@@ -447,7 +447,7 @@ export default function CallFlowsPage() {
                         onChange={(e) => updateNode(index, { timezone: e.target.value })}
                         disabled={!canWrite}
                         placeholder="America/New_York"
-                        className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm disabled:bg-slate-50"
+                        className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 disabled:bg-slate-50"
                       />
                     </div>
                     <div />
@@ -457,7 +457,7 @@ export default function CallFlowsPage() {
                         value={node.within_node_id ?? ""}
                         onChange={(e) => updateNode(index, { within_node_id: e.target.value })}
                         disabled={!canWrite}
-                        className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm font-mono disabled:bg-slate-50"
+                        className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-mono text-slate-900 disabled:bg-slate-50"
                       />
                     </div>
                     <div>
@@ -466,7 +466,7 @@ export default function CallFlowsPage() {
                         value={node.outside_node_id ?? ""}
                         onChange={(e) => updateNode(index, { outside_node_id: e.target.value })}
                         disabled={!canWrite}
-                        className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm font-mono disabled:bg-slate-50"
+                        className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-mono text-slate-900 disabled:bg-slate-50"
                       />
                     </div>
                   </div>
@@ -487,7 +487,7 @@ export default function CallFlowsPage() {
                         }
                         disabled={!canWrite}
                         placeholder="+15551234567, +15557654321"
-                        className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm font-mono placeholder:text-slate-400 disabled:bg-slate-50"
+                        className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-mono text-slate-900 placeholder:text-slate-400 disabled:bg-slate-50"
                       />
                     </div>
                     <div>
@@ -499,7 +499,7 @@ export default function CallFlowsPage() {
                         onChange={(e) => updateNode(index, { on_no_answer_node_id: e.target.value || null })}
                         disabled={!canWrite}
                         placeholder="default: voicemail"
-                        className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm font-mono placeholder:text-slate-400 disabled:bg-slate-50"
+                        className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-mono text-slate-900 placeholder:text-slate-400 disabled:bg-slate-50"
                       />
                     </div>
                   </div>
@@ -513,7 +513,7 @@ export default function CallFlowsPage() {
                         value={node.queue_id ?? ""}
                         onChange={(e) => updateNode(index, { queue_id: e.target.value || null })}
                         disabled={!canWrite}
-                        className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm disabled:bg-slate-50"
+                        className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 disabled:bg-slate-50"
                       >
                         <option value="">Select a queue...</option>
                         {queues.map((q) => (
@@ -537,7 +537,7 @@ export default function CallFlowsPage() {
                         onChange={(e) => updateNode(index, { overflow_node_id: e.target.value || null })}
                         disabled={!canWrite}
                         placeholder="default: voicemail"
-                        className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm font-mono placeholder:text-slate-400 disabled:bg-slate-50"
+                        className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-mono text-slate-900 placeholder:text-slate-400 disabled:bg-slate-50"
                       />
                     </div>
                   </div>
@@ -551,7 +551,7 @@ export default function CallFlowsPage() {
                       onChange={(e) => updateNode(index, { message: e.target.value })}
                       disabled={!canWrite}
                       placeholder="Thanks for calling. Goodbye."
-                      className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm disabled:bg-slate-50"
+                      className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 disabled:bg-slate-50"
                     />
                   </div>
                 )}
