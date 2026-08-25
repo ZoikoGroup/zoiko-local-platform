@@ -160,7 +160,7 @@ export default function MessagingPage() {
             <select
               value={newNumberId}
               onChange={(e) => setNewNumberId(e.target.value)}
-              className="rounded-lg border border-slate-300 px-3 py-2 text-sm"
+              className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900"
             >
               <option value="">From number...</option>
               {channelNumbers.map((n) => (
@@ -173,13 +173,13 @@ export default function MessagingPage() {
               value={newTo}
               onChange={(e) => setNewTo(e.target.value)}
               placeholder="Customer number (+1...)"
-              className="rounded-lg border border-slate-300 px-3 py-2 text-sm placeholder:text-slate-400"
+              className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 placeholder:text-slate-400"
             />
             <input
               value={newBody}
               onChange={(e) => setNewBody(e.target.value)}
               placeholder="Message"
-              className="rounded-lg border border-slate-300 px-3 py-2 text-sm placeholder:text-slate-400"
+              className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 placeholder:text-slate-400"
             />
           </div>
           {channelNumbers.length === 0 && (
