@@ -442,7 +442,10 @@ def place_call(
                 call = _client().calls.create(**kwargs)
         except TwilioException as e:
             raise TelecomError(_clean_twilio_error_message(e)) from e
-        return {"sid": call.sid, "status": call.status, "to": call.to, "from": call.from_}
+        # CallInstance has no public `from_` attribute (the twilio-python
+        # SDK only exposes it via kwargs when creating a call) - the "from"
+        # number on a fetched/created instance is the private `_from`.
+        return {"sid": call.sid, "status": call.status, "to": call.to, "from": call._from}
 
     secondary_fn = (
         (lambda: secondary.place_call(to, from_, twiml_url, twiml, status_callback_url, time_limit_seconds))
@@ -466,7 +469,7 @@ def get_call(call_sid: str) -> dict:
         except TwilioException as e:
             raise TelecomError(_clean_twilio_error_message(e)) from e
         return {
-            "sid": call.sid, "status": call.status, "to": call.to, "from": call.from_, "duration": call.duration,
+            "sid": call.sid, "status": call.status, "to": call.to, "from": call._from, "duration": call.duration,
             "price": call.price, "price_unit": call.price_unit,
         }
 
@@ -484,7 +487,7 @@ def list_calls(limit: int = 20) -> list[dict]:
                 calls = _client().calls.list(limit=limit)
         except TwilioException as e:
             raise TelecomError(_clean_twilio_error_message(e)) from e
-        return [{"sid": c.sid, "status": c.status, "to": c.to, "from": c.from_} for c in calls]
+        return [{"sid": c.sid, "status": c.status, "to": c.to, "from": c._from} for c in calls]
 
     secondary_fn = (lambda: secondary.list_calls(limit)) if settings.telecom_failover_enabled else None
     return with_failover(_breaker, _primary, secondary_fn, TelecomError)
