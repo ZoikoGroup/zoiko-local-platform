@@ -96,18 +96,23 @@ class Account(Base):
         Enum(AccountRiskState, name="account_risk_state_enum"),
         nullable=False, default=AccountRiskState.TRIAL_LOW,
     )
-    # Legal/litigation hold - set by staff (accounts.manage_legal_hold
-    # capability, SUPER_ADMIN only, migration c3b0f40f4bc1) whenever this
-    # account's data must not be destroyed pending a legal matter. Enforced
-    # at the one place data destruction is actually requested through this
-    # app: app.retention.service.create_erasure_request/resolve_erasure_
-    # request refuse to erasure-request (or complete an erasure of) an
-    # account while this is True. Independent of is_test above - a legal
+    # Architecture doc §10 "legal hold model for business customers" - a
+    # simple boolean+reference rather than a separate table, since only
+    # one hold is ever meaningfully "in effect" for retention-purge
+    # purposes at a time (multiple concurrent legal matters on one account
+    # would still just mean "don't purge," which this already captures;
+    # the actual case details live wherever legal tracks the matter, this
+    # is only the retention-system-facing flag). Checked by
+    # app.retention.service's purge sweeps AND by erase_account_data (a
+    # DSAR erasure must be blocked just as hard as a routine purge) - see
+    # is_account_under_legal_hold. Independent of is_test above - a legal
     # hold is a litigation/investigation concern, not a billing one.
     legal_hold: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
-    # Free-text reference to the matter/case this hold is tied to (e.g. a
-    # legal case number) - nullable since a hold can be placed before a
-    # formal reference exists yet.
+    # A real case/matter reference (not free text praise like "just in
+    # case") - required whenever legal_hold=True, enforced in
+    # app.staff.service.set_account_legal_hold (SUPER_ADMIN-only, the
+    # accounts.manage_legal_hold capability), same "record a reference,
+    # not just a reason" discipline as SupportedCountry.legal_signoff_reference.
     legal_hold_reference: Mapped[str | None] = mapped_column(String(100), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 

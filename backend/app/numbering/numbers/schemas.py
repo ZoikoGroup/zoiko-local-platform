@@ -138,6 +138,19 @@ class SupportedCountryResponse(BaseModel):
     market_status: str
     legal_signoff_reference: str | None = None
     legal_signoff_by: str | None = None
+    customer_type_restrictions: list[str] | None = None
+    porting_supported: bool = False
+    recording_consent_basis: str | None = None
+    payments_enabled: bool = False
+    marketing_claims_approved: bool = False
+
+
+class UpdateCountryRegistryFieldsRequest(BaseModel):
+    customer_type_restrictions: list[str] | None = None
+    porting_supported: bool = False
+    recording_consent_basis: str | None = None
+    payments_enabled: bool = False
+    marketing_claims_approved: bool = False
 
 
 class UpsertSupportedCountryRequest(BaseModel):

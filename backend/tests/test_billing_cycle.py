@@ -209,6 +209,89 @@ def test_run_billing_cycle_includes_a_real_tax_decision_on_the_line_item(db_sess
     assert captured["tax_amount_minor_units"] == 0
 
 
+def test_run_billing_cycle_bills_the_annual_catalog_price_for_an_annual_subscription(db_session, monkeypatch):
+    """Real bug fix: run_billing_cycle's catalog lookup used to omit
+    billing_period entirely, so it always defaulted to the MONTHLY entry -
+    an annual subscriber got charged the $12.99 monthly starter price
+    instead of the real $129.00 annual price seeded by migration
+    4ec152435b05 (see test_get_active_price_catalog_entry_returns_the_
+    real_annual_prices in test_billing.py)."""
+    from app.billing.models import BillingPeriod
+
+    account, _sub = _synced_paid_subscription(db_session, "Billing Cycle Annual Co")
+    service.change_plan(db_session, account.id, "starter", actor="test-actor", billing_period=BillingPeriod.ANNUAL)
+
+    line_item_calls = []
+    monkeypatch.setattr(
+        service.zoikonex_adapter, "add_invoice_line_item",
+        lambda invoice_id, **kwargs: line_item_calls.append(kwargs) or {"line_item_id": "zn-line-item-test"},
+    )
+
+    service.run_billing_cycle(db_session, account.id, actor="test-actor")
+
+    plan_fee_call = next(c for c in line_item_calls if c["line_key"] == "plan-fee")
+    assert plan_fee_call["amount_minor_units"] == 12900  # real annual starter price, not 1299 (monthly)
+    assert "annual" in plan_fee_call["description"]
+
+
+def test_run_billing_cycle_bills_the_ai_receptionist_addon_fee_and_overage(db_session, monkeypatch):
+    """Real gap fix: AI Receptionist add-on minutes were metered
+    (usage.service.record_usage_event's ai_receptionist_minutes event) but
+    never actually turned into an invoice line item - CLAUDE.md's
+    2026-08-20 entry admitted this, and a later full-backend audit
+    confirmed it was still true. The $29.00/mo add-on price + 100
+    included minutes + $0.39/min overage are all real, ACTIVE, non-
+    placeholder AIReceptionistAddonRate values seeded by migration
+    fd2501d0b136 - this proves run_billing_cycle actually charges them
+    now, using the exact same overage math get_usage_summary reports."""
+    from app.billing import service as billing_service
+    from app.usage import service as usage_service
+
+    account, sub = _synced_paid_subscription(db_session, "Billing Cycle AI Addon Co")
+    billing_service.set_ai_receptionist_addon(db_session, account.id, enabled=True, actor="test-actor")
+    plan = billing_service.get_plan(db_session, "starter")
+
+    # 130 minutes used, well past the addon's 100 included minutes (starter
+    # itself grants 0) - forces a real overage charge, not just the flat fee.
+    usage_service.record_usage_event(
+        db_session, account_id=account.id, event_type="ai_receptionist_minutes", quantity=130, unit="minutes",
+        country_band=None, idempotency_key="test-ai-addon-overage-1",
+    )
+    expected_overage_minutes = 130 - (plan.included_ai_receptionist_minutes + 100)
+    expected_overage_cents = round(expected_overage_minutes * 39)
+
+    line_item_calls = []
+    monkeypatch.setattr(
+        service.zoikonex_adapter, "add_invoice_line_item",
+        lambda invoice_id, **kwargs: line_item_calls.append(kwargs) or {"line_item_id": "zn-line-item-test"},
+    )
+
+    service.run_billing_cycle(db_session, account.id, actor="test-actor")
+
+    addon_call = next(c for c in line_item_calls if c["line_key"] == "ai-receptionist-addon-fee")
+    assert addon_call["amount_minor_units"] == 2900
+
+    overage_call = next(c for c in line_item_calls if c["line_key"] == "ai-receptionist-overage-fee")
+    assert overage_call["amount_minor_units"] == expected_overage_cents
+
+
+def test_run_billing_cycle_skips_ai_receptionist_addon_fee_when_addon_is_disabled(db_session, monkeypatch):
+    account, _sub = _synced_paid_subscription(db_session, "Billing Cycle No Addon Co")
+    # Deliberately never calling set_ai_receptionist_addon - defaults to disabled.
+
+    line_item_calls = []
+    monkeypatch.setattr(
+        service.zoikonex_adapter, "add_invoice_line_item",
+        lambda invoice_id, **kwargs: line_item_calls.append(kwargs) or {"line_item_id": "zn-line-item-test"},
+    )
+
+    service.run_billing_cycle(db_session, account.id, actor="test-actor")
+
+    line_keys = [c["line_key"] for c in line_item_calls]
+    assert "ai-receptionist-addon-fee" not in line_keys
+    assert "ai-receptionist-overage-fee" not in line_keys
+
+
 def test_run_billing_cycle_adds_pending_number_charges_as_line_items_on_the_same_invoice(db_session, monkeypatch):
     """Architecture doc §9: a number purchase's cost becomes a line item on
     the SAME invoice as the plan fee - real gap fixed 2026-08-22 (numbers

@@ -5,7 +5,7 @@ from app.billing.schemas import UsageSummaryResponse
 from app.billing import service as billing_service
 from app.contacts import service as contacts_service
 from app.core.database import get_db
-from app.core.deps import get_api_key_account_id
+from app.core.deps import get_api_key_account_id, require_entitlement_for_api_key
 from app.core.rate_limit import limiter
 from app.intelligence.models import ConversationSummary
 from app.media import service as media_service
@@ -202,6 +202,7 @@ def create_webhook(
     payload: CreateWebhookEndpointRequest,
     account_id: str = Depends(get_api_key_account_id),
     db: Session = Depends(get_db),
+    _entitlement: str = Depends(require_entitlement_for_api_key("developer.webhooks")),
 ):
     try:
         endpoint, secret = webhooks_service.create_endpoint(

@@ -27,7 +27,7 @@ from app.numbering.identity.models import User, UserRole
 from app.numbering.numbers.service import NumberConflictError, assert_number_access, assigned_number_ids
 from app.numbering.numbers.models import PhoneNumber
 from app.ops.models import KillSwitchScope
-from app.ops.service import assert_kill_switch_not_active
+from app.ops.service import KillSwitchTrippedError, assert_kill_switch_not_active
 from app.retention.service import PURGED_MARKER, RECORDING_FAILED_MARKER
 from app.risk.service import is_ai_receptionist_trial_cap_exceeded
 from app.usage import service as usage_service
@@ -404,6 +404,21 @@ def qualify_caller(
     # skip-AI-enrichment-not-fail-the-call treatment as the consent check
     # above.
     if is_ai_receptionist_trial_cap_exceeded(db, account_id):
+        return None, None
+    # Real gap fix: every batch summarize_* entry point checks both of
+    # these before spending a Groq credit (see summarize_voicemail's own
+    # assert_kill_switch_not_active call and _analyze_and_store's
+    # assert_billing_not_suspended), but this live-call path never did -
+    # tripping the AI_PROCESSING kill switch (Commercial Billing Operating
+    # Standard doc §32.1) didn't actually stop the receptionist's live
+    # Groq spend. Caught, not propagated, for the same reason as the
+    # consent/trial-cap checks above: a live call must always get a TwiML
+    # response, so a halted/suspended account just skips AI enrichment
+    # here, same as missing consent.
+    try:
+        assert_kill_switch_not_active(db, KillSwitchScope.AI_PROCESSING)
+        billing_service.assert_billing_not_suspended(db, account_id)
+    except (KillSwitchTrippedError, billing_service.BillingSuspendedError):
         return None, None
     return extract_receptionist_qualification(transcript), LLM_MODEL_VERSION
 

@@ -669,20 +669,37 @@ def build_dtmf_menu_response(prompt: str, action_url: str, num_digits: int = 1, 
 
 
 def build_receptionist_reply_response(
-    message: str, forward_to: str | None = None, status_callback_url: str | None = None
+    message: str, forward_to: str | None = None, status_callback_url: str | None = None,
+    recording_callback_url: str | None = None,
 ) -> str:
     """Closes out the receptionist flow: a spoken reply, then either an
-    escalation dial to a human or a hangup."""
+    escalation dial to a human or a hangup.
+
+    recording_callback_url (real gap fix): an escalated call - the AI
+    Receptionist forwarding a HIGH-urgency caller straight to a human - is
+    a live two-way conversation with no other capture mechanism of its
+    own, unlike the pre-escalation Gather utterance (which the
+    ReceptionistCall row already preserves) or a plain voicemail/forward
+    call (each already has its own recording path). Without this, the
+    single call category with the least room for missing a detail - an
+    urgent handoff - was the one call category that was never recorded.
+    Same record="record-from-answer-dual" + recording_status_callback
+    shape as build_ring_group_response, and the caller wires it through
+    the exact same AI_PROCESSING consent gate (should_record_forwarded_
+    call) before ever passing a non-None value here."""
     response = VoiceResponse()
     response.say(message)
     if forward_to:
         dial_kwargs = {}
         if status_callback_url:
-            dial_kwargs = {
-                "action": status_callback_url,
-                "status_callback": status_callback_url,
-                "status_callback_event": "completed",
-            }
+            dial_kwargs["action"] = status_callback_url
+            dial_kwargs["status_callback"] = status_callback_url
+            dial_kwargs["status_callback_event"] = "completed"
+        if recording_callback_url:
+            dial_kwargs["record"] = "record-from-answer-dual"
+            dial_kwargs["recording_status_callback"] = recording_callback_url
+            dial_kwargs["recording_status_callback_method"] = "POST"
+            dial_kwargs["recording_status_callback_event"] = "completed"
         response.dial(forward_to, **dial_kwargs)
     else:
         response.hangup()

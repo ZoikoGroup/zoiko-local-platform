@@ -90,6 +90,49 @@ class Plan(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
+class EntitlementValueType(str, enum.Enum):
+    """Commercial Entitlement Governance standard (ZL-COM-ENT-001) §6 lists
+    7 value types (Boolean/Integer/Quantity/Enum/Set/Decimal/Date) - only
+    these 2 are needed for the keys this phase actually gates. Room to grow
+    into the rest later without a breaking change to PlanEntitlement itself."""
+
+    BOOLEAN = "boolean"
+    INTEGER = "integer"
+
+
+class PlanEntitlement(Base):
+    """ZL-COM-ENT-001 §5-6: "explicit entitlement keys; hierarchy is
+    compiled into plan versions, never evaluated by rank at request time."
+    Before this table, features were gated only by raw numeric Plan columns
+    (max_numbers, max_team_seats, etc.) - there was no way to represent a
+    plain boolean capability (API access, advanced routing, ...) at all,
+    so those features were completely ungated by plan (confirmed live: any
+    Starter account could create API keys, publish call flows, pull
+    analytics, and enable the AI Receptionist for free). Same "rules as
+    data" discipline as ComplianceRule/FraudRule/RetentionPolicy - a plan's
+    feature set can be retuned without a deploy.
+
+    Deliberately only plan_code-scoped for this phase - no account-level
+    override/Enterprise-contract table yet (see app.billing.service.
+    has_entitlement's docstring for the deny-by-default fallback when no
+    row exists, e.g. for free_trial and enterprise plan_codes today)."""
+
+    __tablename__ = "plan_entitlements"
+    __table_args__ = (UniqueConstraint("plan_code", "key", name="uq_plan_entitlement_plan_key"),)
+
+    id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=new_uuid)
+    plan_code: Mapped[str] = mapped_column(
+        String(50), ForeignKey("plans.plan_code", ondelete="CASCADE"), nullable=False, index=True
+    )
+    key: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+    value_type: Mapped[EntitlementValueType] = mapped_column(
+        Enum(EntitlementValueType, name="entitlement_value_type_enum"), nullable=False
+    )
+    bool_value: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    int_value: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
 class CatalogEntryStatus(str, enum.Enum):
     # Renamed from the original DRAFT (migration 8f3c1a9d2b47 - ALTER TYPE
     # ... RENAME VALUE, not a new state) to match the Production Readiness

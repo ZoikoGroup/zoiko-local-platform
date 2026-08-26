@@ -17,12 +17,24 @@ def _strip_none(nodes: list[dict]) -> list[dict]:
     return [{k: v for k, v in node.items() if v is not None} for node in nodes]
 
 
-def _signup_and_login(client, email: str) -> str:
+def _signup_and_login(client, db_session, email: str) -> str:
+    """Real gap fix (ZL-COM-ENT-001): call-flow creation/publish now
+    require the routing.advanced entitlement (Pro+ only - see
+    app.billing.service.has_entitlement/app.core.deps.require_entitlement).
+    Every test in this file exercises the Call Flow Designer directly, so
+    this shared helper upgrades to Pro rather than repeating that at each
+    call site - see test_free_trial_account_cannot_create_or_publish_a_
+    call_flow below for the gate itself."""
+    from app.billing import service as billing_service
+
     client.post(
         "/auth/signup",
         json={"account_name": "Call Flow Test Co", "account_type": "business", "email": email, "password": "supersecret123"},
     )
-    return client.post("/auth/login", json={"email": email, "password": "supersecret123"}).json()["access_token"]
+    token = client.post("/auth/login", json={"email": email, "password": "supersecret123"}).json()["access_token"]
+    account_id = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"}).json()["account_id"]
+    billing_service.change_plan(db_session, account_id, "pro", actor="test-setup")
+    return token
 
 
 def _make_active_number(client, db_session, token, e164: str) -> PhoneNumber:
@@ -60,8 +72,33 @@ def _create_and_publish_flow(client, headers, name="Main Line", nodes=None, entr
     return flow["id"]
 
 
+def test_free_trial_account_cannot_create_or_publish_a_call_flow(client, db_session):
+    """Real gap fix: routing.advanced is a Pro+ entitlement
+    (ZL-COM-ENT-001 §7) - before this gate existed, any plan (including
+    free_trial) could build and publish the Advanced IVR / Call Flow
+    Designer."""
+    client.post(
+        "/auth/signup",
+        json={
+            "account_name": "Free Trial Flow Co", "account_type": "business",
+            "email": "flow-freetrial1@example.com", "password": "supersecret123",
+        },
+    )
+    token = client.post(
+        "/auth/login", json={"email": "flow-freetrial1@example.com", "password": "supersecret123"}
+    ).json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    create_response = client.post("/call-flows", json={"name": "Nope"}, headers=headers)
+    assert create_response.status_code == 402
+    body = create_response.json()["detail"]
+    assert body["code"] == "ENTITLEMENT_REQUIRED"
+    assert body["entitlement"] == "routing.advanced"
+    assert body["current_plan"] == "free_trial"
+
+
 def test_create_flow_has_an_empty_draft(client, db_session):
-    token = _signup_and_login(client, "flow-create1@example.com")
+    token = _signup_and_login(client, db_session, "flow-create1@example.com")
     headers = {"Authorization": f"Bearer {token}"}
 
     response = client.post("/call-flows", json={"name": "Main Line"}, headers=headers)
@@ -77,7 +114,7 @@ def test_create_flow_has_an_empty_draft(client, db_session):
 
 
 def test_publish_fails_with_dangling_reference(client, db_session):
-    token = _signup_and_login(client, "flow-invalid1@example.com")
+    token = _signup_and_login(client, db_session, "flow-invalid1@example.com")
     headers = {"Authorization": f"Bearer {token}"}
     flow = client.post("/call-flows", json={"name": "Broken"}, headers=headers).json()
 
@@ -92,7 +129,7 @@ def test_publish_fails_with_dangling_reference(client, db_session):
 
 
 def test_publish_fails_with_no_reachable_destination(client, db_session):
-    token = _signup_and_login(client, "flow-invalid2@example.com")
+    token = _signup_and_login(client, db_session, "flow-invalid2@example.com")
     headers = {"Authorization": f"Bearer {token}"}
     flow = client.post("/call-flows", json={"name": "Loop"}, headers=headers).json()
 
@@ -108,7 +145,7 @@ def test_publish_fails_with_no_reachable_destination(client, db_session):
 
 
 def test_publish_creates_live_version_and_a_fresh_draft(client, db_session):
-    token = _signup_and_login(client, "flow-publish1@example.com")
+    token = _signup_and_login(client, db_session, "flow-publish1@example.com")
     headers = {"Authorization": f"Bearer {token}"}
     flow_id = _create_and_publish_flow(client, headers)
 
@@ -122,7 +159,7 @@ def test_publish_creates_live_version_and_a_fresh_draft(client, db_session):
 
 
 def test_rollback_restores_a_prior_version_as_a_new_version(client, db_session):
-    token = _signup_and_login(client, "flow-rollback1@example.com")
+    token = _signup_and_login(client, db_session, "flow-rollback1@example.com")
     headers = {"Authorization": f"Bearer {token}"}
     flow_id = _create_and_publish_flow(client, headers)
 
@@ -149,7 +186,7 @@ def test_rollback_restores_a_prior_version_as_a_new_version(client, db_session):
 
 
 def test_assign_and_unassign_call_flow_to_a_number(client, db_session):
-    token = _signup_and_login(client, "flow-assign1@example.com")
+    token = _signup_and_login(client, db_session, "flow-assign1@example.com")
     headers = {"Authorization": f"Bearer {token}"}
     number = _make_active_number(client, db_session, token, "+15550009000")
     flow_id = _create_and_publish_flow(client, headers)
@@ -164,18 +201,18 @@ def test_assign_and_unassign_call_flow_to_a_number(client, db_session):
 
 
 def test_cannot_access_another_accounts_call_flow(client, db_session):
-    token_a = _signup_and_login(client, "flow-iso1a@example.com")
+    token_a = _signup_and_login(client, db_session, "flow-iso1a@example.com")
     headers_a = {"Authorization": f"Bearer {token_a}"}
     flow_id = _create_and_publish_flow(client, headers_a)
 
-    token_b = _signup_and_login(client, "flow-iso1b@example.com")
+    token_b = _signup_and_login(client, db_session, "flow-iso1b@example.com")
     headers_b = {"Authorization": f"Bearer {token_b}"}
     response = client.get(f"/call-flows/{flow_id}", headers=headers_b)
     assert response.status_code == 404
 
 
 def test_incoming_call_with_a_live_flow_returns_the_menu_gather(client, db_session):
-    token = _signup_and_login(client, "flow-incoming1@example.com")
+    token = _signup_and_login(client, db_session, "flow-incoming1@example.com")
     headers = {"Authorization": f"Bearer {token}"}
     number = _make_active_number(client, db_session, token, "+15550009111")
     flow_id = _create_and_publish_flow(client, headers)
@@ -194,7 +231,7 @@ def test_incoming_call_with_a_live_flow_returns_the_menu_gather(client, db_sessi
 
 
 def test_menu_digit_routes_to_the_matching_forward_node(client, db_session):
-    token = _signup_and_login(client, "flow-digit1@example.com")
+    token = _signup_and_login(client, db_session, "flow-digit1@example.com")
     headers = {"Authorization": f"Bearer {token}"}
     flow_id = _create_and_publish_flow(client, headers)
     live_version_id = client.get(f"/call-flows/{flow_id}", headers=headers).json()["live"]["id"]
@@ -213,7 +250,7 @@ def test_menu_digit_routes_to_the_matching_forward_node(client, db_session):
 
 
 def test_invalid_menu_digit_repeats_the_same_menu(client, db_session):
-    token = _signup_and_login(client, "flow-digit2@example.com")
+    token = _signup_and_login(client, db_session, "flow-digit2@example.com")
     headers = {"Authorization": f"Bearer {token}"}
     flow_id = _create_and_publish_flow(client, headers)
     live_version_id = client.get(f"/call-flows/{flow_id}", headers=headers).json()["live"]["id"]
@@ -232,7 +269,7 @@ def test_invalid_menu_digit_repeats_the_same_menu(client, db_session):
 
 
 def test_forward_node_failover_routes_to_its_configured_node(client, db_session):
-    token = _signup_and_login(client, "flow-failover1@example.com")
+    token = _signup_and_login(client, db_session, "flow-failover1@example.com")
     headers = {"Authorization": f"Bearer {token}"}
     flow_id = _create_and_publish_flow(client, headers)
     live_version_id = client.get(f"/call-flows/{flow_id}", headers=headers).json()["live"]["id"]
@@ -250,7 +287,7 @@ def test_forward_node_failover_routes_to_its_configured_node(client, db_session)
 
 
 def test_forward_node_without_failover_target_defaults_to_voicemail(client, db_session):
-    token = _signup_and_login(client, "flow-failover2@example.com")
+    token = _signup_and_login(client, db_session, "flow-failover2@example.com")
     headers = {"Authorization": f"Bearer {token}"}
     flow_id = _create_and_publish_flow(client, headers)
     live_version_id = client.get(f"/call-flows/{flow_id}", headers=headers).json()["live"]["id"]

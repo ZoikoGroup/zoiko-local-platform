@@ -441,11 +441,23 @@ def rate_usage_event(
     included_ai_receptionist_minutes) from the estimate - entitlement
     quotas are a separate concern from cost estimation."""
     if event_type == "call_seconds":
+        # destination_country IS NULL - the origin-only rate every row has
+        # today (see CallingRate's docstring); nothing here parses the
+        # call's real destination yet, so this deliberately never matches
+        # a destination-specific row even once one exists.
         rate = None
         if country_band is not None:
-            rate = db.query(CallingRate).filter(CallingRate.country == country_band).first()
+            rate = (
+                db.query(CallingRate)
+                .filter(CallingRate.country == country_band, CallingRate.destination_country.is_(None))
+                .first()
+            )
         if rate is None:
-            rate = db.query(CallingRate).filter(CallingRate.country == DEFAULT_RATE_COUNTRY).first()
+            rate = (
+                db.query(CallingRate)
+                .filter(CallingRate.country == DEFAULT_RATE_COUNTRY, CallingRate.destination_country.is_(None))
+                .first()
+            )
         if rate is None:
             return {"estimated_cost_cents": None}
         minutes = math.ceil(quantity / 60)

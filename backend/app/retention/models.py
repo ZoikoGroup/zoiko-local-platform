@@ -50,18 +50,20 @@ class ErasureRequestStatus(str, enum.Enum):
 
 
 class ErasureRequest(Base):
-    """A customer's request that their account's data be erased ("right to
-    be forgotten" / GDPR-style deletion request). requested_by is NOT a
-    foreign key on purpose - it can reference either a numbering.identity.
-    models.User.id (a customer requesting their own account's erasure) or a
-    app.staff.models.PlatformStaff.id (staff opening one on a customer's
-    behalf), and there's no single table both would cleanly FK to.
+    """Architecture doc §10 "right-to-erasure workflow" - a customer-
+    initiated deletion request ("right to be forgotten" / GDPR-style) that
+    a human reviews before anything is deleted, not a self-service "delete
+    now" button (some records must legally be retained - billing/tax
+    evidence, an open compliance case, a legal hold - even after a
+    request). requested_by is NOT a foreign key on purpose - it can
+    reference either a numbering.identity.models.User.id (a customer
+    requesting their own account's erasure) or a app.staff.models.
+    PlatformStaff.id (staff opening one on a customer's behalf), and
+    there's no single table both would cleanly FK to.
 
-    Marking a request COMPLETED records that a human resolved it through
-    whatever real deletion process they used OUTSIDE this system - see
-    app.retention.service.resolve_erasure_request's docstring for the exact
-    scope boundary (this table does not itself delete any data).
-    """
+    Marking a request COMPLETED actually runs the deletion cascade (see
+    app.retention.service.erase_account_data) - this table is the request/
+    audit record of that decision, not just a status tracker."""
 
     __tablename__ = "erasure_requests"
 

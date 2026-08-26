@@ -19,6 +19,7 @@ class CallingRateResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     country: str
+    destination_country: str | None = None
     price_per_minute_cents: int
     currency: str
 
@@ -27,6 +28,7 @@ class UpsertCallingRateRequest(BaseModel):
     country: str
     price_per_minute_cents: int
     currency: str = "USD"
+    destination_country: str | None = None
 
 
 class NumberRateResponse(BaseModel):

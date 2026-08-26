@@ -75,10 +75,22 @@ def _finish_capture_and_respond(request: Request, db: Session, call: Receptionis
     if should_escalate:
         media_service.mark_receptionist_call_escalated(db, call.id, owner.escalation_user_id)
         status_callback_url = str(request.base_url) + "media/voice/status-callback"
+        # Real gap fix: an escalated call is a live two-way conversation
+        # with no other capture mechanism of its own (unlike the
+        # pre-escalation Gather utterance, already on the ReceptionistCall
+        # row) - same AI_PROCESSING consent gate as a plain forwarded call
+        # (should_record_forwarded_call), reusing /media/voice/recording-
+        # callback since this is still the same outer CallSid throughout.
+        recording_callback_url = (
+            str(request.base_url) + "media/voice/recording-callback"
+            if media_service.should_record_forwarded_call(db, call.account_id)
+            else None
+        )
         twiml = telecom.build_receptionist_reply_response(
             "Thanks — this sounds urgent, connecting you to someone now.",
             forward_to=escalation_number,
             status_callback_url=status_callback_url,
+            recording_callback_url=recording_callback_url,
         )
         return Response(content=twiml, media_type="application/xml")
 

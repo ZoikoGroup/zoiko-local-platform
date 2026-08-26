@@ -39,6 +39,11 @@ def test_create_request_requires_admin_role(client, db_session, monkeypatch):
     monkeypatch.setattr("app.core.config.settings.resend_api_key", "")
     owner_token, account_id = _signup_and_login(client, "portingmember1@example.com")
     owner_headers = {"Authorization": f"Bearer {owner_token}"}
+    # Real gap fix (ZL-COM-ENT-001): adding a team member now requires
+    # team.members.enabled (Business+).
+    from app.billing import service as billing_service
+
+    billing_service.change_plan(db_session, account_id, "business", actor="test-setup")
     client.post(
         "/team/members",
         json={"email": "portingmember1mate@example.com", "password": "supersecret123", "role": "member"},

@@ -62,11 +62,16 @@ class KillSwitchResponse(BaseModel):
     activated_by: str | None
     activated_at: datetime | None
     deactivated_at: datetime | None
+    expires_at: datetime | None
     created_at: datetime
 
 
 class SetKillSwitchRequest(BaseModel):
     reason: str | None = None
+    # Commercial Billing Operating Standard doc §U2 "time-bounded" override
+    # requirement - optional since not every real incident has a known
+    # resolution ETA at activation time.
+    expires_at: datetime | None = None
 
 
 class EventOutboxFlushResponse(BaseModel):

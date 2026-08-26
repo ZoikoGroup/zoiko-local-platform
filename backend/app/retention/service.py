@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy.orm import Session
 
 from app.audit.service import log_event
+from app.contacts.models import Contact
 from app.events.service import (
     publish_retention_erasure_requested,
     publish_retention_policy_set,
@@ -12,7 +13,8 @@ from app.integrations.cache.redis import cache_delete, cache_get, cache_set
 from app.integrations.storage.s3 import StorageError, delete_object
 from app.integrations.telecom import twilio as telecom
 from app.integrations.telecom.twilio import TelecomError
-from app.media.models import CallRecord, VideoSession, Voicemail
+from app.intelligence.models import ConversationSummary
+from app.media.models import CallRecord, ReceptionistCall, VideoSession, Voicemail
 from app.numbering.identity.models import Account
 from app.retention.models import ArtifactType, ErasureRequest, ErasureRequestStatus, RetentionPolicy
 
@@ -28,6 +30,26 @@ PURGED_MARKER = "[deleted - retention policy]"
 # Defined here (not in media.service) to avoid a circular import - media.
 # service already imports PURGED_MARKER from this module.
 RECORDING_FAILED_MARKER = "[recording failed]"
+# Distinct from PURGED_MARKER (a routine, policy-driven purge) - this is a
+# customer-rights-driven erasure (see erase_account_data), a different
+# legal basis worth being able to tell apart in the data itself, not just
+# in the audit log.
+ERASED_MARKER = "[erased - right to erasure]"
+
+
+def is_account_under_legal_hold(db: Session, account_id: str | None) -> bool:
+    """Architecture doc §10 "legal hold model for business customers" -
+    checked at the top of every purge loop below, before the normal
+    retention-window check even runs. A hold blocks purge regardless of
+    how overdue the recording otherwise is - staff set this via
+    app.staff.service.set_account_legal_hold specifically to stop a
+    scheduled sweep from destroying evidence mid-litigation."""
+    if account_id is None:
+        return False
+    from app.numbering.identity.models import Account
+
+    account = db.query(Account).filter(Account.id == account_id).first()
+    return account is not None and account.legal_hold
 
 
 def get_retention_days(db: Session, account_id: str, artifact_type: ArtifactType) -> int:
@@ -105,11 +127,18 @@ def list_retention_policies(db: Session, account_id: str) -> dict[str, int]:
     return result
 
 
-def _purge_voicemails(db: Session, now: datetime) -> tuple[int, int]:
+def _purge_voicemails(
+    db: Session, now: datetime, *, account_id: str | None = None, force: bool = False
+) -> tuple[int, int]:
     purged = failed = 0
-    for vm in db.query(Voicemail).filter(Voicemail.recording_url.isnot(None)).all():
+    query = db.query(Voicemail).filter(Voicemail.recording_url.isnot(None))
+    if account_id is not None:
+        query = query.filter(Voicemail.account_id == account_id)
+    for vm in query.all():
+        if is_account_under_legal_hold(db, vm.account_id):
+            continue
         retention_days = get_retention_days(db, vm.account_id, ArtifactType.VOICEMAIL)
-        if vm.created_at >= now - timedelta(days=retention_days):
+        if not force and vm.created_at >= now - timedelta(days=retention_days):
             continue
         try:
             telecom.delete_recording(telecom.recording_sid_from_url(vm.recording_url))
@@ -135,16 +164,18 @@ def _purge_voicemails(db: Session, now: datetime) -> tuple[int, int]:
     return purged, failed
 
 
-def _purge_call_recordings(db: Session, now: datetime) -> tuple[int, int]:
+def _purge_call_recordings(
+    db: Session, now: datetime, *, account_id: str | None = None, force: bool = False
+) -> tuple[int, int]:
     purged = failed = 0
-    calls = (
-        db.query(CallRecord)
-        .filter(CallRecord.recording_url.isnot(None), CallRecord.account_id.isnot(None))
-        .all()
-    )
-    for call in calls:
+    query = db.query(CallRecord).filter(CallRecord.recording_url.isnot(None), CallRecord.account_id.isnot(None))
+    if account_id is not None:
+        query = query.filter(CallRecord.account_id == account_id)
+    for call in query.all():
+        if is_account_under_legal_hold(db, call.account_id):
+            continue
         retention_days = get_retention_days(db, call.account_id, ArtifactType.CALL_RECORDING)
-        if call.created_at >= now - timedelta(days=retention_days):
+        if not force and call.created_at >= now - timedelta(days=retention_days):
             continue
         try:
             telecom.delete_recording(telecom.recording_sid_from_url(call.recording_url))
@@ -173,15 +204,21 @@ def _purge_call_recordings(db: Session, now: datetime) -> tuple[int, int]:
     return purged, failed
 
 
-def _purge_video_recordings(db: Session, now: datetime) -> tuple[int, int]:
+def _purge_video_recordings(
+    db: Session, now: datetime, *, account_id: str | None = None, force: bool = False
+) -> tuple[int, int]:
     purged = failed = 0
     query = db.query(VideoSession).filter(
         VideoSession.recording_url.isnot(None), VideoSession.recording_url != RECORDING_FAILED_MARKER,
     )
+    if account_id is not None:
+        query = query.filter(VideoSession.account_id == account_id)
     for session in query.all():
+        if is_account_under_legal_hold(db, session.account_id):
+            continue
         retention_days = get_retention_days(db, session.account_id, ArtifactType.VIDEO_RECORDING)
         reference_time = session.ended_at or session.started_at or session.created_at
-        if reference_time >= now - timedelta(days=retention_days):
+        if not force and reference_time >= now - timedelta(days=retention_days):
             continue
         # recording_object_key is the actual key it was uploaded under -
         # older sessions predating that column fall back to the room_name-
@@ -235,15 +272,8 @@ def purge_expired_recordings(db: Session) -> dict[str, dict[str, int]]:
     }
 
 
-class LegalHoldActiveError(Exception):
-    """Raised when an erasure request is created (or resolved to COMPLETED)
-    against an account with accounts.legal_hold set - an account under
-    litigation/investigation hold must not have its data erasure-requested
-    away. This is the actual enforcement this whole feature exists for."""
-
-
 class ErasureRequestNotFoundError(Exception):
-    """Raised when an erasure request id doesn't exist."""
+    """Raised resolving an erasure request that doesn't exist."""
 
 
 class ErasureRequestNotPendingError(Exception):
@@ -251,18 +281,101 @@ class ErasureRequestNotPendingError(Exception):
     currently PENDING - a request can only be resolved once."""
 
 
-def create_erasure_request(
-    db: Session, account_id: str, *, requested_by: str, notes: str | None = None
-) -> ErasureRequest:
-    """Customer (or staff, on a customer's behalf) asks that this account's
-    data be erased. Blocked outright while the account is under legal hold
-    (see LegalHoldActiveError) - a real litigation/investigation hold must
-    never be quietly bypassed by a self-service deletion request."""
+class AccountUnderLegalHoldError(Exception):
+    """Raised by create_erasure_request (fail fast - don't let a request be
+    opened that can never be completed) and by erase_account_data (the
+    same guardrail that already blocks every scheduled purge,
+    is_account_under_legal_hold, must also block a customer-rights
+    erasure, not just a routine retention-window purge) when the account
+    has an active legal hold. Staff must clear the hold
+    (app.staff.service.set_account_legal_hold) before an erasure request
+    on this account can be opened or completed."""
+
+
+def erase_account_data(db: Session, account_id: str, *, actor: str) -> dict[str, int]:
+    """Architecture doc §10 "right-to-erasure workflow" - the actual
+    cascade that resolve_erasure_request's COMPLETED status previously
+    only ASSUMED a human had carried out by hand, through unspecified
+    "domain tools" that didn't actually exist anywhere in this codebase
+    (real gap found in a full-backend audit). Does the following, for
+    real, right now (not on the 90-day retention-window schedule the daily
+    sweep uses - see purge_expired_recordings):
+
+    - Refuses outright if the account is under legal hold (same guardrail
+      every scheduled purge already respects - a hold must block an
+      erasure just as hard as it blocks a routine purge).
+    - Force-purges every voicemail/call/video recording immediately,
+      bypassing the normal retention_days age check (this is a rights-
+      driven immediate deletion, not a "it's finally old enough" sweep).
+    - Deletes the account's contacts outright (no billing/audit tie).
+    - Deletes the account's AI conversation summaries outright (no
+      billing/audit tie - the underlying recording is erased above).
+    - Redacts (not deletes - see ReceptionistCall.duration_seconds's role
+      in ai_receptionist_minutes billing) every PII field on the account's
+      AI Receptionist call records.
+
+    Deliberately does NOT touch CallRecord's own from_number/to_number/
+    duration/status columns, or usage/billing records - those are the
+    account's own billing and audit history, not the kind of "erasable"
+    data a DSAR right-to-erasure request reaches; the model's own PII
+    (the recording) is what gets erased above.
+    """
+    if is_account_under_legal_hold(db, account_id):
+        raise AccountUnderLegalHoldError(
+            f"Account {account_id!r} is under legal hold - clear the hold before this erasure request can be completed."
+        )
+
+    now = datetime.now(timezone.utc)
+    voicemail_purged, voicemail_failed = _purge_voicemails(db, now, account_id=account_id, force=True)
+    call_purged, call_failed = _purge_call_recordings(db, now, account_id=account_id, force=True)
+    video_purged, video_failed = _purge_video_recordings(db, now, account_id=account_id, force=True)
+
+    contacts_deleted = (
+        db.query(Contact).filter(Contact.account_id == account_id).delete(synchronize_session=False)
+    )
+    summaries_deleted = (
+        db.query(ConversationSummary).filter(ConversationSummary.account_id == account_id).delete(synchronize_session=False)
+    )
+
+    receptionist_calls_redacted = 0
+    for call in db.query(ReceptionistCall).filter(ReceptionistCall.account_id == account_id).all():
+        call.raw_transcript = ERASED_MARKER
+        call.caller_name = None
+        call.caller_company = None
+        call.reason = None
+        call.summary = None
+        call.caller_number = "[erased]"  # caller_number is String(20) - too short for ERASED_MARKER
+        receptionist_calls_redacted += 1
+
+    db.commit()
+    result = {
+        "voicemails_purged": voicemail_purged, "voicemails_failed": voicemail_failed,
+        "call_recordings_purged": call_purged, "call_recordings_failed": call_failed,
+        "video_recordings_purged": video_purged, "video_recordings_failed": video_failed,
+        "contacts_deleted": contacts_deleted, "summaries_deleted": summaries_deleted,
+        "receptionist_calls_redacted": receptionist_calls_redacted,
+    }
+    log_event(
+        db, actor_id=account_id, action="retention.account_data_erased",
+        target_type="account", target_id=account_id, metadata={**result, "erased_by": actor},
+    )
+    return result
+
+
+def create_erasure_request(db: Session, *, account_id: str, requested_by: str, notes: str | None = None) -> ErasureRequest:
+    """Architecture doc §10 "right-to-erasure workflow" - customer-
+    initiated, not automatic. Opens a staff-visible request; a human
+    decides what's actually erasable (some records must legally be
+    retained - billing/tax evidence, an open compliance case, a legal
+    hold) via resolve_erasure_request, same posture as ComplianceCase.
+    Blocked outright while the account is under legal hold - fail fast
+    rather than let a request be opened that resolve_erasure_request can
+    never actually complete."""
     account = db.query(Account).filter(Account.id == account_id).first()
     if account is None:
         raise ValueError(f"No such account: {account_id!r}")
     if account.legal_hold:
-        raise LegalHoldActiveError(
+        raise AccountUnderLegalHoldError(
             f"Account {account_id} is under legal hold ({account.legal_hold_reference or 'no reference'}) "
             "and cannot have an erasure request opened against it."
         )
@@ -280,49 +393,30 @@ def create_erasure_request(
     return request
 
 
-def list_erasure_requests(db: Session, *, status: ErasureRequestStatus | None = None) -> list[ErasureRequest]:
-    """Staff-facing list, across every account - same posture as
-    compliance's list_all_cases (listing isn't the sensitive action here,
-    resolving is - see resolve_erasure_request)."""
+def list_erasure_requests(db: Session, *, account_id: str | None = None) -> list[ErasureRequest]:
+    """Staff-facing queue (account_id=None) or a customer's own history
+    (account_id set) - same optional-filter shape as
+    app.compliance.service.list_all_cases."""
     query = db.query(ErasureRequest)
-    if status is not None:
-        query = query.filter(ErasureRequest.status == status)
+    if account_id is not None:
+        query = query.filter(ErasureRequest.account_id == account_id)
     return query.order_by(ErasureRequest.created_at.desc()).all()
 
 
-def list_erasure_requests_for_account(db: Session, account_id: str) -> list[ErasureRequest]:
-    """Customer-facing - own account only."""
-    return (
-        db.query(ErasureRequest)
-        .filter(ErasureRequest.account_id == account_id)
-        .order_by(ErasureRequest.created_at.desc())
-        .all()
-    )
-
-
 def resolve_erasure_request(
-    db: Session, request_id: str, *, status: ErasureRequestStatus, resolved_by: str,
-    resolution_notes: str | None = None,
+    db: Session, request_id: str, *, status: ErasureRequestStatus, resolution_notes: str | None, actor: str
 ) -> ErasureRequest:
-    """Marks a PENDING erasure request COMPLETED or REJECTED. Only a
-    PENDING request can be resolved (see ErasureRequestNotPendingError) -
-    there is no re-resolving an already-decided request.
-
-    IMPORTANT SCOPE BOUNDARY: marking a request COMPLETED does NOT trigger
-    any automated PII-scrubbing/data-deletion across the schema (numbers,
-    call records, billing, etc.) - it only records that a human resolved
-    the request through whatever real deletion process they used outside
-    this system. Building that automated deletion pipeline is a separate,
-    much larger piece of work than tracking the request lifecycle, same
-    scoping boundary this codebase draws elsewhere (see e.g. usage.service.
-    record_usage_event's ai_receptionist_minutes docstring: "meters usage
-    only, does not enforce billing" - this is that same kind of narrow,
-    explicitly-documented scope).
-
-    Re-checks legal_hold at resolution time (not just at creation time) for
-    a transition to COMPLETED - a hold could have been placed after the
-    request was submitted. REJECTED is always allowed regardless of hold
-    status, since rejecting an erasure request never destroys data."""
+    """Staff-only. Marking COMPLETED actually runs erase_account_data (real
+    gap fix - this used to only be staff ATTESTING that deletion happened
+    through unspecified "domain tools" that never actually existed).
+    Raises AccountUnderLegalHoldError if the account is under an active
+    legal hold - callers should surface that as a real error, not a
+    silent no-op resolution. REJECTED never deletes anything, matching a
+    DSAR that was legitimately refused (e.g. still-open compliance case,
+    retained billing/tax evidence). Only a PENDING request can be
+    resolved - there is no re-resolving an already-decided request."""
+    if status == ErasureRequestStatus.PENDING:
+        raise ValueError("resolve_erasure_request cannot set status back to PENDING")
     request = db.query(ErasureRequest).filter(ErasureRequest.id == request_id).first()
     if request is None:
         raise ErasureRequestNotFoundError(f"No such erasure request: {request_id!r}")
@@ -330,26 +424,18 @@ def resolve_erasure_request(
         raise ErasureRequestNotPendingError(
             f"Erasure request {request_id} is already {request.status.value}, cannot resolve again."
         )
-
     if status == ErasureRequestStatus.COMPLETED:
-        account = db.query(Account).filter(Account.id == request.account_id).first()
-        if account is not None and account.legal_hold:
-            raise LegalHoldActiveError(
-                f"Account {request.account_id} is under legal hold "
-                f"({account.legal_hold_reference or 'no reference'}) and this erasure request cannot be "
-                "completed while the hold is active."
-            )
-
-    before = {"status": request.status.value}
+        erase_account_data(db, request.account_id, actor=actor)
+    before_status = request.status
     request.status = status
-    request.resolved_by = resolved_by
+    request.resolved_by = actor
     request.resolution_notes = resolution_notes
     request.resolved_at = datetime.now(timezone.utc)
     db.commit()
     db.refresh(request)
     log_event(
-        db, actor=resolved_by, action="retention.erasure_request_resolved",
-        target=f"erasure_request:{request.id}", account_id=request.account_id,
-        before=before, after={"status": status.value, "resolution_notes": resolution_notes},
+        db, actor=actor, action="retention.erasure_request_resolved", target=f"erasure_request:{request.id}",
+        account_id=request.account_id,
+        before={"status": before_status.value}, after={"status": status.value, "resolution_notes": resolution_notes},
     )
     return request

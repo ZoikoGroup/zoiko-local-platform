@@ -441,6 +441,11 @@ def test_summarize_video_session_rejects_member_who_did_not_host(client, db_sess
     owner_me = client.get("/auth/me", headers=owner_headers).json()
     session = _make_video_session(db_session, owner_account_id, owner_me["id"], room_name="zl-test-host-only")
 
+    # Real gap fix (ZL-COM-ENT-001): adding a team member now requires
+    # team.members.enabled (Business+).
+    from app.billing import service as billing_service
+
+    billing_service.change_plan(db_session, owner_account_id, "business", actor="test-setup")
     client.post(
         "/team/members",
         json={"email": "intelvidhostmember@example.com", "password": "supersecret123", "role": "member"},
@@ -898,3 +903,50 @@ def test_staff_can_list_ai_jobs_filtered_by_status(client, db_session, monkeypat
     assert len(matching) == 1
     assert matching[0]["status"] == "failed"
     assert "simulated failure for staff listing test" in matching[0]["last_error"]
+
+
+# --- qualify_caller kill-switch / billing-suspension gate (real gap fix) ---
+
+
+def test_qualify_caller_skips_enrichment_when_ai_processing_kill_switch_is_active(client, db_session):
+    """Real bug fix: every batch summarize_* entry point checks the
+    AI_PROCESSING kill switch before spending a Groq credit, but the live
+    AI Receptionist call path (qualify_caller) never did - tripping the
+    kill switch didn't actually stop the receptionist's live Groq spend.
+    Must degrade to (None, None), not raise - a live call always needs a
+    TwiML response, same contract as the existing consent/trial-cap
+    checks in this function."""
+    from app.consent.models import ConsentType
+    from app.consent.service import grant_consent
+    from app.intelligence.service import qualify_caller
+    from app.ops.models import KillSwitchScope
+    from app.ops.service import set_kill_switch
+
+    _, account_id = _signup_and_login(client, "qualifykillswitch@example.com", "Qualify Kill Switch Co")
+    grant_consent(db_session, account_id, ConsentType.AI_PROCESSING)
+    set_kill_switch(db_session, KillSwitchScope.AI_PROCESSING, True, actor="staff-1", reason="test")
+
+    qualification, model_version = qualify_caller(db_session, account_id, "hi, my name is Sam, call me back")
+    assert qualification is None
+    assert model_version is None
+
+
+def test_qualify_caller_skips_enrichment_when_billing_is_suspended(client, db_session):
+    """Same fix as above - a canceled subscription must also skip AI
+    enrichment rather than raise, matching _analyze_and_store's
+    assert_billing_not_suspended gate on the batch summarization path."""
+    from app.billing import service as billing_service
+    from app.billing.models import SubscriptionStatus
+    from app.consent.models import ConsentType
+    from app.consent.service import grant_consent
+    from app.intelligence.service import qualify_caller
+
+    _, account_id = _signup_and_login(client, "qualifybillingsuspended@example.com", "Qualify Billing Co")
+    grant_consent(db_session, account_id, ConsentType.AI_PROCESSING)
+    sub = billing_service.get_or_create_subscription(db_session, account_id)
+    sub.status = SubscriptionStatus.CANCELED
+    db_session.commit()
+
+    qualification, model_version = qualify_caller(db_session, account_id, "hi, my name is Sam, call me back")
+    assert qualification is None
+    assert model_version is None

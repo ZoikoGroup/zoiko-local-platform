@@ -1,7 +1,7 @@
 from sqlalchemy.orm import Session
 
 from app.audit.service import log_event
-from app.billing.service import assert_seat_quota_available
+from app.billing.service import assert_entitlement, assert_seat_quota_available
 from app.core.security import (
     create_access_token,
     decode_access_token,
@@ -190,6 +190,14 @@ def add_team_member(
     if existing:
         raise ValueError("A user with this email already exists")
 
+    # ZL-COM-ENT-001 §7 matrix: "Team members, roles & number assignment:
+    # No (Starter) / Yes (Business+)" - Starter has no team-member
+    # capability at all, a distinct check from assert_seat_quota_available
+    # below (a numeric cap that only applies to plans that HAVE the
+    # feature). Real gap fix: previously a Starter account could add up to
+    # its Plan.max_team_seats members (5, per seed data) with no gate on
+    # the team feature itself at all.
+    assert_entitlement(db, account_id, "team.members.enabled")
     assert_seat_quota_available(db, account_id)
 
     member = User(

@@ -163,6 +163,13 @@ class Settings(BaseSettings):
     # immediately with no domain verification, for testing before that.
     resend_api_key: str = ""
     email_from_address: str = "onboarding@resend.dev"
+    # Email Communications System doc A-46 (BLOCKER) "environment
+    # isolation" - comma-separated recipient addresses that still get a
+    # real send outside production (your own inbox during manual testing).
+    # Blank means nobody does - every non-production send logs instead of
+    # actually going out, same "blank disables" pattern as everywhere else
+    # in this file.
+    notification_test_recipients: str = ""
     # Signing secret for Resend's webhook events (bounce/complaint/delivered/
     # clicked) - format "whsec_..." like Svix's other webhook products.
     # Blank until a webhook endpoint is registered in the Resend dashboard;

@@ -88,11 +88,17 @@ def test_owner_can_list_their_own_account_events(client):
     assert "user.login" in actions
 
 
-def test_member_cannot_list_account_events(client):
+def test_member_cannot_list_account_events(client, db_session):
     """Same reasoning as consent/compliance: an account's own audit trail
     is an Owner/Admin-level view, not something every Member can browse."""
+    from app.billing import service as billing_service
+
     owner_token = _signup_and_login(client, "auditmemberowner@example.com")
     owner_headers = {"Authorization": f"Bearer {owner_token}"}
+    # Real gap fix (ZL-COM-ENT-001): adding a team member now requires
+    # team.members.enabled (Business+).
+    owner_account_id = client.get("/auth/me", headers=owner_headers).json()["account_id"]
+    billing_service.change_plan(db_session, owner_account_id, "business", actor="test-setup")
     client.post(
         "/team/members",
         json={"email": "auditmembermember@example.com", "password": "supersecret123", "role": "member"},

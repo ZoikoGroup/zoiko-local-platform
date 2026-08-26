@@ -229,6 +229,45 @@ def upsert_supported_country(
     return country
 
 
+def update_country_registry_fields(
+    db: Session, code: str, *, customer_type_restrictions: list[str] | None, porting_supported: bool,
+    recording_consent_basis: str | None, payments_enabled: bool, marketing_claims_approved: bool, actor: str,
+) -> SupportedCountry:
+    """Commercial Billing Operating Standard doc §34 registry dimensions -
+    separate from upsert_supported_country (which only ever covered basic
+    country creation/enablement) since these represent a distinct real
+    review per dimension, not a bundled property of adding a country to
+    the list. Same SUPER_ADMIN bar as every other registry mutation on
+    this table."""
+    country = db.query(SupportedCountry).filter(SupportedCountry.code == code).first()
+    if country is None:
+        raise UnsupportedCountryError(f"{code!r} is not on Zoiko Local's supported country list yet")
+    before = {
+        "customer_type_restrictions": country.customer_type_restrictions,
+        "porting_supported": country.porting_supported,
+        "recording_consent_basis": country.recording_consent_basis,
+        "payments_enabled": country.payments_enabled,
+        "marketing_claims_approved": country.marketing_claims_approved,
+    }
+    country.customer_type_restrictions = customer_type_restrictions
+    country.porting_supported = porting_supported
+    country.recording_consent_basis = recording_consent_basis
+    country.payments_enabled = payments_enabled
+    country.marketing_claims_approved = marketing_claims_approved
+    db.commit()
+    db.refresh(country)
+    _invalidate_supported_countries_cache()
+    log_event(
+        db, actor=actor, action="numbering.country_registry_fields_updated", target=f"supported_country:{code}",
+        before=before, after={
+            "customer_type_restrictions": customer_type_restrictions, "porting_supported": porting_supported,
+            "recording_consent_basis": recording_consent_basis, "payments_enabled": payments_enabled,
+            "marketing_claims_approved": marketing_claims_approved,
+        },
+    )
+    return country
+
+
 def remove_supported_country(db: Session, code: str) -> None:
     db.query(SupportedCountry).filter(SupportedCountry.code == code).delete()
     db.commit()
@@ -918,6 +957,13 @@ def reserve_number(db: Session, account_id: str, e164: str, country: str, number
         metadata={"e164": e164},
     )
     publish_number_reserved(account_id, number_id=number.id, e164=e164, country=country)
+
+    # Deferred import - see reactivate_numbers_for_account_by_staff's
+    # comment on why (app.risk.service imports this module already).
+    from app.risk.service import check_number_acquisition_velocity
+
+    check_number_acquisition_velocity(db, account_id)
+
     return number
 
 
@@ -1085,11 +1131,17 @@ def purchase_number(db: Session, account_id: str, e164: str) -> PhoneNumber:
 
     try:
         bought = telecom.buy_number(e164, bundle_sid=bundle_sid)
-    except telecom.TelecomError:
+    except telecom.TelecomError as e:
         # payment/provisioning failure must not strand the number silently —
         # release it back to Reserved so the customer can retry or it can expire
         number.status = PhoneNumberStatus.RESERVED
         number.provisioning_started_at = None
+        # Architecture doc's "Provisioning Job... retry_count, error_code" -
+        # see PhoneNumber.last_provisioning_error_code's docstring. Not
+        # cleared on the eventual success - the count is a lifetime total,
+        # not "attempts since the last failure."
+        number.last_provisioning_error_code = str(e)[:100]
+        number.provisioning_attempt_count += 1
         db.commit()
         _invalidate_numbers_cache(account_id)
         log_event(
@@ -1108,6 +1160,7 @@ def purchase_number(db: Session, account_id: str, e164: str) -> PhoneNumber:
     number.provider_sid = bought["sid"]
     number.reserved_until = None
     number.provisioning_started_at = None
+    number.provisioning_attempt_count += 1
     number.next_renewal_at = now + timedelta(days=RENEWAL_PERIOD_DAYS)
     db.commit()
     db.refresh(number)
@@ -1208,6 +1261,11 @@ def revoke_caller_identity(
         target_type="caller_identity", target_id=identity.id, reason=reason,
         metadata={"phone_number_id": phone_number_id, "before_status": before_status.value},
     )
+
+    from app.risk.service import check_caller_id_change_velocity
+
+    check_caller_id_change_velocity(db, identity.account_id)
+
     return identity
 
 
@@ -1229,6 +1287,11 @@ def reinstate_caller_identity(
         target_type="caller_identity", target_id=identity.id, reason=reason,
         metadata={"phone_number_id": phone_number_id, "before_status": before_status.value},
     )
+
+    from app.risk.service import check_caller_id_change_velocity
+
+    check_caller_id_change_velocity(db, identity.account_id)
+
     return identity
 
 
@@ -1282,6 +1345,21 @@ def create_number_purchase_checkout_session(db: Session, account_id: str, e164: 
 
     rate = usage_service.get_number_rate(db, number.country, number.number_type)
     rate_cents = rate.recurring_price_cents if rate is not None else NUMBER_PURCHASE_PRICE_CENTS
+
+    # Real bug fix: is_first_number_included's count-then-act check had no
+    # lock on anything account-scoped, only on the individual PhoneNumber
+    # row being purchased (see reserve_number's own SELECT...FOR UPDATE,
+    # which protects a DIFFERENT race - two purchasers racing for the SAME
+    # e164). Two concurrent checkouts for two DIFFERENT e164s on the same
+    # account could both read included_count < seat_count as true before
+    # either committed, and both take the zero-surcharge path below -
+    # granting two free numbers instead of one. Locking the Account row
+    # here serializes concurrent purchases for the SAME account (this
+    # lock is released at purchase_number's own commit just below, in
+    # every branch, once the number's status becomes one
+    # get_included_number_ids counts) - it does not serialize purchases
+    # across DIFFERENT accounts, which never contended in the first place.
+    db.query(Account).filter(Account.id == account_id).with_for_update().first()
 
     if billing_service.is_first_number_included(db, account_id, exclude_number_id=number.id):
         surcharge_cents = max(0, rate_cents - NUMBER_INCLUSION_THRESHOLD_CENTS)
@@ -1387,9 +1465,11 @@ def retry_provisioning(db: Session, staff_id: str, number_id: str) -> PhoneNumbe
 
     try:
         bought = telecom.buy_number(number.e164)
-    except telecom.TelecomError:
+    except telecom.TelecomError as e:
         number.status = PhoneNumberStatus.RESERVED
         number.provisioning_started_at = None
+        number.last_provisioning_error_code = str(e)[:100]
+        number.provisioning_attempt_count += 1
         db.commit()
         _invalidate_numbers_cache(number.account_id)
         log_event(
@@ -1402,6 +1482,7 @@ def retry_provisioning(db: Session, staff_id: str, number_id: str) -> PhoneNumbe
     number.provider_sid = bought["sid"]
     number.reserved_until = None
     number.provisioning_started_at = None
+    number.provisioning_attempt_count += 1
     number.next_renewal_at = datetime.now(timezone.utc) + timedelta(days=RENEWAL_PERIOD_DAYS)
     db.commit()
     db.refresh(number)
@@ -1793,6 +1874,18 @@ def configure_routing(
         if nominee is None:
             raise NumberConflictError(f"No team member with id {escalation_user_id} on this account")
 
+    # ZL-COM-ENT-001 §7 matrix: "Business-hours & team routing: No (Starter)
+    # / Yes (Business+)" - configuring business hours at all (not just
+    # enabling the feature flag) is the Business+ capability. Checked only
+    # when hours are actually being SET (not on every save with hours left
+    # None) so a Starter account clearing/leaving hours unset is unaffected.
+    if (business_hours_start is not None or business_hours_end is not None) and not billing_service.has_entitlement(
+        db, user.account_id, "routing.business_hours"
+    ):
+        raise billing_service.EntitlementRequiredError(
+            "routing.business_hours", billing_service.get_or_create_subscription(db, user.account_id).plan_code
+        )
+
     number.forwarding_number = forwarding_number
     number.business_hours_start = business_hours_start
     number.business_hours_end = business_hours_end
@@ -1838,6 +1931,16 @@ def set_ring_group(db: Session, user: User, e164: str, destinations: list[str]) 
 
     if len(destinations) > MAX_RING_GROUP_SIZE:
         raise RingGroupTooLargeError(f"A ring group may have up to {MAX_RING_GROUP_SIZE} destinations")
+
+    # ZL-COM-ENT-001 §7 matrix: "Shared call handling: No (Starter) / Yes
+    # (Business+)" - a single destination is just personal forwarding
+    # (already available to every plan via forwarding_number); 2+
+    # destinations ringing simultaneously is the actual "shared handling"
+    # capability being gated here.
+    if len(destinations) > 1 and not billing_service.has_entitlement(db, user.account_id, "routing.shared_handling"):
+        raise billing_service.EntitlementRequiredError(
+            "routing.shared_handling", billing_service.get_or_create_subscription(db, user.account_id).plan_code
+        )
 
     db.query(RingGroupDestination).filter(RingGroupDestination.phone_number_id == number.id).delete()
     rows = [

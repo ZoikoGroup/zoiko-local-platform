@@ -30,9 +30,17 @@ class CallingRate(Base):
     visibility; it does not charge anyone."""
 
     __tablename__ = "calling_rates"
+    __table_args__ = (
+        UniqueConstraint("country", "destination_country", name="uq_calling_rate_country_destination"),
+    )
 
     id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=new_uuid)
-    country: Mapped[str] = mapped_column(String(2), unique=True, nullable=False, index=True)
+    country: Mapped[str] = mapped_column(String(2), nullable=False, index=True)
+    # NULL = origin-only rate (every row today - see this class's docstring
+    # on why destination-based rating isn't implemented yet). A real,
+    # non-NULL value is the schema hook for that future work; nothing reads
+    # it yet, so adding this column doesn't change today's pricing behavior.
+    destination_country: Mapped[str | None] = mapped_column(String(2), nullable=True, index=True)
     price_per_minute_cents: Mapped[int] = mapped_column(Integer, nullable=False)
     currency: Mapped[str] = mapped_column(String(3), nullable=False, default="USD")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

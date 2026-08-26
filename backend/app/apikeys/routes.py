@@ -4,7 +4,7 @@ from sqlalchemy.orm import Session
 from app.apikeys import service
 from app.apikeys.schemas import ApiKeyCreatedResponse, ApiKeyResponse, CreateApiKeyRequest
 from app.core.database import get_db
-from app.core.deps import require_admin
+from app.core.deps import require_admin, require_entitlement
 from app.numbering.identity.models import User
 
 router = APIRouter(prefix="/developer/api-keys", tags=["developer"])
@@ -15,6 +15,7 @@ def create_api_key(
     payload: CreateApiKeyRequest,
     db: Session = Depends(get_db),
     current_user: User = Depends(require_admin),
+    _entitlement: User = Depends(require_entitlement("developer.api")),
 ):
     try:
         key, raw_key = service.create_api_key(

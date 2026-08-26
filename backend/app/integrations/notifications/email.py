@@ -78,6 +78,23 @@ def send_email(
         logger.info("EMAIL (no Resend API key configured) to=%s subject=%r body=%r headers=%r", to, subject, body, headers)
         return None
 
+    # Email Communications System doc A-46 (BLOCKER) "environment
+    # isolation" - a real API key present in dev/staging used to mean any
+    # address passed through this function got a real email, with the only
+    # guard being "is a key configured" rather than "is this production."
+    # notification_test_recipients is a small comma-separated allowlist
+    # (your own inbox during testing) that still gets real sends outside
+    # production; everyone else gets logged instead, same shape as the
+    # no-API-key branch above.
+    allowlist = {addr.strip().lower() for addr in settings.notification_test_recipients.split(",") if addr.strip()}
+    if settings.environment != "production" and to.strip().lower() not in allowlist:
+        logger.info(
+            "EMAIL (non-production environment, %r not on notification_test_recipients allowlist) "
+            "to=%s subject=%r body=%r headers=%r",
+            settings.environment, to, subject, body, headers,
+        )
+        return None
+
     def _primary() -> str | None:
         try:
             with trace_provider_call("resend", "send_email"):

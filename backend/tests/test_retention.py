@@ -1,6 +1,6 @@
 from datetime import datetime, timedelta, timezone
 
-from app.media.models import CallDirection, CallRecord, VideoSession, VideoSessionStatus, Voicemail
+from app.media.models import CallDirection, CallRecord, ReceptionistCall, VideoSession, VideoSessionStatus, Voicemail
 from app.numbering.numbers.models import PhoneNumber, PhoneNumberStatus
 
 
@@ -340,3 +340,164 @@ def test_purge_leaves_video_recording_url_untouched_when_storage_deletion_fails(
 
     db_session.refresh(session)
     assert session.recording_url == original_url  # untouched - safe to retry next run
+
+
+# --- erase_account_data / right-to-erasure (real gap fix) ---
+
+
+def _make_contact(db_session, account_id: str) -> "Contact":
+    from app.contacts.models import Contact
+
+    contact = Contact(account_id=account_id, name="Jane Erasable", phone_number="+15551230000")
+    db_session.add(contact)
+    db_session.commit()
+    return contact
+
+
+def _make_conversation_summary(db_session, account_id: str) -> "ConversationSummary":
+    from app.intelligence.models import ConversationSummary, SummarySourceType
+    from app.core.ids import new_uuid
+
+    summary = ConversationSummary(
+        account_id=account_id, source_type=SummarySourceType.VOICEMAIL, source_id=new_uuid(),
+        transcript="hello this is a real transcript", summary="caller left a message",
+    )
+    db_session.add(summary)
+    db_session.commit()
+    return summary
+
+
+def _make_receptionist_call(db_session, account_id: str, phone_number_id: str) -> ReceptionistCall:
+    call = ReceptionistCall(
+        account_id=account_id, phone_number_id=phone_number_id, call_sid=f"CA_erasetest_{account_id}",
+        caller_number="+15559998888", raw_transcript="my real phone number is 555-0000, call me back",
+        caller_name="Jane Caller", caller_company="Jane Co", reason="wants a callback",
+    )
+    db_session.add(call)
+    db_session.commit()
+    return call
+
+
+def test_erase_account_data_raises_when_account_under_legal_hold(db_session):
+    from app.numbering.identity.models import Account, AccountType
+    from app.retention.service import AccountUnderLegalHoldError, erase_account_data
+
+    account = Account(name="Erase Legal Hold Co", account_type=AccountType.INDIVIDUAL, legal_hold=True)
+    db_session.add(account)
+    db_session.commit()
+
+    _make_contact(db_session, account.id)
+
+    try:
+        erase_account_data(db_session, account.id, actor="staff-1")
+        assert False, "expected AccountUnderLegalHoldError"
+    except AccountUnderLegalHoldError:
+        pass
+
+    # Nothing was touched - the hold blocked the erasure before any deletion.
+    from app.contacts.models import Contact
+
+    assert db_session.query(Contact).filter(Contact.account_id == account.id).count() == 1
+
+
+def test_erase_account_data_deletes_contacts_and_summaries_and_redacts_receptionist_calls(db_session, monkeypatch):
+    from app.contacts.models import Contact
+    from app.intelligence.models import ConversationSummary
+    from app.numbering.identity.models import Account, AccountType
+
+    account = Account(name="Erase Full Co", account_type=AccountType.INDIVIDUAL)
+    db_session.add(account)
+    db_session.commit()
+
+    number = PhoneNumber(e164="+15550002222", country="US", status=PhoneNumberStatus.ACTIVE, account_id=account.id)
+    db_session.add(number)
+    db_session.commit()
+
+    _make_contact(db_session, account.id)
+    _make_conversation_summary(db_session, account.id)
+    call = _make_receptionist_call(db_session, account.id, number.id)
+
+    from app.retention.service import erase_account_data
+
+    result = erase_account_data(db_session, account.id, actor="staff-1")
+
+    assert result["contacts_deleted"] == 1
+    assert result["summaries_deleted"] == 1
+    assert result["receptionist_calls_redacted"] == 1
+    assert db_session.query(Contact).filter(Contact.account_id == account.id).count() == 0
+    assert db_session.query(ConversationSummary).filter(ConversationSummary.account_id == account.id).count() == 0
+
+    db_session.refresh(call)
+    assert "555-0000" not in call.raw_transcript
+    assert call.caller_name is None
+    assert call.caller_company is None
+    assert call.reason is None
+    assert call.caller_number == "[erased]"
+
+
+def test_erase_account_data_force_purges_a_recent_recording_ignoring_retention_window(db_session, monkeypatch):
+    deleted_sids = []
+    monkeypatch.setattr(
+        "app.retention.service.telecom.delete_recording", lambda sid: deleted_sids.append(sid)
+    )
+    from app.numbering.identity.models import Account, AccountType
+
+    account = Account(name="Erase Recent Recording Co", account_type=AccountType.INDIVIDUAL)
+    db_session.add(account)
+    db_session.commit()
+
+    recent = datetime.now(timezone.utc) - timedelta(days=1)  # nowhere near the 90-day default retention window
+    _make_voicemail(db_session, account.id, "+15550003333", created_at=recent)
+
+    from app.retention.service import erase_account_data
+
+    result = erase_account_data(db_session, account.id, actor="staff-1")
+
+    assert result["voicemails_purged"] == 1
+    assert deleted_sids == ["REtest123"]
+
+    vm = db_session.query(Voicemail).filter(Voicemail.account_id == account.id).first()
+    assert vm.recording_url == "[deleted - retention policy]"
+
+
+def test_resolve_erasure_request_completing_actually_erases_the_data(db_session):
+    from app.numbering.identity.models import Account, AccountType
+    from app.retention.models import ErasureRequestStatus
+    from app.retention.service import create_erasure_request, resolve_erasure_request
+
+    account = Account(name="Resolve Erasure Co", account_type=AccountType.INDIVIDUAL)
+    db_session.add(account)
+    db_session.commit()
+    _make_contact(db_session, account.id)
+
+    request = create_erasure_request(db_session, account_id=account.id, requested_by=account.id, notes="delete me")
+    resolve_erasure_request(
+        db_session, request.id, status=ErasureRequestStatus.COMPLETED, resolution_notes="done", actor="staff-1",
+    )
+
+    from app.contacts.models import Contact
+
+    assert db_session.query(Contact).filter(Contact.account_id == account.id).count() == 0
+
+
+def test_resolve_erasure_request_completing_refuses_when_account_under_legal_hold(db_session):
+    from app.numbering.identity.models import Account, AccountType
+    from app.retention.models import ErasureRequestStatus
+    from app.retention.service import AccountUnderLegalHoldError, create_erasure_request, resolve_erasure_request
+
+    account = Account(name="Resolve Erasure Hold Co", account_type=AccountType.INDIVIDUAL, legal_hold=True)
+    db_session.add(account)
+    db_session.commit()
+
+    request = create_erasure_request(db_session, account_id=account.id, requested_by=account.id, notes="delete me")
+
+    try:
+        resolve_erasure_request(
+            db_session, request.id, status=ErasureRequestStatus.COMPLETED, resolution_notes="done", actor="staff-1",
+        )
+        assert False, "expected AccountUnderLegalHoldError"
+    except AccountUnderLegalHoldError:
+        pass
+
+    db_session.refresh(request)
+    assert request.status == ErasureRequestStatus.PENDING  # never advanced past PENDING

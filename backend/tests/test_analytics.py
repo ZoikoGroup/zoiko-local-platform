@@ -16,8 +16,31 @@ def _signup_and_login(client, email: str) -> tuple[str, str]:
     return token, account_id
 
 
+def _signup_login_and_upgrade_to_pro(client, db_session, email: str) -> tuple[str, str]:
+    """Real gap fix (ZL-COM-ENT-001): reporting.advanced is now a Pro+
+    entitlement (see app.billing.service.has_entitlement/app.core.deps.
+    require_entitlement) - a free_trial account no longer qualifies, unlike
+    before this gate existed. See test_free_trial_account_cannot_access_
+    analytics below for the gate itself."""
+    from app.billing import service as billing_service
+
+    token, account_id = _signup_and_login(client, email)
+    billing_service.change_plan(db_session, account_id, "pro", actor="test-setup")
+    return token, account_id
+
+
+def test_free_trial_account_cannot_access_analytics(client):
+    token, _account_id = _signup_and_login(client, "analytics-freetrial1@example.com")
+    response = client.get("/analytics/overview", headers={"Authorization": f"Bearer {token}"})
+    assert response.status_code == 402
+    body = response.json()["detail"]
+    assert body["code"] == "ENTITLEMENT_REQUIRED"
+    assert body["entitlement"] == "reporting.advanced"
+    assert body["current_plan"] == "free_trial"
+
+
 def test_overview_aggregates_calls_video_and_messages(client, db_session):
-    token, account_id = _signup_and_login(client, "analytics1@example.com")
+    token, account_id = _signup_login_and_upgrade_to_pro(client, db_session, "analytics1@example.com")
     headers = {"Authorization": f"Bearer {token}"}
     me = client.get("/auth/me", headers=headers).json()
 
@@ -96,7 +119,7 @@ def test_overview_aggregates_calls_video_and_messages(client, db_session):
 
 
 def test_overview_excludes_data_outside_the_range(client, db_session):
-    token, account_id = _signup_and_login(client, "analytics2@example.com")
+    token, account_id = _signup_login_and_upgrade_to_pro(client, db_session, "analytics2@example.com")
     headers = {"Authorization": f"Bearer {token}"}
 
     old = datetime.now(timezone.utc) - timedelta(days=45)
@@ -113,8 +136,12 @@ def test_overview_excludes_data_outside_the_range(client, db_session):
     assert response.json()["total_calls"] == 0
 
 
-def test_overview_requires_admin(client):
-    owner_token, _ = _signup_and_login(client, "analyticsowner3@example.com")
+def test_overview_requires_admin(client, db_session):
+    # Real gap fix (ZL-COM-ENT-001): adding a team member now requires
+    # team.members.enabled (Business+) - _signup_login_and_upgrade_to_pro
+    # (already used elsewhere in this file for reporting.advanced) covers
+    # both gates at once since Pro grants both.
+    owner_token, _ = _signup_login_and_upgrade_to_pro(client, db_session, "analyticsowner3@example.com")
     owner_headers = {"Authorization": f"Bearer {owner_token}"}
     client.post(
         "/team/members",
@@ -130,7 +157,7 @@ def test_overview_requires_admin(client):
 
 
 def test_export_csv_returns_header_and_daily_rows(client, db_session):
-    token, account_id = _signup_and_login(client, "analytics4@example.com")
+    token, account_id = _signup_login_and_upgrade_to_pro(client, db_session, "analytics4@example.com")
     headers = {"Authorization": f"Bearer {token}"}
 
     db_session.add(
