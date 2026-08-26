@@ -3,13 +3,17 @@
 import { useState } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
-import { login, ApiError } from "@/lib/api";
+import { login, googleAuth, completeMfaLogin, ApiError } from "@/lib/api";
 import { saveToken } from "@/lib/auth";
+import AuthLayout from "@/components/AuthLayout";
+import GoogleSignInButton from "@/components/GoogleSignInButton";
 
 export default function LoginPage() {
   const router = useRouter();
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [code, setCode] = useState("");
+  const [mfaToken, setMfaToken] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
 
@@ -18,8 +22,16 @@ export default function LoginPage() {
     setError(null);
     setLoading(true);
     try {
-      const { access_token } = await login({ email, password });
-      saveToken(access_token);
+      const result = await login({ email, password });
+      if (result.mfa_required && result.mfa_token) {
+        setMfaToken(result.mfa_token);
+        return;
+      }
+      if (!result.access_token) {
+        setError("Something went wrong signing in.");
+        return;
+      }
+      saveToken(result.access_token);
       router.push("/dashboard");
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Something went wrong");
@@ -28,64 +40,140 @@ export default function LoginPage() {
     }
   }
 
-  return (
-    <div className="min-h-screen flex items-center justify-center bg-slate-50">
-      <div className="w-full max-w-sm bg-white rounded-2xl shadow-sm border border-slate-200 p-8">
-        <div className="flex items-center gap-2 mb-6">
-          <div className="w-9 h-9 rounded-lg bg-indigo-600 text-white flex items-center justify-center font-bold">
-            Z
-          </div>
-          <div>
-            <div className="font-semibold text-slate-900">Zoiko Local</div>
-            <div className="text-xs text-slate-500">Communications Platform</div>
-          </div>
-        </div>
+  async function handleMfaSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    if (!mfaToken) return;
+    setError(null);
+    setLoading(true);
+    try {
+      const { access_token } = await completeMfaLogin(mfaToken, code);
+      saveToken(access_token);
+      router.push("/dashboard");
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Invalid code");
+    } finally {
+      setLoading(false);
+    }
+  }
 
-        <h1 className="text-xl font-semibold text-slate-900 mb-1">Log in</h1>
-        <p className="text-sm text-slate-500 mb-6">Welcome back — sign in to continue.</p>
+  async function handleGoogleCredential(credential: string) {
+    setError(null);
+    try {
+      const { access_token, is_new_account } = await googleAuth(credential);
+      saveToken(access_token);
+      // Symmetric with the signup page - someone who's never signed up
+      // before can also land on /login and use Google first, which
+      // creates their account here too. New accounts go through plan
+      // selection either way.
+      router.push(is_new_account ? "/choose-plan" : "/dashboard");
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Google sign-in failed");
+    }
+  }
 
-        <form onSubmit={handleSubmit} className="space-y-4">
-          <div>
-            <label className="block text-sm font-medium text-slate-700 mb-1">Email</label>
-            <input
-              type="email"
-              required
-              value={email}
-              onChange={(e) => setEmail(e.target.value)}
-              className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
-              placeholder="you@example.com"
-            />
-          </div>
-          <div>
-            <label className="block text-sm font-medium text-slate-700 mb-1">Password</label>
-            <input
-              type="password"
-              required
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-              className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
-              placeholder="••••••••"
-            />
-          </div>
+  if (mfaToken) {
+    return (
+      <AuthLayout title="Two-factor verification" subtitle="Enter the 6-digit code from your authenticator app.">
+        <form onSubmit={handleMfaSubmit} className="space-y-4">
+          <input
+            type="text"
+            inputMode="numeric"
+            autoFocus
+            required
+            maxLength={6}
+            value={code}
+            onChange={(e) => setCode(e.target.value.replace(/\D/g, ""))}
+            className="w-full rounded-lg border border-slate-300 px-3.5 py-2.5 text-center text-lg tracking-[0.5em] font-mono placeholder:tracking-normal placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-indigo-500/40 focus:border-indigo-500 transition"
+            placeholder="000000"
+          />
 
-          {error && <p className="text-sm text-red-600">{error}</p>}
+          {error && <p className="text-sm text-red-600 bg-red-50 rounded-lg px-3 py-2">{error}</p>}
 
           <button
             type="submit"
-            disabled={loading}
-            className="w-full bg-indigo-600 hover:bg-indigo-700 disabled:opacity-60 text-white rounded-lg py-2 text-sm font-medium transition"
+            disabled={loading || code.length !== 6}
+            className="w-full flex items-center justify-center gap-2 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-60 text-white rounded-lg py-2.5 text-sm font-medium transition shadow-sm shadow-indigo-600/20"
           >
-            {loading ? "Logging in..." : "Log in"}
+            {loading ? "Verifying..." : "Verify"}
+          </button>
+
+          <button
+            type="button"
+            onClick={() => {
+              setMfaToken(null);
+              setCode("");
+              setError(null);
+            }}
+            className="w-full text-xs text-slate-600 hover:text-slate-700"
+          >
+            Back to login
           </button>
         </form>
+      </AuthLayout>
+    );
+  }
 
-        <p className="text-sm text-slate-500 mt-6 text-center">
-          Don&apos;t have an account?{" "}
-          <Link href="/signup" className="text-indigo-600 font-medium">
-            Sign up
-          </Link>
-        </p>
+  return (
+    <AuthLayout title="Welcome back" subtitle="Log in to continue to your account.">
+      <GoogleSignInButton onCredential={handleGoogleCredential} />
+
+      <div className="flex items-center gap-3 my-5">
+        <div className="h-px bg-slate-200 flex-1" />
+        <span className="text-xs text-slate-600">or continue with email</span>
+        <div className="h-px bg-slate-200 flex-1" />
       </div>
-    </div>
+
+      <form onSubmit={handleSubmit} className="space-y-4">
+        <div>
+          <label className="block text-sm font-medium text-slate-700 mb-1.5">Email</label>
+          <input
+            type="email"
+            required
+            value={email}
+            onChange={(e) => setEmail(e.target.value)}
+            className="w-full rounded-lg border border-slate-300 px-3.5 py-2.5 text-sm placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-indigo-500/40 focus:border-indigo-500 transition"
+            placeholder="you@example.com"
+          />
+        </div>
+        <div>
+          <div className="flex items-center justify-between mb-1.5">
+            <label className="block text-sm font-medium text-slate-700">Password</label>
+            <Link href="/forgot-password" className="text-xs text-indigo-600 hover:text-indigo-700">
+              Forgot password?
+            </Link>
+          </div>
+          <input
+            type="password"
+            required
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            className="w-full rounded-lg border border-slate-300 px-3.5 py-2.5 text-sm placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-indigo-500/40 focus:border-indigo-500 transition"
+            placeholder="••••••••"
+          />
+        </div>
+
+        {error && (
+          <p className="text-sm text-red-600 bg-red-50 rounded-lg px-3 py-2">{error}</p>
+        )}
+
+        <button
+          type="submit"
+          disabled={loading}
+          className="w-full flex items-center justify-center gap-2 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-60 text-white rounded-lg py-2.5 text-sm font-medium transition shadow-sm shadow-indigo-600/20"
+        >
+          {loading && (
+            <span className="w-4 h-4 border-2 border-white/40 border-t-white rounded-full animate-spin" />
+          )}
+          {loading ? "Logging in..." : "Log in"}
+        </button>
+      </form>
+
+      <p className="text-sm text-slate-500 mt-6 text-center">
+        Don&apos;t have an account?{" "}
+        <Link href="/signup" className="text-indigo-600 font-medium hover:text-indigo-700">
+          Sign up
+        </Link>
+      </p>
+    </AuthLayout>
   );
 }

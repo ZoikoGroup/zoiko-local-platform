@@ -1,0 +1,86 @@
+/* ==========================================================================
+   ZOIKO LOCAL — STAFF / OPS CONSOLE THEME
+   --------------------------------------------------------------------------
+   Deliberately a different colour identity from the customer dashboard, so
+   an operator can never mistake one for the other at a glance:
+
+     CUSTOMER  light beige surfaces  #F6F2EC   green chrome    ORANGE accent
+     STAFF     dark ink surfaces     #08110F   cool grey-green TEAL accent
+
+   HOW THIS WORKS
+   Tailwind v4 utilities compile to `var(--color-slate-400)` etc. Custom
+   properties inherit, so redefining them on an ancestor re-themes
+   everything inside it — with zero changes to any class name.
+
+   Scoping to `.staff-scope` means the customer dashboard's beige/orange
+   theme in globals.css is completely untouched. Nothing here leaks out.
+
+   This is why none of the 10 console page files needed editing.
+
+   IMPORTANT — why the ramp is redefined at all:
+   globals.css maps slate to a LIGHT ramp (slate-50 = beige page,
+   slate-800 = mid green). The staff console is a DARK UI that uses
+   slate-900 as card background and slate-800 as border. Under the
+   customer ramp, `border-slate-800` (#0a4f4a) on `bg-slate-900`
+   (#073b37) is nearly invisible and input backgrounds come out too
+   light and saturated. The values below restore proper dark-UI
+   separation.
+   ========================================================================== */
+
+.staff-scope {
+  /* ---- SURFACES + TEXT: near-black teal ink -------------------------- */
+  /* Same light-to-dark direction as any normal ramp, so class names still
+     read the way you expect. Mid tones (500/600) are picked to stay legible
+     on BOTH the dark shell and the light card on the login screen. */
+  --color-slate-50: #f2f7f6; /* login form panel background        */
+  --color-slate-100: #e7efed;
+  --color-slate-200: #dde8e5; /* bright text on dark                */
+  --color-slate-300: #c0d0cc; /* secondary text on dark             */
+  --color-slate-400: #90a39e; /* muted text — 118 uses, 8:1 on ink  */
+  --color-slate-500: #6c807b; /* placeholders; 5.0:1 dark, 4.6:1 lt */
+  --color-slate-600: #54655f; /* hover fills                        */
+  --color-slate-700: #24352f; /* active tab fill, input border      */
+  --color-slate-800: #1a2823; /* borders, input background          */
+  --color-slate-900: #101c19; /* card / panel background            */
+  --color-slate-950: #08110f; /* page background                    */
+
+  /* ---- PRIMARY: teal (customer panel uses orange here) --------------- */
+  --color-indigo-50: #eefbf8;
+  --color-indigo-100: #d3f5ef;
+  --color-indigo-200: #a7ebe1;
+  --color-indigo-300: #5eead4; /* bright links on dark               */
+  --color-indigo-400: #2dd4bf; /* accent text on dark                */
+  --color-indigo-500: #14b8a6; /* focus rings, active borders        */
+  --color-indigo-600: #0f766e; /* primary buttons, 5.1:1 with white  */
+  --color-indigo-700: #115e59; /* hover                              */
+  --color-indigo-800: #124f49;
+  --color-indigo-900: #103f3b;
+  --color-indigo-950: #042f2c; /* dark badge fills                   */
+
+  /* ---- STATUS: kept semantic, retuned for a dark background --------- */
+  /* These are read as badge text (400) on a deep fill (950), so both ends
+     of each ramp matter more here than the mid tones. */
+  --color-emerald-400: #34d399;
+  --color-emerald-600: #059669;
+  --color-emerald-700: #047857;
+  --color-emerald-900: #064e3b;
+  --color-emerald-950: #052e26;
+
+  --color-amber-400: #fbbf24;
+  --color-amber-700: #b45309;
+  --color-amber-800: #92400e;
+  --color-amber-900: #78350f;
+  --color-amber-950: #2e1a06;
+
+  --color-red-400: #f87171;
+  --color-red-600: #dc2626;
+  --color-red-700: #b91c1c;
+  --color-red-900: #7f1d1d;
+  --color-red-950: #300f0f;
+}
+
+/* Grey scrollbars look wrong against ink surfaces. */
+.staff-scope * {
+  scrollbar-color: #24352f transparent;
+  scrollbar-width: thin;
+}
