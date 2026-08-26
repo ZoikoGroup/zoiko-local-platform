@@ -249,9 +249,12 @@ def list_owned_numbers() -> list[dict]:
 
 def set_voice_webhook(phone_number_sid: str, public_base_url: str) -> None:
     """(Re)points an already-purchased number's voice webhook + status
-    callback at the given base URL - needed whenever PUBLIC_BASE_URL changes
-    (e.g. a new ngrok tunnel in dev), since buy_number() only sets these at
-    purchase time.
+    callback, AND its SMS webhook, at the given base URL - needed whenever
+    PUBLIC_BASE_URL changes (e.g. a new ngrok tunnel in dev), since
+    buy_number() only sets these at purchase time. Despite the name (kept
+    for backward compatibility with its existing caller), this also covers
+    SMS - without sms_url, Twilio has nowhere to POST an inbound text and
+    /messaging/sms/incoming (a real, working route) never gets called.
     """
     def _primary() -> None:
         try:
@@ -261,6 +264,8 @@ def set_voice_webhook(phone_number_sid: str, public_base_url: str) -> None:
                     voice_method="POST",
                     status_callback=f"{public_base_url}/media/voice/status-callback",
                     status_callback_method="POST",
+                    sms_url=f"{public_base_url}/messaging/sms/incoming",
+                    sms_method="POST",
                 )
         except TwilioException as e:
             raise TelecomError(_clean_twilio_error_message(e)) from e
@@ -293,9 +298,12 @@ def buy_number(phone_number: str, *, bundle_sid: str | None = None) -> dict:
 
     Registers our own voice webhook (the URL Twilio actually calls when
     someone dials this number - without it, a purchased number never reaches
-    /media/voice/incoming at all) plus a status-callback URL for the final
-    completed/duration event, both only when a public base URL is configured
-    (nothing to point at otherwise, e.g. before ngrok is running in dev).
+    /media/voice/incoming at all), a status-callback URL for the final
+    completed/duration event, and an SMS webhook (so a text sent to this
+    number reaches /messaging/sms/incoming instead of going nowhere - that
+    route already exists and works, it just needs Twilio told to call it),
+    all only when a public base URL is configured (nothing to point at
+    otherwise, e.g. before ngrok is running in dev).
 
     bundle_sid: a Twilio-approved Regulatory Bundle (see
     get_bundle_status/submit_bundle_for_review below) - required by Twilio
@@ -309,6 +317,8 @@ def buy_number(phone_number: str, *, bundle_sid: str | None = None) -> dict:
         kwargs["voice_method"] = "POST"
         kwargs["status_callback"] = f"{settings.public_base_url}/media/voice/status-callback"
         kwargs["status_callback_method"] = "POST"
+        kwargs["sms_url"] = f"{settings.public_base_url}/messaging/sms/incoming"
+        kwargs["sms_method"] = "POST"
 
     def _primary() -> dict:
         try:
