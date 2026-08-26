@@ -578,3 +578,22 @@ async def get_call(
         return telecom.get_call(call_sid)
     except TelecomError as e:
         raise HTTPException(status_code=502, detail=str(e)) from e
+
+
+@router.get("/calls/{call_sid}/recording")
+async def get_call_recording(
+    call_sid: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Streams the recording audio through this backend instead of handing
+    the frontend Twilio's raw recording_url - that URL requires Twilio's
+    own account credentials to fetch, which is why opening it directly in
+    a browser prompts for a login instead of playing audio."""
+    try:
+        content, content_type = media_service.get_call_recording_media(db, current_user, call_sid)
+    except media_service.CallAuthorizationError as e:
+        raise HTTPException(status_code=403, detail=str(e)) from e
+    except TelecomError as e:
+        raise HTTPException(status_code=502, detail=str(e)) from e
+    return Response(content=content, media_type=content_type)

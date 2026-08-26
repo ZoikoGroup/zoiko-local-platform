@@ -797,8 +797,22 @@ def build_record_response(callback_url: str) -> str:
 
 def download_recording(recording_url: str) -> bytes:
     """Recording media URLs require the same Basic Auth as the REST API —
-    unauthenticated fetches get a 401, so this can't just be a plain GET."""
-    def _primary() -> bytes:
+    unauthenticated fetches get a 401, so this can't just be a plain GET.
+    Used where only the audio bytes matter (e.g. handing them to Whisper
+    for transcription) - see get_recording_media below for callers that
+    also need to know the real content type (e.g. serving it to a
+    browser's <audio> player)."""
+    content, _content_type = get_recording_media(recording_url)
+    return content
+
+
+def get_recording_media(recording_url: str) -> tuple[bytes, str]:
+    """Same authenticated fetch as download_recording, but also returns
+    Twilio's real Content-Type header (its recordings default to
+    audio/x-wav) - a browser <audio>/<a> player needs the correct MIME
+    type to play the response voice/voicemail.py streams back, not just
+    the raw bytes."""
+    def _primary() -> tuple[bytes, str]:
         try:
             with trace_provider_call("twilio", "download_recording"):
                 response = httpx.get(
@@ -807,10 +821,11 @@ def download_recording(recording_url: str) -> bytes:
                 response.raise_for_status()
         except httpx.HTTPError as e:
             raise TelecomError(f"Could not download recording: {e}") from e
-        return response.content
+        return response.content, response.headers.get("content-type", "audio/x-wav")
 
     secondary_fn = (
-        (lambda: secondary.download_recording(recording_url)) if settings.telecom_failover_enabled else None
+        (lambda: (secondary.download_recording(recording_url), "audio/x-wav"))
+        if settings.telecom_failover_enabled else None
     )
     return with_failover(_breaker, _primary, secondary_fn, TelecomError, _is_provider_failure)
 

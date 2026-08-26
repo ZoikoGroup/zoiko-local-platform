@@ -11,6 +11,8 @@ import {
   summarizeVoicemail,
   grantAiProcessingConsent,
   listContacts,
+  getCallRecordingBlob,
+  getVoicemailRecordingBlob,
   ApiError,
   type MyPhoneNumber,
   type CallLogEntry,
@@ -309,6 +311,9 @@ export default function CallsPage() {
               duration={c.duration}
               createdAt={c.created_at}
               recordingUrl={c.recording_url}
+              loadRecording={() =>
+                token && c.sid ? getCallRecordingBlob(token, c.sid) : Promise.reject(new Error("Not available"))
+              }
               suspectedSpam={c.is_suspected_spam}
               summaryState={summaries[`call:${c.id}`] ?? { status: "idle" }}
               onSummarize={() => handleSummarize("call", c.id)}
@@ -334,6 +339,9 @@ export default function CallsPage() {
               duration={v.duration}
               createdAt={v.created_at}
               recordingUrl={v.recording_url}
+              loadRecording={() =>
+                token ? getVoicemailRecordingBlob(token, v.id) : Promise.reject(new Error("Not available"))
+              }
               summaryState={summaries[`voicemail:${v.id}`] ?? { status: "idle" }}
               onSummarize={() => handleSummarize("voicemail", v.id)}
               onGrantConsent={() => handleGrantConsent("voicemail", v.id)}

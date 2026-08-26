@@ -620,6 +620,20 @@ def assert_can_access_call(db: Session, user: User, call_sid: str) -> None:
         raise CallAuthorizationError(f"{call_sid} is not a call owned by your account")
 
 
+def get_call_recording_media(db: Session, user: User, call_sid: str) -> tuple[bytes, str]:
+    """Twilio recording URLs need Twilio's own Basic Auth credentials to
+    fetch (see twilio.get_recording_media's docstring) - a browser opening
+    the stored recording_url directly gets a login prompt instead of
+    audio. This does the same ownership check as assert_can_access_call,
+    then fetches the audio server-side so the frontend never needs to
+    know Twilio credentials exist."""
+    assert_can_access_call(db, user, call_sid)
+    call = db.query(CallRecord).filter(CallRecord.provider_call_sid == call_sid).first()
+    if call is None or not call.recording_url:
+        raise CallAuthorizationError(f"{call_sid} has no recording")
+    return telecom.get_recording_media(call.recording_url)
+
+
 def record_voicemail(
     db: Session,
     *,
@@ -720,6 +734,20 @@ def list_account_voicemails(db: Session, user: User) -> list[Voicemail]:
     )
     cache_set(cache_key, [_serialize_voicemail(v) for v in voicemails], ttl_seconds=_VOICEMAILS_CACHE_TTL_SECONDS)
     return voicemails
+
+
+def get_voicemail_recording_media(db: Session, user: User, voicemail_id: str) -> tuple[bytes, str]:
+    """Same rationale as get_call_recording_media - voicemail.recording_url
+    is also a Twilio-authenticated URL a browser can't fetch directly."""
+    voicemail = db.query(Voicemail).filter(Voicemail.id == voicemail_id).first()
+    if voicemail is None or voicemail.account_id != user.account_id:
+        raise CallAuthorizationError(f"{voicemail_id} is not a voicemail owned by your account")
+    ids = assigned_number_ids(db, user)
+    if ids is not None and voicemail.phone_number_id not in ids:
+        raise CallAuthorizationError(f"{voicemail_id} is not a voicemail owned by your account")
+    if not voicemail.recording_url:
+        raise CallAuthorizationError(f"{voicemail_id} has no recording")
+    return telecom.get_recording_media(voicemail.recording_url)
 
 
 def _find_account_video_session(db: Session, account_id: str, room_name: str) -> VideoSession:
