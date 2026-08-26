@@ -429,7 +429,12 @@ async def status_callback(request: Request, db: Session = Depends(get_db)):
         status=params.get("CallStatus", "unknown"),
         duration=int(duration_raw) if duration_raw else None,
     )
-    return Response(status_code=204)
+    # A bare 204 confirmed live (via this call's own Notifications) to reach
+    # Twilio with an empty Content-Type header, which its webhook validator
+    # rejects as error 12300 "Invalid Content-Type" - an empty TwiML
+    # document is the standard, safe response shape for a callback Twilio
+    # doesn't otherwise act on.
+    return Response(content=telecom.build_empty_response(), media_type="application/xml")
 
 
 @router.post("/flow-menu-input")

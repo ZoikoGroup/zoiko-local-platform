@@ -582,11 +582,19 @@ def build_bridge_response(destination: str, caller_id: str, status_callback_url:
     """
     response = VoiceResponse()
     dial_kwargs: dict = {"caller_id": caller_id}
+    number_kwargs: dict = {}
     if status_callback_url:
+        # action belongs on <Dial> itself; status_callback/status_callback_event
+        # are only valid on the nested <Number> noun - Twilio's XML validator
+        # rejects them on <Dial> (confirmed live via a real call's Notifications:
+        # "Attribute 'statusCallback' is not allowed to appear in element
+        # 'Dial'" - tolerated as a warning, not fatal, but still real invalid
+        # TwiML worth fixing outright).
         dial_kwargs["action"] = status_callback_url
-        dial_kwargs["status_callback"] = status_callback_url
-        dial_kwargs["status_callback_event"] = "completed"
-    response.dial(destination, **dial_kwargs)
+        number_kwargs["status_callback"] = status_callback_url
+        number_kwargs["status_callback_event"] = "completed"
+    dial = response.dial(**dial_kwargs)
+    dial.number(destination, **number_kwargs)
     return str(response)
 
 
