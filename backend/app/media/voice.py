@@ -393,9 +393,11 @@ async def browser_connect(request: Request, db: Session = Depends(get_db)):
     to = params.get("To", "")
     from_number = params.get("ZoikoFrom", "")
     call_sid = params.get("CallSid", "")
+    status_callback_url = str(request.base_url) + "media/voice/status-callback"
     try:
         twiml = media_service.handle_browser_connect(
             db, account_id=account_id, from_number=from_number, to=to, call_sid=call_sid,
+            status_callback_url=status_callback_url,
         )
     except (
         media_service.CallAuthorizationError,

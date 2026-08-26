@@ -310,7 +310,9 @@ def place_bridge_call(
     return result
 
 
-def handle_browser_connect(db: Session, *, account_id: str, from_number: str, to: str, call_sid: str) -> str:
+def handle_browser_connect(
+    db: Session, *, account_id: str, from_number: str, to: str, call_sid: str, status_callback_url: str | None = None,
+) -> str:
     """Live two-way calling straight from the browser (@twilio/voice-sdk):
     called by media.voice.browser_connect, the webhook Twilio hits the
     instant someone's browser (already holding a token minted for
@@ -347,7 +349,7 @@ def handle_browser_connect(db: Session, *, account_id: str, from_number: str, to
         provider_call_sid=call_sid,
         status="in-progress",
     )
-    return telecom.build_bridge_response(to, caller_id=from_number)
+    return telecom.build_bridge_response(to, caller_id=from_number, status_callback_url=status_callback_url)
 
 
 def place_outbound_call(
