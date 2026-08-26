@@ -174,7 +174,10 @@ def test_golden_path_signup_through_number_release(client, db_session, monkeypat
         "/media/voice/status-callback", data=status_params,
         headers={"X-Twilio-Signature": _twilio_signature(status_url, status_params)},
     )
-    assert status_response.status_code == 204
+    # /status-callback returns a real empty TwiML doc (200), not a bare 204 -
+    # a bare 204 reaches Twilio with an empty Content-Type header (its error
+    # 12300), confirmed live via a real call's own Notifications log.
+    assert status_response.status_code == 200
 
     usage_events = client.get("/usage", headers=headers).json()
     call_usage = next(e for e in usage_events if e["event_type"] == "call_seconds")

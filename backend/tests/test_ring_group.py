@@ -128,7 +128,9 @@ def test_incoming_call_rings_all_configured_destinations_simultaneously(client, 
     assert "+15557770002" in response.text
     # The plain forwarding_number is NOT used once a ring group is configured.
     assert "+15559998888" not in response.text
-    assert response.text.count("<Number>") == 2
+    # Not a bare "<Number>" - build_ring_group_response puts
+    # statusCallback/statusCallbackEvent as attributes on this noun.
+    assert response.text.count("<Number ") == 2
 
 
 def test_forward_fallback_routes_to_voicemail_on_no_answer(client, db_session):
