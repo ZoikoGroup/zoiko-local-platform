@@ -22,7 +22,10 @@ export default function Topbar({ user }: { user: User | null }) {
       <h1 className="text-lg font-semibold text-slate-900">{currentPageLabel(pathname)}</h1>
 
       <div className="flex items-center gap-3">
-        <button className="flex items-center gap-1.5 bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-medium rounded-lg pl-3 pr-4 py-2 transition shadow-sm shadow-indigo-600/20">
+        <button
+          onClick={() => router.push("/dashboard/numbers")}
+          className="flex items-center gap-1.5 bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-medium rounded-lg pl-3 pr-4 py-2 transition shadow-sm shadow-indigo-600/20"
+        >
           <svg className="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2">
             <path strokeLinecap="round" d="M12 5v14M5 12h14" />
           </svg>

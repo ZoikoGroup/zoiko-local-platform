@@ -74,6 +74,29 @@ def _clean_twilio_error_message(e: TwilioException) -> str:
     return message
 
 
+def _is_provider_failure(e: Exception) -> bool:
+    """Passed as with_failover's is_breaker_failure - _breaker is a single
+    process-wide instance shared by every telecom operation (calls, SMS,
+    number lookups, ...) for every account on the platform, so what counts
+    as a "failure" here matters beyond just this one request. Every
+    TelecomError raised in this module wraps the original TwilioException
+    via `from e`, so e.__cause__ is that original exception.
+
+    A TwilioRestException carries the real HTTP status Twilio returned. A
+    4xx means Twilio understood and rejected THIS specific request (bad
+    destination, unsupported region, invalid number, permission not
+    enabled for a country, ...) - an expected, per-request outcome that
+    says nothing about whether Twilio itself is healthy. Confirmed live:
+    three back-to-back 400s from repeatedly retrying an unsupported SMS
+    destination tripped this breaker OPEN, which then blocked SMS/calls
+    for every other account on the platform for the next 30 seconds, even
+    though Twilio was never actually down. Only a 5xx (or no status at
+    all - a connection/timeout-level failure with nothing HTTP to inspect)
+    should count as a real provider-health signal."""
+    status = getattr(getattr(e, "__cause__", None), "status", None)
+    return status is None or status >= 500
+
+
 # Imported after TelecomError is defined - _secondary_stub imports it back
 # from this module, which would otherwise be a circular import.
 from app.integrations.telecom import _secondary_stub as secondary  # noqa: E402
@@ -122,7 +145,7 @@ def send_sms(to: str, body: str) -> dict:
         return {"sid": message.sid, "status": message.status}
 
     secondary_fn = (lambda: secondary.send_sms(to, body)) if settings.telecom_failover_enabled else None
-    return with_failover(_breaker, _primary, secondary_fn, TelecomError)
+    return with_failover(_breaker, _primary, secondary_fn, TelecomError, _is_provider_failure)
 
 
 def send_whatsapp_message(to: str, from_number: str, body: str) -> dict:
@@ -144,7 +167,7 @@ def send_whatsapp_message(to: str, from_number: str, body: str) -> dict:
             raise TelecomError(_clean_twilio_error_message(e)) from e
         return {"sid": message.sid, "status": message.status}
 
-    return with_failover(_breaker, _primary, None, TelecomError)
+    return with_failover(_breaker, _primary, None, TelecomError, _is_provider_failure)
 
 
 def send_customer_sms(to: str, from_number: str, body: str) -> dict:
@@ -162,7 +185,7 @@ def send_customer_sms(to: str, from_number: str, body: str) -> dict:
             raise TelecomError(_clean_twilio_error_message(e)) from e
         return {"sid": message.sid, "status": message.status}
 
-    return with_failover(_breaker, _primary, None, TelecomError)
+    return with_failover(_breaker, _primary, None, TelecomError, _is_provider_failure)
 
 
 def search_available_numbers(country: str, number_type: str = "local", area_code: str | None = None,
@@ -206,7 +229,7 @@ def search_available_numbers(country: str, number_type: str = "local", area_code
         (lambda: secondary.search_available_numbers(country, number_type, area_code, contains, limit))
         if settings.telecom_failover_enabled else None
     )
-    return with_failover(_breaker, _primary, secondary_fn, TelecomError)
+    return with_failover(_breaker, _primary, secondary_fn, TelecomError, _is_provider_failure)
 
 
 def list_owned_numbers() -> list[dict]:
@@ -219,7 +242,7 @@ def list_owned_numbers() -> list[dict]:
         return [{"sid": n.sid, "phone_number": n.phone_number, "capabilities": n.capabilities} for n in numbers]
 
     secondary_fn = secondary.list_owned_numbers if settings.telecom_failover_enabled else None
-    return with_failover(_breaker, _primary, secondary_fn, TelecomError)
+    return with_failover(_breaker, _primary, secondary_fn, TelecomError, _is_provider_failure)
 
 
 def set_voice_webhook(phone_number_sid: str, public_base_url: str) -> None:
@@ -244,7 +267,7 @@ def set_voice_webhook(phone_number_sid: str, public_base_url: str) -> None:
         (lambda: secondary.set_voice_webhook(phone_number_sid, public_base_url))
         if settings.telecom_failover_enabled else None
     )
-    with_failover(_breaker, _primary, secondary_fn, TelecomError)
+    with_failover(_breaker, _primary, secondary_fn, TelecomError, _is_provider_failure)
 
 
 def release_number(phone_number_sid: str) -> None:
@@ -259,7 +282,7 @@ def release_number(phone_number_sid: str) -> None:
             raise TelecomError(_clean_twilio_error_message(e)) from e
 
     secondary_fn = (lambda: secondary.release_number(phone_number_sid)) if settings.telecom_failover_enabled else None
-    with_failover(_breaker, _primary, secondary_fn, TelecomError)
+    with_failover(_breaker, _primary, secondary_fn, TelecomError, _is_provider_failure)
 
 
 def buy_number(phone_number: str, *, bundle_sid: str | None = None) -> dict:
@@ -300,7 +323,7 @@ def buy_number(phone_number: str, *, bundle_sid: str | None = None) -> dict:
     # second attempt before the customer sees an error. Every other telecom
     # operation (search, calls, SMS) still fails over normally - remove this
     # override once Vonage's account is confirmed able to purchase numbers.
-    return with_failover(_breaker, _primary, None, TelecomError)
+    return with_failover(_breaker, _primary, None, TelecomError, _is_provider_failure)
 
 
 # --- Regulatory Compliance (real Twilio-reviewed identity bundles required
@@ -453,13 +476,16 @@ def place_call(
                 call = _client().calls.create(**kwargs)
         except TwilioException as e:
             raise TelecomError(_clean_twilio_error_message(e)) from e
-        return {"sid": call.sid, "status": call.status, "to": call.to, "from": call.from_}
+        # CallInstance has no public `from_` attribute (the twilio-python
+        # SDK only exposes it via kwargs when creating a call) - the "from"
+        # number on a fetched/created instance is the private `_from`.
+        return {"sid": call.sid, "status": call.status, "to": call.to, "from": call._from}
 
     secondary_fn = (
         (lambda: secondary.place_call(to, from_, twiml_url, twiml, status_callback_url, time_limit_seconds))
         if settings.telecom_failover_enabled else None
     )
-    return with_failover(_breaker, _primary, secondary_fn, TelecomError)
+    return with_failover(_breaker, _primary, secondary_fn, TelecomError, _is_provider_failure)
 
 
 def get_call(call_sid: str) -> dict:
@@ -477,12 +503,12 @@ def get_call(call_sid: str) -> dict:
         except TwilioException as e:
             raise TelecomError(_clean_twilio_error_message(e)) from e
         return {
-            "sid": call.sid, "status": call.status, "to": call.to, "from": call.from_, "duration": call.duration,
+            "sid": call.sid, "status": call.status, "to": call.to, "from": call._from, "duration": call.duration,
             "price": call.price, "price_unit": call.price_unit,
         }
 
     secondary_fn = (lambda: secondary.get_call(call_sid)) if settings.telecom_failover_enabled else None
-    return with_failover(_breaker, _primary, secondary_fn, TelecomError)
+    return with_failover(_breaker, _primary, secondary_fn, TelecomError, _is_provider_failure)
 
 
 def list_calls(limit: int = 20) -> list[dict]:
@@ -495,10 +521,10 @@ def list_calls(limit: int = 20) -> list[dict]:
                 calls = _client().calls.list(limit=limit)
         except TwilioException as e:
             raise TelecomError(_clean_twilio_error_message(e)) from e
-        return [{"sid": c.sid, "status": c.status, "to": c.to, "from": c.from_} for c in calls]
+        return [{"sid": c.sid, "status": c.status, "to": c.to, "from": c._from} for c in calls]
 
     secondary_fn = (lambda: secondary.list_calls(limit)) if settings.telecom_failover_enabled else None
-    return with_failover(_breaker, _primary, secondary_fn, TelecomError)
+    return with_failover(_breaker, _primary, secondary_fn, TelecomError, _is_provider_failure)
 
 
 def build_say_response(message: str) -> str:
@@ -532,6 +558,24 @@ def build_forward_response(
         dial_kwargs["recording_status_callback_method"] = "POST"
         dial_kwargs["recording_status_callback_event"] = "completed"
     response.dial(forwarding_number, **dial_kwargs)
+    return str(response)
+
+
+def build_bridge_response(destination: str, caller_id: str, status_callback_url: str | None = None) -> str:
+    """Builds TwiML that dials `destination` with `caller_id` shown as the
+    caller's number, for the second leg of a call-bridge: the platform has
+    already called the agent's own real phone and they've answered (that's
+    what triggers Twilio to request this response), so this is what
+    connects them live to the actual customer. caller_id is set so the
+    customer sees the Zoiko Local number, not the agent's personal one.
+    """
+    response = VoiceResponse()
+    dial_kwargs: dict = {"caller_id": caller_id}
+    if status_callback_url:
+        dial_kwargs["action"] = status_callback_url
+        dial_kwargs["status_callback"] = status_callback_url
+        dial_kwargs["status_callback_event"] = "completed"
+    response.dial(destination, **dial_kwargs)
     return str(response)
 
 
@@ -732,7 +776,7 @@ def download_recording(recording_url: str) -> bytes:
     secondary_fn = (
         (lambda: secondary.download_recording(recording_url)) if settings.telecom_failover_enabled else None
     )
-    return with_failover(_breaker, _primary, secondary_fn, TelecomError)
+    return with_failover(_breaker, _primary, secondary_fn, TelecomError, _is_provider_failure)
 
 
 def delete_recording(recording_sid: str) -> None:
@@ -749,7 +793,7 @@ def delete_recording(recording_sid: str) -> None:
     secondary_fn = (
         (lambda: secondary.delete_recording(recording_sid)) if settings.telecom_failover_enabled else None
     )
-    with_failover(_breaker, _primary, secondary_fn, TelecomError)
+    with_failover(_breaker, _primary, secondary_fn, TelecomError, _is_provider_failure)
 
 
 def recording_sid_from_url(recording_url: str) -> str:

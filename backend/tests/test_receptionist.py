@@ -21,7 +21,17 @@ def _signup_and_login(client, email: str) -> tuple[str, str]:
     )
     account_id = signup.json()["account_id"]
     login = client.post("/auth/login", json={"email": email, "password": "supersecret123"})
-    return login.json()["access_token"], account_id
+    token = login.json()["access_token"]
+    # A fresh signup defaults to the free trial - app.core.deps.
+    # require_paid_or_read_only now blocks write actions (assigning/editing
+    # a receptionist call) for a TRIALING account, and this file's tests
+    # are about receptionist mechanics, not trial-gating, so upgrade to a
+    # real paid plan here rather than adding this to every individual test.
+    client.put(
+        "/billing/subscription/plan", json={"plan_code": "starter", "billing_period": "monthly"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    return token, account_id
 
 
 def test_incoming_call_uses_receptionist_when_enabled(client, db_session):

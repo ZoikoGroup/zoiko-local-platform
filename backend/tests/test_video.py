@@ -106,7 +106,21 @@ def _signup_and_login(client, email: str) -> str:
         },
     )
     login = client.post("/auth/login", json={"email": email, "password": "supersecret123"})
-    return login.json()["access_token"]
+    token = login.json()["access_token"]
+    # A fresh signup defaults to the free trial - app.core.deps.
+    # require_paid_or_read_only now blocks write actions for a TRIALING
+    # account. This file's tests are about video-call feature behavior,
+    # not trial-gating itself, so upgrade to a real paid plan here rather
+    # than adding this to every individual test. Safe for max_video_
+    # participants specifically - starter shares free_trial's same
+    # max_video_participants=8, confirmed live against the real seeded
+    # Plan rows (see test_create_room_uses_the_free_trial_plans_
+    # participant_cap, which still passes unchanged after this).
+    client.put(
+        "/billing/subscription/plan", json={"plan_code": "starter", "billing_period": "monthly"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    return token
 
 
 def test_create_room_requires_auth(client):

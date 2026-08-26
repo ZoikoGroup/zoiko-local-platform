@@ -1,7 +1,7 @@
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from slowapi import _rate_limit_exceeded_handler
@@ -14,11 +14,14 @@ from app.apikeys.routes import router as apikeys_router
 from app.audit.routes import router as audit_router
 from app.billing.routes import router as billing_router
 from app.compliance.routes import router as compliance_router
+from app.compliance.routes import staff_router as compliance_staff_router
+from app.compliance.routes import webhook_router as compliance_webhook_router
 from app.consent.routes import router as consent_router
 from app.contacts.routes import router as contacts_router
 from app.core.config import settings
 from app.core.database import SessionLocal, engine
 from app.core.error_logging import ErrorLoggingMiddleware
+from app.core.deps import require_paid_or_read_only
 from app.core.errors import EntitlementError
 from app.core.logging import configure_logging
 from app.crm.routes import router as crm_router
@@ -31,6 +34,7 @@ from app.core.startup_checks import (
 from app.core.telemetry import setup_telemetry, shutdown_telemetry
 from app.intelligence.routes import router as intelligence_router
 from app.media.receptionist import router as receptionist_router
+from app.media.video import public_router as video_public_router
 from app.media.video import router as video_router
 from app.media.voice import router as voice_router
 from app.media.voicemail import router as voicemail_router
@@ -144,32 +148,53 @@ app.add_middleware(
 # actually take effect.
 setup_telemetry(app, engine)
 
+# Trial-account gate (app.core.deps.require_paid_or_read_only) - applied
+# router-wide via `dependencies=` rather than per-route, so it covers every
+# current and future route in these feature routers automatically. Only
+# blocks non-GET requests for a TRIALING account; Home's own read-only
+# stat cards keep working since GET is always exempt. NOT applied to
+# identity/team/consent/billing/usage/notifications/webhooks/staff/
+# public_api/audit/ops/retention/risk/crm/apikeys, or to
+# messaging_webhook_router/queues_webhook_router/video_public_router -
+# those are either account-setup basics every account needs regardless of
+# plan (inviting a teammate, granting AI-processing consent - confirmed
+# live: several existing tests' shared signup helpers call these as
+# ordinary setup steps unrelated to what they're testing, not something a
+# trial paywall should ever interrupt), the upgrade path itself (billing),
+# or carry no customer JWT at all (provider webhooks, video's guest
+# endpoints - see video.py's own comment on why those had to be split into
+# a separate router first).
+_TRIAL_GATE = [Depends(require_paid_or_read_only)]
+
 app.include_router(identity_router)
 app.include_router(team_router)
 app.include_router(audit_router)
 app.include_router(billing_router)
-app.include_router(compliance_router)
+app.include_router(compliance_router, dependencies=_TRIAL_GATE)
+app.include_router(compliance_staff_router)
+app.include_router(compliance_webhook_router)
 app.include_router(consent_router)
-app.include_router(contacts_router)
+app.include_router(contacts_router, dependencies=_TRIAL_GATE)
 app.include_router(staff_router)
-app.include_router(voice_router)
-app.include_router(voicemail_router)
-app.include_router(video_router)
-app.include_router(receptionist_router)
-app.include_router(numbers_router)
-app.include_router(intelligence_router)
+app.include_router(voice_router, dependencies=_TRIAL_GATE)
+app.include_router(voicemail_router, dependencies=_TRIAL_GATE)
+app.include_router(video_router, dependencies=_TRIAL_GATE)
+app.include_router(video_public_router)
+app.include_router(receptionist_router, dependencies=_TRIAL_GATE)
+app.include_router(numbers_router, dependencies=_TRIAL_GATE)
+app.include_router(intelligence_router, dependencies=_TRIAL_GATE)
 app.include_router(retention_router)
 app.include_router(notifications_router)
 app.include_router(risk_router)
 app.include_router(usage_router)
 app.include_router(ops_router)
-app.include_router(porting_router)
-app.include_router(call_flows_router)
-app.include_router(queues_router)
+app.include_router(porting_router, dependencies=_TRIAL_GATE)
+app.include_router(call_flows_router, dependencies=_TRIAL_GATE)
+app.include_router(queues_router, dependencies=_TRIAL_GATE)
 app.include_router(queues_webhook_router)
-app.include_router(messaging_router)
+app.include_router(messaging_router, dependencies=_TRIAL_GATE)
 app.include_router(messaging_webhook_router)
-app.include_router(analytics_router)
+app.include_router(analytics_router, dependencies=_TRIAL_GATE)
 app.include_router(webhooks_router)
 app.include_router(apikeys_router)
 app.include_router(public_api_router)

@@ -20,7 +20,21 @@ def _signup_and_login(client, email: str) -> str:
         },
     )
     response = client.post("/auth/login", json={"email": email, "password": "supersecret123"})
-    return response.json()["access_token"]
+    token = response.json()["access_token"]
+    # A fresh signup defaults to the free trial - app.core.deps.
+    # require_paid_or_read_only now blocks write actions (calls, routing
+    # config) for a TRIALING account, and most of this file's tests are
+    # about call-routing mechanics, not trial-gating, so upgrade to a real
+    # paid plan here rather than adding this to every individual test.
+    # (This also keeps test_enabling_ai_receptionist_is_blocked_without_
+    # plan_or_addon_entitlement meaningful: on starter-without-the-addon,
+    # its PUT .../routing call now reaches the real addon-entitlement
+    # check instead of being pre-empted by this trial gate.)
+    client.put(
+        "/billing/subscription/plan", json={"plan_code": "starter", "billing_period": "monthly"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    return token
 
 
 def test_outbound_call_requires_auth(client):

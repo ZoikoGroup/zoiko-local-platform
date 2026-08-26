@@ -309,11 +309,23 @@ export default function MeetingRoom(props: MeetingRoomProps) {
             style={{ gridTemplateColumns: `repeat(${columns}, minmax(0, 1fr))` }}
           >
             <div ref={localTileRef} className="relative w-full h-full min-h-0 bg-slate-800 rounded-xl overflow-hidden flex items-center justify-center">
-              {cameraOn ? (
-                <video ref={localVideoRef} autoPlay muted playsInline className="absolute inset-0 w-full h-full object-cover" />
-              ) : (
-                <div className={`w-16 h-16 rounded-full ${avatarColorFor(displayName || "you")} text-white flex items-center justify-center text-xl font-semibold`}>
-                  {getInitials(displayName || "You")}
+              {/* The <video> element stays permanently mounted (never
+                  conditionally removed) so localVideoRef always points to a
+                  real DOM node - LiveKit's LocalTrackPublished handler
+                  attaches to it the moment the camera track republishes
+                  after being toggled off/on, which can fire before React
+                  would have re-rendered a conditionally-mounted element.
+                  Confirmed live: conditionally rendering this caused video
+                  to intermittently never reappear after a camera toggle,
+                  since the attach could race ahead of the remount. The
+                  avatar placeholder is layered on top instead of replacing
+                  it, and simply hides once real video is visible again. */}
+              <video ref={localVideoRef} autoPlay muted playsInline className="absolute inset-0 w-full h-full object-cover" />
+              {!cameraOn && (
+                <div className="absolute inset-0 bg-slate-800 flex items-center justify-center">
+                  <div className={`w-16 h-16 rounded-full ${avatarColorFor(displayName || "you")} text-white flex items-center justify-center text-xl font-semibold`}>
+                    {getInitials(displayName || "You")}
+                  </div>
                 </div>
               )}
               <span className="absolute bottom-2 left-2 z-10 flex items-center gap-1.5 text-xs text-white/90 bg-black/40 rounded px-2 py-0.5">

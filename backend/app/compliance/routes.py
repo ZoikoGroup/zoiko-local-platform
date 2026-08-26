@@ -20,6 +20,14 @@ from app.numbering.identity.models import User
 from app.staff.models import PlatformStaff
 
 router = APIRouter(prefix="/compliance", tags=["compliance"])
+# Staff act under their own capability grants (require_capability), not a
+# customer JWT/plan at all - app.core.deps.require_paid_or_read_only depends
+# on get_current_user, which can't decode a staff token, so router-wide
+# trial-gating (applied to `router` in main.py) would 401 every staff call
+# here. Same fix as media/video.py's public_router split.
+staff_router = APIRouter(prefix="/compliance", tags=["compliance"])
+# No customer or staff auth at all - Stripe calls this directly.
+webhook_router = APIRouter(prefix="/compliance", tags=["compliance"])
 
 
 def _get_case_or_404(db: Session, case_id: str):
@@ -34,7 +42,7 @@ def list_rules(country: str, db: Session = Depends(get_db)):
     return service.get_active_rules(db, country)
 
 
-@router.get("/staff/rules", response_model=list[ComplianceRuleResponse])
+@staff_router.get("/staff/rules", response_model=list[ComplianceRuleResponse])
 def list_all_rules(
     db: Session = Depends(get_db),
     _staff: PlatformStaff = Depends(get_current_staff),
@@ -45,7 +53,7 @@ def list_all_rules(
     return service.list_all_rules(db)
 
 
-@router.put("/staff/rules", response_model=ComplianceRuleResponse)
+@staff_router.put("/staff/rules", response_model=ComplianceRuleResponse)
 def upsert_rule(
     payload: ComplianceRuleUpsertRequest,
     db: Session = Depends(get_db),
@@ -84,7 +92,7 @@ def my_cases(
     return service.list_cases_for_account(db, current_user.account_id)
 
 
-@router.get("/cases", response_model=list[ComplianceCaseStaffResponse])
+@staff_router.get("/cases", response_model=list[ComplianceCaseStaffResponse])
 def list_all_cases(
     status: str | None = None,
     db: Session = Depends(get_db),
@@ -142,7 +150,7 @@ def get_document_download_url(
     return {"url": url}
 
 
-@router.get("/staff/cases/{case_id}/documents/{document_index}/download-url", response_model=DocumentDownloadUrl)
+@staff_router.get("/staff/cases/{case_id}/documents/{document_index}/download-url", response_model=DocumentDownloadUrl)
 def staff_get_document_download_url(
     case_id: str,
     document_index: int,
@@ -177,7 +185,7 @@ def start_kyc(
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(e)) from e
 
 
-@router.post("/webhooks/stripe-identity", status_code=204)
+@webhook_router.post("/webhooks/stripe-identity", status_code=204)
 async def stripe_identity_webhook(request: Request, db: Session = Depends(get_db)):
     body = await request.body()
     signature = request.headers.get("Stripe-Signature", "")
@@ -199,7 +207,7 @@ async def stripe_identity_webhook(request: Request, db: Session = Depends(get_db
     return None
 
 
-@router.post("/cases/{case_id}/approve", response_model=ComplianceCaseResponse)
+@staff_router.post("/cases/{case_id}/approve", response_model=ComplianceCaseResponse)
 def approve_case(
     case_id: str,
     db: Session = Depends(get_db),
@@ -209,7 +217,7 @@ def approve_case(
     return service.approve_case(db, case, actor=staff.id)
 
 
-@router.post("/cases/{case_id}/reject", response_model=ComplianceCaseResponse)
+@staff_router.post("/cases/{case_id}/reject", response_model=ComplianceCaseResponse)
 def reject_case(
     case_id: str,
     payload: CaseRejectRequest,
@@ -220,7 +228,7 @@ def reject_case(
     return service.reject_case(db, case, actor=staff.id, reason=payload.reason)
 
 
-@router.post("/cases/expire")
+@staff_router.post("/cases/expire")
 def expire_cases(
     db: Session = Depends(get_db),
     _staff: PlatformStaff = Depends(require_capability("compliance.review_case")),

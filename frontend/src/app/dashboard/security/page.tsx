@@ -173,7 +173,7 @@ export default function SecurityPage() {
               required
               value={code}
               onChange={(e) => setCode(e.target.value.replace(/\D/g, ""))}
-              className="w-full rounded-lg border border-slate-300 px-3.5 py-2.5 text-center text-lg tracking-[0.5em] font-mono focus:outline-none focus:ring-2 focus:ring-indigo-500/40 focus:border-indigo-500 transition"
+              className="w-full rounded-lg border border-slate-300 bg-white px-3.5 py-2.5 text-center text-lg tracking-[0.5em] font-mono text-slate-900 focus:outline-none focus:ring-2 focus:ring-indigo-500/40 focus:border-indigo-500 transition"
               placeholder="000000"
             />
             <div className="flex gap-2">
@@ -214,7 +214,7 @@ export default function SecurityPage() {
               required
               value={disableCode}
               onChange={(e) => setDisableCode(e.target.value.replace(/\D/g, ""))}
-              className="w-full rounded-lg border border-slate-300 px-3.5 py-2.5 text-center text-lg tracking-[0.5em] font-mono focus:outline-none focus:ring-2 focus:ring-red-500/40 focus:border-red-500 transition"
+              className="w-full rounded-lg border border-slate-300 bg-white px-3.5 py-2.5 text-center text-lg tracking-[0.5em] font-mono text-slate-900 focus:outline-none focus:ring-2 focus:ring-red-500/40 focus:border-red-500 transition"
               placeholder="000000"
             />
             <div className="flex gap-2">

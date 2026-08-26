@@ -1,27 +1,19 @@
 "use client";
 
-import { useEffect, useState } from "react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { getSubscription, type Subscription } from "@/lib/api";
-import { getToken } from "@/lib/auth";
+import type { Subscription } from "@/lib/api";
 
 function daysLeft(trialEndsAt: string): number {
   const ms = new Date(trialEndsAt).getTime() - Date.now();
   return Math.max(0, Math.ceil(ms / (1000 * 60 * 60 * 24)));
 }
 
-export default function TrialBanner() {
+// subscription is fetched once in dashboard/layout.tsx and shared with
+// Sidebar (both need trial-vs-paid status) - this used to fetch its own
+// copy independently.
+export default function TrialBanner({ subscription }: { subscription: Subscription | null }) {
   const pathname = usePathname();
-  const [subscription, setSubscription] = useState<Subscription | null>(null);
-
-  useEffect(() => {
-    const token = getToken();
-    if (!token) return;
-    getSubscription(token)
-      .then(setSubscription)
-      .catch(() => {});
-  }, []);
 
   // Already on the Billing page - the full plan/trial detail lives there,
   // a duplicate nudge above it would just be noise.

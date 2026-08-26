@@ -123,6 +123,18 @@ class AiReceptionistNotEntitledError(EntitlementError):
     status_code = 402
 
 
+class TrialWriteRestrictedError(EntitlementError):
+    """Raised by app.core.deps.require_paid_or_read_only for a TRIALING
+    account attempting a write (non-GET) action on a gated feature router.
+    Trial accounts can view every dashboard section (Home's own stat cards
+    depend on read access to numbers/calls/voicemail/video/receptionist
+    data), but real actions - buying a number, sending a message, placing
+    a call - require an upgrade. Previously there was no gate here at
+    all: a trial account had full write access to every feature."""
+    code = "UPGRADE_REQUIRED"
+    status_code = 402
+
+
 _PLANS_CACHE_KEY = "billing:plans"
 # Long TTL, no invalidation needed - Plan rows are only ever seeded via
 # migration (see Plan's docstring), never mutated by any runtime service

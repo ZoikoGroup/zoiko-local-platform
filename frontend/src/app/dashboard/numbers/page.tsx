@@ -1077,7 +1077,7 @@ export default function NumbersPage() {
               id="search-country"
               value={countryCode}
               onChange={(e) => setCountryCode(e.target.value)}
-              className="rounded-lg border border-slate-300 px-3 py-2 text-sm"
+              className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900"
             >
               {countries.map((c) => (
                 <option key={c.code} value={c.code}>
@@ -1092,7 +1092,7 @@ export default function NumbersPage() {
               id="search-type"
               value={numberType}
               onChange={(e) => setNumberType(e.target.value)}
-              className="rounded-lg border border-slate-300 px-3 py-2 text-sm"
+              className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900"
             >
               {Object.entries(NUMBER_TYPE_LABELS).map(([value, label]) => (
                 <option key={value} value={value}>
@@ -1366,7 +1366,7 @@ export default function NumbersPage() {
                     <select
                       value={eligibilityDocumentType}
                       onChange={(e) => setEligibilityDocumentType(e.target.value)}
-                      className="w-full rounded-lg border border-slate-300 px-3 py-1.5 text-sm"
+                      className="w-full rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-sm text-slate-900"
                     >
                       <option value="government_issued_document">Government-issued ID</option>
                       <option value="passport">Passport</option>
@@ -1375,7 +1375,7 @@ export default function NumbersPage() {
                       type="file"
                       accept="application/pdf,image/jpeg,image/png"
                       onChange={(e) => setEligibilityFile(e.target.files?.[0] ?? null)}
-                      className="w-full text-sm"
+                      className="w-full text-sm text-slate-900"
                     />
                     <button
                       onClick={handleUploadEligibilityDocument}
@@ -1397,28 +1397,28 @@ export default function NumbersPage() {
                       placeholder="First name"
                       value={eligibilityFirstName}
                       onChange={(e) => setEligibilityFirstName(e.target.value)}
-                      className="rounded-lg border border-slate-300 px-3 py-1.5 text-sm"
+                      className="rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-sm text-slate-900 placeholder:text-slate-400"
                     />
                     <input
                       type="text"
                       placeholder="Last name"
                       value={eligibilityLastName}
                       onChange={(e) => setEligibilityLastName(e.target.value)}
-                      className="rounded-lg border border-slate-300 px-3 py-1.5 text-sm"
+                      className="rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-sm text-slate-900 placeholder:text-slate-400"
                     />
                     <input
                       type="email"
                       placeholder="Email"
                       value={eligibilityEmail}
                       onChange={(e) => setEligibilityEmail(e.target.value)}
-                      className="rounded-lg border border-slate-300 px-3 py-1.5 text-sm"
+                      className="rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-sm text-slate-900 placeholder:text-slate-400"
                     />
                     <input
                       type="tel"
                       placeholder="Real mobile phone number"
                       value={eligibilityPhone}
                       onChange={(e) => setEligibilityPhone(e.target.value)}
-                      className="rounded-lg border border-slate-300 px-3 py-1.5 text-sm"
+                      className="rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-sm text-slate-900 placeholder:text-slate-400"
                     />
                   </div>
                   <button

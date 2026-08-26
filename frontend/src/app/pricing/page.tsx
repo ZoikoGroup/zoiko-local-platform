@@ -11,6 +11,7 @@ import {
   type BillingPeriod,
   type PublicSupportedCountry,
 } from "@/lib/api";
+import Logo from "@/components/Logo";
 
 // Global Plans, Pricing & Commercial Launch Standard doc §8.2 - Enterprise
 // is sales-led/custom, never shown with a dollar amount or precise limits.
@@ -82,7 +83,7 @@ export default function PricingPage() {
       <header className="border-b border-slate-200 bg-white">
         <div className="max-w-6xl mx-auto px-6 h-16 flex items-center justify-between">
           <Link href="/" className="flex items-center gap-2">
-            <img src="/logo-icon.svg" alt="Zoiko Local" className="w-8 h-8 rounded-lg" />
+            <Logo size={32} />
             <span className="font-semibold text-slate-900">Zoiko Local</span>
           </Link>
           <div className="flex items-center gap-3">
@@ -263,7 +264,7 @@ export default function PricingPage() {
       <footer className="border-t border-slate-200 bg-white">
         <div className="max-w-6xl mx-auto px-6 py-8 flex flex-col sm:flex-row items-center justify-between gap-4">
           <div className="flex items-center gap-2">
-            <img src="/logo-icon.svg" alt="Zoiko Local" className="w-7 h-7 rounded-lg" />
+            <Logo size={28} />
             <span className="text-sm font-medium text-slate-700">Zoiko Local</span>
           </div>
           <div className="flex items-center gap-6 text-sm text-slate-500">

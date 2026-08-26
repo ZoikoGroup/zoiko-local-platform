@@ -20,7 +20,18 @@ def _signup_and_login(client, email: str) -> str:
         },
     )
     response = client.post("/auth/login", json={"email": email, "password": "supersecret123"})
-    return response.json()["access_token"]
+    token = response.json()["access_token"]
+    # A fresh signup defaults to the free trial - app.core.deps.
+    # require_paid_or_read_only now blocks write actions (opening a case,
+    # submitting a document, starting KYC) for a TRIALING account, and this
+    # file's tests are about compliance-case mechanics, not trial-gating
+    # itself, so upgrade to a real paid plan here rather than adding this
+    # to every individual test.
+    client.put(
+        "/billing/subscription/plan", json={"plan_code": "starter", "billing_period": "monthly"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    return token
 
 
 def test_list_rules_for_a_country(client, db_session):

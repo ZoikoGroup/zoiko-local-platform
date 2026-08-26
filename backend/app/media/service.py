@@ -192,13 +192,14 @@ def record_call(
     return call
 
 
-def _dispatch_outbound_call(
-    db: Session, *, account_id: str, account_email: str, owner: PhoneNumber, to: str, from_number: str,
-    message: str, status_callback_url: str | None,
-) -> dict:
-    """Shared core of place_outbound_call and place_outbound_call_for_account
-    - everything after "is this number really available to the caller" is
-    identical for both a logged-in user and a public API key."""
+def _assert_outbound_call_allowed(
+    db: Session, *, account_id: str, account_email: str, to: str, from_number: str,
+) -> None:
+    """Shared risk/billing preamble for every real outbound call this
+    account places, however the call is ultimately built (a one-way
+    announcement in _dispatch_outbound_call, or a live call-bridge in
+    _dispatch_bridge_call) - the destination doesn't know or care which
+    kind of call it is, so it must clear the same gates either way."""
     # Commercial Billing Operating Standard doc §32.1 - checked first,
     # alongside (not instead of) the per-account risk gates below; this one
     # is platform-wide and manually triggered, not account-specific.
@@ -231,6 +232,16 @@ def _dispatch_outbound_call(
     # and from assert_concurrent_call_limit_ok's in-flight-call count.
     risk_service.assert_cumulative_trial_usage_ok(db, account_id)
 
+
+def _dispatch_outbound_call(
+    db: Session, *, account_id: str, account_email: str, owner: PhoneNumber, to: str, from_number: str,
+    message: str, status_callback_url: str | None,
+) -> dict:
+    """Shared core of place_outbound_call and place_outbound_call_for_account
+    - everything after "is this number really available to the caller" is
+    identical for both a logged-in user and a public API key."""
+    _assert_outbound_call_allowed(db, account_id=account_id, account_email=account_email, to=to, from_number=from_number)
+
     twiml = telecom.build_say_response(message)
     time_limit = risk_service.get_call_time_limit_for_account(db, account_id)
     result = telecom.place_call(
@@ -241,6 +252,65 @@ def _dispatch_outbound_call(
     record_call(
         db,
         account_id=account_id,
+        phone_number_id=owner.id,
+        direction=CallDirection.OUTBOUND,
+        from_number=from_number,
+        to_number=to,
+        provider_call_sid=result["sid"],
+        status=result["status"],
+    )
+    return result
+
+
+class BridgeAgentNumberNotConfiguredError(Exception):
+    """Raised when call-bridging is requested for a number with no
+    forwarding_number set - there's no real phone to ring as the agent
+    leg. See app.numbering.numbers.service.configure_routing for where
+    that field is set."""
+
+
+def place_bridge_call(
+    db: Session, user: User, from_number: str, to: str, bridge_connect_url: str, status_callback_url: str | None,
+) -> dict:
+    """Live two-way calling ("click to call"): rings the account's own
+    configured forwarding_number first (the real phone an agent already
+    answers inbound calls on - see should_forward_call), and only once
+    THEY pick up does Twilio request bridge_connect_url, which dials the
+    real customer and joins the two legs. The agent experiences this as an
+    ordinary phone call; the platform is just the operator connecting two
+    real calls, the same primitive ring groups already use, aimed the
+    other direction. Unlike place_outbound_call's one-way announcement,
+    both sides get genuine live audio."""
+    owner = find_number_owner(db, from_number)
+    if owner is None or owner.account_id != user.account_id or owner.status != PhoneNumberStatus.ACTIVE:
+        raise CallAuthorizationError(f"{from_number} is not an active number owned by your account")
+    try:
+        assert_number_access(owner, user)
+    except NumberConflictError as e:
+        raise CallAuthorizationError(str(e)) from e
+    try:
+        assert_caller_id_authorized(db, owner.id)
+    except CallerIdNotAuthorizedError as e:
+        raise CallAuthorizationError(str(e)) from e
+    if not owner.forwarding_number:
+        raise BridgeAgentNumberNotConfiguredError(
+            f"{from_number} has no forwarding number set - configure one in this number's routing "
+            "settings first, so there's a real phone to ring as the agent leg."
+        )
+
+    _assert_outbound_call_allowed(
+        db, account_id=user.account_id, account_email=user.email, to=to, from_number=from_number,
+    )
+
+    time_limit = risk_service.get_call_time_limit_for_account(db, user.account_id)
+    result = telecom.place_call(
+        to=owner.forwarding_number, from_=from_number, twiml_url=bridge_connect_url,
+        status_callback_url=status_callback_url, time_limit_seconds=time_limit,
+    )
+
+    record_call(
+        db,
+        account_id=user.account_id,
         phone_number_id=owner.id,
         direction=CallDirection.OUTBOUND,
         from_number=from_number,

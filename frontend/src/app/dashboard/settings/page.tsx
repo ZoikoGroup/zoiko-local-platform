@@ -286,7 +286,7 @@ export default function SettingsPage() {
               required
               value={code}
               onChange={(e) => setCode(e.target.value.replace(/\D/g, ""))}
-              className="w-full rounded-lg border border-slate-300 px-3.5 py-2.5 text-center text-lg tracking-[0.5em] font-mono focus:outline-none focus:ring-2 focus:ring-indigo-500/40 focus:border-indigo-500 transition"
+              className="w-full rounded-lg border border-slate-300 bg-white px-3.5 py-2.5 text-center text-lg tracking-[0.5em] font-mono text-slate-900 focus:outline-none focus:ring-2 focus:ring-indigo-500/40 focus:border-indigo-500 transition"
               placeholder="000000"
             />
             <div className="flex gap-2">
@@ -327,7 +327,7 @@ export default function SettingsPage() {
               required
               value={disableCode}
               onChange={(e) => setDisableCode(e.target.value.replace(/\D/g, ""))}
-              className="w-full rounded-lg border border-slate-300 px-3.5 py-2.5 text-center text-lg tracking-[0.5em] font-mono focus:outline-none focus:ring-2 focus:ring-red-500/40 focus:border-red-500 transition"
+              className="w-full rounded-lg border border-slate-300 bg-white px-3.5 py-2.5 text-center text-lg tracking-[0.5em] font-mono text-slate-900 focus:outline-none focus:ring-2 focus:ring-red-500/40 focus:border-red-500 transition"
               placeholder="000000"
             />
             <div className="flex gap-2">
@@ -367,7 +367,7 @@ export default function SettingsPage() {
             value={phoneDraft}
             onChange={(e) => setPhoneDraft(e.target.value)}
             placeholder="+15551234567"
-            className="flex-1 rounded-lg border border-slate-300 px-3.5 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/40 focus:border-indigo-500 transition"
+            className="flex-1 rounded-lg border border-slate-300 bg-white px-3.5 py-2.5 text-sm text-slate-900 focus:outline-none focus:ring-2 focus:ring-indigo-500/40 focus:border-indigo-500 transition"
           />
           <button
             onClick={handleSavePhone}
@@ -474,7 +474,7 @@ export default function SettingsPage() {
                       onChange={(e) =>
                         setRetentionDrafts((prev) => ({ ...prev, [key]: e.target.value }))
                       }
-                      className="w-20 rounded-lg border border-slate-300 px-2.5 py-1.5 text-sm text-right"
+                      className="w-20 rounded-lg border border-slate-300 bg-white px-2.5 py-1.5 text-sm text-right text-slate-900"
                     />
                     <span className="text-sm text-slate-500">days</span>
                     <button

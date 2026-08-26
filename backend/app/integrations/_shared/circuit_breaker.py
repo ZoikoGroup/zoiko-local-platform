@@ -69,19 +69,24 @@ def with_failover(
     primary: Callable[[], T],
     secondary: Callable[[], T] | None,
     expected_exception: type[Exception],
+    is_breaker_failure: Callable[[Exception], bool] = lambda e: True,
 ) -> T:
     """Call primary unless the breaker is already open; on expected_exception
-    from primary, record the failure and fall back to secondary if one is
-    configured - otherwise re-raise the original error. A HALF_OPEN breaker
-    is treated like CLOSED here: exactly the trial call that lets the
-    breaker recover if the primary is healthy again."""
+    from primary, record the failure (unless is_breaker_failure says this
+    particular exception doesn't indicate the provider itself is unhealthy -
+    see twilio.py's _is_provider_failure for why that distinction matters)
+    and fall back to secondary if one is configured - otherwise re-raise the
+    original error. A HALF_OPEN breaker is treated like CLOSED here: exactly
+    the trial call that lets the breaker recover if the primary is healthy
+    again."""
     if breaker.state != CircuitState.OPEN:
         try:
             result = primary()
             breaker.record_success()
             return result
         except expected_exception as e:
-            breaker.record_failure()
+            if is_breaker_failure(e):
+                breaker.record_failure()
             if secondary is None:
                 raise
             logger.warning("%s: primary provider failed, falling back to secondary: %s", breaker.name, e)
@@ -98,6 +103,7 @@ async def with_failover_async(
     primary: Callable[[], Awaitable[T]],
     secondary: Callable[[], Awaitable[T]] | None,
     expected_exception: type[Exception],
+    is_breaker_failure: Callable[[Exception], bool] = lambda e: True,
 ) -> T:
     """Async counterpart to with_failover, for Provider Gateways whose SDK
     calls are async (e.g. LiveKit) - same CLOSED/OPEN/HALF_OPEN semantics."""
@@ -107,7 +113,8 @@ async def with_failover_async(
             breaker.record_success()
             return result
         except expected_exception as e:
-            breaker.record_failure()
+            if is_breaker_failure(e):
+                breaker.record_failure()
             if secondary is None:
                 raise
             logger.warning("%s: primary provider failed, falling back to secondary: %s", breaker.name, e)

@@ -131,6 +131,54 @@ def require_writer(current_user: User = Depends(get_current_user)) -> User:
     return current_user
 
 
+def require_paid_or_read_only(request: Request, db: Session = Depends(get_db)) -> None:
+    """Applied router-wide (dependencies=[Depends(...)] at include_router,
+    not per-route) to every gated feature router in app.main - a TRIALING
+    account can still read (GET/HEAD/OPTIONS) every gated section, since
+    the dashboard Home page's own stat cards depend on reading numbers/
+    calls/voicemail/video/receptionist data even for a brand-new trial
+    account with nothing in it yet, but any write action needs a paid
+    plan. Deliberately router-wide rather than the usual per-route
+    Depends() pattern elsewhere in this file - the point is automatic
+    coverage of every route in a gated router (present and future),
+    which per-route repetition can't guarantee.
+
+    Deliberately does NOT depend on get_current_user: that pulls in
+    oauth2_scheme, which auto-401s on a missing/invalid token before this
+    function's body ever runs - so a router-wide dependency on it would
+    force customer auth onto every route in a gated router, including
+    plain public GETs (e.g. GET /compliance/rules) and staff-authenticated
+    or webhook routes that were never meant to need a customer JWT at all
+    (found via a real test failure, not by inspection). Instead this does
+    its own soft/optional token check: on anything that isn't a valid,
+    unexpired *customer*-scope token, it simply steps aside - the route's
+    own Depends(get_current_user)/require_admin/require_writer (present on
+    every gated write route per this file's normal per-route convention)
+    is what actually rejects a missing/invalid/wrong-scope token with 401.
+    This gate only ever adds a 402 on top of an already-valid customer
+    session that turns out to be TRIALING."""
+    if request.method in ("GET", "HEAD", "OPTIONS"):
+        return
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.lower().startswith("bearer "):
+        return
+    payload = decode_access_token(auth_header[7:])
+    if payload is None or payload.get("scope") != "customer":
+        return
+    user = db.query(User).filter(User.id == payload.get("sub")).first()
+    if user is None:
+        return
+
+    from app.billing.models import SubscriptionStatus
+    from app.billing.service import TrialWriteRestrictedError, get_or_create_subscription
+
+    sub = get_or_create_subscription(db, user.account_id)
+    if sub.status == SubscriptionStatus.TRIALING:
+        raise TrialWriteRestrictedError(
+            "Upgrade your plan to use this feature - you can view it during your trial, but changes need a paid plan."
+        )
+
+
 def _serialize_staff(staff: PlatformStaff) -> dict:
     return {
         "id": staff.id,

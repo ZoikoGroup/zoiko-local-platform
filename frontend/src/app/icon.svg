@@ -1,4 +1,8 @@
 <?xml version="1.0" encoding="UTF-8"?>
+<!-- Byte-identical copy of ../../public/logo-icon.svg - Next.js's app/icon.svg
+     favicon convention requires a real file at this exact path, so it can't
+     just reference the public/ copy. If the logo ever changes, update BOTH
+     files or the browser tab icon will silently drift from the in-app logo. -->
 <svg id="Layer_1" data-name="Layer 1" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
   <defs>
     <style>

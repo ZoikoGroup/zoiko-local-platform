@@ -3,6 +3,13 @@
 :root {
   --background: #ffffff;
   --foreground: #171717;
+  /* This app is light-themed only (every component hardcodes slate/
+     indigo/white Tailwind colors, not these CSS vars) - without this,
+     a browser on a dark-mode OS renders native form controls (select,
+     file input, text input) with dark-mode text/background regardless
+     of this page's own light styling, making unstyled control text
+     invisible against light custom backgrounds. */
+  color-scheme: light;
 }
 
 @theme inline {

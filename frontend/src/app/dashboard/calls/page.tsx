@@ -31,6 +31,7 @@ export default function CallsPage() {
 
   const [toNumber, setToNumber] = useState("");
   const [fromNumber, setFromNumber] = useState("");
+  const [callMessage, setCallMessage] = useState("");
   const [callBusy, setCallBusy] = useState(false);
   const [callError, setCallError] = useState<string | null>(null);
   const [callSuccess, setCallSuccess] = useState<string | null>(null);
@@ -74,9 +75,14 @@ export default function CallsPage() {
     setCallError(null);
     setCallSuccess(null);
     try {
-      const result = await placeOutboundCall(token, { to: toNumber, from: fromNumber });
+      const result = await placeOutboundCall(token, {
+        to: toNumber,
+        from: fromNumber,
+        ...(callMessage.trim() ? { message: callMessage.trim() } : {}),
+      });
       setCallSuccess(`Call placed to ${result.to} — status: ${result.status}`);
       setToNumber("");
+      setCallMessage("");
       await loadAll();
     } catch (err) {
       setCallError(err instanceof ApiError ? err.message : "Couldn't place the call.");
@@ -137,39 +143,54 @@ export default function CallsPage() {
             You don&apos;t have an active number to call from yet — get one from Phone Numbers first.
           </p>
         ) : (
-          <form onSubmit={handlePlaceCall} className="flex flex-wrap items-end gap-3">
-            <div>
-              <label className="block text-xs font-medium text-slate-500 mb-1">From</label>
-              <select
-                value={fromNumber}
-                onChange={(e) => setFromNumber(e.target.value)}
-                className="rounded-lg border border-slate-300 px-3 py-2 text-sm font-mono"
+          <form onSubmit={handlePlaceCall} className="space-y-3">
+            <div className="flex flex-wrap items-end gap-3">
+              <div>
+                <label className="block text-xs font-medium text-slate-500 mb-1">From</label>
+                <select
+                  value={fromNumber}
+                  onChange={(e) => setFromNumber(e.target.value)}
+                  className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-mono text-slate-900"
+                >
+                  {activeNumbers.map((n) => (
+                    <option key={n.id} value={n.e164}>
+                      {n.e164}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-slate-500 mb-1">To</label>
+                <input
+                  type="tel"
+                  required
+                  value={toNumber}
+                  onChange={(e) => setToNumber(e.target.value)}
+                  placeholder="+15551234567"
+                  className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-mono text-slate-900 placeholder:text-slate-400"
+                />
+              </div>
+              <button
+                type="submit"
+                disabled={callBusy || !fromNumber}
+                className="bg-indigo-600 hover:bg-indigo-700 disabled:opacity-60 text-white text-sm font-medium rounded-lg px-4 py-2"
               >
-                {activeNumbers.map((n) => (
-                  <option key={n.id} value={n.e164}>
-                    {n.e164}
-                  </option>
-                ))}
-              </select>
+                {callBusy ? "Calling..." : "Call"}
+              </button>
             </div>
             <div>
-              <label className="block text-xs font-medium text-slate-500 mb-1">To</label>
+              <label className="block text-xs font-medium text-slate-500 mb-1">
+                Message (spoken aloud when they answer — this is a one-way announcement, not a live conversation)
+              </label>
               <input
-                type="tel"
-                required
-                value={toNumber}
-                onChange={(e) => setToNumber(e.target.value)}
-                placeholder="+15551234567"
-                className="rounded-lg border border-slate-300 px-3 py-2 text-sm font-mono placeholder:text-slate-400"
+                type="text"
+                value={callMessage}
+                onChange={(e) => setCallMessage(e.target.value)}
+                placeholder="This is a call from Zoiko Local."
+                maxLength={500}
+                className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 placeholder:text-slate-400"
               />
             </div>
-            <button
-              type="submit"
-              disabled={callBusy || !fromNumber}
-              className="bg-indigo-600 hover:bg-indigo-700 disabled:opacity-60 text-white text-sm font-medium rounded-lg px-4 py-2"
-            >
-              {callBusy ? "Calling..." : "Call"}
-            </button>
           </form>
         )}
 

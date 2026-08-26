@@ -719,7 +719,7 @@ export default function VideoPage() {
               value={joinRoomInput}
               onChange={(e) => setJoinRoomInput(e.target.value)}
               placeholder="Room name (e.g. zl-...)"
-              className="flex-1 rounded-lg border border-slate-300 px-3 py-2 text-sm font-mono placeholder:text-slate-400"
+              className="flex-1 rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-mono text-slate-900 placeholder:text-slate-400"
             />
             <button
               type="submit"

@@ -485,6 +485,13 @@ def test_canceled_account_is_blocked_from_outbound_calling(client, monkeypatch):
 
     token = _signup_and_login(client, "canceledoutbound@example.com")
     headers = {"Authorization": f"Bearer {token}"}
+    # Upgraded off free_trial first - this test is about the CANCELED-
+    # subscription suspension gate specifically, not the separate trial-
+    # write gate (app.core.deps.require_paid_or_read_only) that would
+    # otherwise block the purchase itself before ever reaching cancellation.
+    assert client.put(
+        "/billing/subscription/plan", json={"plan_code": "starter", "billing_period": "monthly"}, headers=headers
+    ).status_code == 200
     purchase = _reserve_and_purchase(client, headers, "+15550019001")
     assert purchase.status_code == 200, purchase.text
 
@@ -517,17 +524,24 @@ def test_usage_summary_route_returns_zeroed_resources_for_a_fresh_account(client
 
 
 def test_number_purchase_blocked_once_plan_number_quota_is_reached(client, monkeypatch):
-    """free_trial's max_numbers=1 (Global Plans, Pricing & Commercial
-    Launch Standard doc §7: "Maximum one trial number") - the 2nd purchase
-    attempt must be rejected with 402, without ever calling the real
-    Twilio buy_number."""
+    """starter's max_numbers=3 - the 4th purchase attempt must be rejected
+    with 402 RESOURCE_OVER_LIMIT, without ever calling the real Twilio
+    buy_number. Upgraded off free_trial first (app.core.deps.require_paid_
+    or_read_only now blocks a trial account from purchasing at all - see
+    that dependency's own docstring - so free_trial's own max_numbers=1
+    is no longer reachable via a real purchase attempt; a paid plan's
+    quota is the realistic scenario now)."""
     _stub_buy_number(monkeypatch)
     token = _signup_and_login(client, "quotanumbers1@example.com")
     headers = {"Authorization": f"Bearer {token}"}
+    assert client.put(
+        "/billing/subscription/plan", json={"plan_code": "starter", "billing_period": "monthly"}, headers=headers
+    ).status_code == 200
 
-    response = _reserve_and_purchase(client, headers, "+15550011111")
-    assert response.status_code == 200, response.text
-    assert response.json()["status"] == "active"
+    for e164 in ["+15550011111", "+15550011112", "+15550011113"]:
+        response = _reserve_and_purchase(client, headers, e164)
+        assert response.status_code == 200, response.text
+        assert response.json()["status"] == "active"
 
     over_limit = _reserve_and_purchase(client, headers, "+15550022222")
     assert over_limit.status_code == 402, over_limit.text
@@ -536,15 +550,20 @@ def test_number_purchase_blocked_once_plan_number_quota_is_reached(client, monke
 
 
 def test_number_purchase_succeeds_after_upgrading_plan(client, monkeypatch):
-    """Exhausts the free_trial number quota, confirms the next purchase is
-    blocked, upgrades to enterprise (comfortably higher on every plan's
+    """Exhausts starter's number quota (3 - see the previous test's
+    docstring for why starter, not free_trial), confirms the next purchase
+    is blocked, upgrades to enterprise (comfortably higher on every plan's
     limits), then confirms the same purchase now succeeds."""
     _stub_buy_number(monkeypatch)
     token = _signup_and_login(client, "quotanumbers2@example.com")
     headers = {"Authorization": f"Bearer {token}"}
+    assert client.put(
+        "/billing/subscription/plan", json={"plan_code": "starter", "billing_period": "monthly"}, headers=headers
+    ).status_code == 200
 
-    response = _reserve_and_purchase(client, headers, "+15550033331")
-    assert response.status_code == 200, response.text
+    for e164 in ["+15550033331", "+15550033332", "+15550033333"]:
+        response = _reserve_and_purchase(client, headers, e164)
+        assert response.status_code == 200, response.text
 
     blocked = _reserve_and_purchase(client, headers, "+15550044444")
     assert blocked.status_code == 402, blocked.text
