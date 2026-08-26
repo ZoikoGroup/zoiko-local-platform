@@ -21,7 +21,7 @@ export default function AuthLayout({
       {/* Branded side panel - hidden on small screens. Complementary
           marketing content, not the page's main content, so it's an
           <aside>, not part of the <main> landmark below. */}
-      <aside className="hidden lg:flex lg:w-[45%] bg-gradient-to-br from-indigo-700 via-indigo-600 to-slate-900 text-white flex-col justify-between p-12 relative overflow-hidden">
+      <aside className="hidden lg:flex lg:w-[45%] bg-gradient-to-br from-indigo-700 via-indigo-600 to-slate-800 text-white flex-col justify-between p-12 relative overflow-hidden">
         <div className="absolute inset-0 opacity-10 bg-[radial-gradient(circle_at_top_right,white,transparent_60%)]" />
 
         <div className="relative flex items-center gap-2">
