@@ -237,17 +237,29 @@ export default function MessagingPage() {
                     <span className="text-xs font-medium text-red-700 bg-red-50 rounded-full px-2 py-1">Opted out</span>
                   )}
                 </div>
-                <div className="space-y-2 max-h-96 overflow-y-auto">
+                <div className="space-y-3 max-h-96 overflow-y-auto">
                   {messages.map((m) => (
-                    <div
-                      key={m.id}
-                      className={`max-w-[75%] rounded-lg px-3 py-2 text-sm ${
-                        m.direction === "outbound" ? "ml-auto bg-indigo-50 text-indigo-900" : "bg-slate-50 text-slate-800"
-                      }`}
-                    >
-                      <div>{m.body}</div>
-                      <div className="text-[10px] text-slate-400 mt-1">
-                        {m.status} - {new Date(m.created_at).toLocaleString()}
+                    <div key={m.id} className={`max-w-[75%] ${m.direction === "outbound" ? "ml-auto" : ""}`}>
+                      <div
+                        className={`text-[10px] font-medium mb-0.5 ${
+                          m.direction === "outbound" ? "text-right text-indigo-400" : "text-slate-400"
+                        }`}
+                      >
+                        {m.direction === "outbound" ? "You" : selected.customer_number}
+                      </div>
+                      <div
+                        className={`rounded-lg px-3 py-2 text-sm ${
+                          m.direction === "outbound" ? "bg-indigo-600 text-white" : "bg-slate-100 text-slate-800"
+                        }`}
+                      >
+                        <div>{m.body}</div>
+                        <div
+                          className={`text-[10px] mt-1 ${
+                            m.direction === "outbound" ? "text-indigo-200" : "text-slate-400"
+                          }`}
+                        >
+                          {m.status} - {new Date(m.created_at).toLocaleString()}
+                        </div>
                       </div>
                     </div>
                   ))}
