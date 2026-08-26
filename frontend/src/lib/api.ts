@@ -1252,6 +1252,12 @@ export async function placeOutboundCall(
   });
 }
 
+export async function getBrowserVoiceToken(token: string): Promise<{ token: string }> {
+  return request("/media/voice/browser-token", {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
 export async function placeBridgeCall(
   token: string,
   input: { to: string; from: string; agent_number: string }

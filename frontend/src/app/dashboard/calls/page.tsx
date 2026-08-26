@@ -1,11 +1,13 @@
 "use client";
 
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState, useCallback, useRef } from "react";
+import { Call, Device } from "@twilio/voice-sdk";
 import {
   listMyNumbers,
   listCalls,
   placeOutboundCall,
   placeBridgeCall,
+  getBrowserVoiceToken,
   listVoicemails,
   summarizeCall,
   summarizeVoicemail,
@@ -19,6 +21,8 @@ import {
 } from "@/lib/api";
 import { getToken } from "@/lib/auth";
 import { CallRow, type SummaryKey, type SummaryState } from "@/components/CallRow";
+
+type BrowserCallStatus = "idle" | "connecting" | "ringing" | "in-call" | "ended" | "error";
 
 export default function CallsPage() {
   const [token] = useState<string | null>(() => getToken());
@@ -39,6 +43,11 @@ export default function CallsPage() {
   const [callSuccess, setCallSuccess] = useState<string | null>(null);
 
   const [summaries, setSummaries] = useState<Record<SummaryKey, SummaryState>>({});
+
+  const deviceRef = useRef<Device | null>(null);
+  const activeCallRef = useRef<Call | null>(null);
+  const [browserCallStatus, setBrowserCallStatus] = useState<BrowserCallStatus>("idle");
+  const [browserCallError, setBrowserCallError] = useState<string | null>(null);
 
   const loadAll = useCallback(() => {
     if (!token) return;
@@ -113,6 +122,60 @@ export default function CallsPage() {
       setCallBusy(false);
     }
   }
+
+  async function ensureVoiceDevice(): Promise<Device> {
+    if (deviceRef.current) return deviceRef.current;
+    if (!token) throw new Error("Not logged in.");
+    const { token: voiceToken } = await getBrowserVoiceToken(token);
+    const newDevice = new Device(voiceToken, { codecPreferences: [Call.Codec.Opus, Call.Codec.PCMU] });
+    newDevice.on("error", (err) => {
+      setBrowserCallError(err.message || "A browser calling error occurred.");
+      setBrowserCallStatus("error");
+    });
+    await newDevice.register();
+    deviceRef.current = newDevice;
+    return newDevice;
+  }
+
+  async function handleBrowserCall() {
+    if (!fromNumber || !toNumber) return;
+    setBrowserCallError(null);
+    setBrowserCallStatus("connecting");
+    try {
+      const device = await ensureVoiceDevice();
+      const call = await device.connect({ params: { To: toNumber, ZoikoFrom: fromNumber } });
+      activeCallRef.current = call;
+      setBrowserCallStatus("ringing");
+      call.on("accept", () => setBrowserCallStatus("in-call"));
+      call.on("disconnect", () => {
+        setBrowserCallStatus("ended");
+        activeCallRef.current = null;
+      });
+      call.on("cancel", () => {
+        setBrowserCallStatus("ended");
+        activeCallRef.current = null;
+      });
+      call.on("error", (err) => {
+        setBrowserCallError(err.message || "The call ended with an error.");
+        setBrowserCallStatus("error");
+        activeCallRef.current = null;
+      });
+    } catch (err) {
+      setBrowserCallError(err instanceof ApiError ? err.message : "Couldn't start the browser call.");
+      setBrowserCallStatus("error");
+    }
+  }
+
+  function handleHangUp() {
+    activeCallRef.current?.disconnect();
+  }
+
+  useEffect(() => {
+    return () => {
+      activeCallRef.current?.disconnect();
+      deviceRef.current?.destroy();
+    };
+  }, []);
 
   async function handleSummarize(kind: "call" | "voicemail", id: string) {
     if (!token) return;
@@ -222,8 +285,44 @@ export default function CallsPage() {
                 {callBusy ? "Calling..." : "Talk Live"}
               </button>
             </div>
+            <div className="flex flex-wrap items-center gap-3">
+              {browserCallStatus === "in-call" || browserCallStatus === "ringing" || browserCallStatus === "connecting" ? (
+                <button
+                  type="button"
+                  onClick={handleHangUp}
+                  className="bg-red-600 hover:bg-red-700 text-white text-sm font-medium rounded-lg px-4 py-2"
+                >
+                  Hang Up
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  onClick={handleBrowserCall}
+                  disabled={!fromNumber || !toNumber}
+                  className="bg-violet-600 hover:bg-violet-700 disabled:opacity-60 text-white text-sm font-medium rounded-lg px-4 py-2"
+                  title="Talk directly through your computer's microphone - no phone needed at all"
+                >
+                  Call from Browser
+                </button>
+              )}
+              {browserCallStatus === "connecting" && (
+                <span className="text-sm text-slate-500">Connecting…</span>
+              )}
+              {browserCallStatus === "ringing" && (
+                <span className="text-sm text-slate-500">Ringing {toNumber}…</span>
+              )}
+              {browserCallStatus === "in-call" && (
+                <span className="text-sm text-emerald-600 font-medium">● Live — talking to {toNumber}</span>
+              )}
+              {browserCallStatus === "ended" && (
+                <span className="text-sm text-slate-500">Call ended.</span>
+              )}
+              {browserCallStatus === "error" && browserCallError && (
+                <span className="text-sm text-red-600">{browserCallError}</span>
+              )}
+            </div>
             <p className="text-xs text-slate-500">
-              <strong>Announce</strong> plays a one-way message and hangs up. <strong>Talk Live</strong> rings the real phone you enter above first, then connects you to a real, live, two-way conversation with the "To" number once you pick up.
+              <strong>Announce</strong> plays a one-way message and hangs up. <strong>Talk Live</strong> rings a real phone first, then connects it live to the "To" number. <strong>Call from Browser</strong> uses your computer&apos;s microphone directly — no phone needed at all, talk right here in the tab.
             </p>
             <div>
               <label className="block text-xs font-medium text-slate-500 mb-1">
