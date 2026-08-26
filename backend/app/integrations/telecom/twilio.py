@@ -13,6 +13,8 @@ import re
 
 import httpx
 from twilio.base.exceptions import TwilioException, TwilioRestException
+from twilio.jwt.access_token import AccessToken
+from twilio.jwt.access_token.grants import VoiceGrant
 from twilio.request_validator import RequestValidator
 from twilio.rest import Client
 from twilio.twiml.voice_response import VoiceResponse
@@ -548,6 +550,26 @@ def build_forward_response(
         dial_kwargs["recording_status_callback_event"] = "completed"
     response.dial(forwarding_number, **dial_kwargs)
     return str(response)
+
+
+def build_voice_access_token(identity: str) -> str:
+    """Short-lived (1hr) Twilio Voice access token for the browser calling
+    SDK (@twilio/voice-sdk) - lets the browser register as a real Twilio
+    Client and place calls directly, no separate phone involved (unlike
+    place_bridge_call's call-bridging, which needs a real phone to ring
+    first). `identity` is opaque to Twilio - just a value we choose now
+    and read back later - see media.service.handle_browser_connect,
+    where it's the account_id, so that webhook can run the exact same
+    billing/risk checks as every other real outbound call. Uses a
+    dedicated signing key (twilio_voice_api_key_sid/secret), never the
+    general-purpose twilio_api_key_sid/secret - different scope entirely
+    (client-side Voice grants vs. server-side REST API calls)."""
+    token = AccessToken(
+        settings.twilio_account_sid, settings.twilio_voice_api_key_sid,
+        settings.twilio_voice_api_key_secret, identity=identity, ttl=3600,
+    )
+    token.add_grant(VoiceGrant(outgoing_application_sid=settings.twilio_twiml_app_sid, incoming_allow=False))
+    return token.to_jwt()
 
 
 def build_bridge_response(destination: str, caller_id: str, status_callback_url: str | None = None) -> str:

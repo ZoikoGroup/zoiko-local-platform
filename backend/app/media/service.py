@@ -310,6 +310,46 @@ def place_bridge_call(
     return result
 
 
+def handle_browser_connect(db: Session, *, account_id: str, from_number: str, to: str, call_sid: str) -> str:
+    """Live two-way calling straight from the browser (@twilio/voice-sdk):
+    called by media.voice.browser_connect, the webhook Twilio hits the
+    instant someone's browser (already holding a token minted for
+    `account_id` - see telecom.build_voice_access_token) places a call via
+    Device.connect(). Unlike place_bridge_call, there's no agent phone to
+    ring first - the browser itself IS the agent leg by the time this
+    runs, so this only has to authorize `from_number` for `account_id` and
+    return TwiML dialing the real destination with from_number as caller
+    ID. Returns TwiML directly (not a dict, unlike every other place_*
+    call here) because the caller is Twilio itself, which only understands
+    TwiML - raises the same CallAuthorizationError/risk exceptions as
+    every other real call so the route can translate them into a clean
+    spoken error instead of dead air."""
+    owner = find_number_owner(db, from_number)
+    if owner is None or owner.account_id != account_id or owner.status != PhoneNumberStatus.ACTIVE:
+        raise CallAuthorizationError(f"{from_number} is not an active number owned by your account")
+    try:
+        assert_caller_id_authorized(db, owner.id)
+    except CallerIdNotAuthorizedError as e:
+        raise CallAuthorizationError(str(e)) from e
+
+    account_owner = db.query(User).filter(User.account_id == account_id, User.role == UserRole.OWNER).first()
+    account_email = account_owner.email if account_owner else ""
+
+    _assert_outbound_call_allowed(db, account_id=account_id, account_email=account_email, to=to, from_number=from_number)
+
+    record_call(
+        db,
+        account_id=account_id,
+        phone_number_id=owner.id,
+        direction=CallDirection.OUTBOUND,
+        from_number=from_number,
+        to_number=to,
+        provider_call_sid=call_sid,
+        status="in-progress",
+    )
+    return telecom.build_bridge_response(to, caller_id=from_number)
+
+
 def place_outbound_call(
     db: Session, user: User, to: str, from_number: str, message: str, status_callback_url: str | None = None
 ) -> dict:

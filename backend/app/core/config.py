@@ -61,6 +61,15 @@ class Settings(BaseSettings):
     # from - a Zoiko-owned number, distinct from any customer's purchased
     # number. Blank until a real number is provisioned for this purpose.
     twilio_trial_number: str = ""
+    # Browser calling (real-time voice in the dashboard via Twilio's Voice
+    # SDK) - a dedicated TwiML Application (whose Voice URL points at
+    # POST /media/voice/browser-connect) and a dedicated API key used only
+    # to sign short-lived Voice access tokens for the browser. Deliberately
+    # separate from twilio_api_key_sid/secret above (that key's scope is
+    # unrelated - REST API calls, not client-side Voice grants).
+    twilio_twiml_app_sid: str = ""
+    twilio_voice_api_key_sid: str = ""
+    twilio_voice_api_key_secret: str = ""
     # public HTTPS URL this API is reachable at (e.g. an ngrok tunnel in dev,
     # or the real deployed origin) — used to register Twilio webhook URLs
     # (call status callbacks) that can't be constructed from a request object

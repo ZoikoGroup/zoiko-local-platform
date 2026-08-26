@@ -14,6 +14,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, R
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.orm import Session
 
+from app.billing import service as billing_service
 from app.core.database import get_db
 from app.core.deps import get_current_user, require_writer
 from app.integrations.telecom import twilio as telecom
@@ -343,6 +344,73 @@ async def bridge_connect(request: Request, to: str, from_: str = Query(alias="fr
     bridge_call above), not caller-supplied input Twilio is relaying."""
     status_callback_url = str(request.base_url) + "media/voice/status-callback"
     twiml = telecom.build_bridge_response(to, caller_id=from_, status_callback_url=status_callback_url)
+    return Response(content=twiml, media_type="application/xml")
+
+
+@router.get("/browser-token")
+async def browser_token(current_user: User = Depends(require_writer), db: Session = Depends(get_db)):
+    """Issues a short-lived Twilio Voice access token for the browser
+    calling SDK (@twilio/voice-sdk) - the frontend uses this to register a
+    real Twilio Client and place calls directly from the browser, no
+    separate phone involved (unlike /bridge above). Gated the same as
+    every other real write action (require_writer): a Viewer shouldn't be
+    able to place calls, browser or otherwise.
+
+    Deliberately re-checks TRIALING here even though this route is a GET
+    (exempt from app.core.deps.require_paid_or_read_only, since every
+    other GET in this app is read-only) - a token handed out here lets the
+    browser place a real call via /browser-connect, a Twilio webhook with
+    no customer Authorization header at all, so the router-wide trial gate
+    can never see or block that call. Without this explicit check, browser
+    calling would be a real loophole around "trial accounts can view but
+    not perform paid actions.\""""
+    from app.billing.models import SubscriptionStatus
+    from app.billing.service import TrialWriteRestrictedError, get_or_create_subscription
+
+    sub = get_or_create_subscription(db, current_user.account_id)
+    if sub.status == SubscriptionStatus.TRIALING:
+        raise TrialWriteRestrictedError(
+            "Upgrade your plan to use this feature - you can view it during your trial, but changes need a paid plan."
+        )
+
+    token = telecom.build_voice_access_token(identity=current_user.account_id)
+    return {"token": token}
+
+
+@router.post("/browser-connect")
+async def browser_connect(request: Request, db: Session = Depends(get_db)):
+    """Twilio calls this the instant a browser holding a token minted by
+    /browser-token places a call via Device.connect({params: {To,
+    ZoikoFrom}}). `Caller` here is always "client:<account_id>" - the
+    identity Twilio embedded in that token when it was issued, not
+    caller-supplied input being blindly relayed; the browser cannot forge
+    a different identity than the one its token was minted with. Catches
+    every real-call rejection reason and speaks it back instead of
+    returning a JSON error, which Twilio can't render into anything a
+    caller would hear - a webhook must always answer in TwiML."""
+    params = await media_service.verify_twilio_webhook(request)
+    account_id = params.get("Caller", "").removeprefix("client:")
+    to = params.get("To", "")
+    from_number = params.get("ZoikoFrom", "")
+    call_sid = params.get("CallSid", "")
+    try:
+        twiml = media_service.handle_browser_connect(
+            db, account_id=account_id, from_number=from_number, to=to, call_sid=call_sid,
+        )
+    except (
+        media_service.CallAuthorizationError,
+        billing_service.EntitlementError,
+        risk_service.DestinationBlockedError,
+        risk_service.VelocityLimitExceededError,
+        risk_service.ConcurrentCallLimitExceededError,
+        risk_service.GeographicDispersionError,
+        risk_service.SpendLimitExceededError,
+        risk_service.CumulativeTrialUsageExceededError,
+        risk_service.AccountKillSwitchTrippedError,
+        KillSwitchTrippedError,
+        TelecomError,
+    ) as e:
+        twiml = telecom.build_say_response(f"Sorry, this call could not be placed. {e}")
     return Response(content=twiml, media_type="application/xml")
 
 
