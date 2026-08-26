@@ -563,12 +563,19 @@ def build_voice_access_token(identity: str) -> str:
     billing/risk checks as every other real outbound call. Uses a
     dedicated signing key (twilio_voice_api_key_sid/secret), never the
     general-purpose twilio_api_key_sid/secret - different scope entirely
-    (client-side Voice grants vs. server-side REST API calls)."""
+    (client-side Voice grants vs. server-side REST API calls).
+
+    incoming_allow=True so this same identity/token also lets the browser
+    receive real inbound calls - build_ring_group_response dials
+    "client:<account_id>" alongside the number's configured phone
+    destinations on every inbound call, and Twilio only actually delivers
+    that leg to a browser tab that's registered a Device with a token
+    carrying this grant."""
     token = AccessToken(
         settings.twilio_account_sid, settings.twilio_voice_api_key_sid,
         settings.twilio_voice_api_key_secret, identity=identity, ttl=3600,
     )
-    token.add_grant(VoiceGrant(outgoing_application_sid=settings.twilio_twiml_app_sid, incoming_allow=False))
+    token.add_grant(VoiceGrant(outgoing_application_sid=settings.twilio_twiml_app_sid, incoming_allow=True))
     return token.to_jwt()
 
 
@@ -623,20 +630,37 @@ def build_ring_group_response(
     /forward-fallback route (enhanced business routing, routes to
     voicemail), both of which only fire when the dial genuinely wasn't
     answered.
+
+    A destination prefixed "client:" (e.g. "client:<account_id>", the same
+    identity build_voice_access_token issues browser tokens under) rings
+    a registered browser tab instead of a phone - see media/voice.py's
+    _default_call_twiml and _flow_response, which both prepend this
+    destination alongside the number's configured phone destinations.
+    Mixed real numbers and browser clients ring simultaneously in the same
+    ring group; whichever answers first wins, same as multiple phone
+    numbers already do.
     """
     response = VoiceResponse()
     dial_kwargs = {"action": fallback_action_url}
-    if status_callback_url:
-        dial_kwargs["status_callback"] = status_callback_url
-        dial_kwargs["status_callback_event"] = "completed"
     if recording_callback_url:
         dial_kwargs["record"] = "record-from-answer-dual"
         dial_kwargs["recording_status_callback"] = recording_callback_url
         dial_kwargs["recording_status_callback_method"] = "POST"
         dial_kwargs["recording_status_callback_event"] = "completed"
     dial = response.dial(**dial_kwargs)
+    # action belongs on <Dial> itself; status_callback/status_callback_event
+    # are only valid on the nested <Number>/<Client> nouns - Twilio's XML
+    # validator rejects them on <Dial> (confirmed live via a real call's
+    # Notifications log - see build_bridge_response's identical fix).
+    noun_kwargs: dict = {}
+    if status_callback_url:
+        noun_kwargs["status_callback"] = status_callback_url
+        noun_kwargs["status_callback_event"] = "completed"
     for destination in destinations:
-        dial.number(destination)
+        if destination.startswith("client:"):
+            dial.client(identity=destination.removeprefix("client:"), **noun_kwargs)
+        else:
+            dial.number(destination, **noun_kwargs)
     return str(response)
 
 

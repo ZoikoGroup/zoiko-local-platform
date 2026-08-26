@@ -5,8 +5,10 @@ import { useRouter } from "next/navigation";
 import Sidebar from "@/components/Sidebar";
 import Topbar from "@/components/Topbar";
 import TrialBanner from "@/components/TrialBanner";
+import VoiceCallOverlay from "@/components/VoiceCallOverlay";
 import { ApiError, getCurrentUser, getSubscription, type Subscription, type User } from "@/lib/api";
 import { getToken, clearToken } from "@/lib/auth";
+import { VoiceDeviceProvider } from "@/lib/voiceDevice";
 
 export default function DashboardLayout({
   children,
@@ -60,13 +62,16 @@ export default function DashboardLayout({
   }
 
   return (
-    <div className="min-h-screen flex bg-slate-50">
-      <Sidebar subscription={subscription} />
-      <div className="flex-1 flex flex-col min-w-0">
-        <Topbar user={user} />
-        <TrialBanner subscription={subscription} />
-        <main className="flex-1 overflow-y-auto p-6">{children}</main>
+    <VoiceDeviceProvider>
+      <div className="min-h-screen flex bg-slate-50">
+        <Sidebar subscription={subscription} />
+        <div className="flex-1 flex flex-col min-w-0">
+          <Topbar user={user} />
+          <TrialBanner subscription={subscription} />
+          <main className="flex-1 overflow-y-auto p-6">{children}</main>
+        </div>
       </div>
-    </div>
+      <VoiceCallOverlay />
+    </VoiceDeviceProvider>
   );
 }

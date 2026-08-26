@@ -22,7 +22,18 @@ def _signup_and_login(client, email: str) -> str:
         "/auth/signup",
         json={"account_name": "Call Flow Test Co", "account_type": "business", "email": email, "password": "supersecret123"},
     )
-    return client.post("/auth/login", json={"email": email, "password": "supersecret123"}).json()["access_token"]
+    token = client.post("/auth/login", json={"email": email, "password": "supersecret123"}).json()["access_token"]
+    # A fresh signup defaults to the free trial - app.core.deps.
+    # require_paid_or_read_only blocks write actions (creating/publishing/
+    # assigning a call flow) for a TRIALING account, and this file's tests
+    # are about call-flow mechanics, not trial-gating, so upgrade to a
+    # real paid plan here rather than adding this to every individual
+    # test (same pattern as test_voice.py's _signup_and_login).
+    client.put(
+        "/billing/subscription/plan", json={"plan_code": "starter", "billing_period": "monthly"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    return token
 
 
 def _make_active_number(client, db_session, token, e164: str) -> PhoneNumber:
@@ -209,7 +220,10 @@ def test_menu_digit_routes_to_the_matching_forward_node(client, db_session):
 
     assert response.status_code == 200
     assert "+15552220000" in response.text
-    assert "<Number>" in response.text
+    # Not a bare "<Number>" - build_ring_group_response puts
+    # statusCallback/statusCallbackEvent as attributes on this noun (a real
+    # TwiML-validation fix, not a formatting choice - see its docstring).
+    assert "<Number " in response.text
 
 
 def test_invalid_menu_digit_repeats_the_same_menu(client, db_session):

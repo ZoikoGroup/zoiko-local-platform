@@ -101,7 +101,10 @@ def test_status_callback_updates_call_duration(client, db_session):
     status_response = client.post(
         "/media/voice/status-callback", data=status_params, headers={"X-Twilio-Signature": status_signature}
     )
-    assert status_response.status_code == 204
+    # A bare 204 reaches Twilio with an empty Content-Type header (its
+    # error 12300) - the route returns a real empty TwiML document instead
+    # (confirmed live via a real call's own Notifications log).
+    assert status_response.status_code == 200
 
     calls_response = client.get("/media/voice/calls", headers={"Authorization": f"Bearer {token}"})
     assert calls_response.status_code == 200
