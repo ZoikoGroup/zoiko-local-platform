@@ -10,7 +10,7 @@ never imports the twilio SDK directly, per the Provider Gateway rule.
 
 from urllib.parse import quote
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.orm import Session
 
@@ -90,6 +90,13 @@ class OutboundCallRequest(BaseModel):
     to: str
     from_number: str = Field(alias="from")
     message: str = "This is a call from Zoiko Local."
+
+
+class BridgeCallRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    to: str
+    from_number: str = Field(alias="from")
 
 
 def _ai_receptionist_greeting_twiml(request: Request) -> str:
@@ -276,6 +283,68 @@ async def outbound_call(
         raise HTTPException(status_code=503, detail=str(e)) from e
     except TelecomError as e:
         raise HTTPException(status_code=502, detail=str(e)) from e
+
+
+@router.post("/bridge")
+async def bridge_call(
+    body: BridgeCallRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_writer),
+    x_device_fingerprint: str | None = Header(default=None),
+):
+    """Live two-way calling ("click to call"): rings the caller's own
+    configured forwarding number first; once they answer, /bridge-connect
+    dials the real customer and joins both legs - see
+    media.service.place_bridge_call's docstring for the full flow. Unlike
+    /outbound (a one-way announcement), the caller genuinely talks to
+    whoever picks up on the other end."""
+    risk_service.check_fingerprint_on_call(db, fingerprint_hash=x_device_fingerprint, account_id=current_user.account_id)
+
+    status_callback_url = str(request.base_url) + "media/voice/status-callback"
+    bridge_connect_url = (
+        str(request.base_url) + "media/voice/bridge-connect"
+        f"?to={quote(body.to)}&from={quote(body.from_number)}"
+    )
+    try:
+        return media_service.place_bridge_call(
+            db, current_user, body.from_number, body.to, bridge_connect_url, status_callback_url
+        )
+    except media_service.CallAuthorizationError as e:
+        raise HTTPException(status_code=403, detail=str(e)) from e
+    except media_service.BridgeAgentNumberNotConfiguredError as e:
+        raise HTTPException(status_code=422, detail=str(e)) from e
+    except risk_service.DestinationBlockedError as e:
+        raise HTTPException(status_code=403, detail=str(e)) from e
+    except risk_service.VelocityLimitExceededError as e:
+        raise HTTPException(status_code=429, detail=str(e)) from e
+    except risk_service.ConcurrentCallLimitExceededError as e:
+        raise HTTPException(status_code=429, detail=str(e)) from e
+    except risk_service.GeographicDispersionError as e:
+        raise HTTPException(status_code=429, detail=str(e)) from e
+    except risk_service.SpendLimitExceededError as e:
+        raise HTTPException(status_code=429, detail=str(e)) from e
+    except risk_service.CumulativeTrialUsageExceededError as e:
+        raise HTTPException(status_code=402, detail=str(e)) from e
+    except risk_service.AccountKillSwitchTrippedError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+    except KillSwitchTrippedError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+    except TelecomError as e:
+        raise HTTPException(status_code=502, detail=str(e)) from e
+
+
+@router.post("/bridge-connect")
+async def bridge_connect(request: Request, to: str, from_: str = Query(alias="from")):
+    """Twilio requests this once the agent leg (place_bridge_call's call to
+    owner.forwarding_number) is actually answered - never called at all if
+    the agent doesn't pick up, so the customer is never dialed for a call
+    the agent never joined. No signature verification/DB lookup needed:
+    `to`/`from` are values WE put on this URL when creating the call (see
+    bridge_call above), not caller-supplied input Twilio is relaying."""
+    status_callback_url = str(request.base_url) + "media/voice/status-callback"
+    twiml = telecom.build_bridge_response(to, caller_id=from_, status_callback_url=status_callback_url)
+    return Response(content=twiml, media_type="application/xml")
 
 
 @router.post("/status-callback")

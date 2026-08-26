@@ -550,6 +550,24 @@ def build_forward_response(
     return str(response)
 
 
+def build_bridge_response(destination: str, caller_id: str, status_callback_url: str | None = None) -> str:
+    """Builds TwiML that dials `destination` with `caller_id` shown as the
+    caller's number, for the second leg of a call-bridge: the platform has
+    already called the agent's own real phone and they've answered (that's
+    what triggers Twilio to request this response), so this is what
+    connects them live to the actual customer. caller_id is set so the
+    customer sees the Zoiko Local number, not the agent's personal one.
+    """
+    response = VoiceResponse()
+    dial_kwargs: dict = {"caller_id": caller_id}
+    if status_callback_url:
+        dial_kwargs["action"] = status_callback_url
+        dial_kwargs["status_callback"] = status_callback_url
+        dial_kwargs["status_callback_event"] = "completed"
+    response.dial(destination, **dial_kwargs)
+    return str(response)
+
+
 def build_empty_response() -> str:
     """No further instructions - Twilio hangs up. Used as the <Dial>
     action's reply when DialCallStatus is "completed" (the call was
