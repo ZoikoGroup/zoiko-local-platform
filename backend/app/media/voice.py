@@ -97,6 +97,7 @@ class BridgeCallRequest(BaseModel):
 
     to: str
     from_number: str = Field(alias="from")
+    agent_number: str
 
 
 def _ai_receptionist_greeting_twiml(request: Request) -> str:
@@ -308,12 +309,10 @@ async def bridge_call(
     )
     try:
         return media_service.place_bridge_call(
-            db, current_user, body.from_number, body.to, bridge_connect_url, status_callback_url
+            db, current_user, body.from_number, body.to, body.agent_number, bridge_connect_url, status_callback_url
         )
     except media_service.CallAuthorizationError as e:
         raise HTTPException(status_code=403, detail=str(e)) from e
-    except media_service.BridgeAgentNumberNotConfiguredError as e:
-        raise HTTPException(status_code=422, detail=str(e)) from e
     except risk_service.DestinationBlockedError as e:
         raise HTTPException(status_code=403, detail=str(e)) from e
     except risk_service.VelocityLimitExceededError as e:

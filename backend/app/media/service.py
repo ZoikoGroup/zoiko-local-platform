@@ -262,25 +262,19 @@ def _dispatch_outbound_call(
     return result
 
 
-class BridgeAgentNumberNotConfiguredError(Exception):
-    """Raised when call-bridging is requested for a number with no
-    forwarding_number set - there's no real phone to ring as the agent
-    leg. See app.numbering.numbers.service.configure_routing for where
-    that field is set."""
-
-
 def place_bridge_call(
-    db: Session, user: User, from_number: str, to: str, bridge_connect_url: str, status_callback_url: str | None,
+    db: Session, user: User, from_number: str, to: str, agent_number: str,
+    bridge_connect_url: str, status_callback_url: str | None,
 ) -> dict:
-    """Live two-way calling ("click to call"): rings the account's own
-    configured forwarding_number first (the real phone an agent already
-    answers inbound calls on - see should_forward_call), and only once
-    THEY pick up does Twilio request bridge_connect_url, which dials the
-    real customer and joins the two legs. The agent experiences this as an
-    ordinary phone call; the platform is just the operator connecting two
-    real calls, the same primitive ring groups already use, aimed the
-    other direction. Unlike place_outbound_call's one-way announcement,
-    both sides get genuine live audio."""
+    """Live two-way calling ("click to call"): rings agent_number first -
+    any real phone the caller supplies for this specific call, not a saved
+    setting - and only once THEY pick up does Twilio request
+    bridge_connect_url, which dials the real customer and joins the two
+    legs. The agent experiences this as an ordinary phone call; the
+    platform is just the operator connecting two real calls, the same
+    primitive ring groups already use, aimed the other direction. Unlike
+    place_outbound_call's one-way announcement, both sides get genuine
+    live audio."""
     owner = find_number_owner(db, from_number)
     if owner is None or owner.account_id != user.account_id or owner.status != PhoneNumberStatus.ACTIVE:
         raise CallAuthorizationError(f"{from_number} is not an active number owned by your account")
@@ -292,11 +286,6 @@ def place_bridge_call(
         assert_caller_id_authorized(db, owner.id)
     except CallerIdNotAuthorizedError as e:
         raise CallAuthorizationError(str(e)) from e
-    if not owner.forwarding_number:
-        raise BridgeAgentNumberNotConfiguredError(
-            f"{from_number} has no forwarding number set - configure one in this number's routing "
-            "settings first, so there's a real phone to ring as the agent leg."
-        )
 
     _assert_outbound_call_allowed(
         db, account_id=user.account_id, account_email=user.email, to=to, from_number=from_number,
@@ -304,7 +293,7 @@ def place_bridge_call(
 
     time_limit = risk_service.get_call_time_limit_for_account(db, user.account_id)
     result = telecom.place_call(
-        to=owner.forwarding_number, from_=from_number, twiml_url=bridge_connect_url,
+        to=agent_number, from_=from_number, twiml_url=bridge_connect_url,
         status_callback_url=status_callback_url, time_limit_seconds=time_limit,
     )
 
