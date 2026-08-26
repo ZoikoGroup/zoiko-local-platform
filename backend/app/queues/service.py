@@ -302,11 +302,37 @@ def pull_next_caller(db: Session, queue: CallQueue, agent: User, base_url: str) 
     )
     status_callback_url = f"{base_url}media/voice/queue/agent-call-ended?agent_user_id={agent.id}&queue_id={queue.id}"
 
+    # This places a real outbound Twilio call to agent.phone_number (a
+    # plain, self-service-editable string - see identity.routes.
+    # set_phone_number) - it must clear the exact same kill-switch/billing-
+    # suspension/toll-fraud gates as every other real outbound call in this
+    # codebase (media.service._dispatch_outbound_call, place_bridge_call).
+    # Confirmed live: this previously called telecom.place_call directly
+    # with none of those checks at all.
+    from app.media.service import CallDirection, assert_outbound_call_allowed, record_call
+    from app.numbering.identity.models import UserRole
+
+    from_number = oldest.phone_number_e164 or agent.phone_number
+    owner = db.query(User).filter(User.account_id == queue.account_id, User.role == UserRole.OWNER).first()
+    assert_outbound_call_allowed(
+        db, account_id=queue.account_id, account_email=owner.email if owner else "",
+        to=agent.phone_number, from_number=from_number,
+    )
+
     result = telecom.place_call(
         to=agent.phone_number,
-        from_=oldest.phone_number_e164 or agent.phone_number,
+        from_=from_number,
         twiml_url=agent_connect_url,
         status_callback_url=status_callback_url,
+    )
+    # Without a CallRecord, this call is invisible to assert_outbound_
+    # velocity_ok's own count on every subsequent pull, and to usage/
+    # billing metering - both of which key off CallRecord, not just the
+    # audit log below.
+    record_call(
+        db, account_id=queue.account_id, phone_number_id=None, direction=CallDirection.OUTBOUND,
+        from_number=from_number, to_number=agent.phone_number,
+        provider_call_sid=result["sid"], status=result["status"],
     )
     log_event(db, actor_id=queue.account_id, action="queue.agent_pulled_caller", target_type="call_queue",
                target_id=queue.id, metadata={"agent_user_id": agent.id, "queue_call_log_id": oldest.id})

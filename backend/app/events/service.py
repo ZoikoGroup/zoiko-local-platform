@@ -98,6 +98,21 @@ def flush_pending_outbox_events(db: Session, *, batch_size: int = 100) -> dict:
     return {"checked": len(pending), "published": published, "failed": failed}
 
 
+def publish_account_created(account_id: str, *, user_id: str, email: str, account_type: str) -> None:
+    """Real gap fix: confirmed missing entirely - even contact.created/
+    api_key.created/queue.created (far lower-stakes actions) already had
+    Kafka coverage, but account signup itself - arguably the single most
+    fundamental business event in this platform, and the one a downstream
+    CRM sync/analytics/marketing consumer would most want - never did.
+    New topic (zoiko.identity, added to events.consumer.TOPICS) rather
+    than an existing one - this is genuinely a new domain none of the
+    other ~20 topics fit."""
+    publish_event(
+        "zoiko.identity", "account.created", account_id,
+        {"user_id": user_id, "email": email, "account_type": account_type},
+    )
+
+
 def publish_number_reserved(account_id: str, *, number_id: str, e164: str, country: str) -> None:
     publish_event(
         "zoiko.numbers", "number.reserved", account_id,
@@ -396,6 +411,25 @@ def publish_account_billing_classification_updated(
         "zoiko.staff", "account.billing_classification_updated", account_id,
         {"billing_classification": billing_classification, "billing_source": billing_source},
     )
+
+
+def publish_capability_granted(*, capability: str, role: str, actor: str) -> None:
+    """Real gap fix: zoiko.staff was already a real, consumed Kafka topic
+    (see events/consumer.py's TOPICS), but the only thing ever published to
+    it was account.billing_classification_updated above - a billing event
+    that happens to use this topic name, not a genuine staff-domain event.
+    grant_capability/revoke_capability (app.staff.service) - security-
+    sensitive RBAC changes a downstream SIEM/alerting consumer would
+    reasonably want to see - had zero Kafka coverage at all despite
+    already being real, actively-used, audit-logged actions. No account_id
+    - same platform-wide, no-account shape as ops.kill_switch_changed
+    above, since a capability grant affects a role, not one customer
+    account."""
+    publish_event("zoiko.staff", "staff.capability_granted", None, {"capability": capability, "role": role, "actor": actor})
+
+
+def publish_capability_revoked(*, capability: str, role: str, actor: str) -> None:
+    publish_event("zoiko.staff", "staff.capability_revoked", None, {"capability": capability, "role": role, "actor": actor})
 
 
 def publish_consent_granted(account_id: str, *, consent_type: str, jurisdiction: str) -> None:

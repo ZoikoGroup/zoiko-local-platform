@@ -64,13 +64,14 @@ def list_calling_rates(db: Session) -> list[CallingRate]:
 
 def upsert_calling_rate(
     db: Session, *, country: str, price_per_minute_cents: int, currency: str = "USD",
-    destination_country: str | None = None,
+    destination_country: str | None = None, actor: str,
 ) -> CallingRate:
     rate = (
         db.query(CallingRate)
         .filter(CallingRate.country == country, CallingRate.destination_country == destination_country)
         .first()
     )
+    before = None
     if rate is None:
         rate = CallingRate(
             country=country, destination_country=destination_country,
@@ -78,10 +79,21 @@ def upsert_calling_rate(
         )
         db.add(rate)
     else:
+        before = {"price_per_minute_cents": rate.price_per_minute_cents, "currency": rate.currency}
         rate.price_per_minute_cents = price_per_minute_cents
         rate.currency = currency
     db.commit()
     db.refresh(rate)
+    # Real gap fix: a SUPER_ADMIN changing a calling rate previously left
+    # zero audit trail of who did it or what the prior value was, unlike
+    # every sibling pricing/registry mutation in this codebase (CLAUDE.md's
+    # own explicit rule: "Log every state-changing action through
+    # audit/service.py's log_event()").
+    log_event(
+        db, actor=actor, action="usage.calling_rate_upserted", target=f"calling_rate:{rate.id}",
+        before=before,
+        after={"price_per_minute_cents": rate.price_per_minute_cents, "currency": rate.currency},
+    )
     return rate
 
 
@@ -110,9 +122,10 @@ def get_number_rate(db: Session, country: str | None, number_type: str) -> Numbe
 
 def upsert_number_rate(
     db: Session, *, country: str, number_type: str = "local", recurring_price_cents: int,
-    currency: str = "USD", is_placeholder: bool = False,
+    currency: str = "USD", is_placeholder: bool = False, actor: str,
 ) -> NumberRate:
     rate = db.query(NumberRate).filter(NumberRate.country == country, NumberRate.number_type == number_type).first()
+    before = None
     if rate is None:
         rate = NumberRate(
             country=country, number_type=number_type, recurring_price_cents=recurring_price_cents,
@@ -120,11 +133,24 @@ def upsert_number_rate(
         )
         db.add(rate)
     else:
+        before = {
+            "recurring_price_cents": rate.recurring_price_cents, "currency": rate.currency,
+            "is_placeholder": rate.is_placeholder,
+        }
         rate.recurring_price_cents = recurring_price_cents
         rate.currency = currency
         rate.is_placeholder = is_placeholder
     db.commit()
     db.refresh(rate)
+    # Real gap fix - see upsert_calling_rate's comment.
+    log_event(
+        db, actor=actor, action="usage.number_rate_upserted", target=f"number_rate:{rate.id}",
+        before=before,
+        after={
+            "recurring_price_cents": rate.recurring_price_cents, "currency": rate.currency,
+            "is_placeholder": rate.is_placeholder,
+        },
+    )
     return rate
 
 
@@ -143,6 +169,7 @@ def get_ai_usage_rate(db: Session) -> AIUsageRate | None:
 
 def upsert_ai_usage_rate(
     db: Session, *, overage_price_cents_per_minute: int, currency: str = "USD", is_placeholder: bool = False,
+    actor: str,
 ) -> AIUsageRate:
     """Always inserts - see get_ai_usage_rate's docstring on why this is
     intentionally NOT an in-place edit like upsert_calling_rate/
@@ -156,6 +183,16 @@ def upsert_ai_usage_rate(
     db.add(rate)
     db.commit()
     db.refresh(rate)
+    # Real gap fix - see upsert_calling_rate's comment. Always a fresh
+    # insert (see this function's own docstring), so there's no prior
+    # value to log as `before`.
+    log_event(
+        db, actor=actor, action="usage.ai_usage_rate_upserted", target=f"ai_usage_rate:{rate.id}",
+        after={
+            "overage_price_cents_per_minute": rate.overage_price_cents_per_minute,
+            "currency": rate.currency, "is_placeholder": rate.is_placeholder,
+        },
+    )
     return rate
 
 

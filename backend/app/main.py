@@ -14,6 +14,7 @@ from app.apikeys.routes import router as apikeys_router
 from app.audit.routes import router as audit_router
 from app.billing.routes import router as billing_router
 from app.compliance.routes import router as compliance_router
+from app.compliance.routes import kyc_router as compliance_kyc_router
 from app.compliance.routes import staff_router as compliance_staff_router
 from app.compliance.routes import webhook_router as compliance_webhook_router
 from app.consent.routes import router as consent_router
@@ -157,9 +158,11 @@ setup_telemetry(app, engine)
 # public_api/audit/ops/retention/risk/crm/apikeys, or to
 # messaging_webhook_router/queues_webhook_router/video_public_router -
 # those are either account-setup basics every account needs regardless of
-# plan (inviting a teammate, granting AI-processing consent - confirmed
-# live: several existing tests' shared signup helpers call these as
-# ordinary setup steps unrelated to what they're testing, not something a
+# plan (inviting a teammate, granting AI-processing consent, opening/
+# completing a KYC case - a TRIALING account reaching AccountRiskState
+# .TRIAL_VERIFIED depends on this, see compliance/routes.py's kyc_router -
+# confirmed live: several existing tests' shared signup helpers call these
+# as ordinary setup steps unrelated to what they're testing, not something a
 # trial paywall should ever interrupt), the upgrade path itself (billing),
 # or carry no customer JWT at all (provider webhooks, video's guest
 # endpoints - see video.py's own comment on why those had to be split into
@@ -171,6 +174,7 @@ app.include_router(team_router)
 app.include_router(audit_router)
 app.include_router(billing_router)
 app.include_router(compliance_router, dependencies=_TRIAL_GATE)
+app.include_router(compliance_kyc_router)
 app.include_router(compliance_staff_router)
 app.include_router(compliance_webhook_router)
 app.include_router(consent_router)

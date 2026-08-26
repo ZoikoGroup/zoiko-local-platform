@@ -346,7 +346,7 @@ def test_assert_spend_limit_ok_raises_over_threshold(db_session):
     # upsert (not a raw insert) since "US" may already have a seeded rate.
     from app.usage.service import upsert_calling_rate
 
-    upsert_calling_rate(db_session, country="US", price_per_minute_cents=MAX_SPEND_CENTS_PER_WINDOW)
+    upsert_calling_rate(db_session, country="US", price_per_minute_cents=MAX_SPEND_CENTS_PER_WINDOW, actor="test-setup")
 
     record_usage_event(
         db_session, account_id=account_id, event_type="call_seconds", quantity=61, unit="seconds",

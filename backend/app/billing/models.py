@@ -350,6 +350,18 @@ class Subscription(Base):
     trial_ends_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     current_period_start: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     current_period_end: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    # The real, live Stripe Subscription object id (mode="subscription"
+    # Checkout - see create_subscription_checkout_session) once a paid plan
+    # checkout completes. Stripe manages the actual recurring charge itself
+    # from here on - this app never re-bills it. NULL for accounts that
+    # have never completed a real paid checkout (trial, a free plan, or a
+    # staff-applied direct change_plan with no payment). Required so
+    # cancel_subscription/handle_stripe_checkout_completed can tell Stripe
+    # to actually stop charging - without this there was nothing anywhere
+    # in this codebase that could ever cancel the real recurring Stripe
+    # subscription a completed checkout created, so a customer canceling in
+    # this app kept being charged by Stripe indefinitely.
+    stripe_subscription_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     zoikonex_ref: Mapped[str | None] = mapped_column(String(100), nullable=True)
     # ZoikoNex's own Party -> Customer -> Account chain (customer-account
     # service) - a real, separate identity model from ours, created once per
@@ -616,7 +628,18 @@ class PlanChangeCheckoutSession(Base):
     __tablename__ = "plan_change_checkout_sessions"
 
     id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=new_uuid)
-    account_id: Mapped[str] = mapped_column(String(50), ForeignKey("accounts.id"), nullable=False, index=True)
+    # Real bug fix, confirmed live: the migration (7c2e9a48b1d5) created this
+    # column as a genuine Postgres uuid (sa.UUID(as_uuid=False)), matching
+    # every other account_id column in this codebase - but this model
+    # declared it as a plain String(50), which never told SQLAlchemy to
+    # cast the raw uuid.UUID object psycopg2 returns for a native uuid
+    # column back to a str. record.account_id came back as a real UUID
+    # instance, which then broke json.dumps() the moment change_plan's
+    # publish_event_durably tried to write it into the Kafka event_outbox
+    # payload - the webhook 500'd on every real checkout completion.
+    account_id: Mapped[str] = mapped_column(
+        UUID(as_uuid=False), ForeignKey("accounts.id"), nullable=False, index=True
+    )
     plan_code: Mapped[str] = mapped_column(String(50), nullable=False)
     billing_period: Mapped[BillingPeriod] = mapped_column(
         Enum(BillingPeriod, name="billing_period_enum"), nullable=False,

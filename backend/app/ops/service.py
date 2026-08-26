@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 from app.audit.service import log_event
 from app.core.config import settings
 from app.events.service import publish_incident_declared, publish_incident_resolved, publish_kill_switch_changed
+from app.integrations.cache.redis import cache_get, cache_set
 from app.integrations.billing import stripe_checkout
 from app.integrations.embeddings import cohere as cohere_embeddings
 from app.integrations.kyc import stripe_identity
@@ -76,9 +77,8 @@ _PUBLIC_COMPONENT_NAMES = {
     "cohere": "Semantic Search",
 }
 
+_PUBLIC_STATUS_CACHE_KEY = "ops:public_status"
 _PUBLIC_STATUS_CACHE_TTL_SECONDS = 30
-_public_status_cache: dict | None = None
-_public_status_cache_at: float = 0.0
 
 
 async def get_public_status() -> dict:
@@ -89,11 +89,20 @@ async def get_public_status() -> dict:
     provider identity or raw error detail publicly (that stays behind staff
     auth). Cached briefly since this endpoint takes no auth and would
     otherwise let public traffic hammer real provider APIs on every
-    pageview."""
-    global _public_status_cache, _public_status_cache_at
-    now = time.time()
-    if _public_status_cache is not None and (now - _public_status_cache_at) < _PUBLIC_STATUS_CACHE_TTL_SECONDS:
-        return _public_status_cache
+    pageview.
+
+    Redis-backed like every other cached read in this codebase, not a
+    per-process module-level dict (what this used to be) - this app runs
+    WEB_CONCURRENCY=4 uvicorn workers, so a process-local cache meant each
+    worker independently re-ran the real provider health checks on its own
+    30-second clock, up to 4x more often than the TTL implies, and could
+    show a slightly different result depending on which worker answered a
+    given request. Degrades to "no cache" like every other cache_get/
+    cache_set call site if Redis is unavailable - never blocks this
+    endpoint, just re-runs the real checks every time."""
+    cached = cache_get(_PUBLIC_STATUS_CACHE_KEY)
+    if cached is not None:
+        return cached
 
     providers = await get_provider_statuses()
     components = [
@@ -107,8 +116,7 @@ async def get_public_status() -> dict:
     overall = "operational" if all(c["status"] == "operational" for c in components) else "degraded"
 
     result = {"overall": overall, "components": components}
-    _public_status_cache = result
-    _public_status_cache_at = now
+    cache_set(_PUBLIC_STATUS_CACHE_KEY, result, ttl_seconds=_PUBLIC_STATUS_CACHE_TTL_SECONDS)
     return result
 
 
@@ -202,7 +210,7 @@ def get_synthetic_check_summary(db: Session) -> dict:
             db.query(SyntheticCheckRun)
             .filter(SyntheticCheckRun.check_name == name)
             .order_by(SyntheticCheckRun.created_at.desc())
-            .first()
+            .first() 
         )
         if run is not None:
             latest.append(run)
@@ -378,6 +386,7 @@ def expire_overdue_kill_switches(db: Session) -> dict[str, int]:
     remembering to do it. Meant to run periodically (same
     app.ops.scheduled_reconciliation daily slot as the other sweeps in
     that script), not on every request."""
+    from app.events.service import publish_account_kill_switch_changed
     from app.risk.models import AccountKillSwitch
 
     now = datetime.now(timezone.utc)
@@ -409,6 +418,13 @@ def expire_overdue_kill_switches(db: Session) -> dict[str, int]:
             db, actor="system:kill_switch_expiry", action="risk.account_kill_switch_deactivated",
             target=f"account_kill_switch:{switch.id}",
             after={"reason": "expired", "account_id": switch.account_id, "expires_at": switch.expires_at.isoformat()},
+        )
+        # The manual deactivation path (risk/service.py:592) publishes this
+        # same event - this automatic expiry sweep was missing it entirely,
+        # the same asymmetry as the platform-level branch above already
+        # avoids by calling publish_kill_switch_changed on expiry too.
+        publish_account_kill_switch_changed(
+            switch.account_id, scope=switch.scope.value, is_active=False, actor="system:kill_switch_expiry",
         )
 
     if platform_expired or account_expired:

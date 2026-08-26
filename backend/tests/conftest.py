@@ -253,6 +253,27 @@ def _test_markets_stay_paid_open(db_session):
     yield
 
 
+@pytest.fixture(autouse=True)
+def _deliver_webhooks_synchronously_in_tests(monkeypatch, db_session):
+    """dispatch_webhook_event normally delivers on a background thread with
+    its own DB connection (webhooks/service.py's _spawn_delivery) so a
+    slow/unreachable customer endpoint never blocks the request - but
+    db_session's per-test transaction isolation (a single uncommitted
+    transaction, rolled back at teardown, see the fixture above) means a
+    separate connection can never see a WebhookEndpoint row this test just
+    created, and would hit a real foreign-key violation inserting a
+    WebhookDelivery against it. Running inline, on this test's own session,
+    keeps webhook-delivery tests deterministic and correctly isolated -
+    production's real background thread + independent session is untouched."""
+    from app.webhooks import service as webhooks_service
+
+    def _run_inline(endpoint_data, event_type, body_dict):
+        webhooks_service._deliver_to_endpoints(endpoint_data, event_type, body_dict, db=db_session)
+
+    monkeypatch.setattr(webhooks_service, "_spawn_delivery", _run_inline)
+    yield
+
+
 @pytest.fixture()
 def client(db_session):
     def override_get_db():

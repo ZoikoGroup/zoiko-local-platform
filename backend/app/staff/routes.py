@@ -290,14 +290,14 @@ def list_calling_rates_route(
 def upsert_calling_rate_route(
     payload: UpsertCallingRateRequest,
     db: Session = Depends(get_db),
-    _staff: PlatformStaff = Depends(require_capability("billing.manage_calling_rates")),
+    staff: PlatformStaff = Depends(require_capability("billing.manage_calling_rates")),
 ):
     # SUPER_ADMIN only (via the matrix) - pricing changes are a platform-
     # wide decision, not a routine support action like the recovery
     # endpoints above.
     return upsert_calling_rate(
         db, country=payload.country, price_per_minute_cents=payload.price_per_minute_cents,
-        currency=payload.currency, destination_country=payload.destination_country,
+        currency=payload.currency, destination_country=payload.destination_country, actor=staff.id,
     )
 
 
@@ -313,14 +313,14 @@ def list_number_rates_route(
 def upsert_number_rate_route(
     payload: UpsertNumberRateRequest,
     db: Session = Depends(get_db),
-    _staff: PlatformStaff = Depends(require_capability("billing.manage_number_rates")),
+    staff: PlatformStaff = Depends(require_capability("billing.manage_number_rates")),
 ):
     # SUPER_ADMIN only (via the matrix) - same pricing-decision bar as
     # calling-rates above.
     return upsert_number_rate(
         db, country=payload.country, number_type=payload.number_type,
         recurring_price_cents=payload.recurring_price_cents, currency=payload.currency,
-        is_placeholder=payload.is_placeholder,
+        is_placeholder=payload.is_placeholder, actor=staff.id,
     )
 
 
@@ -336,11 +336,11 @@ def get_ai_usage_rate_route(
 def upsert_ai_usage_rate_route(
     payload: UpsertAIUsageRateRequest,
     db: Session = Depends(get_db),
-    _staff: PlatformStaff = Depends(require_capability("billing.manage_ai_usage_rates")),
+    staff: PlatformStaff = Depends(require_capability("billing.manage_ai_usage_rates")),
 ):
     return upsert_ai_usage_rate(
         db, overage_price_cents_per_minute=payload.overage_price_cents_per_minute,
-        currency=payload.currency, is_placeholder=payload.is_placeholder,
+        currency=payload.currency, is_placeholder=payload.is_placeholder, actor=staff.id,
     )
 
 
@@ -356,13 +356,13 @@ def list_supported_countries_route(
 def upsert_supported_country_route(
     payload: UpsertSupportedCountryRequest,
     db: Session = Depends(get_db),
-    _staff: PlatformStaff = Depends(require_capability("numbers.manage_country_list")),
+    staff: PlatformStaff = Depends(require_capability("numbers.manage_country_list")),
 ):
     # SUPER_ADMIN only - expanding the launch country list is a compliance/
     # commercial decision, same bar as a calling-rate change above.
     return upsert_supported_country(
         db, code=payload.code, name=payload.name, sort_order=payload.sort_order,
-        emergency_calling_supported=payload.emergency_calling_supported,
+        emergency_calling_supported=payload.emergency_calling_supported, actor=staff.id,
     )
 
 
@@ -370,9 +370,9 @@ def upsert_supported_country_route(
 def remove_supported_country_route(
     code: str,
     db: Session = Depends(get_db),
-    _staff: PlatformStaff = Depends(require_capability("numbers.manage_country_list")),
+    staff: PlatformStaff = Depends(require_capability("numbers.manage_country_list")),
 ):
-    remove_supported_country(db, code)
+    remove_supported_country(db, code, actor=staff.id)
     return None
 
 
@@ -439,7 +439,7 @@ def list_number_eligibility_rules_route(
 def upsert_number_eligibility_rule_route(
     payload: UpsertNumberEligibilityRuleRequest,
     db: Session = Depends(get_db),
-    _staff: PlatformStaff = Depends(require_capability("numbers.manage_eligibility_rules")),
+    staff: PlatformStaff = Depends(require_capability("numbers.manage_eligibility_rules")),
 ):
     # SUPER_ADMIN only - deciding a market/number-type needs an eligibility
     # case at all is a compliance/commercial decision, same bar as the
@@ -449,7 +449,7 @@ def upsert_number_eligibility_rule_route(
         required_evidence=payload.required_evidence, is_active=payload.is_active,
         emergency_calling_supported=payload.emergency_calling_supported,
         recording_supported=payload.recording_supported,
-        allowed_calling_directions=payload.allowed_calling_directions,
+        allowed_calling_directions=payload.allowed_calling_directions, actor=staff.id,
     )
 
 
@@ -457,22 +457,21 @@ def upsert_number_eligibility_rule_route(
 def remove_number_eligibility_rule_route(
     rule_id: str,
     db: Session = Depends(get_db),
-    _staff: PlatformStaff = Depends(require_capability("numbers.manage_eligibility_rules")),
+    staff: PlatformStaff = Depends(require_capability("numbers.manage_eligibility_rules")),
 ):
-    remove_number_eligibility_rule(db, rule_id)
+    remove_number_eligibility_rule(db, rule_id, actor=staff.id)
 
 
 @router.post("/number-eligibility-rules/seed-market-registry", response_model=list[NumberEligibilityRuleResponse])
 def seed_market_release_registry_route(
     db: Session = Depends(get_db),
-    _staff: PlatformStaff = Depends(require_capability("numbers.manage_eligibility_rules")),
+    staff: PlatformStaff = Depends(require_capability("numbers.manage_eligibility_rules")),
 ):
     """Commercial Billing Operating Standard P0-2 - seeds a market/release
     registry row for every currently-supported country's 'local' numbers.
     Idempotent, safe to re-run after a new country is added to the
     supported list."""
-    return seed_market_release_registry(db)
-    return None
+    return seed_market_release_registry(db, actor=staff.id)
 
 
 @router.get("/number-eligibility-cases", response_model=list[NumberEligibilityCaseResponse])

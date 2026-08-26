@@ -74,7 +74,15 @@ def _finish_capture_and_respond(request: Request, db: Session, call: Receptionis
 
     if should_escalate:
         media_service.mark_receptionist_call_escalated(db, call.id, owner.escalation_user_id)
-        status_callback_url = str(request.base_url) + "media/voice/status-callback"
+        # Dedicated fallback (real gap fix - see escalation_fallback and
+        # twilio.build_receptionist_reply_response's docstring): the generic
+        # /media/voice/status-callback always returns 204 with no TwiML,
+        # which silently hung up an urgent call the moment the escalation
+        # target didn't pick up. This route inspects DialCallStatus and
+        # falls back to voicemail instead, so the message is never lost.
+        fallback_action_url = (
+            str(request.base_url) + f"media/receptionist/escalation-fallback?receptionist_call_id={call.id}"
+        )
         # Real gap fix: an escalated call is a live two-way conversation
         # with no other capture mechanism of its own (unlike the
         # pre-escalation Gather utterance, already on the ReceptionistCall
@@ -89,7 +97,7 @@ def _finish_capture_and_respond(request: Request, db: Session, call: Receptionis
         twiml = telecom.build_receptionist_reply_response(
             "Thanks — this sounds urgent, connecting you to someone now.",
             forward_to=escalation_number,
-            status_callback_url=status_callback_url,
+            fallback_action_url=fallback_action_url,
             recording_callback_url=recording_callback_url,
         )
         return Response(content=twiml, media_type="application/xml")
@@ -189,6 +197,32 @@ async def callback_select(request: Request, db: Session = Depends(get_db)):
 
     window_phrase = _CALLBACK_WINDOW_PHRASE.get(window, "soon")
     twiml = telecom.build_say_response(f"Thanks — we'll call you back {window_phrase}. Goodbye.")
+    return Response(content=twiml, media_type="application/xml")
+
+
+@router.post("/escalation-fallback")
+async def escalation_fallback(request: Request, db: Session = Depends(get_db)):
+    """Twilio's action URL for an escalated (HIGH-urgency) call's <Dial> to
+    the human (see _finish_capture_and_respond and twilio.
+    build_receptionist_reply_response's docstring for the bug this fixes).
+    `DialCallStatus` is "completed" for a call the human actually answered
+    and has now ended normally - nothing further to do there. Any other
+    status (no-answer, busy, failed) means the escalation target never
+    picked up - falls back to a real voicemail (media.voicemail.
+    recording_complete, same as every other voicemail path in this
+    codebase) so the caller's message is preserved instead of the call
+    just silently ending."""
+    params = await media_service.verify_twilio_webhook(request)
+    if params.get("DialCallStatus") == "completed":
+        return Response(content=telecom.build_empty_response(), media_type="application/xml")
+
+    receptionist_call_id = request.query_params.get("receptionist_call_id", "")
+    call = media_service.get_receptionist_call(db, receptionist_call_id)
+    if call is not None:
+        media_service.mark_receptionist_escalation_missed(db, call.id)
+
+    callback_url = str(request.base_url) + "media/voicemail/recording-complete"
+    twiml = telecom.build_record_response(callback_url)
     return Response(content=twiml, media_type="application/xml")
 
 

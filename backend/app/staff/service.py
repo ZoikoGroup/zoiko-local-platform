@@ -3,7 +3,11 @@ from sqlalchemy.orm import Session
 
 from app.audit.service import log_event
 from app.core.security import hash_password, verify_password
-from app.events.service import publish_account_billing_classification_updated
+from app.events.service import (
+    publish_account_billing_classification_updated,
+    publish_capability_granted,
+    publish_capability_revoked,
+)
 from app.numbering.identity.models import Account, User, UserRole
 from app.numbering.numbers.models import PhoneNumber
 from app.numbering.numbers.service import list_due_renewals as _list_due_renewals
@@ -16,6 +20,11 @@ from app.staff.models import PlatformStaff, PlatformStaffRole, StaffCapabilityGr
 # access instead of the UI meant to make this a data change, not a
 # redeploy.
 MATRIX_MANAGEMENT_CAPABILITY = "staff.manage_capabilities"
+
+# Computed once at import time - see authenticate_staff's docstring for why
+# this needs to exist at all (same rationale as identity/service.py's
+# _DUMMY_PASSWORD_HASH_FOR_TIMING_SAFETY).
+_DUMMY_PASSWORD_HASH_FOR_TIMING_SAFETY = hash_password("zoiko-local-timing-safety-dummy")
 
 
 class LastGrantRemovalError(Exception):
@@ -70,8 +79,18 @@ def bootstrap_initial_super_admin(db: Session) -> PlatformStaff | None:
 
 
 def authenticate_staff(db: Session, email: str, password: str) -> PlatformStaff | None:
+    """Always runs verify_password against SOMETHING - a real hash, or
+    _DUMMY_PASSWORD_HASH_FOR_TIMING_SAFETY for a nonexistent/inactive staff
+    account - rather than short-circuiting before ever calling it. Without
+    this, a login attempt for an email that isn't a staff account (or is
+    deactivated) returns measurably faster than a wrong-password attempt
+    against a real, active one, leaking which emails are valid staff
+    accounts through timing alone - a more sensitive thing to leak here
+    than on the customer side, since staff accounts include SUPER_ADMIN."""
     staff = db.query(PlatformStaff).filter(PlatformStaff.email == email).first()
-    if not staff or not staff.is_active or not verify_password(password, staff.hashed_password):
+    hashed_password = staff.hashed_password if staff else _DUMMY_PASSWORD_HASH_FOR_TIMING_SAFETY
+    password_matches = verify_password(password, hashed_password)
+    if not staff or not staff.is_active or not password_matches:
         return None
     return staff
 
@@ -320,6 +339,7 @@ def grant_capability(db: Session, *, capability: str, role: PlatformStaffRole, a
         db, actor=actor, action="staff.capability_granted", target=f"capability:{capability}",
         after={"role": role.value},
     )
+    publish_capability_granted(capability=capability, role=role.value, actor=actor)
 
 
 def revoke_capability(db: Session, *, capability: str, role: PlatformStaffRole, actor: str) -> None:
@@ -353,6 +373,7 @@ def revoke_capability(db: Session, *, capability: str, role: PlatformStaffRole, 
         db, actor=actor, action="staff.capability_revoked", target=f"capability:{capability}",
         before={"role": role.value},
     )
+    publish_capability_revoked(capability=capability, role=role.value, actor=actor)
 
 
 def search_numbers(db: Session, query: str) -> list[dict]:

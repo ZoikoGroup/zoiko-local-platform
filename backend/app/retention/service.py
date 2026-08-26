@@ -131,7 +131,15 @@ def _purge_voicemails(
     db: Session, now: datetime, *, account_id: str | None = None, force: bool = False
 ) -> tuple[int, int]:
     purged = failed = 0
-    query = db.query(Voicemail).filter(Voicemail.recording_url.isnot(None))
+    # Real gap fix: recording_url.isnot(None) alone kept re-selecting
+    # already-purged rows forever, since a successful purge sets
+    # recording_url = PURGED_MARKER (a non-null string) - every subsequent
+    # sweep re-derived a garbage Twilio recording SID from that literal
+    # marker string and called telecom.delete_recording() with it, which
+    # fails, gets logged as a real retention.purge_failed audit event, and
+    # counts against `failed`, indefinitely, for every recording ever
+    # purged.
+    query = db.query(Voicemail).filter(Voicemail.recording_url.isnot(None), Voicemail.recording_url != PURGED_MARKER)
     if account_id is not None:
         query = query.filter(Voicemail.account_id == account_id)
     for vm in query.all():
@@ -168,7 +176,11 @@ def _purge_call_recordings(
     db: Session, now: datetime, *, account_id: str | None = None, force: bool = False
 ) -> tuple[int, int]:
     purged = failed = 0
-    query = db.query(CallRecord).filter(CallRecord.recording_url.isnot(None), CallRecord.account_id.isnot(None))
+    # Real gap fix - see _purge_voicemails' comment on the same bug.
+    query = db.query(CallRecord).filter(
+        CallRecord.recording_url.isnot(None), CallRecord.recording_url != PURGED_MARKER,
+        CallRecord.account_id.isnot(None),
+    )
     if account_id is not None:
         query = query.filter(CallRecord.account_id == account_id)
     for call in query.all():
@@ -208,8 +220,13 @@ def _purge_video_recordings(
     db: Session, now: datetime, *, account_id: str | None = None, force: bool = False
 ) -> tuple[int, int]:
     purged = failed = 0
+    # PURGED_MARKER exclusion is the real gap fix here - see
+    # _purge_voicemails' comment; RECORDING_FAILED_MARKER was already
+    # correctly excluded before this fix.
     query = db.query(VideoSession).filter(
-        VideoSession.recording_url.isnot(None), VideoSession.recording_url != RECORDING_FAILED_MARKER,
+        VideoSession.recording_url.isnot(None),
+        VideoSession.recording_url != RECORDING_FAILED_MARKER,
+        VideoSession.recording_url != PURGED_MARKER,
     )
     if account_id is not None:
         query = query.filter(VideoSession.account_id == account_id)

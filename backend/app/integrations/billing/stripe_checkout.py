@@ -131,6 +131,30 @@ def create_subscription_checkout_session(
     return with_failover(_breaker, _primary, None, PaymentError)
 
 
+def cancel_subscription(stripe_subscription_id: str) -> dict:
+    """Cancels a real, live-recurring Stripe Subscription object immediately
+    (mode="subscription" Checkout - see create_subscription_checkout_session
+    - creates one of these; Stripe then auto-charges it every interval on
+    its own, independent of anything else in this codebase). Must be called
+    whenever this app's own Subscription is canceled or replaced by a new
+    checkout for a different plan - otherwise Stripe has no idea the
+    customer considers this over and keeps charging their card forever."""
+    if not settings.stripe_payments_secret_key:
+        raise PaymentError("Stripe payments secret key is not configured")
+
+    def _primary() -> dict:
+        try:
+            with trace_provider_call("stripe_payments", "cancel_subscription"):
+                subscription = stripe.Subscription.delete(
+                    stripe_subscription_id, api_key=settings.stripe_payments_secret_key,
+                )
+        except stripe.error.StripeError as e:
+            raise PaymentError(f"Stripe cancel subscription failed: {e}") from e
+        return {"id": subscription.id, "status": subscription.status}
+
+    return with_failover(_breaker, _primary, None, PaymentError)
+
+
 def refund_payment(payment_intent_id: str) -> dict:
     """Issues a full refund against a completed Checkout Session's
     PaymentIntent. Confirmed the restricted "One-time payments" key scope

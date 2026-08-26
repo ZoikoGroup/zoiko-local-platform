@@ -203,7 +203,8 @@ def list_supported_countries(db: Session) -> list[SupportedCountry]:
 
 
 def upsert_supported_country(
-    db: Session, *, code: str, name: str, sort_order: int = 0, emergency_calling_supported: bool = False
+    db: Session, *, code: str, name: str, sort_order: int = 0, emergency_calling_supported: bool = False,
+    actor: str,
 ) -> SupportedCountry:
     """Staff-only, SUPER_ADMIN-gated at the route (see app.staff.routes) -
     expanding the launch country list is a compliance/commercial decision,
@@ -213,6 +214,7 @@ def upsert_supported_country(
     exists for this country (Commercial Billing Operating Standard doc
     §10), not an engineering default to flip casually."""
     country = db.query(SupportedCountry).filter(SupportedCountry.code == code).first()
+    before = None
     if country is None:
         country = SupportedCountry(
             code=code, name=name, sort_order=sort_order,
@@ -220,12 +222,27 @@ def upsert_supported_country(
         )
         db.add(country)
     else:
+        before = {
+            "name": country.name, "sort_order": country.sort_order,
+            "emergency_calling_supported": country.emergency_calling_supported,
+        }
         country.name = name
         country.sort_order = sort_order
         country.emergency_calling_supported = emergency_calling_supported
     db.commit()
     db.refresh(country)
     _invalidate_supported_countries_cache()
+    # Real gap fix: unlike its sibling update_country_registry_fields right
+    # below (which already logs correctly), this left zero audit trail of
+    # who added/changed a country or what the prior value was - same
+    # CLAUDE.md rule every other state-changing action here follows.
+    log_event(
+        db, actor=actor, action="numbering.supported_country_upserted", target=f"supported_country:{code}",
+        before=before,
+        after={
+            "name": name, "sort_order": sort_order, "emergency_calling_supported": emergency_calling_supported,
+        },
+    )
     return country
 
 
@@ -268,10 +285,14 @@ def update_country_registry_fields(
     return country
 
 
-def remove_supported_country(db: Session, code: str) -> None:
+def remove_supported_country(db: Session, code: str, *, actor: str) -> None:
     db.query(SupportedCountry).filter(SupportedCountry.code == code).delete()
     db.commit()
     _invalidate_supported_countries_cache()
+    # Real gap fix - see upsert_supported_country's comment.
+    log_event(
+        db, actor=actor, action="numbering.supported_country_removed", target=f"supported_country:{code}",
+    )
 
 
 def _assert_supported_country(db: Session, country: str) -> None:
@@ -425,7 +446,7 @@ def list_number_eligibility_rules(db: Session) -> list[NumberEligibilityRule]:
 def upsert_number_eligibility_rule(
     db: Session, *, country: str, number_type: str, required_evidence: list[str], is_active: bool,
     emergency_calling_supported: bool = False, recording_supported: bool = True,
-    allowed_calling_directions: str = "both",
+    allowed_calling_directions: str = "both", actor: str,
 ) -> NumberEligibilityRule:
     """Staff-only, SUPER_ADMIN-gated at the route - same bar as the country
     list and calling-rate changes (this decides which numbers can even be
@@ -439,9 +460,17 @@ def upsert_number_eligibility_rule(
         .filter(NumberEligibilityRule.country == country, NumberEligibilityRule.number_type == number_type)
         .first()
     )
+    before = None
     if rule is None:
         rule = NumberEligibilityRule(country=country, number_type=number_type)
         db.add(rule)
+    else:
+        before = {
+            "required_evidence": rule.required_evidence, "is_active": rule.is_active,
+            "emergency_calling_supported": rule.emergency_calling_supported,
+            "recording_supported": rule.recording_supported,
+            "allowed_calling_directions": rule.allowed_calling_directions,
+        }
     rule.required_evidence = required_evidence
     rule.is_active = is_active
     rule.emergency_calling_supported = emergency_calling_supported
@@ -449,15 +478,32 @@ def upsert_number_eligibility_rule(
     rule.allowed_calling_directions = allowed_calling_directions
     db.commit()
     db.refresh(rule)
+    # Real gap fix - see upsert_supported_country's comment. Flipping
+    # is_active or required_evidence directly decides whether numbers can
+    # be purchased at all in a market - a compliance/commercial decision
+    # with no prior audit trail before this.
+    log_event(
+        db, actor=actor, action="numbering.eligibility_rule_upserted", target=f"number_eligibility_rule:{rule.id}",
+        before=before,
+        after={
+            "required_evidence": required_evidence, "is_active": is_active,
+            "emergency_calling_supported": emergency_calling_supported,
+            "recording_supported": recording_supported, "allowed_calling_directions": allowed_calling_directions,
+        },
+    )
     return rule
 
 
-def remove_number_eligibility_rule(db: Session, rule_id: str) -> None:
+def remove_number_eligibility_rule(db: Session, rule_id: str, *, actor: str) -> None:
     db.query(NumberEligibilityRule).filter(NumberEligibilityRule.id == rule_id).delete()
     db.commit()
+    # Real gap fix - see upsert_supported_country's comment.
+    log_event(
+        db, actor=actor, action="numbering.eligibility_rule_removed", target=f"number_eligibility_rule:{rule_id}",
+    )
 
 
-def seed_market_release_registry(db: Session) -> list[NumberEligibilityRule]:
+def seed_market_release_registry(db: Session, *, actor: str) -> list[NumberEligibilityRule]:
     """Commercial Billing Operating Standard P0-2: "Implement a versioned
     market/release registry for every country and number type." Creates
     one row per currently-supported country for 'local' numbers (the only
@@ -487,6 +533,7 @@ def seed_market_release_registry(db: Session) -> list[NumberEligibilityRule]:
             upsert_number_eligibility_rule(
                 db, country=country.code, number_type="local", required_evidence=[], is_active=False,
                 emergency_calling_supported=False, recording_supported=True, allowed_calling_directions="both",
+                actor=actor,
             )
         )
     return created
@@ -1492,6 +1539,18 @@ def retry_provisioning(db: Session, staff_id: str, number_id: str) -> PhoneNumbe
         target_type="phone_number", target_id=number.id,
         metadata={"e164": number.e164, "provider_sid": bought["sid"], "retried_by_staff": True},
     )
+    # This docstring's own claim ("reuses the exact same success/failure
+    # transitions as purchase_number's tail") was previously false - the
+    # Kafka publish, caller-identity auto-verification, and risk step-up
+    # below all existed in purchase_number's tail but were missing here,
+    # silent drift between two independently-maintained copies of the same
+    # transition.
+    publish_number_activated(number.account_id, number_id=number.id, e164=number.e164)
+    _auto_verify_caller_identity(db, number, verification_source="platform_provisioned_purchase")
+
+    from app.risk.service import step_up_risk_state_after_purchase
+
+    step_up_risk_state_after_purchase(db, number.account_id)
 
     owner = db.query(User).filter(User.account_id == number.account_id, User.role == UserRole.OWNER).first()
     if owner is not None:

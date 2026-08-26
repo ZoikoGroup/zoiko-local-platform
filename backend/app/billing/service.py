@@ -1,3 +1,4 @@
+import logging
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -58,6 +59,8 @@ from app.notifications.service import (
 )
 from app.ops.models import KillSwitchScope
 from app.ops.service import assert_kill_switch_not_active
+
+logger = logging.getLogger("zoiko.billing")
 
 DEFAULT_PLAN_CODE = "free_trial"
 # Global Plans, Pricing & Commercial Launch doc: annual billing is paid
@@ -196,9 +199,21 @@ def list_plans(db: Session) -> list[Plan]:
 
 
 def get_plan(db: Session, plan_code: str) -> Plan:
+    """Single-plan lookup - called from ~10 hot paths (quota checks, every
+    call's time-limit lookup, checkout, usage summary), unlike list_plans
+    above which only serves the billing page. Reuses that same cache
+    (_serialize_plan/_deserialize_plan, same TTL) keyed per plan_code -
+    plans are only ever seeded via migration, never mutated at runtime, so
+    there's no invalidation path needed, same assumption list_plans already
+    relies on."""
+    cache_key = f"plan:{plan_code}"
+    cached = cache_get(cache_key)
+    if cached is not None:
+        return _deserialize_plan(cached)
     plan = db.query(Plan).filter(Plan.plan_code == plan_code).first()
     if plan is None:
         raise PlanNotFoundError(f"No such plan: {plan_code!r}")
+    cache_set(cache_key, _serialize_plan(plan), ttl_seconds=_PLANS_CACHE_TTL_SECONDS)
     return plan
 
 
@@ -676,11 +691,25 @@ def create_plan_change_checkout_session(
     return session
 
 
-def handle_stripe_checkout_completed(db: Session, *, checkout_record_id: str) -> Subscription:
+def handle_stripe_checkout_completed(
+    db: Session, *, checkout_record_id: str, stripe_subscription_id: str | None = None,
+) -> Subscription:
     """Called from the Stripe webhook once a subscription Checkout Session's
     payment actually succeeds. Idempotent on PlanChangeCheckoutSession.status
     - Stripe retries webhook delivery, so a second delivery of the same
-    completed event must not re-apply (or double-notify) the plan change."""
+    completed event must not re-apply (or double-notify) the plan change.
+
+    stripe_subscription_id is the real, live Stripe Subscription object this
+    Checkout Session created (mode="subscription" - Stripe manages its
+    recurring charge itself from here). It's stored on our own Subscription
+    so cancel_subscription later has something real to cancel - without it,
+    nothing in this codebase could ever stop Stripe from continuing to
+    charge a customer who canceled here. If the account already had a
+    *different* real Stripe subscription (an earlier paid plan, since this
+    system always creates a fresh Checkout Session per plan change rather
+    than updating one in place), that old one is canceled here too -
+    otherwise Stripe would have no idea it's been superseded and would keep
+    billing both in parallel."""
     record = db.query(PlanChangeCheckoutSession).filter(PlanChangeCheckoutSession.id == checkout_record_id).first()
     if record is None:
         raise PlanChangeCheckoutSessionNotFoundError(f"No checkout session record {checkout_record_id!r}")
@@ -688,13 +717,52 @@ def handle_stripe_checkout_completed(db: Session, *, checkout_record_id: str) ->
     if record.status == PlanChangeCheckoutSessionStatus.COMPLETED:
         return get_or_create_subscription(db, record.account_id)
 
+    previous_stripe_subscription_id = get_or_create_subscription(db, record.account_id).stripe_subscription_id
+
+    # Apply the plan change FIRST, and only mark this record COMPLETED once
+    # that has genuinely succeeded - marking it complete first (as this used
+    # to) would leave a paid checkout permanently stuck as "done" with the
+    # plan never actually changed if change_plan raised, since the
+    # idempotency check above would then skip retrying it on Stripe's next
+    # webhook redelivery.
+    sub = change_plan(
+        db, record.account_id, record.plan_code, actor="stripe_checkout_webhook", billing_period=record.billing_period,
+    )
+    sub.stripe_subscription_id = stripe_subscription_id
+
     record.status = PlanChangeCheckoutSessionStatus.COMPLETED
     record.completed_at = datetime.now(timezone.utc)
     db.commit()
+    db.refresh(sub)
 
-    return change_plan(
-        db, record.account_id, record.plan_code, actor="stripe_checkout_webhook", billing_period=record.billing_period,
-    )
+    if previous_stripe_subscription_id and previous_stripe_subscription_id != stripe_subscription_id:
+        from app.integrations.billing import stripe_checkout
+
+        try:
+            stripe_checkout.cancel_subscription(previous_stripe_subscription_id)
+        except stripe_checkout.PaymentError:
+            # The new plan is already paid for and applied - don't roll any
+            # of that back over a cleanup failure. But a still-live old
+            # Stripe subscription will keep charging the customer's card in
+            # parallel with the new one until someone cancels it by hand,
+            # so this needs a human, not a silent log line.
+            logger.exception(
+                "Failed to cancel superseded Stripe subscription %s for account %s after plan change to %s - "
+                "it may still be actively charging this customer and needs manual cancellation in Stripe.",
+                previous_stripe_subscription_id, record.account_id, record.plan_code,
+            )
+            send_internal_alert(
+                db, event_name="bill_int.stripe_subscription_cancel_failed",
+                summary=(
+                    f"Account {record.account_id} changed plan to {record.plan_code}, but canceling its "
+                    f"previous Stripe subscription {previous_stripe_subscription_id} failed. It may still be "
+                    f"actively charging this customer - cancel it manually in the Stripe dashboard."
+                ),
+                console_link=f"{settings.public_base_url}/staff/accounts",
+                tenant_reference=record.account_id,
+            )
+
+    return sub
 
 
 def _count_owned_or_in_flight_numbers(db: Session, account_id: str, *, exclude_number_id: str | None = None) -> int:
@@ -913,19 +981,27 @@ def _assert_not_test_account(db: Session, account_id: str) -> None:
 _PAYMENT_EVENT_TYPES = {"payment_failed", "payment_retry", "payment_restored"}
 
 
-def _apply_zoikonex_payment_event(
+def _apply_payment_event(
     db: Session,
     sub: Subscription,
     event_type: str,
     *,
     actor: str,
     action: str,
-    external_event_id: str | None = None,
+    notif_idempotency_key: str | None = None,
 ) -> Subscription:
-    """Shared state transition for an inbound ZoikoNex payment event
-    (Architecture doc §9: "ZoikoNex sends payment success, failure, retry,
-    grace-period, suspension, and restoration events back to Zoiko Local"),
-    used by both the staff-triggered simulator and the real webhook."""
+    """Provider-agnostic core of a payment_failed/payment_retry/
+    payment_restored state transition - extracted from
+    _apply_zoikonex_payment_event so the SAME PAST_DUE/grace-period
+    machinery (Kafka events, notifications, audit log) can also drive off
+    a REAL Stripe recurring-billing webhook, not just the ZoikoNex mock's
+    simulated events. See handle_stripe_subscription_payment_webhook's
+    docstring for why this mattered: this state machine already existed
+    and was fully correct, but nothing ever fed it from Stripe's own
+    invoice.payment_failed/invoice.paid - a real customer whose card
+    failed on a live Stripe renewal charge stayed ACTIVE with full access
+    forever, since only the ZoikoNex mock webhook (which nothing real
+    calls yet) could ever trip PAST_DUE."""
     if event_type not in _PAYMENT_EVENT_TYPES:
         raise InvalidPaymentEventError(f"Unknown payment event type: {event_type!r}")
 
@@ -940,21 +1016,10 @@ def _apply_zoikonex_payment_event(
         sub.status = SubscriptionStatus.ACTIVE
         sub.grace_period_ends_at = None
     # payment_retry intentionally changes nothing but is still logged below -
-    # it's evidence ZoikoNex is still trying, not a state transition itself.
+    # it's evidence the provider is still trying, not a state transition itself.
 
     db.commit()
     db.refresh(sub)
-
-    db.add(
-        ZoikoNexSyncEvent(
-            account_id=account_id,
-            event_type=ZoikoNexSyncEventType.PAYMENT_EVENT_RECEIVED,
-            zoikonex_ref=sub.zoikonex_ref,
-            external_event_id=external_event_id,
-            payload={"event_type": event_type, "grace_period_ends_at": sub.grace_period_ends_at.isoformat() if sub.grace_period_ends_at else None},
-        )
-    )
-    db.commit()
 
     log_event(
         db, actor=actor, action=action, target=f"subscription:{sub.id}",
@@ -975,12 +1040,6 @@ def _apply_zoikonex_payment_event(
     owner = db.query(User).filter(User.account_id == account_id, User.role == UserRole.OWNER).first()
     if owner is not None:
         plan = get_plan(db, sub.plan_code)
-        # Email Communications System doc A-03 (BLOCKER) "idempotency" - a
-        # retried ZoikoNex webhook delivering the same external_event_id
-        # twice must not double-send this notification. No key for the
-        # staff-triggered simulator path (external_event_id is None there
-        # by construction) since a manual staff action isn't a retry risk.
-        notif_idempotency_key = f"{event_type}:{external_event_id}" if external_event_id else None
         if event_type == "payment_failed":
             notify_payment_failed(
                 db, account_id=account_id, account_email=owner.email, plan_name=plan.name,
@@ -996,6 +1055,46 @@ def _apply_zoikonex_payment_event(
                 db, account_id=account_id, account_email=owner.email, idempotency_key=notif_idempotency_key,
             )
 
+    return sub
+
+
+def _apply_zoikonex_payment_event(
+    db: Session,
+    sub: Subscription,
+    event_type: str,
+    *,
+    actor: str,
+    action: str,
+    external_event_id: str | None = None,
+) -> Subscription:
+    """Shared state transition for an inbound ZoikoNex payment event
+    (Architecture doc §9: "ZoikoNex sends payment success, failure, retry,
+    grace-period, suspension, and restoration events back to Zoiko Local"),
+    used by both the staff-triggered simulator and the real webhook. Thin
+    wrapper around _apply_payment_event that additionally records the
+    ZoikoNexSyncEvent row this specific provider's sync trail needs."""
+    account_id = sub.account_id
+    # Email Communications System doc A-03 (BLOCKER) "idempotency" - a
+    # retried ZoikoNex webhook delivering the same external_event_id twice
+    # must not double-send this notification. No key for the staff-
+    # triggered simulator path (external_event_id is None there by
+    # construction) since a manual staff action isn't a retry risk.
+    notif_idempotency_key = f"{event_type}:{external_event_id}" if external_event_id else None
+
+    sub = _apply_payment_event(
+        db, sub, event_type, actor=actor, action=action, notif_idempotency_key=notif_idempotency_key,
+    )
+
+    db.add(
+        ZoikoNexSyncEvent(
+            account_id=account_id,
+            event_type=ZoikoNexSyncEventType.PAYMENT_EVENT_RECEIVED,
+            zoikonex_ref=sub.zoikonex_ref,
+            external_event_id=external_event_id,
+            payload={"event_type": event_type, "grace_period_ends_at": sub.grace_period_ends_at.isoformat() if sub.grace_period_ends_at else None},
+        )
+    )
+    db.commit()
     return sub
 
 
@@ -1032,6 +1131,63 @@ def handle_zoikonex_payment_webhook(
         db, sub, event_type, actor="zoikonex_webhook",
         action="subscription.payment_event_received", external_event_id=external_event_id,
     )
+
+
+def handle_stripe_subscription_payment_webhook(
+    db: Session, *, stripe_subscription_id: str, event_type: str, stripe_event_id: str | None = None,
+) -> Subscription | None:
+    """Real gap fix: the PAST_DUE/grace-period state machine above
+    (_apply_payment_event) already existed, fully correct, but nothing
+    real ever fed it - only handle_zoikonex_payment_webhook could trigger
+    it, and that's for a ZoikoNex integration that doesn't exist yet.
+    Meanwhile create_subscription_checkout_session's mode="subscription"
+    Checkout makes STRIPE ITSELF the real, live, auto-recurring biller the
+    moment it completes - Stripe charges the customer's card every period
+    on its own, independent of ZoikoNex entirely. Confirmed live: a real
+    customer whose card failed on a genuine Stripe renewal charge stayed
+    ACTIVE with full access forever, since nothing was listening for
+    Stripe's own invoice.payment_failed/invoice.paid webhooks. Routed here
+    from billing/routes.py's stripe_checkout_webhook for those two event
+    types; looks the subscription up by stripe_subscription_id (set once
+    by handle_stripe_checkout_completed when the original Checkout
+    completed - see that field's docstring on Subscription). Returns None
+    if no local Subscription references this Stripe subscription (e.g. one
+    this app didn't create)."""
+    sub = db.query(Subscription).filter(Subscription.stripe_subscription_id == stripe_subscription_id).first()
+    if sub is None:
+        return None
+    notif_idempotency_key = f"stripe:{stripe_event_id}:{event_type}" if stripe_event_id else None
+    return _apply_payment_event(
+        db, sub, event_type, actor="stripe_checkout_webhook",
+        action="subscription.payment_event_received_stripe", notif_idempotency_key=notif_idempotency_key,
+    )
+
+
+def handle_stripe_subscription_deleted_webhook(db: Session, *, stripe_subscription_id: str) -> Subscription | None:
+    """Real gap fix, same rationale as handle_stripe_subscription_payment_
+    webhook above: customer.subscription.deleted fires when Stripe cancels
+    the subscription on its own side (Smart Retries exhausted after
+    repeated failed renewals, or a cancellation made directly in Stripe's
+    dashboard/customer portal) - a path that bypasses this app's own POST
+    /subscription/cancel entirely. Mirrors cancel_subscription's state
+    transition (CANCELED, no grace period), just actor-attributed to
+    Stripe instead of the customer. Returns None (no-op) if no local
+    Subscription references this Stripe subscription, or it's already
+    CANCELED (Stripe can redeliver this webhook)."""
+    sub = db.query(Subscription).filter(Subscription.stripe_subscription_id == stripe_subscription_id).first()
+    if sub is None or sub.status == SubscriptionStatus.CANCELED:
+        return sub
+    sub.status = SubscriptionStatus.CANCELED
+    sub.canceled_at = _db_now(db)
+    db.commit()
+    db.refresh(sub)
+    sync_subscription_to_zoikonex(db, sub)
+    log_event(
+        db, actor="stripe_checkout_webhook", action="billing.subscription_canceled_by_stripe",
+        target=f"subscription:{sub.id}",
+    )
+    publish_subscription_canceled(sub.account_id, subscription_id=sub.id, reason="stripe_subscription_deleted")
+    return sub
 
 
 def _is_billing_suspended(sub: Subscription, now: datetime) -> bool:
@@ -1091,10 +1247,23 @@ def cancel_subscription(db: Session, account_id: str, *, actor: str, reason: str
     Does NOT touch any owned phone numbers - those already have their own
     per-number cancel path (POST /numbers/{e164}/cancel); cascading this
     into a bulk number release is a separate product decision, not made
-    here."""
+    here.
+
+    If this account ever completed a real paid Checkout, Stripe is running
+    its own independent recurring charge against a live Subscription object
+    (see create_subscription_checkout_session) that nothing else in this
+    codebase ever tells to stop. That real subscription is canceled FIRST,
+    before any local state changes - if Stripe's cancel fails, this raises
+    and nothing is marked canceled here either, so the customer isn't shown
+    "canceled" while Stripe silently keeps charging their card."""
     sub = get_or_create_subscription(db, account_id)
     if sub.status == SubscriptionStatus.CANCELED:
         raise SubscriptionAlreadyCanceledError(f"Subscription for account {account_id} is already canceled")
+
+    if sub.stripe_subscription_id:
+        from app.integrations.billing import stripe_checkout
+
+        stripe_checkout.cancel_subscription(sub.stripe_subscription_id)
 
     sub.status = SubscriptionStatus.CANCELED
     sub.canceled_at = _db_now(db)

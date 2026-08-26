@@ -173,7 +173,16 @@ def require_paid_or_read_only(request: Request, db: Session = Depends(get_db)) -
     from app.billing.service import TrialWriteRestrictedError, get_or_create_subscription
 
     sub = get_or_create_subscription(db, user.account_id)
-    if sub.status == SubscriptionStatus.TRIALING:
+    # get_or_create_subscription auto-flips a lapsed trial straight to
+    # ACTIVE with no payment (no payment processor exists yet - see that
+    # function's docstring), but leaves trial_ends_at populated when it
+    # does. A deliberate upgrade (change_plan) is the only other path to
+    # ACTIVE, and it explicitly clears trial_ends_at to None - so a non-NULL
+    # trial_ends_at on an ACTIVE subscription means "still running on the
+    # lapsed trial," not "genuinely paid," and must stay gated.
+    if sub.status == SubscriptionStatus.TRIALING or (
+        sub.status == SubscriptionStatus.ACTIVE and sub.trial_ends_at is not None
+    ):
         raise TrialWriteRestrictedError(
             "Upgrade your plan to use this feature - you can view it during your trial, but changes need a paid plan."
         )

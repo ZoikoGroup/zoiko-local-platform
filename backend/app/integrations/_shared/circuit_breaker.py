@@ -72,21 +72,26 @@ def with_failover(
     is_breaker_failure: Callable[[Exception], bool] = lambda e: True,
 ) -> T:
     """Call primary unless the breaker is already open; on expected_exception
-    from primary, record the failure (unless is_breaker_failure says this
-    particular exception doesn't indicate the provider itself is unhealthy -
-    see twilio.py's _is_provider_failure for why that distinction matters)
-    and fall back to secondary if one is configured - otherwise re-raise the
-    original error. A HALF_OPEN breaker is treated like CLOSED here: exactly
-    the trial call that lets the breaker recover if the primary is healthy
-    again."""
+    from primary, record the failure and fall back to secondary if one is
+    configured - otherwise re-raise the original error. When
+    is_breaker_failure says this particular exception doesn't indicate the
+    provider itself is unhealthy (see twilio.py's _is_provider_failure for
+    why that distinction matters), it's an expected, per-request outcome
+    that says nothing about whether the primary is healthy - re-raise
+    immediately with no breaker bookkeeping and no failover, since the
+    secondary would just reject the same bad input at real vendor cost (or
+    silently accept a destination the primary deliberately rejected). A
+    HALF_OPEN breaker is treated like CLOSED here: exactly the trial call
+    that lets the breaker recover if the primary is healthy again."""
     if breaker.state != CircuitState.OPEN:
         try:
             result = primary()
             breaker.record_success()
             return result
         except expected_exception as e:
-            if is_breaker_failure(e):
-                breaker.record_failure()
+            if not is_breaker_failure(e):
+                raise
+            breaker.record_failure()
             if secondary is None:
                 raise
             logger.warning("%s: primary provider failed, falling back to secondary: %s", breaker.name, e)
@@ -106,15 +111,18 @@ async def with_failover_async(
     is_breaker_failure: Callable[[Exception], bool] = lambda e: True,
 ) -> T:
     """Async counterpart to with_failover, for Provider Gateways whose SDK
-    calls are async (e.g. LiveKit) - same CLOSED/OPEN/HALF_OPEN semantics."""
+    calls are async (e.g. LiveKit) - same CLOSED/OPEN/HALF_OPEN semantics,
+    including the same is_breaker_failure short-circuit (see with_failover's
+    docstring)."""
     if breaker.state != CircuitState.OPEN:
         try:
             result = await primary()
             breaker.record_success()
             return result
         except expected_exception as e:
-            if is_breaker_failure(e):
-                breaker.record_failure()
+            if not is_breaker_failure(e):
+                raise
+            breaker.record_failure()
             if secondary is None:
                 raise
             logger.warning("%s: primary provider failed, falling back to secondary: %s", breaker.name, e)
