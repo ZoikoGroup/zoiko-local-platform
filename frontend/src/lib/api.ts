@@ -1266,6 +1266,21 @@ export async function placeOutboundCall(
   });
 }
 
+export async function placeBridgeCall(
+  token: string,
+  input: { to: string; from: string; agent_number: string }
+): Promise<{ sid: string; status: string; to: string; from: string }> {
+  const fingerprint = await computeDeviceFingerprint();
+  return request("/media/voice/bridge", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      ...(fingerprint ? { "X-Device-Fingerprint": fingerprint } : {}),
+    },
+    body: JSON.stringify(input),
+  });
+}
+
 export type VoicemailEntry = {
   id: string;
   from: string;

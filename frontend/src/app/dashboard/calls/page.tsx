@@ -5,6 +5,7 @@ import {
   listMyNumbers,
   listCalls,
   placeOutboundCall,
+  placeBridgeCall,
   listVoicemails,
   summarizeCall,
   summarizeVoicemail,
@@ -31,6 +32,7 @@ export default function CallsPage() {
 
   const [toNumber, setToNumber] = useState("");
   const [fromNumber, setFromNumber] = useState("");
+  const [agentNumber, setAgentNumber] = useState("");
   const [callMessage, setCallMessage] = useState("");
   const [callBusy, setCallBusy] = useState(false);
   const [callError, setCallError] = useState<string | null>(null);
@@ -86,6 +88,27 @@ export default function CallsPage() {
       await loadAll();
     } catch (err) {
       setCallError(err instanceof ApiError ? err.message : "Couldn't place the call.");
+    } finally {
+      setCallBusy(false);
+    }
+  }
+
+  async function handleBridgeCall() {
+    if (!token || !fromNumber || !toNumber || !agentNumber) return;
+    setCallBusy(true);
+    setCallError(null);
+    setCallSuccess(null);
+    try {
+      const customerNumber = toNumber;
+      const ringingNumber = agentNumber;
+      await placeBridgeCall(token, { to: toNumber, from: fromNumber, agent_number: agentNumber });
+      setCallSuccess(
+        `Calling ${ringingNumber} now — answer it to be connected live to ${customerNumber}.`
+      );
+      setToNumber("");
+      await loadAll();
+    } catch (err) {
+      setCallError(err instanceof ApiError ? err.message : "Couldn't start the call.");
     } finally {
       setCallBusy(false);
     }
@@ -175,12 +198,36 @@ export default function CallsPage() {
                 disabled={callBusy || !fromNumber}
                 className="bg-indigo-600 hover:bg-indigo-700 disabled:opacity-60 text-white text-sm font-medium rounded-lg px-4 py-2"
               >
-                {callBusy ? "Calling..." : "Call"}
+                {callBusy ? "Calling..." : "Announce"}
               </button>
             </div>
+            <div className="flex flex-wrap items-end gap-3">
+              <div>
+                <label className="block text-xs font-medium text-slate-500 mb-1">Ring this number first</label>
+                <input
+                  type="tel"
+                  value={agentNumber}
+                  onChange={(e) => setAgentNumber(e.target.value)}
+                  placeholder="+15559876543 (your real phone)"
+                  className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-mono text-slate-900 placeholder:text-slate-400"
+                />
+              </div>
+              <button
+                type="button"
+                onClick={handleBridgeCall}
+                disabled={callBusy || !fromNumber || !toNumber || !agentNumber}
+                className="bg-emerald-600 hover:bg-emerald-700 disabled:opacity-60 text-white text-sm font-medium rounded-lg px-4 py-2"
+                title="Rings the number above first, then connects you live to the To number once you answer"
+              >
+                {callBusy ? "Calling..." : "Talk Live"}
+              </button>
+            </div>
+            <p className="text-xs text-slate-500">
+              <strong>Announce</strong> plays a one-way message and hangs up. <strong>Talk Live</strong> rings the real phone you enter above first, then connects you to a real, live, two-way conversation with the "To" number once you pick up.
+            </p>
             <div>
               <label className="block text-xs font-medium text-slate-500 mb-1">
-                Message (spoken aloud when they answer — this is a one-way announcement, not a live conversation)
+                Message for Announce (spoken aloud when they answer — not used by Talk Live)
               </label>
               <input
                 type="text"
