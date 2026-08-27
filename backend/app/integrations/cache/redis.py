@@ -109,3 +109,16 @@ def cache_delete(*keys: str) -> None:
     if not keys:
         return
     _run("cache_delete", keys, lambda client: client.delete(*keys))
+
+
+def flush_all_for_tests() -> None:
+    """Test-only: wipes the whole configured Redis DB. Every other cache
+    call site here degrades silently to "no cache" when Redis isn't
+    configured, which is exactly why this cache was invisible to the test
+    suite until REDIS_URL pointed at a real instance - tests that mutate a
+    row a cache_get/cache_set pair reads (a Plan's max_team_seats, the
+    supported-countries list, ops' public status) now need this run
+    between tests, same reasoning as this file's own reset_rate_limiter/
+    reset_circuit_breakers fixtures for other shared, process-external
+    state. Not exposed for anything outside tests/conftest.py."""
+    _run("flush_all_for_tests", "*", lambda client: client.flushdb())

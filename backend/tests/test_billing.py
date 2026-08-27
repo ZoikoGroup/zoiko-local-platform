@@ -170,6 +170,16 @@ def test_seat_quota_allows_up_to_the_limit_then_blocks(db_session):
     service.change_plan(db_session, account.id, "business", actor="test-actor")
     db_session.query(Plan).filter(Plan.plan_code == "business").update({"max_team_seats": 5})
     db_session.commit()
+    # get_plan's own docstring: "plans are only ever seeded via migration,
+    # never mutated at runtime, so there's no invalidation path needed" -
+    # a real assumption its Redis cache relies on, which this test's direct
+    # UPDATE above violates on purpose for test convenience. Without this,
+    # change_plan's own earlier get_plan("business") call already cached
+    # the real seeded max_team_seats=20, and every later add_team_member
+    # call below would see that stale value instead of the lowered 5.
+    from app.integrations.cache.redis import cache_delete
+
+    cache_delete("plan:business")
 
     # Owner isn't created via this helper in this test, so seed a User row
     # directly to represent them (matches how other service-level tests in
@@ -591,6 +601,12 @@ def test_team_member_add_blocked_once_seat_quota_is_reached(client, db_session):
     service.change_plan(db_session, owner_account_id, "business", actor="test-setup")
     db_session.query(Plan).filter(Plan.plan_code == "business").update({"max_team_seats": 5})
     db_session.commit()
+    # See test_seat_quota_allows_up_to_the_limit_then_blocks's comment -
+    # get_plan's Redis cache assumes plans are never mutated at runtime,
+    # which this test's direct UPDATE above deliberately violates.
+    from app.integrations.cache.redis import cache_delete
+
+    cache_delete("plan:business")
 
     for i in range(4):
         response = client.post(

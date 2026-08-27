@@ -40,6 +40,12 @@ def _clear_billing_trial_gate(db_session, account_id: str) -> None:
 
     sub = get_or_create_subscription(db_session, account_id)
     sub.status = SubscriptionStatus.ACTIVE
+    # app.core.deps.require_paid_or_read_only also treats ACTIVE-with-a-
+    # still-set trial_ends_at as "lapsed trial, not genuinely paid" and
+    # keeps it gated (a real upgrade via change_plan explicitly clears this
+    # field) - a direct status flip has to clear it too, or this helper
+    # silently stops working the moment that refinement landed.
+    sub.trial_ends_at = None
     db_session.commit()
 
 

@@ -45,6 +45,22 @@ def _place_call(client, headers, to: str, from_number: str):
     return client.post("/media/voice/outbound", json={"to": to, "from": from_number}, headers=headers)
 
 
+def _clear_billing_trial_gate(db_session, account_id: str) -> None:
+    """See test_risk.py's helper of the same name - app.core.deps.
+    require_paid_or_read_only blocks write actions (placing a call) for a
+    TRIALING account, and also for an ACTIVE one still carrying a
+    trial_ends_at (a lapsed trial auto-rolled to ACTIVE with no real
+    payment, not a genuine upgrade - change_plan explicitly clears this
+    field, so a direct status flip has to as well)."""
+    from app.billing.models import SubscriptionStatus
+    from app.billing.service import get_or_create_subscription
+
+    sub = get_or_create_subscription(db_session, account_id)
+    sub.status = SubscriptionStatus.ACTIVE
+    sub.trial_ends_at = None
+    db_session.commit()
+
+
 def _promote_to_paid_normal(db_session, account_id: str) -> None:
     """See test_risk.py's helper of the same name - avoids the new
     AccountRiskState.TRIAL_LOW concurrent-call limit (1) interfering with
@@ -82,6 +98,7 @@ def test_geographic_dispersion_allowed_below_threshold(client, db_session, monke
     token = _signup_and_login(client, "fraudgeo1@example.com")
     account_id = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"}).json()["account_id"]
     _active_number(db_session, account_id, "+15550070001")
+    _clear_billing_trial_gate(db_session, account_id)
     _promote_to_paid_normal(db_session, account_id)
     headers = {"Authorization": f"Bearer {token}"}
 
@@ -100,6 +117,7 @@ def test_geographic_dispersion_blocks_at_threshold(client, db_session, monkeypat
     token = _signup_and_login(client, "fraudgeo2@example.com")
     account_id = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"}).json()["account_id"]
     _active_number(db_session, account_id, "+15550070002")
+    _clear_billing_trial_gate(db_session, account_id)
     _promote_to_paid_normal(db_session, account_id)
     headers = {"Authorization": f"Bearer {token}"}
 
@@ -124,6 +142,7 @@ def test_geographic_dispersion_signal_is_recorded(client, db_session, monkeypatc
     token = _signup_and_login(client, "fraudgeo3@example.com")
     account_id = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"}).json()["account_id"]
     _active_number(db_session, account_id, "+15550070003")
+    _clear_billing_trial_gate(db_session, account_id)
     _promote_to_paid_normal(db_session, account_id)
     headers = {"Authorization": f"Bearer {token}"}
 
@@ -525,6 +544,7 @@ def test_concurrency_limit_blocks_extra_simultaneous_calls(client, db_session, m
     headers = {"Authorization": f"Bearer {token}"}
     account_id = client.get("/auth/me", headers=headers).json()["account_id"]
     _active_number(db_session, account_id, "+15550070030")
+    _clear_billing_trial_gate(db_session, account_id)
 
     # A fresh signup defaults to TRIAL_LOW - read the real configured limit
     # rather than hardcoding it a second time here (this exact test used to
@@ -581,6 +601,7 @@ def test_account_kill_switch_blocks_outbound_calling_for_one_account(client, db_
     headers = {"Authorization": f"Bearer {token}"}
     account_id = client.get("/auth/me", headers=headers).json()["account_id"]
     _active_number(db_session, account_id, "+15550070040")
+    _clear_billing_trial_gate(db_session, account_id)
 
     from app.staff.models import PlatformStaffRole
     staff_token = _create_staff_and_login(client, db_session, "accountkillswitchstaff1@zoikolocal.com", PlatformStaffRole.SUPER_ADMIN)

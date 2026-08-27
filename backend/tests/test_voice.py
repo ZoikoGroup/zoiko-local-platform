@@ -294,11 +294,16 @@ def test_incoming_call_goes_to_voicemail_outside_business_hours(client, db_sessi
     assert "<Dial" not in response.text
 
 
-def test_free_trial_account_cannot_set_business_hours(client, db_session):
+def test_starter_plan_account_cannot_set_business_hours(client, db_session):
     """ZL-COM-ENT-001 §7 matrix: business-hours routing is Business+ only -
     configuring hours at all (not just leaving them unset) is the gated
-    capability, so a free_trial account must be denied with a real
-    entitlement code."""
+    capability. Uses the shared _signup_and_login (upgrades to starter)
+    rather than a real free_trial account: app.core.deps.
+    require_paid_or_read_only's router-wide gate blocks every write for a
+    genuinely TRIALING account with a plain-string error (not the
+    dict-shaped ENTITLEMENT_REQUIRED body this test checks), so the
+    specific-entitlement path this test exercises only reaches on an
+    already-paid plan that simply lacks routing.business_hours."""
     token = _signup_and_login(client, "voicehoursdenied@example.com")
     account_id = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"}).json()["account_id"]
     number = PhoneNumber(
@@ -321,7 +326,7 @@ def test_free_trial_account_cannot_set_business_hours(client, db_session):
     body = denied.json()["detail"]
     assert body["code"] == "ENTITLEMENT_REQUIRED"
     assert body["entitlement"] == "routing.business_hours"
-    assert body["current_plan"] == "free_trial"
+    assert body["current_plan"] == "starter"
 
 
 def _signup_and_login_with_account(client, email: str) -> tuple[str, str]:

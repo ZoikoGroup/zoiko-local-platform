@@ -86,14 +86,25 @@ def test_an_unhandled_exception_is_logged_before_propagating(client, db_session,
         fresh_db.close()
 
 
-def test_a_handled_5xx_response_is_also_logged(client, monkeypatch):
+def test_a_handled_5xx_response_is_also_logged(client, db_session, monkeypatch):
     """Not just genuinely-unhandled crashes - our own explicit
     raise HTTPException(502, ...) after a caught provider failure is worth
     the same visibility, since it's still a real production failure."""
+    from app.billing.models import SubscriptionStatus
+    from app.billing.service import get_or_create_subscription
     from app.observability.models import ErrorEvent
 
     monkeypatch.setattr("app.integrations.video.livekit.settings.livekit_url", "")
-    token, _ = _signup_and_login(client, "errormonhandled@example.com")
+    token, account_id = _signup_and_login(client, "errormonhandled@example.com")
+
+    # app.core.deps.require_paid_or_read_only blocks write actions (POST
+    # /media/video/rooms) for a TRIALING account; this test is about error
+    # logging, not trial-gating, so clear it directly (same pattern as
+    # test_risk.py's _clear_billing_trial_gate).
+    sub = get_or_create_subscription(db_session, account_id)
+    sub.status = SubscriptionStatus.ACTIVE
+    sub.trial_ends_at = None
+    db_session.commit()
 
     response = client.post("/media/video/rooms", headers={"Authorization": f"Bearer {token}"})
     assert response.status_code == 502

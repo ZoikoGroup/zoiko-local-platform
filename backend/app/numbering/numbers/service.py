@@ -1411,11 +1411,22 @@ def create_number_purchase_checkout_session(db: Session, account_id: str, e164: 
     if billing_service.is_first_number_included(db, account_id, exclude_number_id=number.id):
         surcharge_cents = max(0, rate_cents - NUMBER_INCLUSION_THRESHOLD_CENTS)
         if surcharge_cents == 0:
+            # Real bug fix: log_event does its own unconditional db.commit()
+            # (an audit-durability guarantee, not something to remove) -
+            # calling it BEFORE purchase_number released the account lock
+            # above the instant this line committed, well before
+            # purchase_number ever touched the number's status. A second,
+            # concurrently-blocked purchase on this account would then
+            # unblock and see BOTH numbers still un-purchased, granting a
+            # second "included" number. purchase_number's own first
+            # internal commit already flips the status to one
+            # get_included_number_ids counts - running it first means
+            # nothing releases the lock before that's true.
+            included_number = purchase_number(db, account_id, e164)
             log_event(
                 db, actor_id=account_id, action="number.included_purchase",
                 target_type="phone_number", target_id=number.id, metadata={"e164": e164},
             )
-            included_number = purchase_number(db, account_id, e164)
             return {"id": None, "url": None, "included": True, "number": included_number}
 
         # Doc §5.1: included number, but its real rate is above the

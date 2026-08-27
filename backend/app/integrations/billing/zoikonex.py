@@ -73,6 +73,7 @@ from sqlalchemy.orm import Session
 
 from app.billing.models import Plan
 from app.core.config import settings
+from app.integrations.cache.redis import cache_delete
 from app.observability.service import trace_provider_call
 from app.usage.models import DEFAULT_RATE_COUNTRY, AIUsageRate, CallingRate, NumberRate
 
@@ -294,6 +295,14 @@ def register_plan_in_catalog(
     plan.zoikonex_offer_id = offer["id"]
     plan.zoikonex_price_rule_id = price_rule["id"]
     db.commit()
+    # Real gap fix: app.billing.service.get_plan caches this row for
+    # _PLANS_CACHE_TTL_SECONDS on the documented assumption that "plans are
+    # only ever seeded via migration, never mutated at runtime" - this is
+    # the one real exception to that (a plan's first-ever billing cycle
+    # registers it here). Without invalidating, any get_plan caller within
+    # the TTL window right after a plan's first registration would keep
+    # seeing the pre-registration zoikonex_product_id=None it read earlier.
+    cache_delete(f"plan:{plan.plan_code}")
 
     return {"product_id": product["id"], "offer_id": offer["id"], "price_rule_id": price_rule["id"]}
 

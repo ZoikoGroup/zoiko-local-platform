@@ -65,6 +65,23 @@ def reset_circuit_breakers():
 
 
 @pytest.fixture(autouse=True)
+def reset_redis_cache():
+    """Same "leaks across tests" problem as reset_rate_limiter/
+    reset_circuit_breakers above, for app.integrations.cache.redis - unlike
+    the DB (rolled back per-test via db_session's own transaction), Redis
+    isn't reset between tests at all. A test that mutates a row a
+    cache_get/cache_set pair reads (a Plan's max_team_seats, the
+    supported-countries list, ops' public status) can otherwise see an
+    earlier test's now-stale cached value survive well past its own DB
+    rollback - real gap found live once REDIS_URL pointed at a real
+    instance for the first time in this suite's history."""
+    from app.integrations.cache.redis import flush_all_for_tests
+
+    flush_all_for_tests()
+    yield
+
+
+@pytest.fixture(autouse=True)
 def mock_zoikonex_sync(monkeypatch):
     """app.integrations.billing.zoikonex is a real HTTP client against a
     self-hosted ZoikoNex backend (not a mock, unlike every other Provider

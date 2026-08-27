@@ -85,7 +85,14 @@ def test_run_billing_cycle_registers_plan_in_catalog_and_is_idempotent(db_sessio
 
     account2, _sub2 = _synced_paid_subscription(db_session, "Billing Cycle Catalog Co 2")
     service.run_billing_cycle(db_session, account2.id, actor="test-actor")
-    db_session.refresh(plan)
+    # get_plan again rather than db_session.refresh(plan) - the point here
+    # is "a real caller reading the plan afterward sees it wasn't
+    # re-registered," not SQLAlchemy object-identity semantics, and
+    # get_plan's own cache (real now that register_plan_in_catalog
+    # invalidates it - see that function's comment) can legitimately hand
+    # back a freshly-deserialized, session-detached Plan instance that
+    # .refresh() has no business being called on.
+    plan = get_plan(db_session, "starter")
     assert plan.zoikonex_product_id == first_product_id  # not re-registered
 
 

@@ -203,9 +203,16 @@ def get_plan(db: Session, plan_code: str) -> Plan:
     call's time-limit lookup, checkout, usage summary), unlike list_plans
     above which only serves the billing page. Reuses that same cache
     (_serialize_plan/_deserialize_plan, same TTL) keyed per plan_code -
-    plans are only ever seeded via migration, never mutated at runtime, so
-    there's no invalidation path needed, same assumption list_plans already
-    relies on."""
+    plans are seeded via migration and effectively read-only at runtime,
+    with one real exception: app.integrations.billing.zoikonex.
+    register_plan_in_catalog mutates zoikonex_product_id/offer_id/
+    price_rule_id on a plan's first-ever billing cycle, and explicitly
+    invalidates this same cache key (f"plan:{plan_code}") right after -
+    see that function's own comment. list_plans above has no equivalent
+    invalidation and can serve a stale copy of those three fields for up
+    to _PLANS_CACHE_TTL_SECONDS after a plan's first registration; not
+    fixed there since nothing reads those fields off list_plans's bulk
+    result today."""
     cache_key = f"plan:{plan_code}"
     cached = cache_get(cache_key)
     if cached is not None:

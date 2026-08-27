@@ -18,9 +18,11 @@ def _signup_and_login(client, email: str) -> str:
     # require_paid_or_read_only now blocks write actions (creating/managing
     # a queue) for a TRIALING account, and this file's tests are about
     # queue mechanics, not trial-gating, so upgrade to a real paid plan
-    # here rather than adding this to every individual test.
+    # here rather than adding this to every individual test. Pro, not
+    # starter: the full-lifecycle test wires a queue into a published Call
+    # Flow, which needs the routing.advanced entitlement (Pro+ only).
     client.put(
-        "/billing/subscription/plan", json={"plan_code": "starter", "billing_period": "monthly"},
+        "/billing/subscription/plan", json={"plan_code": "pro", "billing_period": "monthly"},
         headers={"Authorization": f"Bearer {token}"},
     )
     return token
