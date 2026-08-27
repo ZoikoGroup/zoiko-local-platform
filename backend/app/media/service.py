@@ -354,6 +354,16 @@ def handle_browser_connect(
     TwiML - raises the same CallAuthorizationError/risk exceptions as
     every other real call so the route can translate them into a clean
     spoken error instead of dead air."""
+    # Real gap found live: Twilio hit this webhook at least twice with To
+    # blank (both from the account's own browser client, no destination at
+    # all) - assert_outbound_call_allowed doesn't validate this, so it fell
+    # through to build_bridge_response with an empty <Number>, dialing
+    # nothing. Not clear yet whether this is a stray client-side call
+    # attempt or a genuine Twilio-side quirk; either way this is the
+    # correct, defensive response until the real trigger is understood.
+    if not to:
+        raise CallAuthorizationError("No destination number was provided")
+
     owner = find_number_owner(db, from_number)
     if owner is None or owner.account_id != account_id or owner.status != PhoneNumberStatus.ACTIVE:
         raise CallAuthorizationError(f"{from_number} is not an active number owned by your account")
@@ -365,7 +375,7 @@ def handle_browser_connect(
     account_owner = db.query(User).filter(User.account_id == account_id, User.role == UserRole.OWNER).first()
     account_email = account_owner.email if account_owner else ""
 
-    _assert_outbound_call_allowed(db, account_id=account_id, account_email=account_email, to=to, from_number=from_number)
+    assert_outbound_call_allowed(db, account_id=account_id, account_email=account_email, to=to, from_number=from_number)
 
     record_call(
         db,
