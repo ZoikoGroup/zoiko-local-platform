@@ -34,6 +34,17 @@ def create_access_token(subject: str, scope: str = "customer", expire_minutes: i
     return jwt.encode(payload, settings.jwt_secret_key, algorithm=ALGORITHM)
 
 
+def create_scoped_token(subject: str, scope: str, expire_minutes: int, **extra) -> str:
+    """Same signing/expiry mechanism as create_access_token, but for a
+    short-lived, purpose-built token that needs to carry more than just a
+    subject (e.g. ZL-COM-ENT-001 v3.0's plan-change preview token, which
+    also carries the target plan/period/impact-hash) - decode with the
+    same decode_access_token below, then check payload["scope"]."""
+    expire = datetime.now(timezone.utc) + timedelta(minutes=expire_minutes)
+    payload = {"sub": subject, "scope": scope, "exp": expire, **extra}
+    return jwt.encode(payload, settings.jwt_secret_key, algorithm=ALGORITHM)
+
+
 def decode_access_token(token: str) -> dict | None:
     """Tries the current jwt_secret_key first, then jwt_secret_key_previous
     if set - the actual mechanism that makes secret rotation possible

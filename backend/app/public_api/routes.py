@@ -5,7 +5,7 @@ from app.billing.schemas import UsageSummaryResponse
 from app.billing import service as billing_service
 from app.contacts import service as contacts_service
 from app.core.database import get_db
-from app.core.deps import get_api_key_account_id, require_entitlement_for_api_key
+from app.core.deps import get_api_key_account_id, require_entitlement_scope_for_api_key
 from app.core.rate_limit import api_key_or_ip, limiter
 from app.intelligence.models import ConversationSummary
 from app.media import service as media_service
@@ -66,7 +66,7 @@ def list_numbers(
     request: Request,
     account_id: str = Depends(get_api_key_account_id),
     db: Session = Depends(get_db),
-    _entitlement: str = Depends(require_entitlement_for_api_key("developer.api")),
+    _entitlement: str = Depends(require_entitlement_scope_for_api_key("developer.api.scope", min_scope="limited")),
 ):
     return (
         db.query(PhoneNumber)
@@ -83,7 +83,7 @@ def list_calls(
     request: Request,
     account_id: str = Depends(get_api_key_account_id),
     db: Session = Depends(get_db),
-    _entitlement: str = Depends(require_entitlement_for_api_key("developer.api")),
+    _entitlement: str = Depends(require_entitlement_scope_for_api_key("developer.api.scope", min_scope="limited")),
 ):
     return (
         db.query(CallRecord)
@@ -100,7 +100,7 @@ def list_voicemails(
     request: Request,
     account_id: str = Depends(get_api_key_account_id),
     db: Session = Depends(get_db),
-    _entitlement: str = Depends(require_entitlement_for_api_key("developer.api")),
+    _entitlement: str = Depends(require_entitlement_scope_for_api_key("developer.api.scope", min_scope="limited")),
 ):
     return (
         db.query(Voicemail)
@@ -117,7 +117,7 @@ def list_summaries(
     request: Request,
     account_id: str = Depends(get_api_key_account_id),
     db: Session = Depends(get_db),
-    _entitlement: str = Depends(require_entitlement_for_api_key("developer.api")),
+    _entitlement: str = Depends(require_entitlement_scope_for_api_key("developer.api.scope", min_scope="limited")),
 ):
     return (
         db.query(ConversationSummary)
@@ -135,7 +135,7 @@ def place_call(
     payload: PlaceCallRequest,
     account_id: str = Depends(get_api_key_account_id),
     db: Session = Depends(get_db),
-    _entitlement: str = Depends(require_entitlement_for_api_key("developer.api")),
+    _entitlement: str = Depends(require_entitlement_scope_for_api_key("developer.api.scope", min_scope="limited")),
 ):
     try:
         result = media_service.place_outbound_call_for_account(
@@ -172,7 +172,7 @@ def list_contacts(
     request: Request,
     account_id: str = Depends(get_api_key_account_id),
     db: Session = Depends(get_db),
-    _entitlement: str = Depends(require_entitlement_for_api_key("developer.api")),
+    _entitlement: str = Depends(require_entitlement_scope_for_api_key("developer.api.scope", min_scope="limited")),
 ):
     return contacts_service.list_contacts(db, account_id)
 
@@ -184,7 +184,7 @@ def create_contact(
     payload: CreateContactRequest,
     account_id: str = Depends(get_api_key_account_id),
     db: Session = Depends(get_db),
-    _entitlement: str = Depends(require_entitlement_for_api_key("developer.api")),
+    _entitlement: str = Depends(require_entitlement_scope_for_api_key("developer.api.scope", min_scope="limited")),
 ):
     return contacts_service.create_contact(
         db, account_id=account_id, user_id=None, name=payload.name, phone_number=payload.phone_number,
@@ -198,7 +198,7 @@ def usage_summary(
     request: Request,
     account_id: str = Depends(get_api_key_account_id),
     db: Session = Depends(get_db),
-    _entitlement: str = Depends(require_entitlement_for_api_key("developer.api")),
+    _entitlement: str = Depends(require_entitlement_scope_for_api_key("developer.api.scope", min_scope="limited")),
 ):
     """Read-only - this account's current billing period usage against its
     plan limits, the same data the customer-facing Billing page shows.
@@ -213,7 +213,7 @@ def list_webhooks(
     request: Request,
     account_id: str = Depends(get_api_key_account_id),
     db: Session = Depends(get_db),
-    _entitlement: str = Depends(require_entitlement_for_api_key("developer.api")),
+    _entitlement: str = Depends(require_entitlement_scope_for_api_key("developer.api.scope", min_scope="limited")),
 ):
     return webhooks_service.list_endpoints(db, account_id)
 
@@ -225,8 +225,8 @@ def create_webhook(
     payload: CreateWebhookEndpointRequest,
     account_id: str = Depends(get_api_key_account_id),
     db: Session = Depends(get_db),
-    _entitlement: str = Depends(require_entitlement_for_api_key("developer.api")),
-    _webhooks_entitlement: str = Depends(require_entitlement_for_api_key("developer.webhooks")),
+    _entitlement: str = Depends(require_entitlement_scope_for_api_key("developer.api.scope", min_scope="limited")),
+    _webhooks_entitlement: str = Depends(require_entitlement_scope_for_api_key("developer.webhooks.scope", min_scope="limited")),
 ):
     try:
         endpoint, secret = webhooks_service.create_endpoint(
@@ -250,7 +250,7 @@ def delete_webhook(
     endpoint_id: str,
     account_id: str = Depends(get_api_key_account_id),
     db: Session = Depends(get_db),
-    _entitlement: str = Depends(require_entitlement_for_api_key("developer.api")),
+    _entitlement: str = Depends(require_entitlement_scope_for_api_key("developer.api.scope", min_scope="limited")),
 ):
     try:
         webhooks_service.delete_endpoint(
@@ -267,6 +267,6 @@ def list_webhook_deliveries(
     endpoint_id: str | None = None,
     account_id: str = Depends(get_api_key_account_id),
     db: Session = Depends(get_db),
-    _entitlement: str = Depends(require_entitlement_for_api_key("developer.api")),
+    _entitlement: str = Depends(require_entitlement_scope_for_api_key("developer.api.scope", min_scope="limited")),
 ):
     return webhooks_service.list_deliveries(db, account_id=account_id, endpoint_id=endpoint_id)

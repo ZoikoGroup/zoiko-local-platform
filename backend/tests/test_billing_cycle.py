@@ -299,6 +299,44 @@ def test_run_billing_cycle_skips_ai_receptionist_addon_fee_when_addon_is_disable
     assert "ai-receptionist-overage-fee" not in line_keys
 
 
+def test_run_billing_cycle_bills_plan_included_ai_overage_without_the_addon(db_session, monkeypatch):
+    """ZL-COM-ENT-001 v3.0 gap fix: a Pro/Scale account exceeding its
+    PLAN-included AI Receptionist minutes with no add-on purchased used to
+    get no overage invoice line at all - only get_usage_summary showed it
+    informationally. This test fails against the pre-fix code (the whole
+    block was gated on ai_receptionist_addon_enabled) to prove it actually
+    exercises the fix, not just re-confirm the already-working addon path
+    covered above."""
+    from app.billing import service as billing_service
+    from app.usage import service as usage_service
+
+    account, _sub = _synced_paid_subscription(db_session, "Billing Cycle Plan Overage Co", "pro")
+    plan = billing_service.get_plan(db_session, "pro")
+    assert plan.included_ai_receptionist_minutes == 50
+    # Deliberately never calling set_ai_receptionist_addon - stays disabled.
+
+    usage_service.record_usage_event(
+        db_session, account_id=account.id, event_type="ai_receptionist_minutes", quantity=80, unit="minutes",
+        country_band=None, idempotency_key="test-plan-only-overage-1",
+    )
+    expected_overage_minutes = 80 - plan.included_ai_receptionist_minutes
+    expected_overage_cents = round(expected_overage_minutes * 39)
+
+    line_item_calls = []
+    monkeypatch.setattr(
+        service.zoikonex_adapter, "add_invoice_line_item",
+        lambda invoice_id, **kwargs: line_item_calls.append(kwargs) or {"line_item_id": "zn-line-item-test"},
+    )
+
+    service.run_billing_cycle(db_session, account.id, actor="test-actor")
+
+    line_keys = [c["line_key"] for c in line_item_calls]
+    # No add-on fee - the add-on itself was never enabled.
+    assert "ai-receptionist-addon-fee" not in line_keys
+    overage_call = next(c for c in line_item_calls if c["line_key"] == "ai-receptionist-overage-fee")
+    assert overage_call["amount_minor_units"] == expected_overage_cents
+
+
 def test_run_billing_cycle_adds_pending_number_charges_as_line_items_on_the_same_invoice(db_session, monkeypatch):
     """Architecture doc §9: a number purchase's cost becomes a line item on
     the SAME invoice as the plan fee - real gap fixed 2026-08-22 (numbers

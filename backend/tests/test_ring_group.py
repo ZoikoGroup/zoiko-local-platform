@@ -116,7 +116,7 @@ def test_starter_plan_account_cannot_set_a_multi_destination_ring_group(client, 
     assert denied.status_code == 402, denied.text
     body = denied.json()["detail"]
     assert body["code"] == "ENTITLEMENT_REQUIRED"
-    assert body["entitlement"] == "routing.shared_handling"
+    assert body["entitlement"] == "routing.shared"
     assert body["current_plan"] == "starter"
 
 

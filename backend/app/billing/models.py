@@ -92,12 +92,20 @@ class Plan(Base):
 
 class EntitlementValueType(str, enum.Enum):
     """Commercial Entitlement Governance standard (ZL-COM-ENT-001) §6 lists
-    7 value types (Boolean/Integer/Quantity/Enum/Set/Decimal/Date) - only
-    these 2 are needed for the keys this phase actually gates. Room to grow
-    into the rest later without a breaking change to PlanEntitlement itself."""
+    7 value types (Boolean/Integer/Quantity/Enum/Set/Decimal/Date) - v3.0's
+    34-key register (Appendix A) adds a handful of enum-typed "scope/tier"
+    keys (e.g. developer.api.scope: none/limited/standard/advanced/
+    contracted) on top of the plain booleans/integers Phase 1-2 needed.
+    STRING covers both plain strings and these enum-style values in one
+    type - Postgres doesn't enforce enum membership at this column level
+    either way, so a second real ENUM type would only add ceremony;
+    validation of the actual allowed values lives in the accessor
+    (has_entitlement_scope) instead. Room to grow into Decimal/Date later
+    without another breaking change to PlanEntitlement itself."""
 
     BOOLEAN = "boolean"
     INTEGER = "integer"
+    STRING = "string"
 
 
 class PlanEntitlement(Base):
@@ -130,6 +138,7 @@ class PlanEntitlement(Base):
     )
     bool_value: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     int_value: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    string_value: Mapped[str | None] = mapped_column(String(50), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -394,11 +403,24 @@ class Subscription(Base):
     terminated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     # Pricing doc §5.3 "$29.00 per workspace/month" AI Receptionist add-on -
     # an account-level toggle independent of plan_code (see
-    # AIReceptionistAddonRate's docstring). Not yet wired into
-    # run_billing_cycle's actual charge computation (metering only via
-    # get_usage_summary today) - see CLAUDE.md's note on why that's a
-    # separate, larger piece of work.
+    # AIReceptionistAddonRate's docstring). Wired into run_billing_cycle's
+    # actual charge computation (the $29/mo fee line, gated on this flag)
+    # and into plan-included-minute overage billing (gated more broadly -
+    # see run_billing_cycle's ai_receptionist block) - a stale prior note
+    # here claiming otherwise predates both.
     ai_receptionist_addon_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # ZL-COM-ENT-001 v3.0 §8 - a downgrade normally takes effect at the end
+    # of the current paid period, not immediately (unlike an upgrade). No
+    # scheduler/cron exists in this codebase - these 3 columns are applied
+    # lazily, at the exact same choke point get_or_create_subscription
+    # already uses to roll current_period_start/end forward on read (see
+    # that function). NULL/NULL/NULL means "no change scheduled" - the
+    # overwhelming common case.
+    scheduled_plan_code: Mapped[str | None] = mapped_column(String(50), ForeignKey("plans.plan_code"), nullable=True)
+    scheduled_billing_period: Mapped[BillingPeriod | None] = mapped_column(
+        Enum(BillingPeriod, name="billing_period_enum"), nullable=True
+    )
+    scheduled_change_effective_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 

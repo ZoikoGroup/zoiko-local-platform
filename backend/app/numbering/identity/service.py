@@ -221,7 +221,7 @@ def add_team_member(
     # feature). Real gap fix: previously a Starter account could add up to
     # its Plan.max_team_seats members (5, per seed data) with no gate on
     # the team feature itself at all.
-    assert_entitlement(db, account_id, "team.members.enabled")
+    assert_entitlement(db, account_id, "team.enabled")
     assert_seat_quota_available(db, account_id)
 
     member = User(

@@ -2007,9 +2007,9 @@ def set_ring_group(db: Session, user: User, e164: str, destinations: list[str]) 
     # (already available to every plan via forwarding_number); 2+
     # destinations ringing simultaneously is the actual "shared handling"
     # capability being gated here.
-    if len(destinations) > 1 and not billing_service.has_entitlement(db, user.account_id, "routing.shared_handling"):
+    if len(destinations) > 1 and not billing_service.has_entitlement(db, user.account_id, "routing.shared"):
         raise billing_service.EntitlementRequiredError(
-            "routing.shared_handling", billing_service.get_or_create_subscription(db, user.account_id).plan_code
+            "routing.shared", billing_service.get_or_create_subscription(db, user.account_id).plan_code
         )
 
     db.query(RingGroupDestination).filter(RingGroupDestination.phone_number_id == number.id).delete()

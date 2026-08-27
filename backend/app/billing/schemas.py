@@ -92,11 +92,50 @@ class SubscriptionResponse(BaseModel):
     zoikonex_ref: str | None
     grace_period_ends_at: datetime | None
     canceled_at: datetime | None
+    scheduled_plan_code: str | None
+    scheduled_billing_period: str | None
+    scheduled_change_effective_at: datetime | None
+
+
+class EntitlementSnapshotResponse(BaseModel):
+    """ZL-COM-ENT-001 v3.0 - the account's full resolved entitlement set.
+    Deliberately a flat dict (not ~30 named fields) - the register is
+    data-driven (see the plan_entitlements seed migration), so a new key
+    shouldn't need a schema change here."""
+
+    entitlements: dict[str, bool | int | str | None]
 
 
 class ChangePlanRequest(BaseModel):
     plan_code: str
     billing_period: str = "monthly"
+
+
+class PreviewPlanChangeRequest(BaseModel):
+    plan_code: str
+    billing_period: str = "monthly"
+
+
+class PlanChangePreviewResponse(BaseModel):
+    """ZL-COM-ENT-001 v3.0 §7/§8 - a pure-read preview of switching to
+    plan_code: what's gained/lost, resource impact for a downgrade, AI
+    Receptionist minute provenance, and the short-lived signed token
+    confirm_plan_change must present to actually commit."""
+
+    direction: str
+    current_plan_code: str
+    target_plan_code: str
+    billing_period: str
+    effective_at: datetime | None
+    entitlement_diff: dict
+    resource_impact: dict | None
+    ai_receptionist_included_minutes: dict
+    preview_token: str
+    expires_in_minutes: int
+
+
+class ConfirmPlanChangeRequest(BaseModel):
+    preview_token: str
 
 
 class PlanChangeCheckoutSessionResponse(BaseModel):

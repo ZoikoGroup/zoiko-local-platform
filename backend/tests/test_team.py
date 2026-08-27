@@ -134,7 +134,7 @@ def test_free_trial_account_cannot_add_a_team_member(client, db_session):
     assert response.status_code == 402, response.text
     body = response.json()["detail"]
     assert body["code"] == "ENTITLEMENT_REQUIRED"
-    assert body["entitlement"] == "team.members.enabled"
+    assert body["entitlement"] == "team.enabled"
     assert body["current_plan"] == "free_trial"
 
 

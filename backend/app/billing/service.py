@@ -1,3 +1,5 @@
+import hashlib
+import json
 import logging
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -6,6 +8,7 @@ import sqlalchemy as sa
 from sqlalchemy.orm import Session
 
 from app.audit.service import log_event
+from app.core.security import create_scoped_token, decode_access_token
 from app.billing.models import (
     AIReceptionistAddonRate,
     BillingActionRequest,
@@ -582,10 +585,57 @@ def get_or_create_subscription(db: Session, account_id: str) -> Subscription:
         # out with no way to pay. ZoikoNex sync will replace this once built.
         sub.status = SubscriptionStatus.ACTIVE
         changed = True
+    # ZL-COM-ENT-001 v3.0 §8 - a scheduled downgrade (confirm_plan_change)
+    # applies here, lazily, the same no-scheduler pattern the two checks
+    # above already use - the only choke point in this codebase that
+    # already does time-based state transition on read. Guarded to a cheap
+    # is-not-None check so the near-total majority of accounts (nothing
+    # scheduled) pay no extra cost. Applied in the SAME commit as the
+    # period rollover above, not a second read-modify-write.
+    applied_scheduled_change = False
+    if (
+        sub.scheduled_plan_code is not None
+        and sub.scheduled_change_effective_at is not None
+        and sub.scheduled_change_effective_at <= now
+    ):
+        sub.plan_code = sub.scheduled_plan_code
+        if sub.scheduled_billing_period is not None:
+            sub.billing_period = sub.scheduled_billing_period
+        sub.scheduled_plan_code = None
+        sub.scheduled_billing_period = None
+        sub.scheduled_change_effective_at = None
+        changed = True
+        applied_scheduled_change = True
     if changed:
         db.commit()
         db.refresh(sub)
+    if applied_scheduled_change:
+        _invalidate_plan_change_side_effects(db, sub)
     return sub
+
+
+def _invalidate_plan_change_side_effects(db: Session, sub: Subscription) -> None:
+    """Shared by change_plan (immediate) and get_or_create_subscription's
+    lazy scheduled-downgrade application - the same after-effects a plan
+    transition needs regardless of which path caused it: audit trail,
+    ZoikoNex sync, and a durable event other services can react to.
+    Deliberately NOT calling notify_plan_started/notify_plan_changed here -
+    those are customer-facing "you changed your plan" emails, which fire
+    from the explicit user-initiated actions (change_plan, confirm_plan_
+    change) already; a lazy background application shouldn't re-notify for
+    something the customer already saw and confirmed."""
+    from app.events.service import publish_event_durably
+
+    sub = sync_subscription_to_zoikonex(db, sub)
+    log_event(
+        db, actor="system:billing_lifecycle", action="subscription.plan_change_applied",
+        target=f"subscription:{sub.id}", after={"plan_code": sub.plan_code, "billing_period": sub.billing_period.value},
+    )
+    publish_event_durably(
+        db, "zoiko.billing", "subscription.plan_change_applied", sub.account_id,
+        {"subscription_id": sub.id, "plan_code": sub.plan_code, "billing_period": sub.billing_period.value},
+    )
+    db.commit()
 
 
 def change_plan(
@@ -645,6 +695,247 @@ def change_plan(
             previous_plan=before_plan_obj.name if before_plan_obj else before_plan,
             new_plan=plan.name,
         )
+    return sub
+
+
+class PlanChangePreviewExpiredError(EntitlementError):
+    """Preview token expired (short TTL, see preview_plan_change) or is
+    malformed/forged - the customer must review current terms again."""
+    code = "PREVIEW_EXPIRED"
+    status_code = 409
+
+
+class PlanChangePreviewStaleError(EntitlementError):
+    """The account's real, current state (plan, subscription version)
+    changed since the preview was generated - e.g. two browser tabs, or a
+    webhook-driven change landing mid-review. Never commit a transition
+    computed against stale state."""
+    code = "VERSION_CONFLICT"
+    status_code = 409
+
+
+class NoScheduledPlanChangeError(Exception):
+    """Raised by cancel_scheduled_plan_change when there is nothing to
+    cancel - a clean no-op error rather than silently succeeding."""
+
+
+_PLAN_CHANGE_PREVIEW_SCOPE = "plan_change_preview"
+_PLAN_CHANGE_PREVIEW_TTL_MINUTES = 10
+
+
+def _diff_entitlements(current: dict, target: dict) -> dict:
+    """ZL-COM-ENT-001 v3.0 §10 "Downgrade preview: show lost capabilities" /
+    §7.1 "Upgrade preview: show feature additions." Boolean-shaped keys
+    (missing treated as False, same deny-by-default posture as
+    has_entitlement) sort into gained/lost; quantity/scope keys (a number
+    or a string like "standard") have no natural gained/lost framing, so
+    they sort into changed with their before/after values."""
+    gained: list[str] = []
+    lost: list[str] = []
+    changed: list[dict] = []
+    for key in sorted(set(current) | set(target)):
+        cur = current.get(key)
+        tgt = target.get(key)
+        if cur == tgt:
+            continue
+        if isinstance(cur, bool) or isinstance(tgt, bool):
+            if tgt and not cur:
+                gained.append(key)
+            elif cur and not tgt:
+                lost.append(key)
+        else:
+            changed.append({"key": key, "from": cur, "to": tgt})
+    return {"gained": gained, "lost": lost, "changed": changed}
+
+
+def _plan_change_resource_impact(db: Session, account_id: str, target_plan: Plan, target_entitlements: dict) -> dict:
+    """ZL-COM-ENT-001 v3.0 §8.1 downgrade impact matrix - numbers/team seats
+    that would exceed what the target plan allows. Informational only
+    (nothing is disposed of here) - the actual downgrade still doesn't
+    silently release/delete anything, per the doc's own "no surprise
+    disposition" rule; this just surfaces the numbers so the frontend can
+    show them before the customer confirms."""
+    from app.numbering.identity.models import User
+    from app.numbering.numbers.models import PhoneNumber, PhoneNumberStatus
+
+    owned_numbers = (
+        db.query(PhoneNumber)
+        .filter(
+            PhoneNumber.account_id == account_id,
+            PhoneNumber.status.in_([
+                PhoneNumberStatus.PURCHASE_PENDING, PhoneNumberStatus.COMPLIANCE_PENDING,
+                PhoneNumberStatus.PROVISIONING, PhoneNumberStatus.ACTIVE, PhoneNumberStatus.SUSPENDED,
+            ]),
+        )
+        .count()
+    )
+    seat_count = db.query(User).filter(User.account_id == account_id).count()
+    return {
+        "numbers_owned": owned_numbers,
+        "numbers_over_target_limit": max(0, owned_numbers - target_plan.max_numbers),
+        "team_seats_used": seat_count,
+        "team_seats_over_target_limit": max(0, seat_count - target_plan.max_team_seats),
+        "team_capability_lost": bool(target_entitlements.get("team.enabled")) is False and seat_count > 1,
+    }
+
+
+def preview_plan_change(
+    db: Session, account_id: str, target_plan_code: str, *, billing_period: BillingPeriod = BillingPeriod.MONTHLY,
+) -> dict:
+    """ZL-COM-ENT-001 v3.0 §7/§8 "Preview" stage - resolves the real
+    feature diff and resource impact between the account's current plan
+    and target_plan_code, and returns a short-lived signed token
+    confirm_plan_change must present to actually commit. Never mutates
+    anything - a pure read."""
+    sub = get_or_create_subscription(db, account_id)
+    current_plan = get_plan(db, sub.plan_code)  # PlanNotFoundError can't happen for an existing subscription
+    target_plan = get_plan(db, target_plan_code)  # raises PlanNotFoundError for an invalid target
+
+    direction = "downgrade" if target_plan.sort_order < current_plan.sort_order else "upgrade"
+
+    current_entitlements = _entitlement_rows_for_plan(db, sub.plan_code)
+    target_entitlements = _entitlement_rows_for_plan(db, target_plan_code)
+    entitlement_diff = _diff_entitlements(current_entitlements, target_entitlements)
+
+    resource_impact = (
+        _plan_change_resource_impact(db, account_id, target_plan, target_entitlements)
+        if direction == "downgrade" else None
+    )
+
+    # §7.2 AI add-on provenance - the add-on persists across a plan change
+    # unless explicitly disabled (set_ai_receptionist_addon), so both
+    # totals below already correctly stack plan-included + add-on minutes
+    # via the same shared helper run_billing_cycle/get_entitlement_snapshot
+    # use - this can't independently drift from what's actually billed.
+    addon_rate = get_active_ai_receptionist_addon_rate(db) if sub.ai_receptionist_addon_enabled else None
+    current_ai_minutes = _ai_receptionist_minutes_included(current_plan, addon_rate)
+    target_ai_minutes = _ai_receptionist_minutes_included(target_plan, addon_rate)
+
+    effective_at = sub.current_period_end if direction == "downgrade" else None
+    impact_hash = hashlib.sha256(
+        json.dumps(
+            {
+                "plan_code": sub.plan_code, "target_plan_code": target_plan_code,
+                "billing_period": billing_period.value, "resource_impact": resource_impact,
+            },
+            sort_keys=True, default=str,
+        ).encode("utf-8")
+    ).hexdigest()[:16]
+
+    preview_token = create_scoped_token(
+        subject=account_id, scope=_PLAN_CHANGE_PREVIEW_SCOPE, expire_minutes=_PLAN_CHANGE_PREVIEW_TTL_MINUTES,
+        target_plan_code=target_plan_code, billing_period=billing_period.value, impact_hash=impact_hash,
+    )
+
+    return {
+        "direction": direction,
+        "current_plan_code": sub.plan_code,
+        "target_plan_code": target_plan_code,
+        "billing_period": billing_period.value,
+        "effective_at": effective_at,
+        "entitlement_diff": entitlement_diff,
+        "resource_impact": resource_impact,
+        "ai_receptionist_included_minutes": {"current": current_ai_minutes, "target": target_ai_minutes},
+        "preview_token": preview_token,
+        "expires_in_minutes": _PLAN_CHANGE_PREVIEW_TTL_MINUTES,
+    }
+
+
+def _decode_plan_change_preview(db: Session, account_id: str, preview_token: str) -> dict:
+    payload = decode_access_token(preview_token)
+    if payload is None or payload.get("scope") != _PLAN_CHANGE_PREVIEW_SCOPE or payload.get("sub") != account_id:
+        raise PlanChangePreviewExpiredError("This plan-change preview has expired - please review the plan again.")
+
+    sub = get_or_create_subscription(db, account_id)
+    target_plan = get_plan(db, payload["target_plan_code"])
+    current_plan = get_plan(db, sub.plan_code)
+    resource_impact = (
+        _plan_change_resource_impact(db, account_id, target_plan, _entitlement_rows_for_plan(db, target_plan.plan_code))
+        if target_plan.sort_order < current_plan.sort_order else None
+    )
+    fresh_hash = hashlib.sha256(
+        json.dumps(
+            {
+                "plan_code": sub.plan_code, "target_plan_code": payload["target_plan_code"],
+                "billing_period": payload["billing_period"], "resource_impact": resource_impact,
+            },
+            sort_keys=True, default=str,
+        ).encode("utf-8")
+    ).hexdigest()[:16]
+    if fresh_hash != payload.get("impact_hash"):
+        raise PlanChangePreviewStaleError(
+            "Your account changed since this preview was generated - please review the plan again."
+        )
+    return payload
+
+
+def confirm_plan_change(db: Session, account_id: str, preview_token: str, *, actor: str) -> Subscription:
+    """ZL-COM-ENT-001 v3.0 §7/§8 "Confirm" stage. Upgrade: applies
+    immediately via the existing change_plan (payment, where a real price
+    applies, is still collected through the existing Stripe Checkout flow
+    - the preview step precedes checkout-session creation, it doesn't
+    replace it; this path is for a $0/placeholder-price change or a
+    staff/internal direct change, mirroring change_plan's own existing
+    no-payment-gate posture). Downgrade: does NOT call change_plan -
+    schedules it for the end of the current paid period instead (applied
+    later by get_or_create_subscription's lazy rollover)."""
+    payload = _decode_plan_change_preview(db, account_id, preview_token)
+    target_plan_code = payload["target_plan_code"]
+    billing_period = BillingPeriod(payload["billing_period"])
+
+    sub = get_or_create_subscription(db, account_id)
+    target_plan = get_plan(db, target_plan_code)
+    current_plan = get_plan(db, sub.plan_code)
+
+    if target_plan.sort_order < current_plan.sort_order:
+        sub.scheduled_plan_code = target_plan.plan_code
+        sub.scheduled_billing_period = billing_period
+        sub.scheduled_change_effective_at = sub.current_period_end
+        db.commit()
+        db.refresh(sub)
+        from app.events.service import publish_event_durably
+
+        publish_event_durably(
+            db, "zoiko.billing", "subscription.downgrade_scheduled", account_id,
+            {
+                "subscription_id": sub.id, "from_plan": current_plan.plan_code, "to_plan": target_plan.plan_code,
+                "effective_at": sub.scheduled_change_effective_at.isoformat(),
+            },
+        )
+        db.commit()
+        log_event(
+            db, actor=actor, action="subscription.downgrade_scheduled", target=f"subscription:{sub.id}",
+            before={"plan_code": current_plan.plan_code},
+            after={"scheduled_plan_code": target_plan.plan_code, "effective_at": sub.scheduled_change_effective_at.isoformat()},
+        )
+        return sub
+
+    return change_plan(db, account_id, target_plan.plan_code, actor=actor, billing_period=billing_period)
+
+
+def cancel_scheduled_plan_change(db: Session, account_id: str, *, actor: str) -> Subscription:
+    sub = get_or_create_subscription(db, account_id)
+    if sub.scheduled_plan_code is None:
+        raise NoScheduledPlanChangeError("There is no scheduled plan change to cancel.")
+
+    cancelled_plan_code = sub.scheduled_plan_code
+    sub.scheduled_plan_code = None
+    sub.scheduled_billing_period = None
+    sub.scheduled_change_effective_at = None
+    db.commit()
+    db.refresh(sub)
+
+    from app.events.service import publish_event_durably
+
+    publish_event_durably(
+        db, "zoiko.billing", "subscription.plan_change_cancelled", account_id,
+        {"subscription_id": sub.id, "cancelled_target_plan": cancelled_plan_code},
+    )
+    db.commit()
+    log_event(
+        db, actor=actor, action="subscription.plan_change_cancelled", target=f"subscription:{sub.id}",
+        before={"scheduled_plan_code": cancelled_plan_code},
+    )
     return sub
 
 
@@ -918,33 +1209,115 @@ class EntitlementRequiredError(Exception):
         )
 
 
-def has_entitlement(db: Session, account_id: str, key: str) -> bool:
-    """ZL-COM-ENT-001's core principle: 'No entitlement record means no
-    runtime access' - deny-by-default. No PlanEntitlement row for this
-    plan_code+key means False, not an error and not an implicit grant
-    (this is why free_trial and enterprise plan_codes, which have no seeded
-    rows yet, correctly deny every key rather than needing special-casing
-    here). A CANCELED/TERMINATED subscription never has any entitlement,
-    regardless of what row exists for its last plan_code."""
+def get_entitlement_value(db: Session, account_id: str, key: str) -> bool | int | str | None:
+    """ZL-COM-ENT-001 v3.0 §6: some keys are quantities (ai_receptionist.
+    included_minutes) or enum-style scopes/tiers (developer.api.scope), not
+    plain yes/no - has_entitlement's boolean-only return can't express
+    those. Same deny-by-default posture as has_entitlement: no row means
+    None, not an error and not an implicit grant. A CANCELED/TERMINATED
+    subscription never has any entitlement, regardless of what row exists
+    for its last plan_code."""
     sub = get_or_create_subscription(db, account_id)
     if sub.status in (SubscriptionStatus.CANCELED, SubscriptionStatus.TERMINATED):
-        return False
+        return None
     row = (
         db.query(PlanEntitlement)
         .filter(PlanEntitlement.plan_code == sub.plan_code, PlanEntitlement.key == key)
         .first()
     )
     if row is None:
-        return False
+        return None
     if row.value_type == EntitlementValueType.BOOLEAN:
         return bool(row.bool_value)
-    return (row.int_value or 0) > 0
+    if row.value_type == EntitlementValueType.INTEGER:
+        return row.int_value
+    return row.string_value
+
+
+def has_entitlement(db: Session, account_id: str, key: str) -> bool:
+    """Boolean convenience wrapper over get_entitlement_value - kept as its
+    own function since most call sites just need a yes/no. For an INTEGER
+    key this preserves the pre-v3.0 ">0" truthiness (a quantity of 0 means
+    "not entitled", e.g. ai_receptionist.included_minutes=0 on Starter); for
+    a STRING key any non-empty value is truthy (no boolean call site
+    targets a STRING/scope key today - those use has_entitlement_scope)."""
+    value = get_entitlement_value(db, account_id, key)
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value > 0
+    return bool(value)
+
+
+_SCOPE_RANK = {"none": 0, "limited": 1, "standard": 2, "advanced": 3, "contracted": 4}
+
+
+def has_entitlement_scope(db: Session, account_id: str, key: str, min_scope: str) -> bool:
+    """For enum-typed 'scope ladder' keys (developer.api.scope, developer.
+    webhooks.scope) - True iff the account's granted scope is at least as
+    high as min_scope on the none < limited < standard < advanced <
+    contracted ladder. An unrecognized/missing scope value ranks below
+    every real scope, so it denies rather than raising."""
+    value = get_entitlement_value(db, account_id, key)
+    if value is None:
+        return False
+    return _SCOPE_RANK.get(str(value), -1) >= _SCOPE_RANK.get(min_scope, 999)
 
 
 def assert_entitlement(db: Session, account_id: str, key: str) -> None:
     if not has_entitlement(db, account_id, key):
         sub = get_or_create_subscription(db, account_id)
         raise EntitlementRequiredError(key, sub.plan_code)
+
+
+def _entitlement_rows_for_plan(db: Session, plan_code: str) -> dict[str, bool | int | str]:
+    """The raw stored plan_entitlements rows for one plan_code, converted
+    to a plain dict - shared by get_entitlement_snapshot (account-scoped,
+    plus the 3 computed AI/number overlay keys) and preview_plan_change
+    (plan-to-plan diffing, no account/subscription context needed)."""
+    rows = db.query(PlanEntitlement).filter(PlanEntitlement.plan_code == plan_code).all()
+    result: dict[str, bool | int | str] = {}
+    for row in rows:
+        if row.value_type == EntitlementValueType.BOOLEAN:
+            result[row.key] = bool(row.bool_value)
+        elif row.value_type == EntitlementValueType.INTEGER:
+            result[row.key] = row.int_value
+        else:
+            result[row.key] = row.string_value
+    return result
+
+
+def get_entitlement_snapshot(db: Session, account_id: str) -> dict[str, bool | int | str | None]:
+    """ZL-COM-ENT-001 v3.0 §11.1 "Effective Entitlement Snapshot" - every
+    stored plan_entitlements row for the account's current plan, plus 3
+    computed keys the doc lists in Appendix A that are deliberately NOT
+    stored rows (see the seed migration's module docstring for why): the
+    AI Receptionist trio (ai_receptionist.enabled/included_minutes/
+    addon_minutes, read from the same Plan/Subscription/AddonRate sources
+    is_ai_receptionist_enabled_for_account and _compute_ai_receptionist_
+    overage already use, so this can never drift from the real billing
+    math) and number.standard.included_qty (the account's live seat count
+    - already exactly "1 per paid user" via get_included_number_ids, no
+    separate stored quantity needed). A CANCELED/TERMINATED subscription
+    or a plan with no seeded rows (free_trial, enterprise) returns the
+    stored keys as empty/deny - same deny-by-default posture as
+    has_entitlement, just surfaced for every key at once instead of one at
+    a time."""
+    from app.numbering.identity.models import User
+
+    sub = get_or_create_subscription(db, account_id)
+    snapshot: dict[str, bool | int | str | None] = {}
+
+    if sub.status not in (SubscriptionStatus.CANCELED, SubscriptionStatus.TERMINATED):
+        snapshot.update(_entitlement_rows_for_plan(db, sub.plan_code))
+
+    plan = get_plan(db, sub.plan_code)
+    addon_rate = get_active_ai_receptionist_addon_rate(db) if sub.ai_receptionist_addon_enabled else None
+    snapshot["ai_receptionist.enabled"] = plan.included_ai_receptionist_minutes > 0 or sub.ai_receptionist_addon_enabled
+    snapshot["ai_receptionist.included_minutes"] = _ai_receptionist_minutes_included(plan, addon_rate)
+    snapshot["ai_receptionist.addon_minutes"] = addon_rate.included_minutes if addon_rate is not None else 0
+    seat_count = db.query(User).filter(User.account_id == account_id).count()
+    snapshot["number.standard.included_qty"] = seat_count if sub.plan_code != DEFAULT_PLAN_CODE else 0
+
+    return snapshot
 
 
 class InvalidPaymentEventError(Exception):
@@ -2048,14 +2421,24 @@ def run_billing_cycle(db: Session, account_id: str, *, actor: str) -> dict:
         # gate outside development as the plan-fee catalog entry above -
         # a second money-charging price deserves the same "no ad-hoc
         # invented price" discipline, not a quieter exception to it.
-        if sub.ai_receptionist_addon_enabled:
+        #
+        # ZL-COM-ENT-001 v3.0 gap fix: this used to be gated entirely on
+        # ai_receptionist_addon_enabled, so a Pro/Scale account using its
+        # PLAN-included minutes (no add-on purchased) never got billed for
+        # overage past that plan allowance - only get_usage_summary showed
+        # it informationally. Now gated on "does this account have AI
+        # Receptionist at all" (matches is_ai_receptionist_enabled_for_
+        # account); the add-on's own $29/mo fee line still only appears
+        # when the add-on itself is actually enabled.
+        if plan.included_ai_receptionist_minutes > 0 or sub.ai_receptionist_addon_enabled:
             from app.usage.models import UsageEvent
 
-            addon_rate = get_active_ai_receptionist_addon_rate(db)
-            if addon_rate is not None and (
+            rate_for_gating = get_active_ai_receptionist_addon_rate(db)
+            if rate_for_gating is not None and (
                 settings.environment == "development"
-                or (not addon_rate.is_placeholder and addon_rate.status == CatalogEntryStatus.ACTIVE)
+                or (not rate_for_gating.is_placeholder and rate_for_gating.status == CatalogEntryStatus.ACTIVE)
             ):
+                addon_rate = rate_for_gating if sub.ai_receptionist_addon_enabled else None
                 addon_minutes_used = float(
                     db.query(sa.func.coalesce(sa.func.sum(UsageEvent.quantity), 0))
                     .filter(
@@ -2067,23 +2450,25 @@ def run_billing_cycle(db: Session, account_id: str, *, actor: str) -> dict:
                 overage_minutes, overage_cost_cents, _ = _compute_ai_receptionist_overage(
                     db, sub, plan, addon_minutes_used
                 )
-                addon_tax = zoikonex_adapter.determine_tax_for_invoice_line(
-                    invoice_id=invoice["invoice_id"], taxable_amount_minor_units=addon_rate.monthly_price_minor_units,
-                    currency_code=addon_rate.currency_code,
-                )
-                zoikonex_adapter.add_invoice_line_item(
-                    invoice["invoice_id"], description="AI Receptionist add-on - monthly",
-                    amount_minor_units=addon_rate.monthly_price_minor_units,
-                    tax_amount_minor_units=addon_tax.get("tax_amount_minor_units"),
-                    line_key="ai-receptionist-addon-fee",
-                )
-                line_item_total_minor_units += addon_rate.monthly_price_minor_units
-                tax_total_minor_units += addon_tax.get("tax_amount_minor_units") or 0
+
+                if addon_rate is not None:
+                    addon_tax = zoikonex_adapter.determine_tax_for_invoice_line(
+                        invoice_id=invoice["invoice_id"], taxable_amount_minor_units=addon_rate.monthly_price_minor_units,
+                        currency_code=addon_rate.currency_code,
+                    )
+                    zoikonex_adapter.add_invoice_line_item(
+                        invoice["invoice_id"], description="AI Receptionist add-on - monthly",
+                        amount_minor_units=addon_rate.monthly_price_minor_units,
+                        tax_amount_minor_units=addon_tax.get("tax_amount_minor_units"),
+                        line_key="ai-receptionist-addon-fee",
+                    )
+                    line_item_total_minor_units += addon_rate.monthly_price_minor_units
+                    tax_total_minor_units += addon_tax.get("tax_amount_minor_units") or 0
 
                 if overage_cost_cents:
                     overage_tax = zoikonex_adapter.determine_tax_for_invoice_line(
                         invoice_id=invoice["invoice_id"], taxable_amount_minor_units=overage_cost_cents,
-                        currency_code=addon_rate.currency_code,
+                        currency_code=rate_for_gating.currency_code,
                     )
                     zoikonex_adapter.add_invoice_line_item(
                         invoice["invoice_id"],
@@ -2326,6 +2711,17 @@ def is_ai_receptionist_enabled_for_account(db: Session, account_id: str) -> bool
     return plan.included_ai_receptionist_minutes > 0 or sub.ai_receptionist_addon_enabled
 
 
+def _ai_receptionist_minutes_included(plan: Plan, addon_rate: "AIReceptionistAddonRate | None") -> int:
+    """The account's total included AI Receptionist minutes this period -
+    plan-granted (Pro/Scale) plus add-on-granted (Starter/Business who
+    bought the $29/mo add-on) stacking. Single source of truth shared by
+    _compute_ai_receptionist_overage (billing math) and
+    get_entitlement_snapshot (the ai_receptionist.included_minutes key
+    shown to the frontend) - deliberately not a stored plan_entitlements
+    row, so there's exactly one place this number can come from."""
+    return plan.included_ai_receptionist_minutes + (addon_rate.included_minutes if addon_rate is not None else 0)
+
+
 def _compute_ai_receptionist_overage(
     db: Session, sub: Subscription, plan: Plan, ai_receptionist_minutes_used: float,
 ) -> tuple[float, int | None, AIReceptionistAddonRate | None]:
@@ -2337,9 +2733,7 @@ def _compute_ai_receptionist_overage(
     history). Plan-granted minutes (Pro/Scale) and add-on-granted minutes
     (Starter/Business who bought the $29/mo add-on) stack."""
     addon_rate = get_active_ai_receptionist_addon_rate(db) if sub.ai_receptionist_addon_enabled else None
-    minutes_included = plan.included_ai_receptionist_minutes + (
-        addon_rate.included_minutes if addon_rate is not None else 0
-    )
+    minutes_included = _ai_receptionist_minutes_included(plan, addon_rate)
     overage_minutes = max(0.0, ai_receptionist_minutes_used - minutes_included)
     overage_cost_cents = None
     if overage_minutes > 0:

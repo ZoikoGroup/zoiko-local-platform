@@ -149,8 +149,14 @@ def should_record_forwarded_call(db: Session, account_id: str) -> bool:
     """Architecture doc §2.2: "Recording: off by default. Where enabled, it
     must be consented..." - reuses the same AI_PROCESSING consent record the
     video-recording feature gates on, rather than recording every forwarded
-    call unconditionally the moment forwarding_number is configured."""
-    return has_active_consent(db, account_id, ConsentType.AI_PROCESSING)
+    call unconditionally the moment forwarding_number is configured. Also
+    checks the ZL-COM-ENT-001 v3.0 recording.policy_enabled plan gate -
+    additive to consent, not a replacement. This feeds TwiML for a live
+    Twilio webhook, so it fails closed/silent (has_entitlement) rather than
+    raising (assert_entitlement would 500 the call)."""
+    return has_active_consent(db, account_id, ConsentType.AI_PROCESSING) and billing_service.has_entitlement(
+        db, account_id, "recording.policy_enabled"
+    )
 
 
 def record_call(
@@ -340,20 +346,36 @@ def place_bridge_call(
 
 def handle_browser_connect(
     db: Session, *, account_id: str, from_number: str, to: str, call_sid: str, status_callback_url: str | None = None,
-) -> str:
+) -> dict:
     """Live two-way calling straight from the browser (@twilio/voice-sdk):
     called by media.voice.browser_connect, the webhook Twilio hits the
     instant someone's browser (already holding a token minted for
     `account_id` - see telecom.build_voice_access_token) places a call via
     Device.connect(). Unlike place_bridge_call, there's no agent phone to
     ring first - the browser itself IS the agent leg by the time this
-    runs, so this only has to authorize `from_number` for `account_id` and
-    return TwiML dialing the real destination with from_number as caller
-    ID. Returns TwiML directly (not a dict, unlike every other place_*
-    call here) because the caller is Twilio itself, which only understands
-    TwiML - raises the same CallAuthorizationError/risk exceptions as
-    every other real call so the route can translate them into a clean
-    spoken error instead of dead air."""
+    runs, so this only has to authorize `from_number` for `account_id`.
+    Raises the same CallAuthorizationError/risk exceptions as every other
+    real call so the route can translate them into a clean spoken error
+    instead of dead air.
+
+    Returns a dict describing HOW to route the call rather than building
+    TwiML directly (unlike every other place_* call here) - TwiML
+    construction needs `request`/routing_service, which live in
+    media.voice, not here. Two shapes:
+      - {"mode": "pstn_bridge", "destination": to, "caller_id": from_number}
+        - the normal case, dial `to` over the carrier network.
+      - {"mode": "app_to_app", "owner": <PhoneNumber>} - ZL-COM-ENT-001
+        v3.0 voice.app_to_app: `to` is owned by a DIFFERENT Zoiko account
+        and the caller's plan includes app-to-app calling. Routed through
+        that account's OWN real call handling (ring group/business hours/
+        AI receptionist/voicemail via media.voice._resolve_call_twiml),
+        not a bare client-to-client bridge that would skip it entirely -
+        skips the PSTN leg, not the callee's configured call handling.
+        has_entitlement (not assert_entitlement) - voice.app_to_app is
+        Included on every real plan, so lacking it just falls back to
+        the normal pstn_bridge mode (dialing `to` as an ordinary number
+        still works fine), never a hard denial for what's meant to be a
+        transparent optimization."""
     # Real gap found live: Twilio hit this webhook at least twice with To
     # blank (both from the account's own browser client, no destination at
     # all) - assert_outbound_call_allowed doesn't validate this, so it fell
@@ -387,7 +409,46 @@ def handle_browser_connect(
         provider_call_sid=call_sid,
         status="in-progress",
     )
-    return telecom.build_bridge_response(to, caller_id=from_number, status_callback_url=status_callback_url)
+
+    target_owner = find_number_owner(db, to)
+    if (
+        target_owner is not None
+        and target_owner.account_id != account_id
+        and target_owner.status == PhoneNumberStatus.ACTIVE
+        and billing_service.has_entitlement(db, account_id, "voice.app_to_app")
+    ):
+        return {"mode": "app_to_app", "owner": target_owner}
+    return {"mode": "pstn_bridge", "destination": to, "caller_id": from_number}
+
+
+class CallNotTransferableError(Exception):
+    """Raised by transfer_call when the target call doesn't exist, isn't
+    owned by the caller's account, or isn't currently in-progress."""
+
+
+def transfer_call(db: Session, user: User, call_sid: str, destination: str) -> dict:
+    """ZL-COM-ENT-001 v3.0 - routing.transfer (Business+). Blind/cold
+    transfer only: redirects the call's live leg to fresh TwiML dialing
+    `destination`, dropping whoever was on the transferring leg - not a
+    3-way warm/attended transfer (a materially bigger feature, needing a
+    conference bridge). Reuses assert_can_access_call's exact ownership
+    check (account + assigned-number scoping) rather than a new one."""
+    assert_can_access_call(db, user, call_sid)
+    billing_service.assert_entitlement(db, user.account_id, "routing.transfer")
+
+    call = db.query(CallRecord).filter(CallRecord.provider_call_sid == call_sid).first()
+    if call is None or call.status != "in-progress":
+        raise CallNotTransferableError(f"{call_sid} is not an in-progress call")
+    if not destination or not destination.startswith("+"):
+        raise CallNotTransferableError("destination must be a real phone number in E.164 format")
+
+    twiml = telecom.build_bridge_response(destination, caller_id=call.from_number)
+    result = telecom.redirect_call(call_sid, twiml)
+    log_event(
+        db, actor_id=user.id, action="call.transferred", target_type="call_record", target_id=call.id,
+        metadata={"call_sid": call_sid, "destination": destination},
+    )
+    return result
 
 
 def place_outbound_call(
@@ -891,6 +952,11 @@ async def start_video_recording(db: Session, user: User, room_name: str) -> Vide
             "AI processing consent is required before recording video calls — "
             "grant it via POST /compliance/consent first"
         )
+    # ZL-COM-ENT-001 v3.0 - plan-tier gate, additive to (not a replacement
+    # for) the AI_PROCESSING consent check above: consent covers "may we
+    # legally process this," the entitlement covers "does this plan
+    # include recording at all."
+    billing_service.assert_entitlement(db, user.account_id, "recording.policy_enabled")
 
     started_at = datetime.now(timezone.utc)
     object_key = _build_recording_object_key(db, session, started_at)

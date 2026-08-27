@@ -12,9 +12,13 @@ from app.billing.schemas import (
     CancelSubscriptionRequest,
     ChangePlanRequest,
     CreatePriceCatalogEntryRequest,
+    ConfirmPlanChangeRequest,
     CreditNoteResponse,
     CustomerBillingHistoryEntryResponse,
     DebitNoteResponse,
+    EntitlementSnapshotResponse,
+    PlanChangePreviewResponse,
+    PreviewPlanChangeRequest,
     IssueCreditNoteRequest,
     IssueDebitNoteRequest,
     PlanChangeCheckoutSessionResponse,
@@ -174,6 +178,14 @@ def get_subscription(db: Session = Depends(get_db), current_user: User = Depends
     return service.get_or_create_subscription(db, current_user.account_id)
 
 
+@router.get("/entitlements", response_model=EntitlementSnapshotResponse)
+def get_entitlements(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    """ZL-COM-ENT-001 v3.0 - the caller's full resolved entitlement
+    snapshot, so the frontend can lock nav items / show plan comparisons
+    without guessing at plan tiers client-side."""
+    return EntitlementSnapshotResponse(entitlements=service.get_entitlement_snapshot(db, current_user.account_id))
+
+
 @router.put("/subscription/plan", response_model=SubscriptionResponse)
 def change_plan(
     payload: ChangePlanRequest,
@@ -196,6 +208,56 @@ def change_plan(
         )
     except service.PlanNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
+
+
+@router.post("/subscription/plan/preview", response_model=PlanChangePreviewResponse)
+def preview_plan_change(
+    payload: PreviewPlanChangeRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin),
+):
+    """ZL-COM-ENT-001 v3.0 §7/§8 "Preview" stage - a pure read, never
+    mutates anything. Returns the signed preview_token POST /subscription/
+    plan/confirm needs."""
+    try:
+        return service.preview_plan_change(
+            db, current_user.account_id, payload.plan_code, billing_period=BillingPeriod(payload.billing_period),
+        )
+    except service.PlanNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
+
+
+@router.post("/subscription/plan/confirm", response_model=SubscriptionResponse)
+def confirm_plan_change(
+    payload: ConfirmPlanChangeRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin),
+):
+    """ZL-COM-ENT-001 v3.0 §7/§8 "Confirm" stage - an upgrade applies
+    immediately; a downgrade is scheduled for the end of the current paid
+    period (see service.confirm_plan_change's docstring). PlanChangePreview
+    ExpiredError/StaleError aren't caught here - both subclass EntitlementError,
+    handled by the global entitlement_error_handler, same as every other
+    EntitlementError subclass in this module."""
+    try:
+        return service.confirm_plan_change(db, current_user.account_id, payload.preview_token, actor=current_user.id)
+    except service.PlanNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
+
+
+@router.post("/subscription/plan/cancel-scheduled", response_model=SubscriptionResponse)
+def cancel_scheduled_plan_change(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin),
+):
+    """ZL-COM-ENT-001 v3.0 §7 "Confirm" stage note - "Scheduled change can
+    be canceled before the boundary." Undoes a pending downgrade from
+    POST /subscription/plan/confirm; no-ops with a 409 if nothing is
+    scheduled."""
+    try:
+        return service.cancel_scheduled_plan_change(db, current_user.account_id, actor=current_user.id)
+    except service.NoScheduledPlanChangeError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e
 
 
 @router.post("/subscription/plan/checkout-session", response_model=PlanChangeCheckoutSessionResponse)
