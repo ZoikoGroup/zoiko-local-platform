@@ -26,7 +26,7 @@ TOPICS = [
     "zoiko.risk", "zoiko.billing", "zoiko.porting", "zoiko.messaging",
     "zoiko.queues", "zoiko.crm", "zoiko.apikeys", "zoiko.staff",
     "zoiko.consent", "zoiko.contacts", "zoiko.ops", "zoiko.retention", "zoiko.routing",
-    "zoiko.audit",
+    "zoiko.audit", "zoiko.identity",
 ]
 GROUP_ID = "event-log-writer"
 DLQ_TOPIC = "zoiko.dlq"

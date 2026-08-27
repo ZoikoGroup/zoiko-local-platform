@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 from app.audit.service import log_event
 from app.core.config import settings
 from app.events.service import publish_incident_declared, publish_incident_resolved, publish_kill_switch_changed
+from app.integrations.cache.redis import cache_get, cache_set
 from app.integrations.billing import stripe_checkout
 from app.integrations.embeddings import cohere as cohere_embeddings
 from app.integrations.kyc import stripe_identity
@@ -76,9 +77,8 @@ _PUBLIC_COMPONENT_NAMES = {
     "cohere": "Semantic Search",
 }
 
+_PUBLIC_STATUS_CACHE_KEY = "ops:public_status"
 _PUBLIC_STATUS_CACHE_TTL_SECONDS = 30
-_public_status_cache: dict | None = None
-_public_status_cache_at: float = 0.0
 
 
 async def get_public_status() -> dict:
@@ -89,11 +89,20 @@ async def get_public_status() -> dict:
     provider identity or raw error detail publicly (that stays behind staff
     auth). Cached briefly since this endpoint takes no auth and would
     otherwise let public traffic hammer real provider APIs on every
-    pageview."""
-    global _public_status_cache, _public_status_cache_at
-    now = time.time()
-    if _public_status_cache is not None and (now - _public_status_cache_at) < _PUBLIC_STATUS_CACHE_TTL_SECONDS:
-        return _public_status_cache
+    pageview.
+
+    Redis-backed like every other cached read in this codebase, not a
+    per-process module-level dict (what this used to be) - this app runs
+    WEB_CONCURRENCY=4 uvicorn workers, so a process-local cache meant each
+    worker independently re-ran the real provider health checks on its own
+    30-second clock, up to 4x more often than the TTL implies, and could
+    show a slightly different result depending on which worker answered a
+    given request. Degrades to "no cache" like every other cache_get/
+    cache_set call site if Redis is unavailable - never blocks this
+    endpoint, just re-runs the real checks every time."""
+    cached = cache_get(_PUBLIC_STATUS_CACHE_KEY)
+    if cached is not None:
+        return cached
 
     providers = await get_provider_statuses()
     components = [
@@ -107,8 +116,7 @@ async def get_public_status() -> dict:
     overall = "operational" if all(c["status"] == "operational" for c in components) else "degraded"
 
     result = {"overall": overall, "components": components}
-    _public_status_cache = result
-    _public_status_cache_at = now
+    cache_set(_PUBLIC_STATUS_CACHE_KEY, result, ttl_seconds=_PUBLIC_STATUS_CACHE_TTL_SECONDS)
     return result
 
 
@@ -202,7 +210,7 @@ def get_synthetic_check_summary(db: Session) -> dict:
             db.query(SyntheticCheckRun)
             .filter(SyntheticCheckRun.check_name == name)
             .order_by(SyntheticCheckRun.created_at.desc())
-            .first()
+            .first() 
         )
         if run is not None:
             latest.append(run)
@@ -332,10 +340,15 @@ def list_kill_switches(db: Session) -> list[PlatformKillSwitch]:
 
 
 def set_kill_switch(
-    db: Session, scope: KillSwitchScope, is_active: bool, *, actor: str, reason: str | None = None
+    db: Session, scope: KillSwitchScope, is_active: bool, *, actor: str, reason: str | None = None,
+    expires_at: datetime | None = None,
 ) -> PlatformKillSwitch:
     """Upserts the one row for this scope - see PlatformKillSwitch's
-    docstring for why this is an upsert, not an appended history row."""
+    docstring for why this is an upsert, not an appended history row.
+    expires_at is optional (doc §U2 requires the override be time-bounded,
+    but not every real incident has a known resolution ETA at activation
+    time) - only meaningful when is_active=True; ignored/cleared on
+    deactivation."""
     switch = db.query(PlatformKillSwitch).filter(PlatformKillSwitch.scope == scope).first()
     now = datetime.now(timezone.utc)
     if switch is None:
@@ -347,8 +360,10 @@ def set_kill_switch(
         switch.activated_by = actor
         switch.activated_at = now
         switch.deactivated_at = None
+        switch.expires_at = expires_at
     else:
         switch.deactivated_at = now
+        switch.expires_at = None
     db.commit()
     db.refresh(switch)
     log_event(
@@ -359,13 +374,79 @@ def set_kill_switch(
     return switch
 
 
+def expire_overdue_kill_switches(db: Session) -> dict[str, int]:
+    """Commercial Billing Operating Standard doc §U2's "time-bounded"
+    override requirement - a switch nobody remembers to turn off is exactly
+    the "override outlives the incident" failure the doc is guarding
+    against. assert_kill_switch_not_active/assert_account_kill_switch_not_
+    active already treat an overdue switch as inactive immediately (so
+    nothing is actually blocked between expiry and this sweep running),
+    but the row itself still needs flipping to is_active=False for the
+    audit trail and staff dashboards to reflect reality without a human
+    remembering to do it. Meant to run periodically (same
+    app.ops.scheduled_reconciliation daily slot as the other sweeps in
+    that script), not on every request."""
+    from app.events.service import publish_account_kill_switch_changed
+    from app.risk.models import AccountKillSwitch
+
+    now = datetime.now(timezone.utc)
+    platform_expired = (
+        db.query(PlatformKillSwitch)
+        .filter(PlatformKillSwitch.is_active.is_(True), PlatformKillSwitch.expires_at.isnot(None),
+                PlatformKillSwitch.expires_at <= now)
+        .all()
+    )
+    for switch in platform_expired:
+        switch.is_active = False
+        switch.deactivated_at = now
+        log_event(
+            db, actor="system:kill_switch_expiry", action="ops.kill_switch_deactivated",
+            target=f"kill_switch:{switch.scope.value}", after={"reason": "expired", "expires_at": switch.expires_at.isoformat()},
+        )
+        publish_kill_switch_changed(scope=switch.scope.value, is_active=False, actor="system:kill_switch_expiry")
+
+    account_expired = (
+        db.query(AccountKillSwitch)
+        .filter(AccountKillSwitch.is_active.is_(True), AccountKillSwitch.expires_at.isnot(None),
+                AccountKillSwitch.expires_at <= now)
+        .all()
+    )
+    for switch in account_expired:
+        switch.is_active = False
+        switch.deactivated_at = now
+        log_event(
+            db, actor="system:kill_switch_expiry", action="risk.account_kill_switch_deactivated",
+            target=f"account_kill_switch:{switch.id}",
+            after={"reason": "expired", "account_id": switch.account_id, "expires_at": switch.expires_at.isoformat()},
+        )
+        # The manual deactivation path (risk/service.py:592) publishes this
+        # same event - this automatic expiry sweep was missing it entirely,
+        # the same asymmetry as the platform-level branch above already
+        # avoids by calling publish_kill_switch_changed on expiry too.
+        publish_account_kill_switch_changed(
+            switch.account_id, scope=switch.scope.value, is_active=False, actor="system:kill_switch_expiry",
+        )
+
+    if platform_expired or account_expired:
+        db.commit()
+    return {"platform": len(platform_expired), "account": len(account_expired)}
+
+
 def assert_kill_switch_not_active(db: Session, scope: KillSwitchScope) -> None:
     """Call at the start of any action this scope is meant to halt (number
     provisioning, outbound calling, AI processing, payments/billing) -
-    raises before any side effect if a staff member has tripped it."""
+    raises before any side effect if a staff member has tripped it.
+
+    A switch past its own expires_at is treated as inactive immediately
+    here, not just once expire_overdue_kill_switches's daily sweep catches
+    up - doc §U2's "time-bounded" requirement means the override itself
+    expires, not just its eventual bookkeeping."""
     switch = db.query(PlatformKillSwitch).filter(PlatformKillSwitch.scope == scope).first()
-    if switch is not None and switch.is_active:
-        raise KillSwitchTrippedError(
-            f"{scope.value} is currently halted by an active kill switch"
-            + (f": {switch.reason}" if switch.reason else "")
-        )
+    if switch is None or not switch.is_active:
+        return
+    if switch.expires_at is not None and switch.expires_at <= datetime.now(timezone.utc):
+        return
+    raise KillSwitchTrippedError(
+        f"{scope.value} is currently halted by an active kill switch"
+        + (f": {switch.reason}" if switch.reason else "")
+    )

@@ -34,9 +34,19 @@ def _make_active_number(client, db_session, token, e164: str) -> str:
     return account_id
 
 
+def _upgrade_to_business(db_session, account_id: str) -> None:
+    """routing.shared_handling (a 2+-destination ring group) is Business+
+    (ZL-COM-ENT-001) - a fresh signup's default free_trial plan grants no
+    shared-handling capability."""
+    from app.billing import service as billing_service
+
+    billing_service.change_plan(db_session, account_id, "business", actor="test-setup")
+
+
 def test_owner_can_set_and_read_a_ring_group(client, db_session):
     token = _signup_and_login(client, "ring-owner1@example.com")
-    _make_active_number(client, db_session, token, "+15550001111")
+    account_id = _make_active_number(client, db_session, token, "+15550001111")
+    _upgrade_to_business(db_session, account_id)
     headers = {"Authorization": f"Bearer {token}"}
 
     response = client.put(
@@ -56,7 +66,8 @@ def test_owner_can_set_and_read_a_ring_group(client, db_session):
 
 def test_setting_a_ring_group_replaces_the_previous_one(client, db_session):
     token = _signup_and_login(client, "ring-owner2@example.com")
-    _make_active_number(client, db_session, token, "+15550002222")
+    account_id = _make_active_number(client, db_session, token, "+15550002222")
+    _upgrade_to_business(db_session, account_id)
     headers = {"Authorization": f"Bearer {token}"}
 
     client.put("/numbers/+15550002222/ring-group", json={"destinations": ["+15553330001"]}, headers=headers)
@@ -75,6 +86,31 @@ def test_empty_destinations_clears_the_ring_group(client, db_session):
     client.put("/numbers/+15550003333/ring-group", json={"destinations": ["+15554440001"]}, headers=headers)
     response = client.put("/numbers/+15550003333/ring-group", json={"destinations": []}, headers=headers)
     assert response.json() == []
+
+
+def test_free_trial_account_cannot_set_a_multi_destination_ring_group(client, db_session):
+    """ZL-COM-ENT-001 §7 matrix: shared call handling (2+ destinations
+    ringing at once) is Business+ only - a single destination is just
+    personal forwarding and stays available to every plan."""
+    token = _signup_and_login(client, "ring-freetrial1@example.com")
+    _make_active_number(client, db_session, token, "+15550009991")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    single = client.put(
+        "/numbers/+15550009991/ring-group", json={"destinations": ["+15552220001"]}, headers=headers,
+    )
+    assert single.status_code == 200, single.text
+
+    denied = client.put(
+        "/numbers/+15550009991/ring-group",
+        json={"destinations": ["+15552220001", "+15552220002"]},
+        headers=headers,
+    )
+    assert denied.status_code == 402, denied.text
+    body = denied.json()["detail"]
+    assert body["code"] == "ENTITLEMENT_REQUIRED"
+    assert body["entitlement"] == "routing.shared_handling"
+    assert body["current_plan"] == "free_trial"
 
 
 def test_ring_group_size_is_capped(client, db_session):
@@ -103,7 +139,8 @@ def test_cannot_read_another_accounts_ring_group(client, db_session):
 
 def test_incoming_call_rings_all_configured_destinations_simultaneously(client, db_session):
     token = _signup_and_login(client, "ring-incoming1@example.com")
-    _make_active_number(client, db_session, token, "+15550006666")
+    account_id = _make_active_number(client, db_session, token, "+15550006666")
+    _upgrade_to_business(db_session, account_id)
     headers = {"Authorization": f"Bearer {token}"}
 
     client.put(

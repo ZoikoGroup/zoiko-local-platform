@@ -90,6 +90,49 @@ class Plan(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
+class EntitlementValueType(str, enum.Enum):
+    """Commercial Entitlement Governance standard (ZL-COM-ENT-001) §6 lists
+    7 value types (Boolean/Integer/Quantity/Enum/Set/Decimal/Date) - only
+    these 2 are needed for the keys this phase actually gates. Room to grow
+    into the rest later without a breaking change to PlanEntitlement itself."""
+
+    BOOLEAN = "boolean"
+    INTEGER = "integer"
+
+
+class PlanEntitlement(Base):
+    """ZL-COM-ENT-001 §5-6: "explicit entitlement keys; hierarchy is
+    compiled into plan versions, never evaluated by rank at request time."
+    Before this table, features were gated only by raw numeric Plan columns
+    (max_numbers, max_team_seats, etc.) - there was no way to represent a
+    plain boolean capability (API access, advanced routing, ...) at all,
+    so those features were completely ungated by plan (confirmed live: any
+    Starter account could create API keys, publish call flows, pull
+    analytics, and enable the AI Receptionist for free). Same "rules as
+    data" discipline as ComplianceRule/FraudRule/RetentionPolicy - a plan's
+    feature set can be retuned without a deploy.
+
+    Deliberately only plan_code-scoped for this phase - no account-level
+    override/Enterprise-contract table yet (see app.billing.service.
+    has_entitlement's docstring for the deny-by-default fallback when no
+    row exists, e.g. for free_trial and enterprise plan_codes today)."""
+
+    __tablename__ = "plan_entitlements"
+    __table_args__ = (UniqueConstraint("plan_code", "key", name="uq_plan_entitlement_plan_key"),)
+
+    id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=new_uuid)
+    plan_code: Mapped[str] = mapped_column(
+        String(50), ForeignKey("plans.plan_code", ondelete="CASCADE"), nullable=False, index=True
+    )
+    key: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+    value_type: Mapped[EntitlementValueType] = mapped_column(
+        Enum(EntitlementValueType, name="entitlement_value_type_enum"), nullable=False
+    )
+    bool_value: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    int_value: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
 class CatalogEntryStatus(str, enum.Enum):
     # Renamed from the original DRAFT (migration 8f3c1a9d2b47 - ALTER TYPE
     # ... RENAME VALUE, not a new state) to match the Production Readiness
@@ -307,6 +350,18 @@ class Subscription(Base):
     trial_ends_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     current_period_start: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     current_period_end: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    # The real, live Stripe Subscription object id (mode="subscription"
+    # Checkout - see create_subscription_checkout_session) once a paid plan
+    # checkout completes. Stripe manages the actual recurring charge itself
+    # from here on - this app never re-bills it. NULL for accounts that
+    # have never completed a real paid checkout (trial, a free plan, or a
+    # staff-applied direct change_plan with no payment). Required so
+    # cancel_subscription/handle_stripe_checkout_completed can tell Stripe
+    # to actually stop charging - without this there was nothing anywhere
+    # in this codebase that could ever cancel the real recurring Stripe
+    # subscription a completed checkout created, so a customer canceling in
+    # this app kept being charged by Stripe indefinitely.
+    stripe_subscription_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     zoikonex_ref: Mapped[str | None] = mapped_column(String(100), nullable=True)
     # ZoikoNex's own Party -> Customer -> Account chain (customer-account
     # service) - a real, separate identity model from ours, created once per
@@ -551,3 +606,48 @@ class BillingActionRequest(Base):
     result: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+
+
+class PlanChangeCheckoutSessionStatus(str, enum.Enum):
+    PENDING = "pending"
+    COMPLETED = "completed"
+
+
+class PlanChangeCheckoutSession(Base):
+    """A customer-initiated plan upgrade must not grant the target plan's
+    entitlements until Stripe confirms real payment (Production Readiness
+    Standard doc: "A payment-success UI is not the same as an authoritative
+    paid invoice" / Global Pricing doc: "Stripe live payments" is a P0
+    blocker). Previously PUT /subscription/plan applied a plan change
+    immediately with zero payment collection - this table is the holding
+    record between "customer asked to upgrade" and "Stripe confirmed the
+    charge," so the webhook has something idempotent to complete against
+    (same role ZoikoNexSyncEvent.external_event_id plays for the ZoikoNex
+    webhook, just keyed on the Stripe Checkout Session id instead)."""
+
+    __tablename__ = "plan_change_checkout_sessions"
+
+    id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=new_uuid)
+    # Real bug fix, confirmed live: the migration (7c2e9a48b1d5) created this
+    # column as a genuine Postgres uuid (sa.UUID(as_uuid=False)), matching
+    # every other account_id column in this codebase - but this model
+    # declared it as a plain String(50), which never told SQLAlchemy to
+    # cast the raw uuid.UUID object psycopg2 returns for a native uuid
+    # column back to a str. record.account_id came back as a real UUID
+    # instance, which then broke json.dumps() the moment change_plan's
+    # publish_event_durably tried to write it into the Kafka event_outbox
+    # payload - the webhook 500'd on every real checkout completion.
+    account_id: Mapped[str] = mapped_column(
+        UUID(as_uuid=False), ForeignKey("accounts.id"), nullable=False, index=True
+    )
+    plan_code: Mapped[str] = mapped_column(String(50), nullable=False)
+    billing_period: Mapped[BillingPeriod] = mapped_column(
+        Enum(BillingPeriod, name="billing_period_enum"), nullable=False,
+    )
+    stripe_session_id: Mapped[str] = mapped_column(String(255), nullable=False, unique=True, index=True)
+    status: Mapped[PlanChangeCheckoutSessionStatus] = mapped_column(
+        Enum(PlanChangeCheckoutSessionStatus, name="plan_change_checkout_session_status_enum"),
+        nullable=False, default=PlanChangeCheckoutSessionStatus.PENDING,
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

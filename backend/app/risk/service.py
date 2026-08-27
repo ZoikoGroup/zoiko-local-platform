@@ -29,6 +29,17 @@ from app.risk.models import (
 VELOCITY_WINDOW_MINUTES = 5
 MAX_OUTBOUND_CALLS_PER_WINDOW = 20
 
+# Commercial Billing Operating Standard doc §32 "Fraud/abuse" row -
+# conservative first-pass thresholds, same caveat as every other number in
+# this file. Detection-only (never blocks the action itself, same posture
+# as DEVICE_FINGERPRINT_ABUSE) - a real customer legitimately buying
+# several numbers at once, or a staff-driven caller-ID dispute resolution,
+# has real false-positive risk if hard-blocked.
+NUMBER_ACQUISITION_WINDOW_HOURS = 24
+MAX_NUMBER_ACQUISITIONS_PER_WINDOW = 5
+CALLER_ID_CHANGE_WINDOW_HOURS = 24
+MAX_CALLER_ID_CHANGES_PER_WINDOW = 3
+
 # Account risk scoring (Roadmap doc §13 Risk Register: "account risk
 # scoring", "rapid suspension workflow"; Architecture doc Phase 4 "proprietary
 # fraud models"). Defaults are a conservative first pass, same caveat as the
@@ -45,6 +56,21 @@ _DEFAULT_WEIGHTS = {
     RiskSignalType.GEOGRAPHIC_DISPERSION: 25,
     RiskSignalType.SPEND_LIMIT_EXCEEDED: 35,
     RiskSignalType.CONCURRENT_CALL_LIMIT_EXCEEDED: 20,
+    # Real gap fix: these 5 signal types (added to the enum by 9c1f4a0d2e77,
+    # e7c2b6f184a9, 98ac3783df0b) were being recorded by record_risk_signal
+    # but had no weight here and no FraudRule row - get_signal_weight
+    # silently returned 0 for every one of them, so they could never
+    # contribute to compute_account_risk_score or open_fraud_case_if_needed,
+    # regardless of how many fired. Same "no active row -> conservative
+    # built-in default" fallback design as the five signals above, not a
+    # staff-tunable FraudRule row (same precedent as SPEND_LIMIT_EXCEEDED/
+    # CONCURRENT_CALL_LIMIT_EXCEEDED, which were also left as code-only
+    # defaults - see 7a2e5c918bf4's migration comment).
+    RiskSignalType.ACCOUNT_TAKEOVER_INDICATOR: 40,  # established account, never-seen fingerprint - high confidence
+    RiskSignalType.CALLER_ID_CHANGE_PATTERN: 30,  # probing for a CLI that passes spam detection
+    RiskSignalType.REPEATED_NUMBER_ACQUISITION: 25,  # same shape/severity as VELOCITY_EXCEEDED
+    RiskSignalType.DEVICE_FINGERPRINT_ABUSE: 20,  # real false-positive risk (shared office network/device)
+    RiskSignalType.AI_RECEPTIONIST_TRIAL_CAP_EXCEEDED: 15,  # resource-cap signal, not itself evidence of fraud
 }
 MAX_RISK_SCORE = 100
 AUTO_SUSPEND_THRESHOLD = 100
@@ -390,6 +416,74 @@ def assert_spend_limit_ok(db: Session, account_id: str) -> None:
         )
 
 
+def check_number_acquisition_velocity(db: Session, account_id: str) -> None:
+    """Commercial Billing Operating Standard doc §32 "repeated number
+    acquisition" - distinct from Plan.max_numbers (a hard entitlement cap
+    that a paid plan can set high, e.g. 20) and from SPEND_LIMIT_EXCEEDED
+    (caps rated call cost, not number count). Counts RESERVED-or-later
+    numbers (same statuses billing.assert_number_quota_available already
+    treats as "owned or in flight") in the trailing window - detection
+    only, never blocks the reservation/purchase itself."""
+    from app.numbering.numbers.models import PhoneNumber, PhoneNumberStatus
+
+    window_start = datetime.now(timezone.utc) - timedelta(hours=NUMBER_ACQUISITION_WINDOW_HOURS)
+    count = (
+        db.query(PhoneNumber)
+        .filter(
+            PhoneNumber.account_id == account_id,
+            PhoneNumber.created_at >= window_start,
+            PhoneNumber.status.in_([
+                PhoneNumberStatus.RESERVED, PhoneNumberStatus.PURCHASE_PENDING,
+                PhoneNumberStatus.COMPLIANCE_PENDING, PhoneNumberStatus.PROVISIONING,
+                PhoneNumberStatus.ACTIVE,
+            ]),
+        )
+        .count()
+    )
+    if count > MAX_NUMBER_ACQUISITIONS_PER_WINDOW:
+        record_risk_signal(
+            db, account_id=account_id, signal_type=RiskSignalType.REPEATED_NUMBER_ACQUISITION,
+            detail=f"{count} numbers reserved/acquired in the last {NUMBER_ACQUISITION_WINDOW_HOURS}h "
+                   f"(threshold {MAX_NUMBER_ACQUISITIONS_PER_WINDOW})",
+        )
+
+
+def check_caller_id_change_velocity(db: Session, account_id: str) -> None:
+    """Commercial Billing Operating Standard doc §32 "suspicious CLI
+    changes." This codebase has no customer-initiated "change my caller
+    ID" action yet (CallerIdentity is auto-verified once at purchase/port-
+    in - see _auto_verify_caller_identity) - the closest real signal today
+    is an account whose caller identities keep getting revoked and
+    reinstated by staff, which is itself evidence of ongoing dispute/abuse
+    on that account's outbound presentation. Revisit this detection if a
+    real customer-facing CLI-change flow is ever built."""
+    from app.audit.models import AuditEvent
+    from app.numbering.numbers.models import CallerIdentity
+
+    window_start = datetime.now(timezone.utc) - timedelta(hours=CALLER_ID_CHANGE_WINDOW_HOURS)
+    identity_ids = [
+        row[0] for row in db.query(CallerIdentity.id).filter(CallerIdentity.account_id == account_id).all()
+    ]
+    if not identity_ids:
+        return
+    targets = [f"caller_identity:{identity_id}" for identity_id in identity_ids]
+    count = (
+        db.query(AuditEvent)
+        .filter(
+            AuditEvent.action.in_(["caller_identity.revoked", "caller_identity.reinstated"]),
+            AuditEvent.target.in_(targets),
+            AuditEvent.created_at >= window_start,
+        )
+        .count()
+    )
+    if count > MAX_CALLER_ID_CHANGES_PER_WINDOW:
+        record_risk_signal(
+            db, account_id=account_id, signal_type=RiskSignalType.CALLER_ID_CHANGE_PATTERN,
+            detail=f"{count} caller-identity status changes in the last {CALLER_ID_CHANGE_WINDOW_HOURS}h "
+                   f"(threshold {MAX_CALLER_ID_CHANGES_PER_WINDOW})",
+        )
+
+
 def assert_cumulative_trial_usage_ok(db: Session, account_id: str) -> None:
     """Production Readiness Standard Table 15 "Usage ceilings: ...
     cumulative trial usage." Only applies while the account is still in a
@@ -464,7 +558,8 @@ def get_call_time_limit_for_account(db: Session, account_id: str) -> int | None:
 
 
 def set_account_kill_switch(
-    db: Session, account_id: str, scope: KillSwitchScope, is_active: bool, *, actor: str, reason: str | None = None
+    db: Session, account_id: str, scope: KillSwitchScope, is_active: bool, *, actor: str, reason: str | None = None,
+    expires_at: datetime | None = None,
 ) -> AccountKillSwitch:
     """Staff-only (ops.manage_kill_switches - same capability as the
     platform-wide switch). Upserts the one row for this account+scope -
@@ -484,8 +579,10 @@ def set_account_kill_switch(
         switch.activated_by = actor
         switch.activated_at = now
         switch.deactivated_at = None
+        switch.expires_at = expires_at
     else:
         switch.deactivated_at = now
+        switch.expires_at = None
     db.commit()
     db.refresh(switch)
     log_event(
@@ -504,16 +601,22 @@ def assert_account_kill_switch_not_active(db: Session, account_id: str, scope: K
     """Call alongside (not instead of) app.ops.service.
     assert_kill_switch_not_active - that one halts the whole platform for
     this scope; this one halts just this one account, without suspending
-    it outright (Production Readiness Standard Table 15's "Tenant" scope)."""
+    it outright (Production Readiness Standard Table 15's "Tenant" scope).
+
+    Same immediate-expiry treatment as the platform-wide version - see
+    that function's docstring."""
     switch = (
         db.query(AccountKillSwitch)
         .filter(AccountKillSwitch.account_id == account_id, AccountKillSwitch.scope == scope)
         .first()
     )
-    if switch is not None and switch.is_active:
-        raise AccountKillSwitchTrippedError(
-            f"{scope.value} is currently halted for this account" + (f": {switch.reason}" if switch.reason else "")
-        )
+    if switch is None or not switch.is_active:
+        return
+    if switch.expires_at is not None and switch.expires_at <= datetime.now(timezone.utc):
+        return
+    raise AccountKillSwitchTrippedError(
+        f"{scope.value} is currently halted for this account" + (f": {switch.reason}" if switch.reason else "")
+    )
 
 
 def _decayed_score(db: Session, signals: list[RiskSignal]) -> int:
@@ -1000,6 +1103,27 @@ def check_fingerprint_on_signup(db: Session, *, fingerprint_hash: str | None, ac
     _check_and_record_fingerprint(db, fingerprint_hash=fingerprint_hash, account_id=account_id, context="signup")
 
 
+def _is_new_device_for_established_account(db: Session, *, fingerprint_hash: str, account_id: str) -> bool:
+    """Commercial Billing Operating Standard doc §32 "account takeover
+    indicators" - the mirror image of is_suspected_fingerprint_abuse
+    (which asks "has this DEVICE touched too many accounts?"). This asks
+    "has this ACCOUNT ever been touched by this device before?" on an
+    account that already has an established fingerprint history - a
+    login from a genuinely new device isn't itself suspicious (that's
+    every real customer's first login from a new phone), but it's the
+    signal worth recording so a later real anomaly-detection pass (new
+    device + unusual geo/time, e.g.) has something to build on. Detection
+    only, called before the current sighting is recorded so "established"
+    reflects prior logins, not this one."""
+    prior_fingerprints = {
+        row[0] for row in db.query(DeviceFingerprintSighting.fingerprint_hash)
+        .filter(DeviceFingerprintSighting.account_id == account_id)
+        .distinct()
+        .all()
+    }
+    return bool(prior_fingerprints) and fingerprint_hash not in prior_fingerprints
+
+
 def check_fingerprint_on_login(db: Session, *, fingerprint_hash: str | None, account_id: str) -> None:
     """Same detection as check_fingerprint_on_signup, wired into
     app.numbering.identity.routes.login instead - a fingerprint that's
@@ -1007,7 +1131,16 @@ def check_fingerprint_on_login(db: Session, *, fingerprint_hash: str | None, acc
     signal if it keeps recurring across logins to many DIFFERENT accounts
     (farmed/credential-stuffed account access from one device), which a
     signup-only check would never see since each account only signs up
-    once."""
+    once. Also checks the opposite direction - see
+    _is_new_device_for_established_account - for a login to THIS account
+    from a device it's never seen before."""
+    if fingerprint_hash and _is_new_device_for_established_account(
+        db, fingerprint_hash=fingerprint_hash, account_id=account_id
+    ):
+        record_risk_signal(
+            db, account_id=account_id, signal_type=RiskSignalType.ACCOUNT_TAKEOVER_INDICATOR,
+            detail="login from a fingerprint never previously seen on this established account",
+        )
     _check_and_record_fingerprint(db, fingerprint_hash=fingerprint_hash, account_id=account_id, context="login")
 
 

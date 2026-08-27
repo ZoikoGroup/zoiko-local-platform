@@ -17,6 +17,7 @@ from app.billing.schemas import (
     DebitNoteResponse,
     IssueCreditNoteRequest,
     IssueDebitNoteRequest,
+    PlanChangeCheckoutSessionResponse,
     PlanResponse,
     PriceCatalogEntryResponse,
     PublicSupportedCountryResponse,
@@ -37,6 +38,7 @@ from app.billing.schemas import (
 from app.core.database import get_db
 from app.core.deps import get_current_staff, get_current_user, require_admin, require_capability
 from app.core.rate_limit import limiter
+from app.integrations.billing import stripe_checkout
 from app.integrations.billing import zoikonex as zoikonex_adapter
 from app.numbering.identity.models import User
 from app.numbering.numbers.models import MarketActivationStatus
@@ -179,10 +181,14 @@ def change_plan(
     current_user: User = Depends(require_admin),
 ):
     """Owner/Admin only, matching every other account-wide commercial
-    decision in this app. Purely local plan reassignment - no real payment
-    is collected or processed anywhere in this system; it changes which
-    entitlement limits apply and syncs the change to the MOCK ZoikoNex
-    adapter (see app.integrations.billing.zoikonex's docstring)."""
+    decision in this app. Kept for staff/internal use (e.g. a comped
+    upgrade, or restoring a plan after a support-approved correction) -
+    the customer-facing upgrade path is now POST /subscription/plan/
+    checkout-session below, which requires real Stripe payment before this
+    same change_plan logic ever runs. Calling this route directly still
+    changes entitlements immediately with no payment collected, by design,
+    for exactly those internal cases - it is deliberately not exposed as
+    a button in the customer dashboard."""
     try:
         return service.change_plan(
             db, current_user.account_id, payload.plan_code, actor=current_user.id,
@@ -190,6 +196,113 @@ def change_plan(
         )
     except service.PlanNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
+
+
+@router.post("/subscription/plan/checkout-session", response_model=PlanChangeCheckoutSessionResponse)
+def create_plan_change_checkout_session(
+    payload: ChangePlanRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin),
+):
+    """The customer-facing way to upgrade a plan goes through here, not
+    PUT /subscription/plan directly - Production Readiness Standard doc:
+    "A payment-success UI is not the same as an authoritative paid
+    invoice." The frontend must redirect the browser to the returned
+    `url`; the plan itself only changes once Stripe confirms payment via
+    POST /stripe/checkout-webhook below."""
+    try:
+        return service.create_plan_change_checkout_session(
+            db, current_user.account_id, payload.plan_code, actor=current_user.id,
+            billing_period=BillingPeriod(payload.billing_period),
+        )
+    except service.PlanNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
+    except service.PriceUnavailableForCheckoutError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e
+    except stripe_checkout.PaymentError as e:
+        raise HTTPException(status_code=502, detail=str(e)) from e
+
+
+@router.post("/stripe/checkout-webhook", status_code=status.HTTP_204_NO_CONTENT)
+async def stripe_checkout_webhook(request: Request, db: Session = Depends(get_db)):
+    """Real inbound Stripe -> Zoiko Local payment-completion webhook for
+    subscription plan upgrades. Unauthenticated by user session (Stripe
+    isn't one of our users) - trust comes entirely from the Stripe-
+    Signature HMAC, same posture as the ZoikoNex and Stripe Identity
+    webhooks elsewhere in this codebase.
+
+    Real gap fix: this used to handle checkout.session.completed only -
+    every other event type Stripe actually sends for a real, live,
+    mode="subscription" Checkout (which auto-recurs entirely on Stripe's
+    own side once it completes, independent of ZoikoNex) was silently
+    ignored. invoice.payment_failed/invoice.paid (renewal only - a
+    subscription_create invoice.paid is the SAME event checkout.session.
+    completed already handles, so treating it as a "restoration" here
+    too would be a no-op at best) and customer.subscription.deleted now
+    feed the same PAST_DUE/grace-period machinery real ZoikoNex payment
+    events already used - see billing.service.
+    handle_stripe_subscription_payment_webhook's docstring for the
+    customer-facing bug this closes.
+
+    .to_dict() everywhere below (real bug, confirmed live): stripe-python
+    15.x's StripeObject no longer subclasses dict, so it has no .get() at
+    all - a bare .get() call raises AttributeError (surfaced as a 500,
+    since stripe_checkout.construct_webhook_event lets a genuine
+    stripe.Event object through, not a plain dict). This affected even
+    the pre-existing checkout.session.completed branch's metadata lookup,
+    not just the new event types added in this pass - a real Stripe
+    webhook delivery for ANY event type on this route would have 500'd
+    before this fix, meaning no plan upgrade could ever actually complete
+    even with a fully configured, live webhook endpoint. Only
+    __getitem__ (event["type"]) and .to_dict() are safe; .get() is not."""
+    body = await request.body()
+    signature = request.headers.get("Stripe-Signature")
+
+    try:
+        event = stripe_checkout.construct_webhook_event(body, signature)
+    except stripe_checkout.PaymentError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e)) from e
+
+    stripe_event_id = event["id"]
+
+    if event["type"] == "checkout.session.completed":
+        session_object = event["data"]["object"].to_dict()
+        checkout_record_id = session_object.get("metadata", {}).get("checkout_record_id")
+        if not checkout_record_id:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Missing checkout_record_id metadata")
+        try:
+            service.handle_stripe_checkout_completed(
+                db, checkout_record_id=checkout_record_id,
+                stripe_subscription_id=session_object.get("subscription"),
+            )
+        except service.PlanChangeCheckoutSessionNotFoundError as e:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
+    elif event["type"] == "invoice.payment_failed":
+        invoice = event["data"]["object"].to_dict()
+        stripe_subscription_id = invoice.get("subscription")
+        if stripe_subscription_id:
+            service.handle_stripe_subscription_payment_webhook(
+                db, stripe_subscription_id=stripe_subscription_id, event_type="payment_failed",
+                stripe_event_id=stripe_event_id,
+            )
+    elif event["type"] == "invoice.paid":
+        invoice = event["data"]["object"].to_dict()
+        stripe_subscription_id = invoice.get("subscription")
+        # subscription_create is the SAME successful payment checkout.
+        # session.completed above already applies - only a genuine
+        # renewal (subscription_cycle) or a manual retry after a prior
+        # failure (subscription_update) means "restore from PAST_DUE."
+        if stripe_subscription_id and invoice.get("billing_reason") != "subscription_create":
+            service.handle_stripe_subscription_payment_webhook(
+                db, stripe_subscription_id=stripe_subscription_id, event_type="payment_restored",
+                stripe_event_id=stripe_event_id,
+            )
+    elif event["type"] == "customer.subscription.deleted":
+        stripe_subscription_object = event["data"]["object"].to_dict()
+        stripe_subscription_id = stripe_subscription_object.get("id")
+        if stripe_subscription_id:
+            service.handle_stripe_subscription_deleted_webhook(db, stripe_subscription_id=stripe_subscription_id)
+    return None
 
 
 @router.post("/subscription/cancel", response_model=SubscriptionResponse)
@@ -206,6 +319,11 @@ def cancel_subscription(
         return service.cancel_subscription(db, current_user.account_id, actor=current_user.id, reason=payload.reason)
     except service.SubscriptionAlreadyCanceledError as e:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e
+    except stripe_checkout.PaymentError as e:
+        # Cancellation deliberately did not apply locally if this failed -
+        # see service.cancel_subscription's docstring - so this is a real
+        # "nothing changed, please retry" error, not a partial success.
+        raise HTTPException(status_code=502, detail=str(e)) from e
 
 
 @router.put("/subscription/ai-receptionist-addon", response_model=SubscriptionResponse)

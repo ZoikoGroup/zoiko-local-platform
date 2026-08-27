@@ -1,3 +1,4 @@
+import logging
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -12,9 +13,13 @@ from app.billing.models import (
     BillingActionType,
     BillingPeriod,
     CatalogEntryStatus,
+    EntitlementValueType,
     PendingAccountCharge,
     PendingAccountChargeStatus,
     Plan,
+    PlanChangeCheckoutSession,
+    PlanChangeCheckoutSessionStatus,
+    PlanEntitlement,
     PriceCatalogEntry,
     Subscription,
     SubscriptionStatus,
@@ -55,8 +60,18 @@ from app.notifications.service import (
 from app.ops.models import KillSwitchScope
 from app.ops.service import assert_kill_switch_not_active
 
+logger = logging.getLogger("zoiko.billing")
+
 DEFAULT_PLAN_CODE = "free_trial"
-_PERIOD_LENGTH = timedelta(days=30)
+# Global Plans, Pricing & Commercial Launch doc: annual billing is paid
+# upfront for a full year, not 12 monthly rollovers - each BillingPeriod
+# needs its own period length so an annual subscriber's current_period_end
+# (and therefore run_billing_cycle's re-bill cadence) actually reflects
+# what they're paying for.
+_PERIOD_LENGTHS = {
+    BillingPeriod.MONTHLY: timedelta(days=30),
+    BillingPeriod.ANNUAL: timedelta(days=365),
+}
 # Architecture doc §9 "Graceful degradation" - no specific number is given
 # in the spec, so this is a reasonable Phase-1 default, stored as a
 # constant (not per-plan) since the doc describes it as a platform-wide
@@ -184,10 +199,35 @@ def list_plans(db: Session) -> list[Plan]:
 
 
 def get_plan(db: Session, plan_code: str) -> Plan:
+    """Single-plan lookup - called from ~10 hot paths (quota checks, every
+    call's time-limit lookup, checkout, usage summary), unlike list_plans
+    above which only serves the billing page. Reuses that same cache
+    (_serialize_plan/_deserialize_plan, same TTL) keyed per plan_code -
+    plans are only ever seeded via migration, never mutated at runtime, so
+    there's no invalidation path needed, same assumption list_plans already
+    relies on."""
+    cache_key = f"plan:{plan_code}"
+    cached = cache_get(cache_key)
+    if cached is not None:
+        return _deserialize_plan(cached)
     plan = db.query(Plan).filter(Plan.plan_code == plan_code).first()
     if plan is None:
         raise PlanNotFoundError(f"No such plan: {plan_code!r}")
+    cache_set(cache_key, _serialize_plan(plan), ttl_seconds=_PLANS_CACHE_TTL_SECONDS)
     return plan
+
+
+class PriceUnavailableForCheckoutError(Exception):
+    """Raised when a plan has no real, non-placeholder ACTIVE price to
+    charge - refusing to create a Stripe Checkout Session for an invented
+    or placeholder amount (Production Readiness Standard doc: "no charge
+    without an active price book")."""
+
+
+class PlanChangeCheckoutSessionNotFoundError(Exception):
+    """Raised when a Stripe webhook references a checkout session id this
+    system never created - either a forged/unrelated event or a record
+    that predates this feature."""
 
 
 class PriceCatalogEntryExistsError(Exception):
@@ -379,8 +419,8 @@ def activate_price_catalog_entry(db: Session, entry_id: str, *, actor: str) -> P
     return entry
 
 
-def _new_period(now: datetime) -> tuple[datetime, datetime]:
-    return now, now + _PERIOD_LENGTH
+def _new_period(now: datetime, billing_period: BillingPeriod = BillingPeriod.MONTHLY) -> tuple[datetime, datetime]:
+    return now, now + _PERIOD_LENGTHS[billing_period]
 
 
 def sync_subscription_to_zoikonex(db: Session, sub: Subscription) -> Subscription:
@@ -526,7 +566,7 @@ def get_or_create_subscription(db: Session, account_id: str) -> Subscription:
 
     changed = False
     if sub.current_period_end < now:
-        sub.current_period_start, sub.current_period_end = _new_period(now)
+        sub.current_period_start, sub.current_period_end = _new_period(now, sub.billing_period)
         changed = True
     if sub.status == SubscriptionStatus.TRIALING and sub.trial_ends_at is not None and sub.trial_ends_at < now:
         # No payment processor exists to actually charge anyone yet (see
@@ -598,6 +638,130 @@ def change_plan(
             previous_plan=before_plan_obj.name if before_plan_obj else before_plan,
             new_plan=plan.name,
         )
+    return sub
+
+
+def create_plan_change_checkout_session(
+    db: Session, account_id: str, plan_code: str, *, billing_period: BillingPeriod, actor: str,
+) -> dict:
+    """Customer-facing entry point for a plan upgrade going forward -
+    change_plan() above is no longer called directly from a customer
+    request (see billing/routes.py's change_plan route docstring for why
+    it's kept for staff/internal use). Real money must be collected before
+    the target plan's entitlements apply (Production Readiness Standard
+    doc: "A payment-success UI is not the same as an authoritative paid
+    invoice" - this system was skipping that distinction entirely for
+    subscriptions, unlike numbers/ZoikoNex which at least record a pending
+    charge). Returns the Stripe-hosted Checkout Session {id, url} the
+    frontend must redirect the browser to; the plan itself only changes
+    once handle_stripe_checkout_completed processes the resulting webhook."""
+    plan = get_plan(db, plan_code)  # raises PlanNotFoundError for an invalid code
+
+    price = get_active_price_catalog_entry(db, plan_code, billing_period=billing_period)
+    if price is None or price.is_placeholder:
+        raise PriceUnavailableForCheckoutError(
+            f"No real, non-placeholder ACTIVE price is configured for {plan_code}/{billing_period.value}"
+        )
+
+    record = PlanChangeCheckoutSession(
+        account_id=account_id, plan_code=plan.plan_code, billing_period=billing_period,
+        stripe_session_id="",  # filled in below once Stripe returns the real session id
+    )
+    db.add(record)
+    db.flush()  # assigns record.id without committing yet - needed for the metadata below
+
+    from app.integrations.billing import stripe_checkout
+
+    interval = "year" if billing_period == BillingPeriod.ANNUAL else "month"
+    session = stripe_checkout.create_subscription_checkout_session(
+        plan_name=plan.name, amount_cents=price.amount_minor_units, currency=price.currency_code.lower(),
+        interval=interval,
+        success_url=f"{settings.frontend_base_url}/dashboard/billing?checkout=success",
+        cancel_url=f"{settings.frontend_base_url}/dashboard/billing?checkout=cancel",
+        metadata={"checkout_record_id": record.id, "account_id": account_id, "plan_code": plan.plan_code},
+    )
+    record.stripe_session_id = session["id"]
+    db.commit()
+
+    log_event(
+        db, actor=actor, action="subscription.plan_change_checkout_created",
+        target=f"subscription_checkout:{record.id}",
+        after={"plan_code": plan.plan_code, "billing_period": billing_period.value, "stripe_session_id": session["id"]},
+    )
+    return session
+
+
+def handle_stripe_checkout_completed(
+    db: Session, *, checkout_record_id: str, stripe_subscription_id: str | None = None,
+) -> Subscription:
+    """Called from the Stripe webhook once a subscription Checkout Session's
+    payment actually succeeds. Idempotent on PlanChangeCheckoutSession.status
+    - Stripe retries webhook delivery, so a second delivery of the same
+    completed event must not re-apply (or double-notify) the plan change.
+
+    stripe_subscription_id is the real, live Stripe Subscription object this
+    Checkout Session created (mode="subscription" - Stripe manages its
+    recurring charge itself from here). It's stored on our own Subscription
+    so cancel_subscription later has something real to cancel - without it,
+    nothing in this codebase could ever stop Stripe from continuing to
+    charge a customer who canceled here. If the account already had a
+    *different* real Stripe subscription (an earlier paid plan, since this
+    system always creates a fresh Checkout Session per plan change rather
+    than updating one in place), that old one is canceled here too -
+    otherwise Stripe would have no idea it's been superseded and would keep
+    billing both in parallel."""
+    record = db.query(PlanChangeCheckoutSession).filter(PlanChangeCheckoutSession.id == checkout_record_id).first()
+    if record is None:
+        raise PlanChangeCheckoutSessionNotFoundError(f"No checkout session record {checkout_record_id!r}")
+
+    if record.status == PlanChangeCheckoutSessionStatus.COMPLETED:
+        return get_or_create_subscription(db, record.account_id)
+
+    previous_stripe_subscription_id = get_or_create_subscription(db, record.account_id).stripe_subscription_id
+
+    # Apply the plan change FIRST, and only mark this record COMPLETED once
+    # that has genuinely succeeded - marking it complete first (as this used
+    # to) would leave a paid checkout permanently stuck as "done" with the
+    # plan never actually changed if change_plan raised, since the
+    # idempotency check above would then skip retrying it on Stripe's next
+    # webhook redelivery.
+    sub = change_plan(
+        db, record.account_id, record.plan_code, actor="stripe_checkout_webhook", billing_period=record.billing_period,
+    )
+    sub.stripe_subscription_id = stripe_subscription_id
+
+    record.status = PlanChangeCheckoutSessionStatus.COMPLETED
+    record.completed_at = datetime.now(timezone.utc)
+    db.commit()
+    db.refresh(sub)
+
+    if previous_stripe_subscription_id and previous_stripe_subscription_id != stripe_subscription_id:
+        from app.integrations.billing import stripe_checkout
+
+        try:
+            stripe_checkout.cancel_subscription(previous_stripe_subscription_id)
+        except stripe_checkout.PaymentError:
+            # The new plan is already paid for and applied - don't roll any
+            # of that back over a cleanup failure. But a still-live old
+            # Stripe subscription will keep charging the customer's card in
+            # parallel with the new one until someone cancels it by hand,
+            # so this needs a human, not a silent log line.
+            logger.exception(
+                "Failed to cancel superseded Stripe subscription %s for account %s after plan change to %s - "
+                "it may still be actively charging this customer and needs manual cancellation in Stripe.",
+                previous_stripe_subscription_id, record.account_id, record.plan_code,
+            )
+            send_internal_alert(
+                db, event_name="bill_int.stripe_subscription_cancel_failed",
+                summary=(
+                    f"Account {record.account_id} changed plan to {record.plan_code}, but canceling its "
+                    f"previous Stripe subscription {previous_stripe_subscription_id} failed. It may still be "
+                    f"actively charging this customer - cancel it manually in the Stripe dashboard."
+                ),
+                console_link=f"{settings.public_base_url}/staff/accounts",
+                tenant_reference=record.account_id,
+            )
+
     return sub
 
 
@@ -733,6 +897,49 @@ def assert_seat_quota_available(db: Session, account_id: str) -> None:
         )
 
 
+class EntitlementRequiredError(Exception):
+    """ZL-COM-ENT-001 §5-6 real gap fix - raised by assert_entitlement (and
+    caught the same way SeatQuotaExceededError already is at each call
+    site) when neither the account's base plan nor an active add-on grants
+    the requested entitlement key."""
+
+    def __init__(self, key: str, plan_code: str):
+        self.key = key
+        self.plan_code = plan_code
+        super().__init__(
+            f"Your current plan ({plan_code}) does not include {key!r} - upgrade to unlock this feature."
+        )
+
+
+def has_entitlement(db: Session, account_id: str, key: str) -> bool:
+    """ZL-COM-ENT-001's core principle: 'No entitlement record means no
+    runtime access' - deny-by-default. No PlanEntitlement row for this
+    plan_code+key means False, not an error and not an implicit grant
+    (this is why free_trial and enterprise plan_codes, which have no seeded
+    rows yet, correctly deny every key rather than needing special-casing
+    here). A CANCELED/TERMINATED subscription never has any entitlement,
+    regardless of what row exists for its last plan_code."""
+    sub = get_or_create_subscription(db, account_id)
+    if sub.status in (SubscriptionStatus.CANCELED, SubscriptionStatus.TERMINATED):
+        return False
+    row = (
+        db.query(PlanEntitlement)
+        .filter(PlanEntitlement.plan_code == sub.plan_code, PlanEntitlement.key == key)
+        .first()
+    )
+    if row is None:
+        return False
+    if row.value_type == EntitlementValueType.BOOLEAN:
+        return bool(row.bool_value)
+    return (row.int_value or 0) > 0
+
+
+def assert_entitlement(db: Session, account_id: str, key: str) -> None:
+    if not has_entitlement(db, account_id, key):
+        sub = get_or_create_subscription(db, account_id)
+        raise EntitlementRequiredError(key, sub.plan_code)
+
+
 class InvalidPaymentEventError(Exception):
     """Raised for an unrecognized simulated payment event type."""
 
@@ -774,19 +981,27 @@ def _assert_not_test_account(db: Session, account_id: str) -> None:
 _PAYMENT_EVENT_TYPES = {"payment_failed", "payment_retry", "payment_restored"}
 
 
-def _apply_zoikonex_payment_event(
+def _apply_payment_event(
     db: Session,
     sub: Subscription,
     event_type: str,
     *,
     actor: str,
     action: str,
-    external_event_id: str | None = None,
+    notif_idempotency_key: str | None = None,
 ) -> Subscription:
-    """Shared state transition for an inbound ZoikoNex payment event
-    (Architecture doc §9: "ZoikoNex sends payment success, failure, retry,
-    grace-period, suspension, and restoration events back to Zoiko Local"),
-    used by both the staff-triggered simulator and the real webhook."""
+    """Provider-agnostic core of a payment_failed/payment_retry/
+    payment_restored state transition - extracted from
+    _apply_zoikonex_payment_event so the SAME PAST_DUE/grace-period
+    machinery (Kafka events, notifications, audit log) can also drive off
+    a REAL Stripe recurring-billing webhook, not just the ZoikoNex mock's
+    simulated events. See handle_stripe_subscription_payment_webhook's
+    docstring for why this mattered: this state machine already existed
+    and was fully correct, but nothing ever fed it from Stripe's own
+    invoice.payment_failed/invoice.paid - a real customer whose card
+    failed on a live Stripe renewal charge stayed ACTIVE with full access
+    forever, since only the ZoikoNex mock webhook (which nothing real
+    calls yet) could ever trip PAST_DUE."""
     if event_type not in _PAYMENT_EVENT_TYPES:
         raise InvalidPaymentEventError(f"Unknown payment event type: {event_type!r}")
 
@@ -801,21 +1016,10 @@ def _apply_zoikonex_payment_event(
         sub.status = SubscriptionStatus.ACTIVE
         sub.grace_period_ends_at = None
     # payment_retry intentionally changes nothing but is still logged below -
-    # it's evidence ZoikoNex is still trying, not a state transition itself.
+    # it's evidence the provider is still trying, not a state transition itself.
 
     db.commit()
     db.refresh(sub)
-
-    db.add(
-        ZoikoNexSyncEvent(
-            account_id=account_id,
-            event_type=ZoikoNexSyncEventType.PAYMENT_EVENT_RECEIVED,
-            zoikonex_ref=sub.zoikonex_ref,
-            external_event_id=external_event_id,
-            payload={"event_type": event_type, "grace_period_ends_at": sub.grace_period_ends_at.isoformat() if sub.grace_period_ends_at else None},
-        )
-    )
-    db.commit()
 
     log_event(
         db, actor=actor, action=action, target=f"subscription:{sub.id}",
@@ -837,15 +1041,60 @@ def _apply_zoikonex_payment_event(
     if owner is not None:
         plan = get_plan(db, sub.plan_code)
         if event_type == "payment_failed":
-            notify_payment_failed(db, account_id=account_id, account_email=owner.email, plan_name=plan.name)
+            notify_payment_failed(
+                db, account_id=account_id, account_email=owner.email, plan_name=plan.name,
+                idempotency_key=notif_idempotency_key,
+            )
         elif event_type == "payment_retry":
             notify_payment_reminder(
                 db, account_id=account_id, account_email=owner.email, plan_name=plan.name,
                 grace_period_ends_at=sub.grace_period_ends_at.strftime("%Y-%m-%d") if sub.grace_period_ends_at else "",
             )
         elif event_type == "payment_restored":
-            notify_service_restored(db, account_id=account_id, account_email=owner.email)
+            notify_service_restored(
+                db, account_id=account_id, account_email=owner.email, idempotency_key=notif_idempotency_key,
+            )
 
+    return sub
+
+
+def _apply_zoikonex_payment_event(
+    db: Session,
+    sub: Subscription,
+    event_type: str,
+    *,
+    actor: str,
+    action: str,
+    external_event_id: str | None = None,
+) -> Subscription:
+    """Shared state transition for an inbound ZoikoNex payment event
+    (Architecture doc §9: "ZoikoNex sends payment success, failure, retry,
+    grace-period, suspension, and restoration events back to Zoiko Local"),
+    used by both the staff-triggered simulator and the real webhook. Thin
+    wrapper around _apply_payment_event that additionally records the
+    ZoikoNexSyncEvent row this specific provider's sync trail needs."""
+    account_id = sub.account_id
+    # Email Communications System doc A-03 (BLOCKER) "idempotency" - a
+    # retried ZoikoNex webhook delivering the same external_event_id twice
+    # must not double-send this notification. No key for the staff-
+    # triggered simulator path (external_event_id is None there by
+    # construction) since a manual staff action isn't a retry risk.
+    notif_idempotency_key = f"{event_type}:{external_event_id}" if external_event_id else None
+
+    sub = _apply_payment_event(
+        db, sub, event_type, actor=actor, action=action, notif_idempotency_key=notif_idempotency_key,
+    )
+
+    db.add(
+        ZoikoNexSyncEvent(
+            account_id=account_id,
+            event_type=ZoikoNexSyncEventType.PAYMENT_EVENT_RECEIVED,
+            zoikonex_ref=sub.zoikonex_ref,
+            external_event_id=external_event_id,
+            payload={"event_type": event_type, "grace_period_ends_at": sub.grace_period_ends_at.isoformat() if sub.grace_period_ends_at else None},
+        )
+    )
+    db.commit()
     return sub
 
 
@@ -882,6 +1131,63 @@ def handle_zoikonex_payment_webhook(
         db, sub, event_type, actor="zoikonex_webhook",
         action="subscription.payment_event_received", external_event_id=external_event_id,
     )
+
+
+def handle_stripe_subscription_payment_webhook(
+    db: Session, *, stripe_subscription_id: str, event_type: str, stripe_event_id: str | None = None,
+) -> Subscription | None:
+    """Real gap fix: the PAST_DUE/grace-period state machine above
+    (_apply_payment_event) already existed, fully correct, but nothing
+    real ever fed it - only handle_zoikonex_payment_webhook could trigger
+    it, and that's for a ZoikoNex integration that doesn't exist yet.
+    Meanwhile create_subscription_checkout_session's mode="subscription"
+    Checkout makes STRIPE ITSELF the real, live, auto-recurring biller the
+    moment it completes - Stripe charges the customer's card every period
+    on its own, independent of ZoikoNex entirely. Confirmed live: a real
+    customer whose card failed on a genuine Stripe renewal charge stayed
+    ACTIVE with full access forever, since nothing was listening for
+    Stripe's own invoice.payment_failed/invoice.paid webhooks. Routed here
+    from billing/routes.py's stripe_checkout_webhook for those two event
+    types; looks the subscription up by stripe_subscription_id (set once
+    by handle_stripe_checkout_completed when the original Checkout
+    completed - see that field's docstring on Subscription). Returns None
+    if no local Subscription references this Stripe subscription (e.g. one
+    this app didn't create)."""
+    sub = db.query(Subscription).filter(Subscription.stripe_subscription_id == stripe_subscription_id).first()
+    if sub is None:
+        return None
+    notif_idempotency_key = f"stripe:{stripe_event_id}:{event_type}" if stripe_event_id else None
+    return _apply_payment_event(
+        db, sub, event_type, actor="stripe_checkout_webhook",
+        action="subscription.payment_event_received_stripe", notif_idempotency_key=notif_idempotency_key,
+    )
+
+
+def handle_stripe_subscription_deleted_webhook(db: Session, *, stripe_subscription_id: str) -> Subscription | None:
+    """Real gap fix, same rationale as handle_stripe_subscription_payment_
+    webhook above: customer.subscription.deleted fires when Stripe cancels
+    the subscription on its own side (Smart Retries exhausted after
+    repeated failed renewals, or a cancellation made directly in Stripe's
+    dashboard/customer portal) - a path that bypasses this app's own POST
+    /subscription/cancel entirely. Mirrors cancel_subscription's state
+    transition (CANCELED, no grace period), just actor-attributed to
+    Stripe instead of the customer. Returns None (no-op) if no local
+    Subscription references this Stripe subscription, or it's already
+    CANCELED (Stripe can redeliver this webhook)."""
+    sub = db.query(Subscription).filter(Subscription.stripe_subscription_id == stripe_subscription_id).first()
+    if sub is None or sub.status == SubscriptionStatus.CANCELED:
+        return sub
+    sub.status = SubscriptionStatus.CANCELED
+    sub.canceled_at = _db_now(db)
+    db.commit()
+    db.refresh(sub)
+    sync_subscription_to_zoikonex(db, sub)
+    log_event(
+        db, actor="stripe_checkout_webhook", action="billing.subscription_canceled_by_stripe",
+        target=f"subscription:{sub.id}",
+    )
+    publish_subscription_canceled(sub.account_id, subscription_id=sub.id, reason="stripe_subscription_deleted")
+    return sub
 
 
 def _is_billing_suspended(sub: Subscription, now: datetime) -> bool:
@@ -941,10 +1247,23 @@ def cancel_subscription(db: Session, account_id: str, *, actor: str, reason: str
     Does NOT touch any owned phone numbers - those already have their own
     per-number cancel path (POST /numbers/{e164}/cancel); cascading this
     into a bulk number release is a separate product decision, not made
-    here."""
+    here.
+
+    If this account ever completed a real paid Checkout, Stripe is running
+    its own independent recurring charge against a live Subscription object
+    (see create_subscription_checkout_session) that nothing else in this
+    codebase ever tells to stop. That real subscription is canceled FIRST,
+    before any local state changes - if Stripe's cancel fails, this raises
+    and nothing is marked canceled here either, so the customer isn't shown
+    "canceled" while Stripe silently keeps charging their card."""
     sub = get_or_create_subscription(db, account_id)
     if sub.status == SubscriptionStatus.CANCELED:
         raise SubscriptionAlreadyCanceledError(f"Subscription for account {account_id} is already canceled")
+
+    if sub.stripe_subscription_id:
+        from app.integrations.billing import stripe_checkout
+
+        stripe_checkout.cancel_subscription(sub.stripe_subscription_id)
 
     sub.status = SubscriptionStatus.CANCELED
     sub.canceled_at = _db_now(db)
@@ -1599,7 +1918,7 @@ def run_billing_cycle(db: Session, account_id: str, *, actor: str) -> dict:
         # with nothing left to ever bill again.
         return {"billed": False, "reason": "subscription is canceled"}
     plan = get_plan(db, sub.plan_code)
-    catalog_entry = get_active_price_catalog_entry(db, plan.plan_code)
+    catalog_entry = get_active_price_catalog_entry(db, plan.plan_code, billing_period=sub.billing_period)
 
     if catalog_entry is None or catalog_entry.amount_minor_units <= 0:
         return {"billed": False, "reason": f"plan {plan.plan_code!r} has no price catalog entry to bill"}
@@ -1629,7 +1948,10 @@ def run_billing_cycle(db: Session, account_id: str, *, actor: str) -> dict:
             "(no account_id) - check ZoikoNex connectivity and retry."
         )
 
-    zoikonex_adapter.register_plan_in_catalog(db, plan, amount_minor_units=amount_minor_units, currency_code=currency_code)
+    zoikonex_adapter.register_plan_in_catalog(
+        db, plan, amount_minor_units=amount_minor_units, currency_code=currency_code,
+        billing_period=sub.billing_period.value.upper(),
+    )
 
     bill_cycle = zoikonex_adapter.open_bill_cycle(sub)
     invoice = zoikonex_adapter.create_invoice(sub, bill_cycle["bill_cycle_id"], currency_code=currency_code)
@@ -1668,7 +1990,7 @@ def run_billing_cycle(db: Session, account_id: str, *, actor: str) -> dict:
         description_suffix = " (TEST PLACEHOLDER PRICE, not a real charge)" if catalog_entry.is_placeholder else ""
         zoikonex_adapter.add_invoice_line_item(
             invoice["invoice_id"],
-            description=f"{plan.name} - monthly subscription{description_suffix}",
+            description=f"{plan.name} - {sub.billing_period.value} subscription{description_suffix}",
             amount_minor_units=amount_minor_units,
             tax_amount_minor_units=tax.get("tax_amount_minor_units"),
             line_key="plan-fee",
@@ -1707,6 +2029,64 @@ def run_billing_cycle(db: Session, account_id: str, *, actor: str) -> dict:
             charge.zoikonex_line_item_id = line_item["line_item_id"]
             line_item_total_minor_units += charge.amount_minor_units
             tax_total_minor_units += charge_tax.get("tax_amount_minor_units") or 0
+
+        # Pricing doc §5.3 "$29.00 per workspace/month" AI Receptionist
+        # add-on + overage - real gap fix: this was metered
+        # (usage.service.record_usage_event's ai_receptionist_minutes
+        # event) but never actually invoiced. Shares the exact same
+        # included-allowance + overage math as get_usage_summary (see
+        # _compute_ai_receptionist_overage) so the informational number a
+        # customer sees there and the number they're actually charged
+        # here can never independently drift. Same placeholder/ACTIVE
+        # gate outside development as the plan-fee catalog entry above -
+        # a second money-charging price deserves the same "no ad-hoc
+        # invented price" discipline, not a quieter exception to it.
+        if sub.ai_receptionist_addon_enabled:
+            from app.usage.models import UsageEvent
+
+            addon_rate = get_active_ai_receptionist_addon_rate(db)
+            if addon_rate is not None and (
+                settings.environment == "development"
+                or (not addon_rate.is_placeholder and addon_rate.status == CatalogEntryStatus.ACTIVE)
+            ):
+                addon_minutes_used = float(
+                    db.query(sa.func.coalesce(sa.func.sum(UsageEvent.quantity), 0))
+                    .filter(
+                        UsageEvent.account_id == account_id, UsageEvent.event_type == "ai_receptionist_minutes",
+                        UsageEvent.created_at >= sub.current_period_start,
+                    )
+                    .scalar()
+                )
+                overage_minutes, overage_cost_cents, _ = _compute_ai_receptionist_overage(
+                    db, sub, plan, addon_minutes_used
+                )
+                addon_tax = zoikonex_adapter.determine_tax_for_invoice_line(
+                    invoice_id=invoice["invoice_id"], taxable_amount_minor_units=addon_rate.monthly_price_minor_units,
+                    currency_code=addon_rate.currency_code,
+                )
+                zoikonex_adapter.add_invoice_line_item(
+                    invoice["invoice_id"], description="AI Receptionist add-on - monthly",
+                    amount_minor_units=addon_rate.monthly_price_minor_units,
+                    tax_amount_minor_units=addon_tax.get("tax_amount_minor_units"),
+                    line_key="ai-receptionist-addon-fee",
+                )
+                line_item_total_minor_units += addon_rate.monthly_price_minor_units
+                tax_total_minor_units += addon_tax.get("tax_amount_minor_units") or 0
+
+                if overage_cost_cents:
+                    overage_tax = zoikonex_adapter.determine_tax_for_invoice_line(
+                        invoice_id=invoice["invoice_id"], taxable_amount_minor_units=overage_cost_cents,
+                        currency_code=addon_rate.currency_code,
+                    )
+                    zoikonex_adapter.add_invoice_line_item(
+                        invoice["invoice_id"],
+                        description=f"AI Receptionist overage - {overage_minutes:.1f} min",
+                        amount_minor_units=overage_cost_cents,
+                        tax_amount_minor_units=overage_tax.get("tax_amount_minor_units"),
+                        line_key="ai-receptionist-overage-fee",
+                    )
+                    line_item_total_minor_units += overage_cost_cents
+                    tax_total_minor_units += overage_tax.get("tax_amount_minor_units") or 0
 
         issued = zoikonex_adapter.issue_invoice(invoice["invoice_id"])
         # ZoikoNex's own invoice total is authoritative (it's the system of
@@ -1794,7 +2174,7 @@ def run_billing_cycle(db: Session, account_id: str, *, actor: str) -> dict:
                 notify_payment_succeeded(
                     db, account_id=account_id, account_email=owner.email,
                     total=f"{amount_minor_units / 100:.2f}", currency=currency_code,
-                    description=f"{plan.name} plan - monthly subscription",
+                    description=f"{plan.name} plan - {sub.billing_period.value} subscription",
                     payment_date=_db_now(db).date().isoformat(),
                     payment_method_masked="on file with ZoikoNex",
                 )
@@ -1939,6 +2319,29 @@ def is_ai_receptionist_enabled_for_account(db: Session, account_id: str) -> bool
     return plan.included_ai_receptionist_minutes > 0 or sub.ai_receptionist_addon_enabled
 
 
+def _compute_ai_receptionist_overage(
+    db: Session, sub: Subscription, plan: Plan, ai_receptionist_minutes_used: float,
+) -> tuple[float, int | None, AIReceptionistAddonRate | None]:
+    """Pricing doc §5.3 included-allowance + overage math - single source
+    of truth shared by get_usage_summary (informational) and
+    run_billing_cycle (the real charge), so the two can never
+    independently drift apart the way ai_receptionist_minutes' usage-
+    event write once did (see media.service.update_call_status's fix
+    history). Plan-granted minutes (Pro/Scale) and add-on-granted minutes
+    (Starter/Business who bought the $29/mo add-on) stack."""
+    addon_rate = get_active_ai_receptionist_addon_rate(db) if sub.ai_receptionist_addon_enabled else None
+    minutes_included = plan.included_ai_receptionist_minutes + (
+        addon_rate.included_minutes if addon_rate is not None else 0
+    )
+    overage_minutes = max(0.0, ai_receptionist_minutes_used - minutes_included)
+    overage_cost_cents = None
+    if overage_minutes > 0:
+        overage_rate = addon_rate or get_active_ai_receptionist_addon_rate(db)
+        if overage_rate is not None:
+            overage_cost_cents = round(overage_minutes * overage_rate.overage_rate_minor_units_per_minute)
+    return overage_minutes, overage_cost_cents, addon_rate
+
+
 def set_ai_receptionist_addon(db: Session, account_id: str, *, enabled: bool, actor: str) -> Subscription:
     """Pricing doc §5.3 "$29.00 per workspace/month" - a subscription-level
     toggle, not a plan change (see change_plan for that), so this doesn't
@@ -1989,25 +2392,16 @@ def get_usage_summary(db: Session, account_id: str) -> dict:
     ai_summaries_used = float(totals.get("ai_summary", 0))
     ai_receptionist_minutes_used = float(totals.get("ai_receptionist_minutes", 0))
 
-    # Pricing doc §5.3 included-allowance + overage math. Plan-granted
-    # minutes (Pro/Scale) and add-on-granted minutes (Starter/Business who
-    # bought the $29/mo add-on) stack; both are real columns/rows now (see
-    # Plan.included_ai_receptionist_minutes, AIReceptionistAddonRate) - this
-    # is still reporting-only, same as every other resource above. Nothing
-    # here charges the overage; see run_billing_cycle, which does not yet
-    # add this as an invoice line (CLAUDE.md's 2026-08-20 entry).
-    addon_rate = get_active_ai_receptionist_addon_rate(db) if sub.ai_receptionist_addon_enabled else None
+    # Pricing doc §5.3 included-allowance + overage math (see
+    # _compute_ai_receptionist_overage, shared with run_billing_cycle -
+    # which DOES now actually charge this, unlike every other resource
+    # reported here).
+    ai_receptionist_overage_minutes, ai_receptionist_overage_cost_cents, addon_rate = (
+        _compute_ai_receptionist_overage(db, sub, plan, ai_receptionist_minutes_used)
+    )
     ai_receptionist_minutes_included = plan.included_ai_receptionist_minutes + (
         addon_rate.included_minutes if addon_rate is not None else 0
     )
-    ai_receptionist_overage_minutes = max(0.0, ai_receptionist_minutes_used - ai_receptionist_minutes_included)
-    ai_receptionist_overage_cost_cents = None
-    if ai_receptionist_overage_minutes > 0:
-        overage_rate = addon_rate or get_active_ai_receptionist_addon_rate(db)
-        if overage_rate is not None:
-            ai_receptionist_overage_cost_cents = round(
-                ai_receptionist_overage_minutes * overage_rate.overage_rate_minor_units_per_minute
-            )
 
     return {
         "plan_code": plan.plan_code,

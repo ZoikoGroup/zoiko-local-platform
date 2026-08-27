@@ -30,12 +30,25 @@ class AccountOverviewResponse(BaseModel):
     number_count: int
     billing_classification: str
     billing_source: str
+    is_test: bool
+    legal_hold: bool
+    legal_hold_reference: str | None
     created_at: datetime
 
 
 class UpdateAccountBillingClassificationRequest(BaseModel):
     billing_classification: str
     billing_source: str
+
+
+class SetAccountTestFlagRequest(BaseModel):
+    is_test: bool
+    reason: str
+
+
+class SetAccountLegalHoldRequest(BaseModel):
+    on: bool
+    reference: str | None = None
 
 
 class AccessMatrixEntryResponse(BaseModel):

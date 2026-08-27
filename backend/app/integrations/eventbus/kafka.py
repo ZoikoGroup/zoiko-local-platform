@@ -35,6 +35,35 @@ def _get_producer() -> KafkaProducer:
             # either blocking the caller indefinitely or silently dropping.
             retries=3,
             request_timeout_ms=10_000,
+            # Real gap fix, confirmed live: this module's whole docstring/
+            # design promise is "fire-and-forget... returns without waiting
+            # for the broker's ack" (see publish()'s own docstring on the
+            # prior future.get(timeout=10) bug it already fixed) - but two
+            # separate, unaddressed defaults undermined that same promise:
+            # api_version left at its default (None) makes kafka-python do
+            # a real, blocking broker-version-detection handshake the FIRST
+            # time this producer is constructed in each worker process
+            # (once per WEB_CONCURRENCY worker, whichever request happens
+            # to trigger the first domain-event publish pays for it); and
+            # max_block_ms's default (60_000) governs a SEPARATE, earlier
+            # blocking point than the ack-wait fix already addressed -
+            # producer.send() itself synchronously waits up to this long
+            # for topic metadata before ever handing the message off to the
+            # background sender thread, on the first publish to any given
+            # topic in this producer's lifetime, or anytime the broker is
+            # slow/unreachable and cached metadata goes stale. The
+            # resulting KafkaTimeoutError is already caught correctly
+            # (publish()'s except KafkaError below, then events.service.
+            # publish_event's own try/except) and never fails the caller's
+            # request - but correctness isn't the gap here, latency is: a
+            # request that happens to hit this could silently block for up
+            # to a full minute before that safety net even engages.
+            # api_version pinned to match docker-compose's actual broker
+            # (apache/kafka:3.8.0) skips the auto-detection handshake
+            # entirely; max_block_ms lowered so a real metadata-fetch
+            # failure fails fast instead of near-hanging the request.
+            api_version=(3, 8, 0),
+            max_block_ms=2_000,
         )
     return _producer
 

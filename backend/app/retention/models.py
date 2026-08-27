@@ -1,7 +1,7 @@
 import enum
 from datetime import datetime
 
-from sqlalchemy import DateTime, Enum, ForeignKey, Integer, UniqueConstraint, func
+from sqlalchemy import DateTime, Enum, ForeignKey, Integer, String, Text, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -37,3 +37,47 @@ class RetentionPolicy(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
+
+
+class ErasureRequestStatus(str, enum.Enum):
+    """Matches the DB enum erasure_request_status_enum's member names
+    exactly (migration c3b0f40f4bc1) - these are the enum VALUES stored in
+    Postgres, not lowercased."""
+
+    PENDING = "PENDING"
+    COMPLETED = "COMPLETED"
+    REJECTED = "REJECTED"
+
+
+class ErasureRequest(Base):
+    """Architecture doc §10 "right-to-erasure workflow" - a customer-
+    initiated deletion request ("right to be forgotten" / GDPR-style) that
+    a human reviews before anything is deleted, not a self-service "delete
+    now" button (some records must legally be retained - billing/tax
+    evidence, an open compliance case, a legal hold - even after a
+    request). requested_by is NOT a foreign key on purpose - it can
+    reference either a numbering.identity.models.User.id (a customer
+    requesting their own account's erasure) or a app.staff.models.
+    PlatformStaff.id (staff opening one on a customer's behalf), and
+    there's no single table both would cleanly FK to.
+
+    Marking a request COMPLETED actually runs the deletion cascade (see
+    app.retention.service.erase_account_data) - this table is the request/
+    audit record of that decision, not just a status tracker."""
+
+    __tablename__ = "erasure_requests"
+
+    id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=new_uuid)
+    account_id: Mapped[str] = mapped_column(
+        UUID(as_uuid=False), ForeignKey("accounts.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    requested_by: Mapped[str] = mapped_column(UUID(as_uuid=False), nullable=False)
+    status: Mapped[ErasureRequestStatus] = mapped_column(
+        Enum(ErasureRequestStatus, name="erasure_request_status_enum"),
+        nullable=False, default=ErasureRequestStatus.PENDING,
+    )
+    notes: Mapped[str | None] = mapped_column(Text(), nullable=True)
+    resolved_by: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    resolution_notes: Mapped[str | None] = mapped_column(Text(), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

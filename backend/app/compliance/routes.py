@@ -20,6 +20,15 @@ from app.numbering.identity.models import User
 from app.staff.models import PlatformStaff
 
 router = APIRouter(prefix="/compliance", tags=["compliance"])
+# Opening a KYC case, submitting its documents, and starting Stripe Identity
+# verification are how a TRIALING account reaches AccountRiskState
+# .TRIAL_VERIFIED (risk/service.py's higher concurrent-call/dispersion
+# limits for trial accounts) - gating them behind "upgrade first" makes
+# that step-up path unreachable for the accounts it exists for. Same
+# "account-setup basics every account needs regardless of plan" exemption
+# main.py already gives identity/team/consent - just split into its own
+# router since only 3 of this file's routes need it.
+kyc_router = APIRouter(prefix="/compliance", tags=["compliance"])
 # Staff act under their own capability grants (require_capability), not a
 # customer JWT/plan at all - app.core.deps.require_paid_or_read_only depends
 # on get_current_user, which can't decode a staff token, so router-wide
@@ -65,7 +74,7 @@ def upsert_rule(
     )
 
   
-@router.post("/cases", response_model=ComplianceCaseResponse, status_code=201)
+@kyc_router.post("/cases", response_model=ComplianceCaseResponse, status_code=201)
 def create_case(
     payload: ComplianceCaseCreate,
     db: Session = Depends(get_db),
@@ -101,7 +110,7 @@ def list_all_cases(
     return service.list_all_cases(db, status=status)
 
 
-@router.post("/cases/{case_id}/documents", response_model=ComplianceCaseResponse)
+@kyc_router.post("/cases/{case_id}/documents", response_model=ComplianceCaseResponse)
 async def submit_document(
     case_id: str,
     document_type: str = Form(...),
@@ -167,7 +176,7 @@ def staff_get_document_download_url(
     return {"url": url}
 
 
-@router.post("/cases/{case_id}/kyc/start", response_model=KYCVerificationStart)
+@kyc_router.post("/cases/{case_id}/kyc/start", response_model=KYCVerificationStart)
 def start_kyc(
     case_id: str,
     db: Session = Depends(get_db),
@@ -214,7 +223,10 @@ def approve_case(
     staff: PlatformStaff = Depends(require_capability("compliance.review_case")),
 ):
     case = _get_case_or_404(db, case_id)
-    return service.approve_case(db, case, actor=staff.id)
+    try:
+        return service.approve_case(db, case, actor=staff.id)
+    except service.ComplianceCaseAlreadyDecidedError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e
 
 
 @staff_router.post("/cases/{case_id}/reject", response_model=ComplianceCaseResponse)
@@ -225,7 +237,10 @@ def reject_case(
     staff: PlatformStaff = Depends(require_capability("compliance.review_case")),
 ):
     case = _get_case_or_404(db, case_id)
-    return service.reject_case(db, case, actor=staff.id, reason=payload.reason)
+    try:
+        return service.reject_case(db, case, actor=staff.id, reason=payload.reason)
+    except service.ComplianceCaseAlreadyDecidedError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e
 
 
 @staff_router.post("/cases/expire")

@@ -122,7 +122,9 @@ def activate_account_kill_switch(
     """SUPER_ADMIN only - halts new activity in this scope for ONE account,
     without suspending it outright. Same capability as the platform-wide
     switch (app.ops.routes.activate_kill_switch)."""
-    return service.set_account_kill_switch(db, account_id, scope, True, actor=staff.id, reason=payload.reason)
+    return service.set_account_kill_switch(
+        db, account_id, scope, True, actor=staff.id, reason=payload.reason, expires_at=payload.expires_at,
+    )
 
 
 @router.post("/accounts/{account_id}/kill-switches/{scope}/deactivate", response_model=AccountKillSwitchResponse)

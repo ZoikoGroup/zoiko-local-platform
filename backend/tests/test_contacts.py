@@ -163,12 +163,17 @@ def test_contact_from_another_account_is_not_found(client):
     assert client.delete(f"/contacts/{owner_contact['id']}", headers=intruder_headers).status_code == 404
 
 
-def test_viewer_can_list_contacts_but_not_create_them(client):
-    owner_token, _ = _signup_and_login(client, "contactsviewerowner@example.com")
+def test_viewer_can_list_contacts_but_not_create_them(client, db_session):
+    from app.billing import service as billing_service
+
+    owner_token, owner_account_id = _signup_and_login(client, "contactsviewerowner@example.com")
     owner_headers = {"Authorization": f"Bearer {owner_token}"}
     client.post(
         "/contacts", json={"name": "Owner's Contact", "phone_number": "+15550000005"}, headers=owner_headers
     )
+    # Real gap fix (ZL-COM-ENT-001): adding a team member now requires
+    # team.members.enabled (Business+).
+    billing_service.change_plan(db_session, owner_account_id, "business", actor="test-setup")
     viewer_token = _add_viewer(client, owner_headers, "contactsviewer1@example.com")
     viewer_headers = {"Authorization": f"Bearer {viewer_token}"}
 

@@ -14,7 +14,7 @@ def test_valid_google_credential_creates_a_new_account(client, db_session, monke
     create an account and issue a working JWT."""
 
     def fake_verify(_credential):
-        return {"email": "newgoogleuser@example.com", "name": "New Google User"}
+        return {"email": "newgoogleuser@example.com", "name": "New Google User", "email_verified": True}
 
     monkeypatch.setattr(identity_routes, "verify_google_id_token", fake_verify)
 
@@ -42,7 +42,7 @@ def test_valid_google_credential_logs_into_existing_account(client, db_session, 
     )
 
     def fake_verify(_credential):
-        return {"email": "existing@example.com", "name": "Existing User"}
+        return {"email": "existing@example.com", "name": "Existing User", "email_verified": True}
 
     monkeypatch.setattr(identity_routes, "verify_google_id_token", fake_verify)
 
@@ -60,7 +60,7 @@ def test_google_only_account_cannot_log_in_with_a_password(client, db_session, m
     reject them cleanly, not crash."""
 
     def fake_verify(_credential):
-        return {"email": "googleonly@example.com", "name": "Google Only"}
+        return {"email": "googleonly@example.com", "name": "Google Only", "email_verified": True}
 
     monkeypatch.setattr(identity_routes, "verify_google_id_token", fake_verify)
     client.post("/auth/google", json={"credential": "fake-but-verified"})

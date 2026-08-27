@@ -16,18 +16,23 @@ already-applied migration's file doesn't retroactively undo what it did to
 a real database - this migration is the actual DROP, confirmed live via
 `alembic check` after the merge (which is exactly what caught this drift).
 
-Guarded with checkfirst=True (2026-08-24): a database that never had the
-old, pre-edit version of 4ec152435b05 run against it (any fresh database
-migrating from scratch - confirmed live against a brand-new Neon instance)
-never had these 3 columns to begin with, so an unconditional drop_column
-fails with UndefinedColumn. Only databases that ran the old 4ec152435b05
-(this repo's shared local dev DB) actually need this drop; everyone else
-needs it to be a no-op.
+IF EXISTS/IF NOT EXISTS on every column op below: this migration is only
+meaningful for a database whose history actually ran the OLD
+(pre-edit) 4ec152435b05 and therefore has these 3 columns to drop. A
+from-scratch bootstrap (a fresh dev DB, CI, or anyone cloning this repo
+today) runs 4ec152435b05's CURRENT source, which never creates them in
+the first place - this DROP must not fail just because there was nothing
+to drop in that case.
+
+(2026-08-24 merge note: a parallel session independently hit and fixed
+this same fresh-database crash via a SQLAlchemy inspector column-
+existence check instead of raw SQL IF EXISTS - functionally equivalent,
+kept this version since Postgres's own IF EXISTS already covers it
+without a round-trip through information_schema.)
 """
 from typing import Sequence, Union
 
 from alembic import op
-import sqlalchemy as sa
 
 
 # revision identifiers, used by Alembic.
@@ -38,20 +43,21 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    bind = op.get_bind()
-    inspector = sa.inspect(bind)
-    ai_usage_rates_columns = {c['name'] for c in inspector.get_columns('ai_usage_rates')}
-    subscriptions_columns = {c['name'] for c in inspector.get_columns('subscriptions')}
-
-    if 'addon_monthly_price_cents' in ai_usage_rates_columns:
-        op.drop_column('ai_usage_rates', 'addon_monthly_price_cents')
-    if 'addon_included_minutes' in ai_usage_rates_columns:
-        op.drop_column('ai_usage_rates', 'addon_included_minutes')
-    if 'ai_receptionist_addon_active' in subscriptions_columns:
-        op.drop_column('subscriptions', 'ai_receptionist_addon_active')
+    op.execute("ALTER TABLE ai_usage_rates DROP COLUMN IF EXISTS addon_monthly_price_cents")
+    op.execute("ALTER TABLE ai_usage_rates DROP COLUMN IF EXISTS addon_included_minutes")
+    op.execute("ALTER TABLE subscriptions DROP COLUMN IF EXISTS ai_receptionist_addon_active")
 
 
 def downgrade() -> None:
-    op.add_column('subscriptions', sa.Column('ai_receptionist_addon_active', sa.Boolean(), server_default='false', nullable=False))
-    op.add_column('ai_usage_rates', sa.Column('addon_included_minutes', sa.Integer(), server_default='100', nullable=False))
-    op.add_column('ai_usage_rates', sa.Column('addon_monthly_price_cents', sa.Integer(), server_default='2900', nullable=False))
+    op.execute(
+        "ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS ai_receptionist_addon_active "
+        "boolean NOT NULL DEFAULT false"
+    )
+    op.execute(
+        "ALTER TABLE ai_usage_rates ADD COLUMN IF NOT EXISTS addon_included_minutes "
+        "integer NOT NULL DEFAULT 100"
+    )
+    op.execute(
+        "ALTER TABLE ai_usage_rates ADD COLUMN IF NOT EXISTS addon_monthly_price_cents "
+        "integer NOT NULL DEFAULT 2900"
+    )

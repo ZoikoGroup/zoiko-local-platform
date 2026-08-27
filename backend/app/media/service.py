@@ -129,8 +129,16 @@ def is_within_business_hours(start: time, end: time, tz_name: str) -> bool:
     return now_local >= start or now_local <= end  # overnight range, e.g. 22:00-06:00
 
 
-def should_forward_call(owner: PhoneNumber) -> bool:
-    if not owner.forwarding_number:
+def should_forward_call(owner: PhoneNumber, *, has_ring_group: bool = False) -> bool:
+    """has_ring_group (real gap fix): a ring group used to be invisible
+    here entirely - only forwarding_number's presence ever flipped this to
+    True, so an account that configured a ring group but never separately
+    set the legacy forwarding_number field got zero forwarding at all
+    (every call fell straight through to AI receptionist/voicemail). The
+    caller (media.voice._default_call_twiml) computes has_ring_group from
+    the same numbers_service.list_ring_group query it already needs for
+    the actual destinations list, so this adds no extra query here."""
+    if not owner.forwarding_number and not has_ring_group:
         return False
     if owner.business_hours_start is None or owner.business_hours_end is None:
         return True  # forwarding configured with no schedule restriction = always forward
@@ -192,14 +200,20 @@ def record_call(
     return call
 
 
-def _assert_outbound_call_allowed(
+def assert_outbound_call_allowed(
     db: Session, *, account_id: str, account_email: str, to: str, from_number: str,
 ) -> None:
     """Shared risk/billing preamble for every real outbound call this
     account places, however the call is ultimately built (a one-way
-    announcement in _dispatch_outbound_call, or a live call-bridge in
-    _dispatch_bridge_call) - the destination doesn't know or care which
-    kind of call it is, so it must clear the same gates either way."""
+    announcement in _dispatch_outbound_call, a live call-bridge in
+    _dispatch_bridge_call, or an agent-pull in queues.service.
+    pull_next_caller) - the destination doesn't know or care which kind of
+    call it is, so it must clear the same gates either way. Not module-
+    private (no leading underscore) precisely because queues.service needs
+    to call this too - pull_next_caller previously placed a real outbound
+    call via telecom.place_call with none of these checks at all, a real
+    kill-switch/billing-suspension/toll-fraud bypass fixed by reusing this
+    instead of duplicating (and inevitably drifting from) it."""
     # Commercial Billing Operating Standard doc §32.1 - checked first,
     # alongside (not instead of) the per-account risk gates below; this one
     # is platform-wide and manually triggered, not account-specific.
@@ -240,7 +254,7 @@ def _dispatch_outbound_call(
     """Shared core of place_outbound_call and place_outbound_call_for_account
     - everything after "is this number really available to the caller" is
     identical for both a logged-in user and a public API key."""
-    _assert_outbound_call_allowed(db, account_id=account_id, account_email=account_email, to=to, from_number=from_number)
+    assert_outbound_call_allowed(db, account_id=account_id, account_email=account_email, to=to, from_number=from_number)
 
     twiml = telecom.build_say_response(message)
     time_limit = risk_service.get_call_time_limit_for_account(db, account_id)
@@ -287,9 +301,23 @@ def place_bridge_call(
     except CallerIdNotAuthorizedError as e:
         raise CallAuthorizationError(str(e)) from e
 
-    _assert_outbound_call_allowed(
+    assert_outbound_call_allowed(
         db, account_id=user.account_id, account_email=user.email, to=to, from_number=from_number,
     )
+    # agent_number is a real destination Twilio dials immediately below - a
+    # free-form per-call number, not a saved/vetted forwarding_number - so
+    # it needs the same destination-specific fraud/compliance checks as the
+    # customer `to` above. The account-wide gates (kill switch, billing,
+    # velocity, spend) were already covered by assert_outbound_call_allowed.
+    try:
+        risk_service.assert_destination_allowed(db, agent_number, user.account_id)
+    except risk_service.DestinationBlockedError as e:
+        notify_high_risk_destination_blocked(
+            db, account_id=user.account_id, account_email=user.email,
+            from_number=from_number, to_number=agent_number, reason=str(e),
+        )
+        raise
+    risk_service.assert_geographic_dispersion_ok(db, user.account_id, agent_number)
 
     time_limit = risk_service.get_call_time_limit_for_account(db, user.account_id)
     result = telecom.place_call(
@@ -443,24 +471,6 @@ def update_call_status(db: Session, provider_call_sid: str, status: str, duratio
             idempotency_key=f"call_seconds:{provider_call_sid}",
             disposition=status,
         )
-        # AI Receptionist minutes (Global Plans, Pricing & Commercial Launch
-        # Standard doc §5.3) - only for calls that actually reached the AI
-        # receptionist. A ReceptionistCall row only exists once the Gather
-        # verb captured real caller speech (see media.receptionist's
-        # /respond handler / capture_receptionist_call below), so a call
-        # that rang through to forwarding/voicemail/hangup instead never
-        # creates one and can't be over-counted here.
-        if db.query(ReceptionistCall).filter(ReceptionistCall.call_sid == provider_call_sid).first() is not None:
-            usage_service.record_usage_event(
-                db,
-                account_id=call.account_id,
-                event_type="ai_receptionist_minutes",
-                quantity=math.ceil((duration or 0) / 60),
-                unit="minutes",
-                country_band=country_band,
-                idempotency_key=f"ai_receptionist_minutes:{provider_call_sid}",
-            )
-
         # AI Receptionist minute metering (Pricing doc §5.3) - only for
         # calls the receptionist actually handled. Whole-call duration, same
         # caveat as call_seconds above: every TwiML leg, not narrowly
@@ -478,7 +488,7 @@ def update_call_status(db: Session, provider_call_sid: str, status: str, duratio
                 db,
                 account_id=call.account_id,
                 event_type="ai_receptionist_minutes",
-                quantity=(duration or 0) / 60,
+                quantity=math.ceil((duration or 0) / 60),
                 unit="minutes",
                 country_band=country_band,
                 idempotency_key=f"ai_receptionist_minutes:{provider_call_sid}",
@@ -1249,6 +1259,15 @@ def handle_video_webhook_event(db: Session, event) -> None:
                 target_type="video_session", target_id=session.id,
                 metadata={"room_name": event.room.name, "source": "livekit_webhook"},
             )
+            # end_video_session (the explicit POST /rooms/{name}/end path)
+            # publishes these same two events - this webhook path is how a
+            # room ends when participants just leave without anyone
+            # explicitly ending the call (the more common case in practice),
+            # and was missing them entirely until now, so any real consumer
+            # of zoiko.video's video.room.ended/video.session.ended silently
+            # missed most actual call endings.
+            publish_video_room_ended(session.account_id, room_name=event.room.name)
+            publish_video_session_ended(session.account_id, session_id=session.id, room_name=event.room.name)
         # Close out anyone whose participant_left event never arrived (e.g.
         # an abrupt disconnect) - otherwise their usage would count as
         # still-open/unbounded forever.
@@ -1686,6 +1705,22 @@ def mark_receptionist_call_escalated(db: Session, receptionist_call_id: str, esc
         db, actor_id=call.account_id, action="receptionist.call_escalated",
         target_type="receptionist_call", target_id=call.id,
         metadata={"escalated_to_user_id": escalated_to_user_id},
+    )
+
+
+def mark_receptionist_escalation_missed(db: Session, receptionist_call_id: str) -> None:
+    """Called from receptionist.escalation_fallback when a HIGH-urgency
+    call's escalation dial resolves to anything other than "completed" -
+    the human never picked up. `escalated` stays True (the platform DID
+    attempt the escalation) - this only records that the attempt went
+    unanswered, so staff reviewing the call summary can see it fell
+    through to voicemail rather than assuming a human actually handled it."""
+    call = db.query(ReceptionistCall).filter(ReceptionistCall.id == receptionist_call_id).first()
+    if call is None:
+        return
+    log_event(
+        db, actor_id=call.account_id, action="receptionist.escalation_missed",
+        target_type="receptionist_call", target_id=call.id,
     )
 
 

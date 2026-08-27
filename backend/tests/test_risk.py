@@ -346,7 +346,7 @@ def test_assert_spend_limit_ok_raises_over_threshold(db_session):
     # upsert (not a raw insert) since "US" may already have a seeded rate.
     from app.usage.service import upsert_calling_rate
 
-    upsert_calling_rate(db_session, country="US", price_per_minute_cents=MAX_SPEND_CENTS_PER_WINDOW)
+    upsert_calling_rate(db_session, country="US", price_per_minute_cents=MAX_SPEND_CENTS_PER_WINDOW, actor="test-setup")
 
     record_usage_event(
         db_session, account_id=account_id, event_type="call_seconds", quantity=61, unit="seconds",
@@ -398,6 +398,24 @@ def test_get_signal_weight_uses_active_fraud_rule_override(db_session):
     db_session.commit()
 
     assert get_signal_weight(db_session, RiskSignalType.SPEND_LIMIT_EXCEEDED) == 99
+
+
+def test_get_signal_weight_is_nonzero_for_every_risk_signal_type(db_session):
+    """Real bug fix: DEVICE_FINGERPRINT_ABUSE, AI_RECEPTIONIST_TRIAL_CAP_
+    EXCEEDED, REPEATED_NUMBER_ACQUISITION, CALLER_ID_CHANGE_PATTERN, and
+    ACCOUNT_TAKEOVER_INDICATOR were all being recorded by record_risk_signal
+    (each has its own real detection function - is_suspected_fingerprint_
+    abuse, assert_number_acquisition_velocity_ok, etc.) but were missing
+    from _DEFAULT_WEIGHTS entirely, so get_signal_weight silently returned
+    0 for all five - they could never move compute_account_risk_score or
+    trigger auto-suspend/review, no matter how many fired. This asserts
+    every RiskSignalType has a real, positive weight with no FraudRule
+    row present (the pure-fallback path)."""
+    from app.risk.models import RiskSignalType
+    from app.risk.service import get_signal_weight
+
+    for signal_type in RiskSignalType:
+        assert get_signal_weight(db_session, signal_type) > 0, signal_type
 
 
 def test_get_signal_weight_is_zero_for_an_explicitly_deactivated_fraud_rule(db_session):

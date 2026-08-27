@@ -400,14 +400,25 @@ def upload_supporting_document(
 
 
 def create_regulatory_bundle(
-    *, friendly_name: str, email: str, iso_country: str, end_user_type: str, number_type: str
+    *, friendly_name: str, email: str, iso_country: str, end_user_type: str, number_type: str,
+    status_callback: str | None = None,
 ) -> dict:
+    """status_callback: when set, Twilio POSTs BundleSid/Status/FailureReason
+    to this URL the moment its own review team approves or rejects the
+    bundle - a real-time push instead of waiting for the customer to click
+    "check status" or for the daily reconciliation sweep to notice. Passed
+    only when a public URL is actually configured (same conditional pattern
+    as buy_number's voice_url above) - there's nothing to point Twilio at
+    otherwise, e.g. before ngrok is running in dev."""
+    kwargs = {
+        "friendly_name": friendly_name, "email": email, "iso_country": iso_country,
+        "end_user_type": end_user_type, "number_type": number_type,
+    }
+    if status_callback:
+        kwargs["status_callback"] = status_callback
     try:
         with trace_provider_call("twilio", "create_regulatory_bundle"):
-            bundle = _client().numbers.v2.regulatory_compliance.bundles.create(
-                friendly_name=friendly_name, email=email, iso_country=iso_country,
-                end_user_type=end_user_type, number_type=number_type,
-            )
+            bundle = _client().numbers.v2.regulatory_compliance.bundles.create(**kwargs)
     except TwilioException as e:
         raise TelecomError(_clean_twilio_error_message(e)) from e
     return {"sid": bundle.sid, "status": bundle.status}
@@ -550,9 +561,11 @@ def build_forward_response(
     response = VoiceResponse()
     dial_kwargs = {}
     if status_callback_url:
+        # <Dial> itself has no statusCallback/statusCallbackEvent attribute
+        # in Twilio's TwiML schema (those exist only on the nested <Number>/
+        # <Client>/<Sip> nouns) - action is the real, documented <Dial>
+        # attribute Twilio actually calls when the dial completes.
         dial_kwargs["action"] = status_callback_url
-        dial_kwargs["status_callback"] = status_callback_url
-        dial_kwargs["status_callback_event"] = "completed"
     if recording_callback_url:
         dial_kwargs["record"] = "record-from-answer-dual"
         dial_kwargs["recording_status_callback"] = recording_callback_url
@@ -606,7 +619,12 @@ def build_bridge_response(destination: str, caller_id: str, status_callback_url:
         # rejects them on <Dial> (confirmed live via a real call's Notifications:
         # "Attribute 'statusCallback' is not allowed to appear in element
         # 'Dial'" - tolerated as a warning, not fatal, but still real invalid
-        # TwiML worth fixing outright).
+        # TwiML worth fixing outright). anilupdated independently hit the same
+        # bug and fixed it by dropping status_callback/status_callback_event
+        # entirely (relying on action alone) - kept this branch's fix instead
+        # since it was verified live against a real bridged call and still
+        # gets per-leg CallStatus/CallDuration on this URL, which action alone
+        # (DialCallStatus/DialCallDuration, describing the parent leg) doesn't.
         dial_kwargs["action"] = status_callback_url
         number_kwargs["status_callback"] = status_callback_url
         number_kwargs["status_callback_event"] = "completed"
@@ -766,20 +784,52 @@ def build_dtmf_menu_response(prompt: str, action_url: str, num_digits: int = 1, 
 
 
 def build_receptionist_reply_response(
-    message: str, forward_to: str | None = None, status_callback_url: str | None = None
+    message: str, forward_to: str | None = None, fallback_action_url: str | None = None,
+    recording_callback_url: str | None = None,
 ) -> str:
     """Closes out the receptionist flow: a spoken reply, then either an
-    escalation dial to a human or a hangup."""
+    escalation dial to a human or a hangup.
+
+    fallback_action_url (real gap fix, renamed from status_callback_url):
+    this used to double as BOTH the <Dial> action AND statusCallback/
+    statusCallbackEvent, the latter two being silent no-ops on <Dial>
+    itself in Twilio's TwiML schema (see build_forward_response's identical
+    fix) - action is the one that's real. Worse, the caller was pointing
+    this at the generic /media/voice/status-callback, which always returns
+    204 with no TwiML - fine for that route's OTHER use as a genuine fire-
+    and-forget statusCallback (outbound calls placed via place_call), but
+    fatal as an action URL: Twilio expects real TwiML back once the dial
+    resolves, for ANY outcome (busy/no-answer/failed/completed), and a bare
+    204 just ends the call. Confirmed live: a genuinely urgent call
+    forwarded to a human who doesn't pick up was silently disconnected -
+    no voicemail, no retry, no notification - the opposite of the plain
+    forward/ring-group path's dedicated /forward-fallback. Callers now pass
+    a dedicated fallback route (media.receptionist.escalation_fallback)
+    that inspects DialCallStatus and falls back to voicemail.
+
+    recording_callback_url (real gap fix): an escalated call - the AI
+    Receptionist forwarding a HIGH-urgency caller straight to a human - is
+    a live two-way conversation with no other capture mechanism of its
+    own, unlike the pre-escalation Gather utterance (which the
+    ReceptionistCall row already preserves) or a plain voicemail/forward
+    call (each already has its own recording path). Without this, the
+    single call category with the least room for missing a detail - an
+    urgent handoff - was the one call category that was never recorded.
+    Same record="record-from-answer-dual" + recording_status_callback
+    shape as build_ring_group_response, and the caller wires it through
+    the exact same AI_PROCESSING consent gate (should_record_forwarded_
+    call) before ever passing a non-None value here."""
     response = VoiceResponse()
     response.say(message)
     if forward_to:
         dial_kwargs = {}
-        if status_callback_url:
-            dial_kwargs = {
-                "action": status_callback_url,
-                "status_callback": status_callback_url,
-                "status_callback_event": "completed",
-            }
+        if fallback_action_url:
+            dial_kwargs["action"] = fallback_action_url
+        if recording_callback_url:
+            dial_kwargs["record"] = "record-from-answer-dual"
+            dial_kwargs["recording_status_callback"] = recording_callback_url
+            dial_kwargs["recording_status_callback_method"] = "POST"
+            dial_kwargs["recording_status_callback_event"] = "completed"
         response.dial(forward_to, **dial_kwargs)
     else:
         response.hangup()

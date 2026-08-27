@@ -5,8 +5,8 @@ from app.billing.schemas import UsageSummaryResponse
 from app.billing import service as billing_service
 from app.contacts import service as contacts_service
 from app.core.database import get_db
-from app.core.deps import get_api_key_account_id
-from app.core.rate_limit import limiter
+from app.core.deps import get_api_key_account_id, require_entitlement_for_api_key
+from app.core.rate_limit import api_key_or_ip, limiter
 from app.intelligence.models import ConversationSummary
 from app.media import service as media_service
 from app.media.models import CallRecord, Voicemail
@@ -61,9 +61,12 @@ _LIST_LIMIT = 200
 
 
 @router.get("/numbers", response_model=list[PublicNumberResponse])
-@limiter.limit("60/minute")
+@limiter.limit("60/minute", key_func=api_key_or_ip)
 def list_numbers(
-    request: Request, account_id: str = Depends(get_api_key_account_id), db: Session = Depends(get_db)
+    request: Request,
+    account_id: str = Depends(get_api_key_account_id),
+    db: Session = Depends(get_db),
+    _entitlement: str = Depends(require_entitlement_for_api_key("developer.api")),
 ):
     return (
         db.query(PhoneNumber)
@@ -75,9 +78,12 @@ def list_numbers(
 
 
 @router.get("/calls", response_model=list[PublicCallResponse])
-@limiter.limit("60/minute")
+@limiter.limit("60/minute", key_func=api_key_or_ip)
 def list_calls(
-    request: Request, account_id: str = Depends(get_api_key_account_id), db: Session = Depends(get_db)
+    request: Request,
+    account_id: str = Depends(get_api_key_account_id),
+    db: Session = Depends(get_db),
+    _entitlement: str = Depends(require_entitlement_for_api_key("developer.api")),
 ):
     return (
         db.query(CallRecord)
@@ -89,9 +95,12 @@ def list_calls(
 
 
 @router.get("/voicemails", response_model=list[PublicVoicemailResponse])
-@limiter.limit("60/minute")
+@limiter.limit("60/minute", key_func=api_key_or_ip)
 def list_voicemails(
-    request: Request, account_id: str = Depends(get_api_key_account_id), db: Session = Depends(get_db)
+    request: Request,
+    account_id: str = Depends(get_api_key_account_id),
+    db: Session = Depends(get_db),
+    _entitlement: str = Depends(require_entitlement_for_api_key("developer.api")),
 ):
     return (
         db.query(Voicemail)
@@ -103,9 +112,12 @@ def list_voicemails(
 
 
 @router.get("/summaries", response_model=list[PublicSummaryResponse])
-@limiter.limit("60/minute")
+@limiter.limit("60/minute", key_func=api_key_or_ip)
 def list_summaries(
-    request: Request, account_id: str = Depends(get_api_key_account_id), db: Session = Depends(get_db)
+    request: Request,
+    account_id: str = Depends(get_api_key_account_id),
+    db: Session = Depends(get_db),
+    _entitlement: str = Depends(require_entitlement_for_api_key("developer.api")),
 ):
     return (
         db.query(ConversationSummary)
@@ -117,12 +129,13 @@ def list_summaries(
 
 
 @router.post("/calls", response_model=PlaceCallResponse, status_code=status.HTTP_201_CREATED)
-@limiter.limit("20/minute")
+@limiter.limit("20/minute", key_func=api_key_or_ip)
 def place_call(
     request: Request,
     payload: PlaceCallRequest,
     account_id: str = Depends(get_api_key_account_id),
     db: Session = Depends(get_db),
+    _entitlement: str = Depends(require_entitlement_for_api_key("developer.api")),
 ):
     try:
         result = media_service.place_outbound_call_for_account(
@@ -154,20 +167,24 @@ def place_call(
 
 
 @router.get("/contacts", response_model=list[PublicContactResponse])
-@limiter.limit("60/minute")
+@limiter.limit("60/minute", key_func=api_key_or_ip)
 def list_contacts(
-    request: Request, account_id: str = Depends(get_api_key_account_id), db: Session = Depends(get_db)
+    request: Request,
+    account_id: str = Depends(get_api_key_account_id),
+    db: Session = Depends(get_db),
+    _entitlement: str = Depends(require_entitlement_for_api_key("developer.api")),
 ):
     return contacts_service.list_contacts(db, account_id)
 
 
 @router.post("/contacts", response_model=PublicContactResponse, status_code=status.HTTP_201_CREATED)
-@limiter.limit("30/minute")
+@limiter.limit("30/minute", key_func=api_key_or_ip)
 def create_contact(
     request: Request,
     payload: CreateContactRequest,
     account_id: str = Depends(get_api_key_account_id),
     db: Session = Depends(get_db),
+    _entitlement: str = Depends(require_entitlement_for_api_key("developer.api")),
 ):
     return contacts_service.create_contact(
         db, account_id=account_id, user_id=None, name=payload.name, phone_number=payload.phone_number,
@@ -176,9 +193,12 @@ def create_contact(
 
 
 @router.get("/usage", response_model=UsageSummaryResponse)
-@limiter.limit("60/minute")
+@limiter.limit("60/minute", key_func=api_key_or_ip)
 def usage_summary(
-    request: Request, account_id: str = Depends(get_api_key_account_id), db: Session = Depends(get_db)
+    request: Request,
+    account_id: str = Depends(get_api_key_account_id),
+    db: Session = Depends(get_db),
+    _entitlement: str = Depends(require_entitlement_for_api_key("developer.api")),
 ):
     """Read-only - this account's current billing period usage against its
     plan limits, the same data the customer-facing Billing page shows.
@@ -188,20 +208,25 @@ def usage_summary(
 
 
 @router.get("/webhooks", response_model=list[WebhookEndpointResponse])
-@limiter.limit("60/minute")
+@limiter.limit("60/minute", key_func=api_key_or_ip)
 def list_webhooks(
-    request: Request, account_id: str = Depends(get_api_key_account_id), db: Session = Depends(get_db)
+    request: Request,
+    account_id: str = Depends(get_api_key_account_id),
+    db: Session = Depends(get_db),
+    _entitlement: str = Depends(require_entitlement_for_api_key("developer.api")),
 ):
     return webhooks_service.list_endpoints(db, account_id)
 
 
 @router.post("/webhooks", response_model=WebhookEndpointCreatedResponse, status_code=status.HTTP_201_CREATED)
-@limiter.limit("10/minute")
+@limiter.limit("10/minute", key_func=api_key_or_ip)
 def create_webhook(
     request: Request,
     payload: CreateWebhookEndpointRequest,
     account_id: str = Depends(get_api_key_account_id),
     db: Session = Depends(get_db),
+    _entitlement: str = Depends(require_entitlement_for_api_key("developer.api")),
+    _webhooks_entitlement: str = Depends(require_entitlement_for_api_key("developer.webhooks")),
 ):
     try:
         endpoint, secret = webhooks_service.create_endpoint(
@@ -219,12 +244,13 @@ def create_webhook(
 
 
 @router.delete("/webhooks/{endpoint_id}", status_code=status.HTTP_204_NO_CONTENT)
-@limiter.limit("10/minute")
+@limiter.limit("10/minute", key_func=api_key_or_ip)
 def delete_webhook(
     request: Request,
     endpoint_id: str,
     account_id: str = Depends(get_api_key_account_id),
     db: Session = Depends(get_db),
+    _entitlement: str = Depends(require_entitlement_for_api_key("developer.api")),
 ):
     try:
         webhooks_service.delete_endpoint(
@@ -235,11 +261,12 @@ def delete_webhook(
 
 
 @router.get("/webhooks/deliveries", response_model=list[WebhookDeliveryResponse])
-@limiter.limit("60/minute")
+@limiter.limit("60/minute", key_func=api_key_or_ip)
 def list_webhook_deliveries(
     request: Request,
     endpoint_id: str | None = None,
     account_id: str = Depends(get_api_key_account_id),
     db: Session = Depends(get_db),
+    _entitlement: str = Depends(require_entitlement_for_api_key("developer.api")),
 ):
     return webhooks_service.list_deliveries(db, account_id=account_id, endpoint_id=endpoint_id)

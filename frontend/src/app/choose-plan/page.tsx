@@ -6,6 +6,7 @@ import {
   listPlans,
   getPriceCatalogEntry,
   changeSubscriptionPlan,
+  createPlanChangeCheckoutSession,
   ApiError,
   type Plan,
   type PriceCatalogEntry,
@@ -120,6 +121,18 @@ export default function ChoosePlanPage() {
     setChoosing(planCode);
     setChooseError(null);
     try {
+      const entry = prices[planCode];
+      const requiresPayment = !!entry && !entry.is_placeholder && entry.amount_minor_units > 0;
+      if (requiresPayment) {
+        // Same real-money gate as dashboard/billing's handleChangePlan -
+        // a paid plan must go through Stripe's hosted Checkout page before
+        // its entitlements apply, not switch locally for free. The plan
+        // only changes once Stripe confirms payment via
+        // /billing/stripe/checkout-webhook, not on this click.
+        const session = await createPlanChangeCheckoutSession(token, planCode, billingPeriod);
+        window.location.href = session.url;
+        return;
+      }
       await changeSubscriptionPlan(token, planCode, billingPeriod);
       router.push("/dashboard");
     } catch (err) {

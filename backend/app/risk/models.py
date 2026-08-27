@@ -70,6 +70,29 @@ class RiskSignalType(str, enum.Enum):
     # call must always get a TwiML response, so hitting this cap skips AI
     # enrichment rather than failing the call.
     AI_RECEPTIONIST_TRIAL_CAP_EXCEEDED = "ai_receptionist_trial_cap_exceeded"
+    # Commercial Billing Operating Standard doc §32 "Fraud/abuse" row's
+    # "repeated number acquisition" category - an account reserving/
+    # purchasing numbers unusually fast in a trailing window, distinct from
+    # SPEND_LIMIT_EXCEEDED (which caps call cost, not number count) and
+    # from Plan.max_numbers (a hard entitlement cap, not a velocity signal -
+    # a paid plan allowing 20 numbers can still burn through them
+    # suspiciously fast). See assert_number_acquisition_velocity_ok.
+    # Conservative first-pass threshold, not a tuned model - same caveat as
+    # every other signal in this file.
+    REPEATED_NUMBER_ACQUISITION = "repeated_number_acquisition"
+    # Same doc §32 row's "suspicious CLI changes" category - an account
+    # changing its verified caller identity unusually often. A legitimate
+    # business rarely re-verifies its outbound caller ID; a compromised
+    # account probing for a caller ID that passes spam-detection is a real
+    # pattern this doc names explicitly. See assert_caller_id_change_velocity_ok.
+    CALLER_ID_CHANGE_PATTERN = "caller_id_change_pattern"
+    # Same doc §32 row's "account takeover indicators" - distinct from
+    # DEVICE_FINGERPRINT_ABUSE (one device touching many NEW accounts,
+    # the signup/quota-farming pattern) - this is the opposite shape: a
+    # login to one already-ESTABLISHED account from a fingerprint that
+    # account has never been associated with before. See
+    # check_fingerprint_on_login's extended detection.
+    ACCOUNT_TAKEOVER_INDICATOR = "account_takeover_indicator"
 
 
 class AccountRiskState(str, enum.Enum):
@@ -211,6 +234,10 @@ class AccountKillSwitch(Base):
     activated_by: Mapped[str | None] = mapped_column(String(100), nullable=True)
     activated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     deactivated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Same "time-bounded override" requirement (Commercial Billing
+    # Operating Standard doc §U2) as PlatformKillSwitch.expires_at - see
+    # that column's docstring.
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 

@@ -99,6 +99,16 @@ class ChangePlanRequest(BaseModel):
     billing_period: str = "monthly"
 
 
+class PlanChangeCheckoutSessionResponse(BaseModel):
+    """Real Stripe-hosted Checkout Session for a plan upgrade - unlike
+    numbering.numbers.schemas.CheckoutSessionResponse (id/url always None,
+    kept only for old-client compatibility), both fields here are always
+    populated: the frontend must redirect the browser to `url`."""
+
+    id: str
+    url: str
+
+
 class CancelSubscriptionRequest(BaseModel):
     reason: str | None = None
 

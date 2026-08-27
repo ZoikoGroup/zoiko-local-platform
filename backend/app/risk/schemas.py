@@ -61,11 +61,13 @@ class AccountKillSwitchResponse(BaseModel):
     activated_by: str | None
     activated_at: datetime | None
     deactivated_at: datetime | None
+    expires_at: datetime | None
     created_at: datetime
 
 
 class SetAccountKillSwitchRequest(BaseModel):
     reason: str | None = None
+    expires_at: datetime | None = None
 
 
 class FraudRuleResponse(BaseModel):

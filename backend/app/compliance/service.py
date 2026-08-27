@@ -362,7 +362,25 @@ def get_document_download_url(case: ComplianceCase, document_index: int) -> str:
     return storage.generate_presigned_url(storage_key)
 
 
+class ComplianceCaseAlreadyDecidedError(Exception):
+    """Raised by approve_case/reject_case when the case isn't PENDING -
+    APPROVED/REJECTED/EXPIRED are all terminal decisions (same "only
+    PENDING cases are in scope" rule expire_overdue_cases already applies).
+    Real gap fix: neither function used to check this at all, unlike
+    every sibling resolver in this codebase (resolve_erasure_request
+    checks status != PENDING, resolve_fraud_case checks status != OPEN) -
+    Stripe redelivering the same identity.verification_session.verified
+    webhook (a documented Stripe behavior) re-ran approve_case a second
+    time, re-publishing Kafka events, re-sending the approval email, and
+    re-running the risk step-up; a stray double-click or an out-of-order
+    webhook could also silently reverse an already-REJECTED case."""
+
+
 def approve_case(db: Session, case: ComplianceCase, *, actor: str) -> ComplianceCase:
+    if case.status != ComplianceCaseStatus.PENDING:
+        raise ComplianceCaseAlreadyDecidedError(
+            f"Case {case.id} is already {case.status.value} - cannot approve a case that isn't pending"
+        )
     before_status = case.status
     case.status = ComplianceCaseStatus.APPROVED
     db.commit()
@@ -402,6 +420,10 @@ def approve_case(db: Session, case: ComplianceCase, *, actor: str) -> Compliance
 
 
 def reject_case(db: Session, case: ComplianceCase, *, actor: str, reason: str | None = None) -> ComplianceCase:
+    if case.status != ComplianceCaseStatus.PENDING:
+        raise ComplianceCaseAlreadyDecidedError(
+            f"Case {case.id} is already {case.status.value} - cannot reject a case that isn't pending"
+        )
     before_status = case.status
     case.status = ComplianceCaseStatus.REJECTED
     db.commit()
@@ -531,6 +553,16 @@ def handle_stripe_identity_webhook(
     case = db.query(ComplianceCase).filter(ComplianceCase.kyc_inquiry_id == session_id).first()
     if case is None:
         return None
+
+    # Idempotent against Stripe's own documented webhook-redelivery
+    # behavior - a second delivery of the same completed/failed event must
+    # not re-approve/re-reject (re-publishing Kafka events, re-sending the
+    # notification email, re-running the risk step-up) a case this webhook
+    # already decided. Not an error worth surfacing to Stripe as a
+    # failure (which would just trigger more retries) - the case is
+    # already in the state this event asked for.
+    if case.status != ComplianceCaseStatus.PENDING:
+        return case
 
     if status in _APPROVING_STATUSES:
         return approve_case(db, case, actor="stripe_identity_webhook")

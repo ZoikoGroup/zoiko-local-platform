@@ -184,7 +184,14 @@ def test_suspending_a_number_with_a_reason_includes_it_in_the_notification(clien
     assert any("Suspicious call volume" in record.message for record in caplog.records)
 
 
-def _add_member(client, admin_headers, email: str) -> str:
+def _add_member(client, db_session, admin_headers, email: str) -> str:
+    # Real gap fix (ZL-COM-ENT-001): adding a team member now requires
+    # team.members.enabled (Business+) - see app.billing.service.
+    # assert_entitlement in add_team_member.
+    from app.billing import service as billing_service
+
+    admin_account_id = client.get("/auth/me", headers=admin_headers).json()["account_id"]
+    billing_service.change_plan(db_session, admin_account_id, "business", actor="test-setup")
     response = client.post(
         "/team/members",
         json={"email": email, "password": "supersecret123", "role": "member"},
@@ -194,14 +201,14 @@ def _add_member(client, admin_headers, email: str) -> str:
     return response.json()["id"]
 
 
-def test_member_only_sees_numbers_assigned_to_them(client, monkeypatch):
+def test_member_only_sees_numbers_assigned_to_them(client, db_session, monkeypatch):
     _stub_buy_number(monkeypatch)
     owner_token = _signup_and_login(client, "assignowner1@example.com")
     owner_headers = {"Authorization": f"Bearer {owner_token}"}
     _reserve(client, owner_headers, "+15550002222")
     client.post("/numbers/purchase", json={"e164": "+15550002222"}, headers=owner_headers)
 
-    member_id = _add_member(client, owner_headers, "assignmember1@example.com")
+    member_id = _add_member(client, db_session, owner_headers, "assignmember1@example.com")
     member_token = client.post(
         "/auth/login", json={"email": "assignmember1@example.com", "password": "supersecret123"}
     ).json()["access_token"]
@@ -224,14 +231,14 @@ def test_member_only_sees_numbers_assigned_to_them(client, monkeypatch):
     assert [n["e164"] for n in owner_listed] == ["+15550002222"]
 
 
-def test_member_cannot_manage_a_number_not_assigned_to_them(client, monkeypatch):
+def test_member_cannot_manage_a_number_not_assigned_to_them(client, db_session, monkeypatch):
     _stub_buy_number(monkeypatch)
     owner_token = _signup_and_login(client, "assignowner2@example.com")
     owner_headers = {"Authorization": f"Bearer {owner_token}"}
     _reserve(client, owner_headers, "+15550003333")
     client.post("/numbers/purchase", json={"e164": "+15550003333"}, headers=owner_headers)
 
-    _add_member(client, owner_headers, "assignmember2@example.com")
+    _add_member(client, db_session, owner_headers, "assignmember2@example.com")
     member_token = client.post(
         "/auth/login", json={"email": "assignmember2@example.com", "password": "supersecret123"}
     ).json()["access_token"]
@@ -242,14 +249,14 @@ def test_member_cannot_manage_a_number_not_assigned_to_them(client, monkeypatch)
     assert "not assigned to you" in response.json()["detail"]
 
 
-def test_member_can_manage_a_number_once_assigned_to_them(client, monkeypatch):
+def test_member_can_manage_a_number_once_assigned_to_them(client, db_session, monkeypatch):
     _stub_buy_number(monkeypatch)
     owner_token = _signup_and_login(client, "assignowner3@example.com")
     owner_headers = {"Authorization": f"Bearer {owner_token}"}
     _reserve(client, owner_headers, "+15550004444")
     client.post("/numbers/purchase", json={"e164": "+15550004444"}, headers=owner_headers)
 
-    member_id = _add_member(client, owner_headers, "assignmember3@example.com")
+    member_id = _add_member(client, db_session, owner_headers, "assignmember3@example.com")
     client.put("/numbers/+15550004444/assign", json={"user_id": member_id}, headers=owner_headers)
 
     member_token = client.post(
@@ -262,14 +269,14 @@ def test_member_can_manage_a_number_once_assigned_to_them(client, monkeypatch):
     assert response.json()["status"] == "suspended"
 
 
-def test_member_cannot_assign_numbers(client, monkeypatch):
+def test_member_cannot_assign_numbers(client, db_session, monkeypatch):
     _stub_buy_number(monkeypatch)
     owner_token = _signup_and_login(client, "assignowner4@example.com")
     owner_headers = {"Authorization": f"Bearer {owner_token}"}
     _reserve(client, owner_headers, "+15550005555")
     client.post("/numbers/purchase", json={"e164": "+15550005555"}, headers=owner_headers)
 
-    member_id = _add_member(client, owner_headers, "assignmember4@example.com")
+    member_id = _add_member(client, db_session, owner_headers, "assignmember4@example.com")
     member_token = client.post(
         "/auth/login", json={"email": "assignmember4@example.com", "password": "supersecret123"}
     ).json()["access_token"]
@@ -800,7 +807,12 @@ def test_checkout_session_is_free_for_a_second_number_on_a_two_seat_account(clie
     count, not a flat 1-per-account regardless of team size (see
     billing_service.get_included_number_ids). A 2-seat account gets 2 free
     numbers; a 3rd would still be charged, same as the single-seat case
-    above."""
+    above. Uses "business" (not "starter" as this test originally did) -
+    ZL-COM-ENT-001 §15 specs Starter as a flat 1/workspace regardless of
+    seat count, unlike Business/Pro/Scale's explicit 1-per-paid-user - and
+    separately, Starter no longer grants team.members.enabled at all
+    (§7), so a 2-seat Starter account isn't reachable through the real
+    add-team-member flow any more either."""
     from app.billing import service as billing_service
     from app.billing.models import PendingAccountCharge
 
@@ -817,7 +829,7 @@ def test_checkout_session_is_free_for_a_second_number_on_a_two_seat_account(clie
     token = _signup_and_login(client, "twoseatnumbers@example.com", account_type="business")
     headers = {"Authorization": f"Bearer {token}"}
     account_id = client.get("/auth/me", headers=headers).json()["account_id"]
-    billing_service.change_plan(db_session, account_id, "starter", actor="test-actor")
+    billing_service.change_plan(db_session, account_id, "business", actor="test-actor")
 
     added = client.post(
         "/team/members",

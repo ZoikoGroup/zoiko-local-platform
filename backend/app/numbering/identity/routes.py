@@ -157,7 +157,16 @@ def mfa_disable(
 @router.post("/google", response_model=TokenResponse)
 def google_auth(payload: GoogleAuthRequest, db: Session = Depends(get_db)):
     claims = verify_google_id_token(payload.credential)
-    if claims is None or not claims.get("email"):
+    # email_verified, not just the presence of an email claim - Google's ID
+    # tokens can carry an email Google itself hasn't confirmed the holder
+    # actually owns (real for some Workspace/legacy configurations).
+    # find_or_create_user_from_google matches an EXISTING account purely by
+    # email, so skipping this check would let anyone who can get Google to
+    # issue them a token containing a victim's (unverified) email log in as
+    # that victim's real, already-registered account - a genuine account-
+    # takeover path, not a theoretical one, and exactly what this claim
+    # exists to guard against per Google's own ID-token verification docs.
+    if claims is None or not claims.get("email") or not claims.get("email_verified"):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid Google credential")
 
     user, is_new_account = service.find_or_create_user_from_google(db, claims["email"], claims.get("name"))

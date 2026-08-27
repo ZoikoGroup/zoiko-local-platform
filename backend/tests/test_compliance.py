@@ -132,11 +132,17 @@ def _add_member(client, admin_headers, email: str) -> str:
     return response.json()["id"]
 
 
-def test_plain_member_cannot_open_a_compliance_case(client):
+def test_plain_member_cannot_open_a_compliance_case(client, db_session):
     """Opening a KYC case is an account-wide legal decision - Owner/Admin
     only, same reasoning as AI-processing consent."""
+    from app.billing import service as billing_service
+
     owner_token = _signup_and_login(client, "membercompowner@example.com")
     owner_headers = {"Authorization": f"Bearer {owner_token}"}
+    # Real gap fix (ZL-COM-ENT-001): adding a team member now requires
+    # team.members.enabled (Business+).
+    owner_account_id = client.get("/auth/me", headers=owner_headers).json()["account_id"]
+    billing_service.change_plan(db_session, owner_account_id, "business", actor="test-setup")
     _add_member(client, owner_headers, "membercompmember@example.com")
 
     member_token = client.post(

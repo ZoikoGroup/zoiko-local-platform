@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 from app.analytics import service
 from app.analytics.schemas import AnalyticsOverviewResponse
 from app.core.database import get_db
-from app.core.deps import require_admin
+from app.core.deps import require_admin, require_entitlement
 from app.numbering.identity.models import User
 
 router = APIRouter(prefix="/analytics", tags=["analytics"])
@@ -19,6 +19,7 @@ def get_overview(
     days: int = Query(service.DEFAULT_RANGE_DAYS, ge=1, le=service.MAX_RANGE_DAYS),
     db: Session = Depends(get_db),
     current_user: User = Depends(require_admin),
+    _entitlement: User = Depends(require_entitlement("reporting.advanced")),
 ):
     # Owner/Admin only - same sensitivity as usage/routes.py's list_usage,
     # this is account-wide business activity, not a per-user view.
@@ -30,6 +31,7 @@ def export_csv(
     days: int = Query(service.DEFAULT_RANGE_DAYS, ge=1, le=service.MAX_RANGE_DAYS),
     db: Session = Depends(get_db),
     current_user: User = Depends(require_admin),
+    _entitlement: User = Depends(require_entitlement("reporting.advanced")),
 ):
     overview = service.get_overview(db, current_user.account_id, days)
 

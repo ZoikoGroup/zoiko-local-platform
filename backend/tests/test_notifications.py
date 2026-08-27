@@ -110,6 +110,10 @@ def test_send_email_raises_cleanly_on_resend_failure(monkeypatch):
     from app.integrations.notifications.email import EmailError, send_email
 
     monkeypatch.setattr("app.core.config.settings.resend_api_key", "re_fake_invalid_key_for_test")
+    # This test exercises the real-send Resend error path directly, which
+    # the environment-isolation guard (A-46) would otherwise short-circuit
+    # to log-mode in the default "development" test environment.
+    monkeypatch.setattr("app.core.config.settings.environment", "production")
 
     def _raise(*args, **kwargs):
         raise httpx.ConnectError("simulated network failure")
@@ -1184,9 +1188,15 @@ def test_put_preferences_rejects_invalid_timezone(client):
     assert response.status_code == 422
 
 
-def test_put_preferences_forbidden_for_viewer(client):
+def test_put_preferences_forbidden_for_viewer(client, db_session):
+    from app.billing import service as billing_service
+
     owner_token = _signup_and_login_owner(client, "prefsrouteviewer@example.com")
     owner_headers = {"Authorization": f"Bearer {owner_token}"}
+    # Real gap fix (ZL-COM-ENT-001): adding a team member now requires
+    # team.members.enabled (Business+).
+    owner_account_id = client.get("/auth/me", headers=owner_headers).json()["account_id"]
+    billing_service.change_plan(db_session, owner_account_id, "business", actor="test-setup")
     client.post(
         "/team/members",
         json={"email": "prefsrouteviewermember@example.com", "password": "supersecret123", "role": "viewer"},

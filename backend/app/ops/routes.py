@@ -247,7 +247,7 @@ def activate_kill_switch(
     (Commercial Billing Operating Standard doc §32.1). Does not touch
     activity already in flight or destroy any existing customer evidence -
     see PlatformKillSwitch's docstring."""
-    return service.set_kill_switch(db, scope, True, actor=staff.id, reason=payload.reason)
+    return service.set_kill_switch(db, scope, True, actor=staff.id, reason=payload.reason, expires_at=payload.expires_at)
 
 
 @router.post("/kill-switches/{scope}/deactivate", response_model=KillSwitchResponse)

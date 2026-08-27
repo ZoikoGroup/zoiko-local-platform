@@ -13,6 +13,7 @@ from app.numbering.numbers.schemas import (
     ResolveNumberEligibilityCaseRequest,
     SetMarketActivationStatusRequest,
     SupportedCountryResponse,
+    UpdateCountryRegistryFieldsRequest,
     UpsertNumberEligibilityRuleRequest,
     UpsertSupportedCountryRequest,
 )
@@ -38,6 +39,7 @@ from app.numbering.numbers.service import (
     revoke_caller_identity,
     seed_market_release_registry,
     set_market_activation_status,
+    update_country_registry_fields,
     upsert_number_eligibility_rule,
     upsert_supported_country,
 )
@@ -46,6 +48,8 @@ from app.staff.models import PlatformStaff, PlatformStaffRole
 from app.staff.schemas import (
     AccessMatrixEntryResponse,
     AccountOverviewResponse,
+    SetAccountLegalHoldRequest,
+    SetAccountTestFlagRequest,
     StaffLoginRequest,
     StaffTokenResponse,
     UpdateAccountBillingClassificationRequest,
@@ -118,6 +122,48 @@ def update_account_billing_classification(
         )
     except service.AccountNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
+
+    return service.get_account_overview(db, account_id)
+
+
+@router.put("/accounts/{account_id}/test-flag", response_model=AccountOverviewResponse)
+def set_account_test_flag(
+    account_id: str,
+    payload: SetAccountTestFlagRequest,
+    db: Session = Depends(get_db),
+    staff: PlatformStaff = Depends(require_capability("accounts.manage_test_flag")),
+):
+    """Flags/unflags an account is_test - lets it bypass the CONTROLLED_BETA/
+    INTERNAL_TEST market-activation gate for testing purchases, at the cost
+    of also being blocked from real Stripe/ZoikoNex billing while flagged.
+    SUPER_ADMIN-only (see the accounts.manage_test_flag grant) - a
+    platform-wide decision, not a routine support action."""
+    try:
+        service.set_account_test_flag(
+            db, account_id, is_test=payload.is_test, actor=staff.id, reason=payload.reason,
+        )
+    except service.AccountNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
+
+    return service.get_account_overview(db, account_id)
+
+
+@router.put("/accounts/{account_id}/legal-hold", response_model=AccountOverviewResponse)
+def set_account_legal_hold(
+    account_id: str,
+    payload: SetAccountLegalHoldRequest,
+    db: Session = Depends(get_db),
+    staff: PlatformStaff = Depends(require_capability("accounts.manage_legal_hold")),
+):
+    """SUPER_ADMIN-only. Architecture doc §10 "legal hold model" - while
+    active, blocks app.retention.service's purge sweeps from deleting this
+    account's recordings/voicemail regardless of retention-window expiry."""
+    try:
+        service.set_account_legal_hold(db, account_id, on=payload.on, reference=payload.reference, actor=staff.id)
+    except service.AccountNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
+    except service.LegalHoldRequiresReferenceError as e:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e)) from e
 
     return service.get_account_overview(db, account_id)
 
@@ -244,14 +290,14 @@ def list_calling_rates_route(
 def upsert_calling_rate_route(
     payload: UpsertCallingRateRequest,
     db: Session = Depends(get_db),
-    _staff: PlatformStaff = Depends(require_capability("billing.manage_calling_rates")),
+    staff: PlatformStaff = Depends(require_capability("billing.manage_calling_rates")),
 ):
     # SUPER_ADMIN only (via the matrix) - pricing changes are a platform-
     # wide decision, not a routine support action like the recovery
     # endpoints above.
     return upsert_calling_rate(
         db, country=payload.country, price_per_minute_cents=payload.price_per_minute_cents,
-        currency=payload.currency,
+        currency=payload.currency, destination_country=payload.destination_country, actor=staff.id,
     )
 
 
@@ -267,14 +313,14 @@ def list_number_rates_route(
 def upsert_number_rate_route(
     payload: UpsertNumberRateRequest,
     db: Session = Depends(get_db),
-    _staff: PlatformStaff = Depends(require_capability("billing.manage_number_rates")),
+    staff: PlatformStaff = Depends(require_capability("billing.manage_number_rates")),
 ):
     # SUPER_ADMIN only (via the matrix) - same pricing-decision bar as
     # calling-rates above.
     return upsert_number_rate(
         db, country=payload.country, number_type=payload.number_type,
         recurring_price_cents=payload.recurring_price_cents, currency=payload.currency,
-        is_placeholder=payload.is_placeholder,
+        is_placeholder=payload.is_placeholder, actor=staff.id,
     )
 
 
@@ -290,11 +336,11 @@ def get_ai_usage_rate_route(
 def upsert_ai_usage_rate_route(
     payload: UpsertAIUsageRateRequest,
     db: Session = Depends(get_db),
-    _staff: PlatformStaff = Depends(require_capability("billing.manage_ai_usage_rates")),
+    staff: PlatformStaff = Depends(require_capability("billing.manage_ai_usage_rates")),
 ):
     return upsert_ai_usage_rate(
         db, overage_price_cents_per_minute=payload.overage_price_cents_per_minute,
-        currency=payload.currency, is_placeholder=payload.is_placeholder,
+        currency=payload.currency, is_placeholder=payload.is_placeholder, actor=staff.id,
     )
 
 
@@ -310,13 +356,13 @@ def list_supported_countries_route(
 def upsert_supported_country_route(
     payload: UpsertSupportedCountryRequest,
     db: Session = Depends(get_db),
-    _staff: PlatformStaff = Depends(require_capability("numbers.manage_country_list")),
+    staff: PlatformStaff = Depends(require_capability("numbers.manage_country_list")),
 ):
     # SUPER_ADMIN only - expanding the launch country list is a compliance/
     # commercial decision, same bar as a calling-rate change above.
     return upsert_supported_country(
         db, code=payload.code, name=payload.name, sort_order=payload.sort_order,
-        emergency_calling_supported=payload.emergency_calling_supported,
+        emergency_calling_supported=payload.emergency_calling_supported, actor=staff.id,
     )
 
 
@@ -324,9 +370,9 @@ def upsert_supported_country_route(
 def remove_supported_country_route(
     code: str,
     db: Session = Depends(get_db),
-    _staff: PlatformStaff = Depends(require_capability("numbers.manage_country_list")),
+    staff: PlatformStaff = Depends(require_capability("numbers.manage_country_list")),
 ):
-    remove_supported_country(db, code)
+    remove_supported_country(db, code, actor=staff.id)
     return None
 
 
@@ -358,6 +404,29 @@ def set_market_activation_status_route(
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e)) from e
 
 
+@router.put("/countries/{code}/registry-fields", response_model=SupportedCountryResponse)
+def update_country_registry_fields_route(
+    code: str,
+    payload: UpdateCountryRegistryFieldsRequest,
+    db: Session = Depends(get_db),
+    staff: PlatformStaff = Depends(require_capability("numbers.manage_country_list")),
+):
+    """Commercial Billing Operating Standard doc §34 registry dimensions -
+    same SUPER_ADMIN bar as every other registry mutation on this table."""
+    try:
+        return update_country_registry_fields(
+            db, code,
+            customer_type_restrictions=payload.customer_type_restrictions,
+            porting_supported=payload.porting_supported,
+            recording_consent_basis=payload.recording_consent_basis,
+            payments_enabled=payload.payments_enabled,
+            marketing_claims_approved=payload.marketing_claims_approved,
+            actor=staff.id,
+        )
+    except UnsupportedCountryError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
+
+
 @router.get("/number-eligibility-rules", response_model=list[NumberEligibilityRuleResponse])
 def list_number_eligibility_rules_route(
     db: Session = Depends(get_db),
@@ -370,7 +439,7 @@ def list_number_eligibility_rules_route(
 def upsert_number_eligibility_rule_route(
     payload: UpsertNumberEligibilityRuleRequest,
     db: Session = Depends(get_db),
-    _staff: PlatformStaff = Depends(require_capability("numbers.manage_eligibility_rules")),
+    staff: PlatformStaff = Depends(require_capability("numbers.manage_eligibility_rules")),
 ):
     # SUPER_ADMIN only - deciding a market/number-type needs an eligibility
     # case at all is a compliance/commercial decision, same bar as the
@@ -380,7 +449,7 @@ def upsert_number_eligibility_rule_route(
         required_evidence=payload.required_evidence, is_active=payload.is_active,
         emergency_calling_supported=payload.emergency_calling_supported,
         recording_supported=payload.recording_supported,
-        allowed_calling_directions=payload.allowed_calling_directions,
+        allowed_calling_directions=payload.allowed_calling_directions, actor=staff.id,
     )
 
 
@@ -388,22 +457,21 @@ def upsert_number_eligibility_rule_route(
 def remove_number_eligibility_rule_route(
     rule_id: str,
     db: Session = Depends(get_db),
-    _staff: PlatformStaff = Depends(require_capability("numbers.manage_eligibility_rules")),
+    staff: PlatformStaff = Depends(require_capability("numbers.manage_eligibility_rules")),
 ):
-    remove_number_eligibility_rule(db, rule_id)
+    remove_number_eligibility_rule(db, rule_id, actor=staff.id)
 
 
 @router.post("/number-eligibility-rules/seed-market-registry", response_model=list[NumberEligibilityRuleResponse])
 def seed_market_release_registry_route(
     db: Session = Depends(get_db),
-    _staff: PlatformStaff = Depends(require_capability("numbers.manage_eligibility_rules")),
+    staff: PlatformStaff = Depends(require_capability("numbers.manage_eligibility_rules")),
 ):
     """Commercial Billing Operating Standard P0-2 - seeds a market/release
     registry row for every currently-supported country's 'local' numbers.
     Idempotent, safe to re-run after a new country is added to the
     supported list."""
-    return seed_market_release_registry(db)
-    return None
+    return seed_market_release_registry(db, actor=staff.id)
 
 
 @router.get("/number-eligibility-cases", response_model=list[NumberEligibilityCaseResponse])

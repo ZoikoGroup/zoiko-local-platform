@@ -17,7 +17,22 @@ can key off the exit code without parsing log output.
 expire_overdue_cases and purge_expired_recordings both existed with no
 scheduler calling them (see their own docstrings) - this is that scheduler.
 Nothing new was built for it; this reuses the one daily job slot that
-already existed for reconciliation/renewals.
+already existed for reconciliation/renewals. expire_overdue_kill_switches
+(Commercial Billing Operating Standard doc §U2 "time-bounded overrides")
+was added to this same slot when kill switches gained an expires_at.
+
+flush_pending_outbox_events (real gap fix) existed with no scheduler
+either - it was only reachable via a manual staff endpoint
+(POST /ops/event-outbox/flush), so a row could sit unpublished
+indefinitely if nobody happened to trigger it. Drained in a loop (its own
+batch_size defaults to 100) up to _MAX_OUTBOX_FLUSH_BATCHES per run - a
+safety cap against one bad run spending unbounded time on the outbox, not
+a claim that backlog beyond that cap is expected; genuinely exceeding it
+would show up in the checked/published counts logged below.
+
+sync_all_pending_eligibility_cases (Twilio Regulatory Bundle KYC) is the
+scheduled fallback for the customer-triggered "check status" button - an
+approval/rejection isn't missed just because nobody came back to check.
 """
 
 import logging
@@ -26,9 +41,13 @@ import sys
 from app.billing.service import run_zoikonex_reconciliation
 from app.compliance.service import expire_overdue_cases
 from app.core.database import SessionLocal
+from app.events.service import flush_pending_outbox_events
 from app.media.service import sweep_stale_video_recordings
-from app.numbering.numbers.service import list_due_renewals
+from app.numbering.numbers.service import list_due_renewals, sync_all_pending_eligibility_cases
+from app.ops.service import expire_overdue_kill_switches
 from app.retention.service import purge_expired_recordings
+
+_MAX_OUTBOX_FLUSH_BATCHES = 50
 
 logger = logging.getLogger("zoiko.ops.reconciliation")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -62,6 +81,12 @@ def main() -> int:
         expired = expire_overdue_cases(db)
         logger.info("compliance_cases_expired count=%d", expired["expired"])
 
+        expired_switches = expire_overdue_kill_switches(db)
+        logger.info(
+            "kill_switches_expired platform=%d account=%d",
+            expired_switches["platform"], expired_switches["account"],
+        )
+
         purged = purge_expired_recordings(db)
         total_failed = sum(bucket["failed"] for bucket in purged.values())
         logger.info(
@@ -73,6 +98,30 @@ def main() -> int:
 
         swept = sweep_stale_video_recordings(db)
         logger.info("stale_video_recordings_swept count=%d", swept["swept"])
+
+        # sync_number_eligibility_bundle_status only fires when a customer
+        # clicks "check status" - this is the automated fallback (see that
+        # function's docstring) so a Twilio approval/rejection is never
+        # missed just because nobody came back to check.
+        eligibility = sync_all_pending_eligibility_cases(db)
+        logger.info(
+            "eligibility_cases_synced checked=%d approved=%d rejected=%d still_pending=%d failed=%d",
+            eligibility["checked"], eligibility["approved"], eligibility["rejected"],
+            eligibility["still_pending"], eligibility["failed"],
+        )
+        if eligibility["failed"] > 0:
+            exit_code = 1
+
+        outbox_published = outbox_failed = 0
+        for _ in range(_MAX_OUTBOX_FLUSH_BATCHES):
+            result = flush_pending_outbox_events(db)
+            outbox_published += result["published"]
+            outbox_failed += result["failed"]
+            if result["checked"] == 0:
+                break
+        logger.info("event_outbox_flushed published=%d failed=%d", outbox_published, outbox_failed)
+        if outbox_failed > 0:
+            exit_code = 1
     except Exception:
         logger.exception("scheduled_reconciliation run failed")
         exit_code = 1

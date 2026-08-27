@@ -3,7 +3,11 @@ from sqlalchemy.orm import Session
 
 from app.audit.service import log_event
 from app.core.security import hash_password, verify_password
-from app.events.service import publish_account_billing_classification_updated
+from app.events.service import (
+    publish_account_billing_classification_updated,
+    publish_capability_granted,
+    publish_capability_revoked,
+)
 from app.numbering.identity.models import Account, User, UserRole
 from app.numbering.numbers.models import PhoneNumber
 from app.numbering.numbers.service import list_due_renewals as _list_due_renewals
@@ -16,6 +20,11 @@ from app.staff.models import PlatformStaff, PlatformStaffRole, StaffCapabilityGr
 # access instead of the UI meant to make this a data change, not a
 # redeploy.
 MATRIX_MANAGEMENT_CAPABILITY = "staff.manage_capabilities"
+
+# Computed once at import time - see authenticate_staff's docstring for why
+# this needs to exist at all (same rationale as identity/service.py's
+# _DUMMY_PASSWORD_HASH_FOR_TIMING_SAFETY).
+_DUMMY_PASSWORD_HASH_FOR_TIMING_SAFETY = hash_password("zoiko-local-timing-safety-dummy")
 
 
 class LastGrantRemovalError(Exception):
@@ -39,9 +48,49 @@ def create_staff(db: Session, email: str, password: str, role: PlatformStaffRole
     return staff
 
 
+def bootstrap_initial_super_admin(db: Session) -> PlatformStaff | None:
+    """Called once from main.py's lifespan startup, every boot. app.seed
+    refuses to run outside development on purpose (it hardcodes real
+    checked-into-repo demo credentials) - which left production/staging
+    with genuinely no way to create the first staff account at all
+    (platform_staff has no public signup route by design, see routes.py's
+    top-of-file comment). This is that missing bootstrap: idempotent
+    (no-ops the instant any staff row exists, so it's safe to call on
+    every restart) and driven entirely by operator-supplied env vars
+    (INITIAL_SUPER_ADMIN_EMAIL/_PASSWORD) rather than a hardcoded
+    password, so it can run in any environment without becoming a
+    standing backdoor. Returns None (does nothing) if either env var is
+    unset, or if a staff account already exists."""
+    if db.query(PlatformStaff).first() is not None:
+        return None
+    from app.core.config import settings
+
+    email = settings.initial_super_admin_email
+    password = settings.initial_super_admin_password
+    if not email or not password:
+        return None
+
+    staff = create_staff(db, email=email, password=password, role=PlatformStaffRole.SUPER_ADMIN)
+    log_event(
+        db, actor="system_bootstrap", action="staff.bootstrapped", target=f"platform_staff:{staff.id}",
+        after={"email": email, "role": PlatformStaffRole.SUPER_ADMIN.value},
+    )
+    return staff
+
+
 def authenticate_staff(db: Session, email: str, password: str) -> PlatformStaff | None:
+    """Always runs verify_password against SOMETHING - a real hash, or
+    _DUMMY_PASSWORD_HASH_FOR_TIMING_SAFETY for a nonexistent/inactive staff
+    account - rather than short-circuiting before ever calling it. Without
+    this, a login attempt for an email that isn't a staff account (or is
+    deactivated) returns measurably faster than a wrong-password attempt
+    against a real, active one, leaking which emails are valid staff
+    accounts through timing alone - a more sensitive thing to leak here
+    than on the customer side, since staff accounts include SUPER_ADMIN."""
     staff = db.query(PlatformStaff).filter(PlatformStaff.email == email).first()
-    if not staff or not staff.is_active or not verify_password(password, staff.hashed_password):
+    hashed_password = staff.hashed_password if staff else _DUMMY_PASSWORD_HASH_FOR_TIMING_SAFETY
+    password_matches = verify_password(password, hashed_password)
+    if not staff or not staff.is_active or not password_matches:
         return None
     return staff
 
@@ -75,6 +124,9 @@ def list_accounts_overview(db: Session) -> list[dict]:
             "number_count": number_counts.get(account.id, 0),
             "billing_classification": account.billing_classification,
             "billing_source": account.billing_source,
+            "is_test": account.is_test,
+            "legal_hold": account.legal_hold,
+            "legal_hold_reference": account.legal_hold_reference,
             "created_at": account.created_at,
         }
         for account in accounts
@@ -102,6 +154,9 @@ def get_account_overview(db: Session, account_id: str) -> dict:
         "number_count": db.query(PhoneNumber).filter(PhoneNumber.account_id == account_id).count(),
         "billing_classification": account.billing_classification,
         "billing_source": account.billing_source,
+        "is_test": account.is_test,
+        "legal_hold": account.legal_hold,
+        "legal_hold_reference": account.legal_hold_reference,
         "created_at": account.created_at,
     }
 
@@ -114,7 +169,7 @@ def update_account_billing_classification(
     by staff for the non-default cases (marking an account DEMO, SANDBOX,
     a PARTNER_SPONSORED deal, etc.) - see Account model's docstring for
     why the public signup path only ever creates COMMERCIAL_STANDALONE."""
-    account = db.query(Account).filter(Account.id == account_id).first()
+    account = db.query(Account).filter( Account.id == account_id).first()
     if account is None:
         raise AccountNotFoundError(f"No such account: {account_id!r}")
 
@@ -130,6 +185,66 @@ def update_account_billing_classification(
     )
     publish_account_billing_classification_updated(
         account_id, billing_classification=billing_classification.value, billing_source=billing_source.value,
+    )
+    return account
+
+
+def set_account_test_flag(db: Session, account_id: str, *, is_test: bool, actor: str, reason: str) -> Account:
+    """Backs the accounts.manage_test_flag capability (granted in migration
+    db8d0f0b2e05, which shipped no route/service function for it - this is
+    that missing piece). is_test bypasses the CONTROLLED_BETA/INTERNAL_TEST
+    market-activation gate (see app.numbering.numbers.service.
+    _assert_market_activated) and blocks real ZoikoNex/Stripe billing (see
+    app.billing.service.assert_not_test_account) - a platform-wide decision
+    a SUPER_ADMIN makes deliberately, not a routine support toggle, so
+    `reason` is mandatory for the audit trail (same bar as
+    set_market_activation_status's reason)."""
+    account = db.query(Account).filter(Account.id == account_id).first()
+    if account is None:
+        raise AccountNotFoundError(f"No such account: {account_id!r}")
+
+    previous = account.is_test
+    account.is_test = is_test
+    db.commit()
+    db.refresh(account)
+    log_event(
+        db, actor=actor, action="account.test_flag_updated", target=f"account:{account.id}",
+        reason=reason, before={"is_test": previous}, after={"is_test": is_test},
+    )
+    return account
+
+
+class LegalHoldRequiresReferenceError(Exception):
+    """Raised when activating a legal hold with no reference - a real
+    case/matter reference is required (same "record a reference, not just
+    a reason" discipline as the market-activation legal sign-off), not a
+    free-text justification."""
+
+
+def set_account_legal_hold(
+    db: Session, account_id: str, *, on: bool, reference: str | None, actor: str
+) -> Account:
+    """Architecture doc §10 "legal hold model for business customers" -
+    while active, app.retention.service's purge sweeps AND
+    erase_account_data skip/refuse every recording/voicemail (or the whole
+    erasure) on this account regardless of how overdue its normal
+    retention window is. Staff-only (same SUPER_ADMIN bar as the test-flag
+    toggle above) - this can override a customer's own configured
+    retention preference, which is exactly the kind of override that needs
+    a real audit trail, not a routine support action."""
+    if on and not reference:
+        raise LegalHoldRequiresReferenceError("Activating a legal hold requires a real case/matter reference")
+    account = db.query(Account).filter(Account.id == account_id).first()
+    if account is None:
+        raise AccountNotFoundError(f"No such account: {account_id!r}")
+    previous = {"legal_hold": account.legal_hold, "legal_hold_reference": account.legal_hold_reference}
+    account.legal_hold = on
+    account.legal_hold_reference = reference if on else None
+    db.commit()
+    db.refresh(account)
+    log_event(
+        db, actor=actor, action="account.legal_hold_changed", target=f"account:{account.id}",
+        before=previous, after={"legal_hold": account.legal_hold, "legal_hold_reference": account.legal_hold_reference},
     )
     return account
 
@@ -156,6 +271,8 @@ def list_stuck_provisioning(db: Session) -> list[dict]:
             "account_name": accounts[n.account_id].name if n.account_id in accounts else None,
             "account_owner_email": owners.get(n.account_id),
             "provisioning_started_at": n.provisioning_started_at,
+            "last_provisioning_error_code": n.last_provisioning_error_code,
+            "provisioning_attempt_count": n.provisioning_attempt_count,
         }
         for n in numbers
     ]
@@ -222,6 +339,7 @@ def grant_capability(db: Session, *, capability: str, role: PlatformStaffRole, a
         db, actor=actor, action="staff.capability_granted", target=f"capability:{capability}",
         after={"role": role.value},
     )
+    publish_capability_granted(capability=capability, role=role.value, actor=actor)
 
 
 def revoke_capability(db: Session, *, capability: str, role: PlatformStaffRole, actor: str) -> None:
@@ -255,6 +373,7 @@ def revoke_capability(db: Session, *, capability: str, role: PlatformStaffRole, 
         db, actor=actor, action="staff.capability_revoked", target=f"capability:{capability}",
         before={"role": role.value},
     )
+    publish_capability_revoked(capability=capability, role=role.value, actor=actor)
 
 
 def search_numbers(db: Session, query: str) -> list[dict]:

@@ -122,6 +122,14 @@ class NotificationDelivery(Base):
     # available for real sends (not the no-API-key-configured log stub) and
     # for non-email channels (SMS/push) that don't go through Resend at all.
     provider_message_id: Mapped[str | None] = mapped_column(String(100), nullable=True, index=True)
+    # Email Communications System doc A-03 (BLOCKER) "idempotency" -
+    # "domain retries, queue retries, provider failover, and webhook
+    # retries cannot duplicate recipient delivery." Nullable (not every
+    # call site passes one yet - see send_notification's docstring on the
+    # "representative, not universal" scoping of where this is actually
+    # wired in this pass) but unique when present, same discipline as
+    # UsageEvent.idempotency_key (usage/models.py).
+    idempotency_key: Mapped[str | None] = mapped_column(String(255), nullable=True, unique=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     # In-app notification center - the dashboard bell icon reads this ledger

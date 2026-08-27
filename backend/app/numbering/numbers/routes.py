@@ -1,11 +1,13 @@
 import logging
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, Response, UploadFile, status
 from sqlalchemy.orm import Session
 
+from app.billing.service import EntitlementRequiredError
 from app.core.database import get_db
 from app.core.deps import get_current_user, require_admin, require_writer
 from app.integrations.telecom.twilio import TelecomError
+from app.media.service import verify_twilio_webhook
 from app.numbering.identity.models import User
 from app.ops.service import KillSwitchTrippedError
 from app.risk.service import AccountKillSwitchTrippedError
@@ -36,6 +38,7 @@ from app.numbering.numbers.service import (
     NumberConflictError,
     NumberDocumentTooLargeError,
     NumberDocumentTypeUnsupportedError,
+    NumberEligibilityBundleAlreadySubmittedError,
     NumberEligibilityCaseNotFoundError,
     NumberEligibilityDocumentRequiredError,
     NumberEligibilityRequiredError,
@@ -207,6 +210,8 @@ def submit_eligibility_bundle(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
     except NumberEligibilityDocumentRequiredError as e:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e)) from e
+    except NumberEligibilityBundleAlreadySubmittedError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e
     except TelecomError as e:
         raise HTTPException(status_code=502, detail=str(e)) from e
 
@@ -217,9 +222,10 @@ def sync_eligibility_bundle_status(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_admin),
 ):
-    """On-demand check against Twilio's real bundle review status - see
-    service.sync_number_eligibility_bundle_status's docstring for why this
-    is poll-on-request rather than a webhook."""
+    """On-demand check against Twilio's real bundle review status - the
+    manual fallback for /bundle-status-callback below (the real-time
+    webhook push), for whenever that webhook was never delivered or this
+    environment has no PUBLIC_BASE_URL configured to receive it at all."""
     try:
         return service.sync_number_eligibility_bundle_status(
             db, case_id, account_id=current_user.account_id, actor=current_user.id,
@@ -230,6 +236,27 @@ def sync_eligibility_bundle_status(
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e)) from e
     except TelecomError as e:
         raise HTTPException(status_code=502, detail=str(e)) from e
+
+
+@router.post("/eligibility-cases/bundle-status-callback", status_code=status.HTTP_204_NO_CONTENT)
+async def bundle_status_callback(request: Request, db: Session = Depends(get_db)):
+    """Twilio calls this directly the moment a Bundle's review status
+    changes (see telecom.create_regulatory_bundle's status_callback param,
+    set to this exact path when the number was submitted) - the real-time
+    fast path so a customer's dashboard reflects Twilio's decision without
+    them ever clicking "check status" or waiting for the daily
+    reconciliation sweep. Twilio, not a logged-in customer, calls this, so
+    there's no account/session to authenticate against -
+    X-Twilio-Signature verification is the only thing standing between
+    this endpoint and a forged approval/rejection. Always answers 204
+    (even for a bundle_sid this environment doesn't recognize) so Twilio
+    never retry-storms this endpoint over something that isn't transient."""
+    params = await verify_twilio_webhook(request)
+    service.handle_bundle_status_webhook(
+        db, bundle_sid=params.get("BundleSid", ""),
+        status=params.get("Status", ""), failure_reason=params.get("FailureReason"),
+    )
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @router.post("/{e164}/checkout-session", response_model=CheckoutSessionResponse)
@@ -358,6 +385,11 @@ def configure_routing(
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e
     except ComplianceRequiredError as e:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e)) from e
+    except EntitlementRequiredError as e:
+        raise HTTPException(
+            status_code=status.HTTP_402_PAYMENT_REQUIRED,
+            detail={"code": "ENTITLEMENT_REQUIRED", "entitlement": e.key, "current_plan": e.plan_code},
+        ) from e
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e)) from e
 
@@ -375,6 +407,11 @@ def set_ring_group(
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e
     except service.RingGroupTooLargeError as e:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e)) from e
+    except EntitlementRequiredError as e:
+        raise HTTPException(
+            status_code=status.HTTP_402_PAYMENT_REQUIRED,
+            detail={"code": "ENTITLEMENT_REQUIRED", "entitlement": e.key, "current_plan": e.plan_code},
+        ) from e
 
 
 @router.get("/{e164}/ring-group", response_model=list[RingGroupDestinationResponse])

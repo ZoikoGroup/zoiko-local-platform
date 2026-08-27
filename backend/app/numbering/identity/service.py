@@ -1,7 +1,8 @@
 from sqlalchemy.orm import Session
 
 from app.audit.service import log_event
-from app.billing.service import assert_seat_quota_available
+from app.billing.service import assert_entitlement, assert_seat_quota_available
+from app.events.service import publish_account_created
 from app.core.security import (
     create_access_token,
     decode_access_token,
@@ -26,6 +27,11 @@ from app.numbering.identity.models import Account, AccountType, User, UserRole
 from app.risk.service import check_fingerprint_on_signup
 
 PASSWORD_RESET_TOKEN_EXPIRE_MINUTES = 30
+
+# Computed once at import time (a one-time bcrypt cost, same as hashing any
+# real password) - see authenticate_user's docstring for why this needs to
+# exist at all.
+_DUMMY_PASSWORD_HASH_FOR_TIMING_SAFETY = hash_password("zoiko-local-timing-safety-dummy")
 
 
 def create_account_with_owner(
@@ -57,6 +63,7 @@ def create_account_with_owner(
         target=f"account:{account.id}",
         after={"account_id": account.id, "user_id": user.id, "email": user.email, "role": user.role},
     )
+    publish_account_created(account.id, user_id=user.id, email=user.email, account_type=account_type)
     notify_account_activated(db, account_id=account.id, user_email=user.email)
     # Architecture doc §5 "Fraud and Risk: device fingerprinting" - detection
     # only, never blocks signup itself (see check_fingerprint_on_signup's
@@ -70,7 +77,19 @@ def authenticate_user(db: Session, email: str, password: str) -> User | None:
     user = db.query(User).filter(User.email == email).first()
     # Google-only accounts have no password at all - never match, and
     # never pass None into verify_password (it expects a real hash string).
-    if not user or user.hashed_password is None or not verify_password(password, user.hashed_password):
+    # Always runs verify_password against SOMETHING - a real hash, or
+    # _DUMMY_PASSWORD_HASH_FOR_TIMING_SAFETY when there's no user or no
+    # password to compare against - rather than short-circuiting before
+    # ever calling it. bcrypt verification is the dominant cost of this
+    # function; skipping it for a nonexistent email would make that lookup
+    # return measurably faster than a wrong-password attempt against a
+    # real account, leaking whether an email is registered through timing
+    # alone even though the error is already generic (the same account-
+    # enumeration surface request_password_reset's identical response
+    # already guards against, just via timing instead of content).
+    hashed_password = user.hashed_password if user and user.hashed_password else _DUMMY_PASSWORD_HASH_FOR_TIMING_SAFETY
+    password_matches = verify_password(password, hashed_password)
+    if not user or user.hashed_password is None or not password_matches:
         return None
 
     # Only log "user.login" here if this IS the complete login. If MFA is
@@ -135,6 +154,10 @@ def reset_password(db: Session, token: str, new_password: str) -> User:
     user.hashed_password = hash_password(new_password)
     db.commit()
     db.refresh(user)
+
+    from app.core.deps import invalidate_cached_user
+
+    invalidate_cached_user(user.id)
     log_event(db, actor=user.id, action="user.password_reset_completed", target=f"user:{user.id}")
     notify_password_changed(db, account_id=user.account_id, user_email=user.email)
     return user
@@ -175,6 +198,7 @@ def find_or_create_user_from_google(db: Session, email: str, name: str | None) -
         reason="google",
         after={"account_id": account.id, "user_id": user.id, "email": user.email, "role": user.role},
     )
+    publish_account_created(account.id, user_id=user.id, email=user.email, account_type=AccountType.INDIVIDUAL.value)
     return user, True
 
 
@@ -190,6 +214,14 @@ def add_team_member(
     if existing:
         raise ValueError("A user with this email already exists")
 
+    # ZL-COM-ENT-001 §7 matrix: "Team members, roles & number assignment:
+    # No (Starter) / Yes (Business+)" - Starter has no team-member
+    # capability at all, a distinct check from assert_seat_quota_available
+    # below (a numeric cap that only applies to plans that HAVE the
+    # feature). Real gap fix: previously a Starter account could add up to
+    # its Plan.max_team_seats members (5, per seed data) with no gate on
+    # the team feature itself at all.
+    assert_entitlement(db, account_id, "team.members.enabled")
     assert_seat_quota_available(db, account_id)
 
     member = User(

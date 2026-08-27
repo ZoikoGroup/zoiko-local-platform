@@ -25,6 +25,8 @@ from app.usage import service as usage_service
 from app.notifications.service import (
     notify_number_activated,
     notify_number_assigned,
+    notify_number_eligibility_approved,
+    notify_number_eligibility_rejected,
     notify_number_order_not_approved,
     notify_number_released,
     notify_number_suspended,
@@ -201,7 +203,8 @@ def list_supported_countries(db: Session) -> list[SupportedCountry]:
 
 
 def upsert_supported_country(
-    db: Session, *, code: str, name: str, sort_order: int = 0, emergency_calling_supported: bool = False
+    db: Session, *, code: str, name: str, sort_order: int = 0, emergency_calling_supported: bool = False,
+    actor: str,
 ) -> SupportedCountry:
     """Staff-only, SUPER_ADMIN-gated at the route (see app.staff.routes) -
     expanding the launch country list is a compliance/commercial decision,
@@ -211,6 +214,7 @@ def upsert_supported_country(
     exists for this country (Commercial Billing Operating Standard doc
     §10), not an engineering default to flip casually."""
     country = db.query(SupportedCountry).filter(SupportedCountry.code == code).first()
+    before = None
     if country is None:
         country = SupportedCountry(
             code=code, name=name, sort_order=sort_order,
@@ -218,19 +222,77 @@ def upsert_supported_country(
         )
         db.add(country)
     else:
+        before = {
+            "name": country.name, "sort_order": country.sort_order,
+            "emergency_calling_supported": country.emergency_calling_supported,
+        }
         country.name = name
         country.sort_order = sort_order
         country.emergency_calling_supported = emergency_calling_supported
     db.commit()
     db.refresh(country)
     _invalidate_supported_countries_cache()
+    # Real gap fix: unlike its sibling update_country_registry_fields right
+    # below (which already logs correctly), this left zero audit trail of
+    # who added/changed a country or what the prior value was - same
+    # CLAUDE.md rule every other state-changing action here follows.
+    log_event(
+        db, actor=actor, action="numbering.supported_country_upserted", target=f"supported_country:{code}",
+        before=before,
+        after={
+            "name": name, "sort_order": sort_order, "emergency_calling_supported": emergency_calling_supported,
+        },
+    )
     return country
 
 
-def remove_supported_country(db: Session, code: str) -> None:
+def update_country_registry_fields(
+    db: Session, code: str, *, customer_type_restrictions: list[str] | None, porting_supported: bool,
+    recording_consent_basis: str | None, payments_enabled: bool, marketing_claims_approved: bool, actor: str,
+) -> SupportedCountry:
+    """Commercial Billing Operating Standard doc §34 registry dimensions -
+    separate from upsert_supported_country (which only ever covered basic
+    country creation/enablement) since these represent a distinct real
+    review per dimension, not a bundled property of adding a country to
+    the list. Same SUPER_ADMIN bar as every other registry mutation on
+    this table."""
+    country = db.query(SupportedCountry).filter(SupportedCountry.code == code).first()
+    if country is None:
+        raise UnsupportedCountryError(f"{code!r} is not on Zoiko Local's supported country list yet")
+    before = {
+        "customer_type_restrictions": country.customer_type_restrictions,
+        "porting_supported": country.porting_supported,
+        "recording_consent_basis": country.recording_consent_basis,
+        "payments_enabled": country.payments_enabled,
+        "marketing_claims_approved": country.marketing_claims_approved,
+    }
+    country.customer_type_restrictions = customer_type_restrictions
+    country.porting_supported = porting_supported
+    country.recording_consent_basis = recording_consent_basis
+    country.payments_enabled = payments_enabled
+    country.marketing_claims_approved = marketing_claims_approved
+    db.commit()
+    db.refresh(country)
+    _invalidate_supported_countries_cache()
+    log_event(
+        db, actor=actor, action="numbering.country_registry_fields_updated", target=f"supported_country:{code}",
+        before=before, after={
+            "customer_type_restrictions": customer_type_restrictions, "porting_supported": porting_supported,
+            "recording_consent_basis": recording_consent_basis, "payments_enabled": payments_enabled,
+            "marketing_claims_approved": marketing_claims_approved,
+        },
+    )
+    return country
+
+
+def remove_supported_country(db: Session, code: str, *, actor: str) -> None:
     db.query(SupportedCountry).filter(SupportedCountry.code == code).delete()
     db.commit()
     _invalidate_supported_countries_cache()
+    # Real gap fix - see upsert_supported_country's comment.
+    log_event(
+        db, actor=actor, action="numbering.supported_country_removed", target=f"supported_country:{code}",
+    )
 
 
 def _assert_supported_country(db: Session, country: str) -> None:
@@ -348,6 +410,19 @@ class NumberEligibilityDocumentRequiredError(Exception):
     real supporting document, there's nothing to submit without one."""
 
 
+class NumberEligibilityBundleAlreadySubmittedError(Exception):
+    """Raised when submit_number_eligibility_bundle is called again while a
+    previously-submitted bundle is still with Twilio, or once the case is
+    already approved. Without this guard a double-click or a retried
+    request after a slow response would create a second EndUser/
+    SupportingDocument/Bundle in Twilio and overwrite the case's
+    twilio_bundle_sid pointer - orphaning the first bundle in Twilio and,
+    if it had already been approved but not yet synced locally, silently
+    discarding that approval in favor of a brand-new unreviewed bundle.
+    Only a rejected bundle may be resubmitted (the outcome notification
+    itself tells the customer to "resubmit from your dashboard")."""
+
+
 _ALLOWED_ELIGIBILITY_DOCUMENT_CONTENT_TYPES = {"application/pdf", "image/jpeg", "image/png"}
 _MAX_ELIGIBILITY_DOCUMENT_SIZE_BYTES = 10 * 1024 * 1024
 
@@ -371,7 +446,7 @@ def list_number_eligibility_rules(db: Session) -> list[NumberEligibilityRule]:
 def upsert_number_eligibility_rule(
     db: Session, *, country: str, number_type: str, required_evidence: list[str], is_active: bool,
     emergency_calling_supported: bool = False, recording_supported: bool = True,
-    allowed_calling_directions: str = "both",
+    allowed_calling_directions: str = "both", actor: str,
 ) -> NumberEligibilityRule:
     """Staff-only, SUPER_ADMIN-gated at the route - same bar as the country
     list and calling-rate changes (this decides which numbers can even be
@@ -385,9 +460,17 @@ def upsert_number_eligibility_rule(
         .filter(NumberEligibilityRule.country == country, NumberEligibilityRule.number_type == number_type)
         .first()
     )
+    before = None
     if rule is None:
         rule = NumberEligibilityRule(country=country, number_type=number_type)
         db.add(rule)
+    else:
+        before = {
+            "required_evidence": rule.required_evidence, "is_active": rule.is_active,
+            "emergency_calling_supported": rule.emergency_calling_supported,
+            "recording_supported": rule.recording_supported,
+            "allowed_calling_directions": rule.allowed_calling_directions,
+        }
     rule.required_evidence = required_evidence
     rule.is_active = is_active
     rule.emergency_calling_supported = emergency_calling_supported
@@ -395,15 +478,32 @@ def upsert_number_eligibility_rule(
     rule.allowed_calling_directions = allowed_calling_directions
     db.commit()
     db.refresh(rule)
+    # Real gap fix - see upsert_supported_country's comment. Flipping
+    # is_active or required_evidence directly decides whether numbers can
+    # be purchased at all in a market - a compliance/commercial decision
+    # with no prior audit trail before this.
+    log_event(
+        db, actor=actor, action="numbering.eligibility_rule_upserted", target=f"number_eligibility_rule:{rule.id}",
+        before=before,
+        after={
+            "required_evidence": required_evidence, "is_active": is_active,
+            "emergency_calling_supported": emergency_calling_supported,
+            "recording_supported": recording_supported, "allowed_calling_directions": allowed_calling_directions,
+        },
+    )
     return rule
 
 
-def remove_number_eligibility_rule(db: Session, rule_id: str) -> None:
+def remove_number_eligibility_rule(db: Session, rule_id: str, *, actor: str) -> None:
     db.query(NumberEligibilityRule).filter(NumberEligibilityRule.id == rule_id).delete()
     db.commit()
+    # Real gap fix - see upsert_supported_country's comment.
+    log_event(
+        db, actor=actor, action="numbering.eligibility_rule_removed", target=f"number_eligibility_rule:{rule_id}",
+    )
 
 
-def seed_market_release_registry(db: Session) -> list[NumberEligibilityRule]:
+def seed_market_release_registry(db: Session, *, actor: str) -> list[NumberEligibilityRule]:
     """Commercial Billing Operating Standard P0-2: "Implement a versioned
     market/release registry for every country and number type." Creates
     one row per currently-supported country for 'local' numbers (the only
@@ -433,6 +533,7 @@ def seed_market_release_registry(db: Session) -> list[NumberEligibilityRule]:
             upsert_number_eligibility_rule(
                 db, country=country.code, number_type="local", required_evidence=[], is_active=False,
                 emergency_calling_supported=False, recording_supported=True, allowed_calling_directions="both",
+                actor=actor,
             )
         )
     return created
@@ -588,6 +689,15 @@ def submit_number_eligibility_bundle(
         raise NumberEligibilityDocumentRequiredError(
             "Upload a supporting document before submitting this case for review"
         )
+    if case.status == NumberEligibilityCaseStatus.APPROVED:
+        raise NumberEligibilityBundleAlreadySubmittedError(
+            "This eligibility case is already approved - there's nothing to resubmit."
+        )
+    if case.twilio_bundle_sid and case.twilio_bundle_status != "twilio-rejected":
+        raise NumberEligibilityBundleAlreadySubmittedError(
+            "A bundle for this case was already submitted and is still with Twilio for review. "
+            "Use sync-bundle-status to check its outcome instead of submitting again."
+        )
     latest_doc = case.documents[-1]
 
     owner = db.query(User).filter(User.account_id == account_id, User.role == UserRole.OWNER).first()
@@ -606,10 +716,15 @@ def submit_number_eligibility_bundle(
         file_bytes=file_bytes, content_type=latest_doc["content_type"],
     )
 
+    status_callback = (
+        f"{settings.public_base_url}/numbers/eligibility-cases/bundle-status-callback"
+        if settings.public_base_url else None
+    )
     bundle = telecom.create_regulatory_bundle(
         friendly_name=f"Zoiko Local {case.country} {case.number_type} - {case.id}",
         email=email,
         iso_country=case.country, end_user_type=end_user_type, number_type=case.number_type,
+        status_callback=status_callback,
     )
     telecom.create_bundle_item_assignment(bundle["sid"], end_user["sid"])
     telecom.create_bundle_item_assignment(bundle["sid"], supporting_document["sid"])
@@ -629,23 +744,15 @@ def submit_number_eligibility_bundle(
     return case
 
 
-def sync_number_eligibility_bundle_status(db: Session, case_id: str, *, account_id: str, actor: str) -> NumberEligibilityCase:
-    """On-demand check, not a webhook - Twilio's bundle review isn't
-    instant, and depending on a webhook here would tie this to the same
-    fragile local ngrok tunnel that already caused a real lost-webhook
-    incident elsewhere in this project (see the video-recording sweep's
-    own docstring) for an event that fires rarely enough this is simpler
-    and just as reliable. Flipping to APPROVED here flows through the
-    SAME NumberEligibilityCaseStatus.APPROVED status purchase_number
-    already checks via has_approved_eligibility_case - no separate
-    purchase-gate code needed for the Twilio-approval path."""
-    case = _get_eligibility_case(db, case_id)
-    if case.account_id != account_id:
-        raise NumberEligibilityCaseNotFoundError(f"No eligibility case with id {case_id}")
-    if not case.twilio_bundle_sid:
-        raise NumberEligibilityDocumentRequiredError("This case hasn't been submitted to Twilio for review yet")
-
-    result = telecom.get_bundle_status(case.twilio_bundle_sid)
+def _apply_bundle_status_result(
+    db: Session, case: NumberEligibilityCase, result: dict, *, actor: str,
+) -> NumberEligibilityCase:
+    """Shared by both the customer-triggered on-demand check
+    (sync_number_eligibility_bundle_status) and the scheduled sweep
+    (sync_all_pending_eligibility_cases) - one place that flips the case's
+    status and sends the matching outcome notification, so both call
+    sites behave identically regardless of which one happened to notice
+    Twilio's decision first."""
     before_status = case.status
     case.twilio_bundle_status = result["status"]
     case.twilio_bundle_rejection_reason = result.get("rejection_reason")
@@ -663,7 +770,109 @@ def sync_number_eligibility_bundle_status(db: Session, case_id: str, *, account_
         target=f"number_eligibility_case:{case.id}",
         before={"status": before_status}, after={"status": case.status, "twilio_bundle_status": result["status"]},
     )
+
+    if case.status != before_status and case.status in (
+        NumberEligibilityCaseStatus.APPROVED, NumberEligibilityCaseStatus.REJECTED,
+    ):
+        owner = db.query(User).filter(User.account_id == case.account_id, User.role == UserRole.OWNER).first()
+        if owner is not None:
+            if case.status == NumberEligibilityCaseStatus.APPROVED:
+                notify_number_eligibility_approved(
+                    db, account_id=case.account_id, account_email=owner.email,
+                    country=case.country, number_type=case.number_type,
+                )
+            else:
+                notify_number_eligibility_rejected(
+                    db, account_id=case.account_id, account_email=owner.email,
+                    country=case.country, number_type=case.number_type,
+                    rejection_reason=case.review_notes or "",
+                )
     return case
+
+
+def sync_number_eligibility_bundle_status(db: Session, case_id: str, *, account_id: str, actor: str) -> NumberEligibilityCase:
+    """On-demand check, not a webhook - Twilio's bundle review isn't
+    instant, and depending on a webhook here would tie this to the same
+    fragile local ngrok tunnel that already caused a real lost-webhook
+    incident elsewhere in this project (see the video-recording sweep's
+    own docstring) for an event that fires rarely enough this is simpler
+    and just as reliable. Flipping to APPROVED here flows through the
+    SAME NumberEligibilityCaseStatus.APPROVED status purchase_number
+    already checks via has_approved_eligibility_case - no separate
+    purchase-gate code needed for the Twilio-approval path.
+
+    This is the customer-triggered path (dashboard "check status" button).
+    sync_all_pending_eligibility_cases below is the same check run on a
+    schedule, so an approval/rejection isn't missed just because nobody
+    happened to click the button."""
+    case = _get_eligibility_case(db, case_id)
+    if case.account_id != account_id:
+        raise NumberEligibilityCaseNotFoundError(f"No eligibility case with id {case_id}")
+    if not case.twilio_bundle_sid:
+        raise NumberEligibilityDocumentRequiredError("This case hasn't been submitted to Twilio for review yet")
+
+    result = telecom.get_bundle_status(case.twilio_bundle_sid)
+    return _apply_bundle_status_result(db, case, result, actor=actor)
+
+
+def sync_all_pending_eligibility_cases(db: Session) -> dict:
+    """Scheduled-job counterpart to the on-demand sync above - called from
+    app.ops.scheduled_reconciliation so an approval/rejection is picked up
+    even if the customer never comes back to click "check status."
+    Deliberately still polling rather than a webhook (see
+    sync_number_eligibility_bundle_status's docstring for why) - this just
+    automates the same on-demand check instead of depending on the
+    customer to trigger it. One Twilio call failure for one case must not
+    abort the whole sweep, so each case is isolated in its own try/except."""
+    cases = (
+        db.query(NumberEligibilityCase)
+        .filter(
+            NumberEligibilityCase.status == NumberEligibilityCaseStatus.PENDING,
+            NumberEligibilityCase.twilio_bundle_sid.isnot(None),
+        )
+        .all()
+    )
+    checked = 0
+    approved = 0
+    rejected = 0
+    failed = 0
+    for case in cases:
+        checked += 1
+        try:
+            result = telecom.get_bundle_status(case.twilio_bundle_sid)
+            updated = _apply_bundle_status_result(db, case, result, actor="scheduled_reconciliation")
+            if updated.status == NumberEligibilityCaseStatus.APPROVED:
+                approved += 1
+            elif updated.status == NumberEligibilityCaseStatus.REJECTED:
+                rejected += 1
+        except telecom.TelecomError:
+            failed += 1
+    return {"checked": checked, "approved": approved, "rejected": rejected, "still_pending": checked - approved - rejected - failed, "failed": failed}
+
+
+def handle_bundle_status_webhook(
+    db: Session, *, bundle_sid: str, status: str, failure_reason: str | None,
+) -> NumberEligibilityCase | None:
+    """Twilio's real-time BundleSid/Status/FailureReason push (see
+    telecom.create_regulatory_bundle's status_callback param) - the fast
+    path that updates a case the moment Twilio's review team decides,
+    instead of waiting for the customer to click "check status" or for
+    sync_all_pending_eligibility_cases' daily sweep to notice. Deliberately
+    NOT the only path: this project has a real prior incident with lost
+    webhooks over a fragile local tunnel (see
+    sync_number_eligibility_bundle_status's docstring), so the on-demand
+    check and the daily sweep both stay in place as a reliable fallback for
+    whatever this webhook misses. All three converge on the same
+    _apply_bundle_status_result, so it doesn't matter which one notices
+    first. Returns None (never raises) for a bundle_sid this environment
+    doesn't recognize - e.g. a stale callback after a case was deleted, or
+    a misdirected retry - so the webhook route can still answer Twilio
+    with 2xx and it stops retrying."""
+    case = db.query(NumberEligibilityCase).filter(NumberEligibilityCase.twilio_bundle_sid == bundle_sid).first()
+    if case is None:
+        return None
+    result = {"sid": bundle_sid, "status": status, "rejection_reason": failure_reason}
+    return _apply_bundle_status_result(db, case, result, actor="twilio_bundle_status_webhook")
 
 
 def approve_number_eligibility_case(db: Session, case_id: str, *, actor: str, notes: str | None = None) -> NumberEligibilityCase:
@@ -795,6 +1004,13 @@ def reserve_number(db: Session, account_id: str, e164: str, country: str, number
         metadata={"e164": e164},
     )
     publish_number_reserved(account_id, number_id=number.id, e164=e164, country=country)
+
+    # Deferred import - see reactivate_numbers_for_account_by_staff's
+    # comment on why (app.risk.service imports this module already).
+    from app.risk.service import check_number_acquisition_velocity
+
+    check_number_acquisition_velocity(db, account_id)
+
     return number
 
 
@@ -962,11 +1178,17 @@ def purchase_number(db: Session, account_id: str, e164: str) -> PhoneNumber:
 
     try:
         bought = telecom.buy_number(e164, bundle_sid=bundle_sid)
-    except telecom.TelecomError:
+    except telecom.TelecomError as e:
         # payment/provisioning failure must not strand the number silently —
         # release it back to Reserved so the customer can retry or it can expire
         number.status = PhoneNumberStatus.RESERVED
         number.provisioning_started_at = None
+        # Architecture doc's "Provisioning Job... retry_count, error_code" -
+        # see PhoneNumber.last_provisioning_error_code's docstring. Not
+        # cleared on the eventual success - the count is a lifetime total,
+        # not "attempts since the last failure."
+        number.last_provisioning_error_code = str(e)[:100]
+        number.provisioning_attempt_count += 1
         db.commit()
         _invalidate_numbers_cache(account_id)
         log_event(
@@ -985,6 +1207,7 @@ def purchase_number(db: Session, account_id: str, e164: str) -> PhoneNumber:
     number.provider_sid = bought["sid"]
     number.reserved_until = None
     number.provisioning_started_at = None
+    number.provisioning_attempt_count += 1
     number.next_renewal_at = now + timedelta(days=RENEWAL_PERIOD_DAYS)
     db.commit()
     db.refresh(number)
@@ -1085,6 +1308,11 @@ def revoke_caller_identity(
         target_type="caller_identity", target_id=identity.id, reason=reason,
         metadata={"phone_number_id": phone_number_id, "before_status": before_status.value},
     )
+
+    from app.risk.service import check_caller_id_change_velocity
+
+    check_caller_id_change_velocity(db, identity.account_id)
+
     return identity
 
 
@@ -1106,6 +1334,11 @@ def reinstate_caller_identity(
         target_type="caller_identity", target_id=identity.id, reason=reason,
         metadata={"phone_number_id": phone_number_id, "before_status": before_status.value},
     )
+
+    from app.risk.service import check_caller_id_change_velocity
+
+    check_caller_id_change_velocity(db, identity.account_id)
+
     return identity
 
 
@@ -1159,6 +1392,21 @@ def create_number_purchase_checkout_session(db: Session, account_id: str, e164: 
 
     rate = usage_service.get_number_rate(db, number.country, number.number_type)
     rate_cents = rate.recurring_price_cents if rate is not None else NUMBER_PURCHASE_PRICE_CENTS
+
+    # Real bug fix: is_first_number_included's count-then-act check had no
+    # lock on anything account-scoped, only on the individual PhoneNumber
+    # row being purchased (see reserve_number's own SELECT...FOR UPDATE,
+    # which protects a DIFFERENT race - two purchasers racing for the SAME
+    # e164). Two concurrent checkouts for two DIFFERENT e164s on the same
+    # account could both read included_count < seat_count as true before
+    # either committed, and both take the zero-surcharge path below -
+    # granting two free numbers instead of one. Locking the Account row
+    # here serializes concurrent purchases for the SAME account (this
+    # lock is released at purchase_number's own commit just below, in
+    # every branch, once the number's status becomes one
+    # get_included_number_ids counts) - it does not serialize purchases
+    # across DIFFERENT accounts, which never contended in the first place.
+    db.query(Account).filter(Account.id == account_id).with_for_update().first()
 
     if billing_service.is_first_number_included(db, account_id, exclude_number_id=number.id):
         surcharge_cents = max(0, rate_cents - NUMBER_INCLUSION_THRESHOLD_CENTS)
@@ -1264,9 +1512,11 @@ def retry_provisioning(db: Session, staff_id: str, number_id: str) -> PhoneNumbe
 
     try:
         bought = telecom.buy_number(number.e164)
-    except telecom.TelecomError:
+    except telecom.TelecomError as e:
         number.status = PhoneNumberStatus.RESERVED
         number.provisioning_started_at = None
+        number.last_provisioning_error_code = str(e)[:100]
+        number.provisioning_attempt_count += 1
         db.commit()
         _invalidate_numbers_cache(number.account_id)
         log_event(
@@ -1279,6 +1529,7 @@ def retry_provisioning(db: Session, staff_id: str, number_id: str) -> PhoneNumbe
     number.provider_sid = bought["sid"]
     number.reserved_until = None
     number.provisioning_started_at = None
+    number.provisioning_attempt_count += 1
     number.next_renewal_at = datetime.now(timezone.utc) + timedelta(days=RENEWAL_PERIOD_DAYS)
     db.commit()
     db.refresh(number)
@@ -1288,6 +1539,18 @@ def retry_provisioning(db: Session, staff_id: str, number_id: str) -> PhoneNumbe
         target_type="phone_number", target_id=number.id,
         metadata={"e164": number.e164, "provider_sid": bought["sid"], "retried_by_staff": True},
     )
+    # This docstring's own claim ("reuses the exact same success/failure
+    # transitions as purchase_number's tail") was previously false - the
+    # Kafka publish, caller-identity auto-verification, and risk step-up
+    # below all existed in purchase_number's tail but were missing here,
+    # silent drift between two independently-maintained copies of the same
+    # transition.
+    publish_number_activated(number.account_id, number_id=number.id, e164=number.e164)
+    _auto_verify_caller_identity(db, number, verification_source="platform_provisioned_purchase")
+
+    from app.risk.service import step_up_risk_state_after_purchase
+
+    step_up_risk_state_after_purchase(db, number.account_id)
 
     owner = db.query(User).filter(User.account_id == number.account_id, User.role == UserRole.OWNER).first()
     if owner is not None:
@@ -1670,6 +1933,18 @@ def configure_routing(
         if nominee is None:
             raise NumberConflictError(f"No team member with id {escalation_user_id} on this account")
 
+    # ZL-COM-ENT-001 §7 matrix: "Business-hours & team routing: No (Starter)
+    # / Yes (Business+)" - configuring business hours at all (not just
+    # enabling the feature flag) is the Business+ capability. Checked only
+    # when hours are actually being SET (not on every save with hours left
+    # None) so a Starter account clearing/leaving hours unset is unaffected.
+    if (business_hours_start is not None or business_hours_end is not None) and not billing_service.has_entitlement(
+        db, user.account_id, "routing.business_hours"
+    ):
+        raise billing_service.EntitlementRequiredError(
+            "routing.business_hours", billing_service.get_or_create_subscription(db, user.account_id).plan_code
+        )
+
     number.forwarding_number = forwarding_number
     number.business_hours_start = business_hours_start
     number.business_hours_end = business_hours_end
@@ -1715,6 +1990,16 @@ def set_ring_group(db: Session, user: User, e164: str, destinations: list[str]) 
 
     if len(destinations) > MAX_RING_GROUP_SIZE:
         raise RingGroupTooLargeError(f"A ring group may have up to {MAX_RING_GROUP_SIZE} destinations")
+
+    # ZL-COM-ENT-001 §7 matrix: "Shared call handling: No (Starter) / Yes
+    # (Business+)" - a single destination is just personal forwarding
+    # (already available to every plan via forwarding_number); 2+
+    # destinations ringing simultaneously is the actual "shared handling"
+    # capability being gated here.
+    if len(destinations) > 1 and not billing_service.has_entitlement(db, user.account_id, "routing.shared_handling"):
+        raise billing_service.EntitlementRequiredError(
+            "routing.shared_handling", billing_service.get_or_create_subscription(db, user.account_id).plan_code
+        )
 
     db.query(RingGroupDestination).filter(RingGroupDestination.phone_number_id == number.id).delete()
     rows = [

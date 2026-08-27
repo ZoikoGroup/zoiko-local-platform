@@ -75,6 +75,32 @@ def test_subscription_rolls_over_an_expired_period(db_session):
     assert refreshed.status == SubscriptionStatus.ACTIVE
 
 
+def test_annual_subscription_rolls_over_to_a_365_day_period(db_session):
+    """Real bug fix: _new_period previously ignored billing_period entirely
+    (a flat 30-day _PERIOD_LENGTH), so an annual subscriber's period rolled
+    over monthly and got re-billed at the monthly rate every ~30 days even
+    though they paid upfront for a full year. Confirms the rollover a
+    lapsed ANNUAL subscription gets now actually spans ~365 days, not 30."""
+    from app.billing.models import BillingPeriod
+
+    account = Account(name="Annual Rollover Co", account_type=AccountType.INDIVIDUAL)
+    db_session.add(account)
+    db_session.flush()
+
+    now = datetime.now(timezone.utc)
+    sub = Subscription(
+        account_id=account.id, plan_code="starter", status=SubscriptionStatus.ACTIVE,
+        billing_period=BillingPeriod.ANNUAL,
+        current_period_start=now - timedelta(days=400), current_period_end=now - timedelta(days=10),
+    )
+    db_session.add(sub)
+    db_session.commit()
+
+    refreshed = service.get_or_create_subscription(db_session, account.id)
+    new_span = refreshed.current_period_end - refreshed.current_period_start
+    assert 360 <= new_span.days <= 366
+
+
 def test_change_plan_ends_trial_and_updates_plan(db_session):
     account = Account(name="Change Plan Co", account_type=AccountType.INDIVIDUAL)
     db_session.add(account)
@@ -128,12 +154,22 @@ def test_usage_summary_reflects_recorded_usage(db_session):
 
 
 def test_seat_quota_allows_up_to_the_limit_then_blocks(db_session):
+    from app.billing.models import Plan
     from app.numbering.identity.service import add_team_member
 
     account = Account(name="Seat Quota Co", account_type=AccountType.INDIVIDUAL)
     db_session.add(account)
     db_session.flush()
-    service.change_plan(db_session, account.id, "free_trial", actor="test-actor")  # max_team_seats=5
+    # "business" (not free_trial/starter): real gap fix (ZL-COM-ENT-001) -
+    # adding a team member now also requires team.members.enabled, which
+    # free_trial/starter don't grant at all - this test is specifically
+    # about the NUMERIC max_team_seats cap, an orthogonal, later check.
+    # business's real seed value is 20; lowered to 5 for this test only
+    # (rolled back with the rest of the test's transaction) so this test
+    # keeps exercising the cap quickly, without needing 20 real inserts.
+    service.change_plan(db_session, account.id, "business", actor="test-actor")
+    db_session.query(Plan).filter(Plan.plan_code == "business").update({"max_team_seats": 5})
+    db_session.commit()
 
     # Owner isn't created via this helper in this test, so seed a User row
     # directly to represent them (matches how other service-level tests in
@@ -145,14 +181,14 @@ def test_seat_quota_allows_up_to_the_limit_then_blocks(db_session):
     db_session.add(owner)
     db_session.commit()
 
-    # 1 owner + 4 new members = 5, at the free_trial limit - should succeed.
+    # 1 owner + 4 new members = 5, at the (test-lowered) limit - should succeed.
     for i in range(4):
         add_team_member(
             db_session, account_id=account.id, email=f"seatmember{i}@example.com",
             password="supersecret123", role="member", actor=owner.id,
         )
 
-    # A 6th seat exceeds the free_trial plan's max_team_seats=5.
+    # A 6th seat exceeds the (test-lowered) max_team_seats=5.
     try:
         add_team_member(db_session, account_id=account.id, email="seatmemberover@example.com", password="supersecret123", role="member", actor=owner.id)
         assert False, "expected SeatQuotaExceededError"
@@ -282,9 +318,13 @@ def test_get_subscription_returns_default_free_trial(client):
     assert body["zoikonex_ref"] is not None
 
 
-def test_change_plan_route_requires_admin(client):
+def test_change_plan_route_requires_admin(client, db_session):
     owner_token = _signup_and_login(client, "billingplanowner@example.com", account_type="business")
     owner_headers = {"Authorization": f"Bearer {owner_token}"}
+    # Real gap fix (ZL-COM-ENT-001): adding a team member now requires
+    # team.members.enabled (Business+).
+    owner_account_id = client.get("/auth/me", headers=owner_headers).json()["account_id"]
+    service.change_plan(db_session, owner_account_id, "business", actor="test-setup")
     client.post(
         "/team/members",
         json={"email": "billingplanmember@example.com", "password": "supersecret123", "role": "member"},
@@ -396,9 +436,13 @@ def test_run_billing_cycle_skips_a_canceled_subscription_instead_of_billing_it(d
     assert result == {"billed": False, "reason": "subscription is canceled"}
 
 
-def test_cancel_subscription_route_requires_admin(client):
+def test_cancel_subscription_route_requires_admin(client, db_session):
     owner_token = _signup_and_login(client, "cancelsubowner@example.com", account_type="business")
     owner_headers = {"Authorization": f"Bearer {owner_token}"}
+    # Real gap fix (ZL-COM-ENT-001): adding a team member now requires
+    # team.members.enabled (Business+).
+    owner_account_id = client.get("/auth/me", headers=owner_headers).json()["account_id"]
+    service.change_plan(db_session, owner_account_id, "business", actor="test-setup")
     client.post(
         "/team/members",
         json={"email": "cancelsubmember@example.com", "password": "supersecret123", "role": "member"},
@@ -531,11 +575,22 @@ def test_number_purchase_succeeds_after_upgrading_plan(client, monkeypatch):
     assert now_ok.status_code == 200, now_ok.text
 
 
-def test_team_member_add_blocked_once_seat_quota_is_reached(client):
-    """free_trial's max_team_seats=5. Owner counts as seat 1, so 4 members
-    can be added before the route returns 402 on the 5th."""
+def test_team_member_add_blocked_once_seat_quota_is_reached(client, db_session):
+    """Business plan's max_team_seats, lowered to 5 for this test only
+    (rolled back with the rest of the test's transaction - see
+    test_seat_quota_allows_up_to_the_limit_then_blocks for the same
+    pattern). Owner counts as seat 1, so 4 members can be added before the
+    route returns 402 on the 5th. Real gap fix (ZL-COM-ENT-001): must be
+    on a plan with team.members.enabled (Business+) to add a member at
+    all now - free_trial/starter don't grant it."""
+    from app.billing.models import Plan
+
     owner_token = _signup_and_login(client, "quotaseats1@example.com", account_type="business")
     owner_headers = {"Authorization": f"Bearer {owner_token}"}
+    owner_account_id = client.get("/auth/me", headers=owner_headers).json()["account_id"]
+    service.change_plan(db_session, owner_account_id, "business", actor="test-setup")
+    db_session.query(Plan).filter(Plan.plan_code == "business").update({"max_team_seats": 5})
+    db_session.commit()
 
     for i in range(4):
         response = client.post(

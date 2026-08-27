@@ -27,7 +27,7 @@ from app.numbering.numbers import service as numbers_service
 from app.queues import service as queues_service
 from app.risk import service as risk_service
 from app.routing import service as routing_service
-from app.routing.models import CallFlowVersion
+from app.routing.models import CallFlow, CallFlowVersion
 from app.routing.service import ResolvedAction
 
 router = APIRouter(prefix="/media/voice", tags=["voice"])
@@ -43,7 +43,9 @@ def _inner_verbs(twiml: str) -> str:
     return twiml[start:end]
 
 
-def _flow_response(action: ResolvedAction, version: CallFlowVersion, request: Request, to_number: str, owner=None) -> str:
+def _flow_response(
+    db: Session, action: ResolvedAction, version: CallFlowVersion, request: Request, to_number: str, owner=None
+) -> str:
     """Turns a resolved call-flow node (Advanced IVR builder, Phase 3) into
     TwiML - the flow equivalent of incoming_call's own if/elif chain below,
     just driven by a node graph instead of the four legacy PhoneNumber
@@ -62,18 +64,33 @@ def _flow_response(action: ResolvedAction, version: CallFlowVersion, request: Re
         left_action_url = f"{base}media/voice/queue/left"
         if action.overflow_node_id:
             overflow_action = routing_service.resolve_specific_node(version, action.overflow_node_id)
-            overflow_twiml = _flow_response(overflow_action, version, request, to_number, owner)
+            overflow_twiml = _flow_response(db, overflow_action, version, request, to_number, owner)
         else:
             overflow_twiml = telecom.build_record_response(base + "media/voicemail/recording-complete")
         return telecom.build_enqueue_response(queue_name, wait_url, left_action_url, _inner_verbs(overflow_twiml))
     if action.kind == "forward":
         fallback_url = f"{base}media/voice/flow-forward-fallback?flow_version_id={version.id}&node_id={action.node_id}"
         status_callback_url = base + "media/voice/status-callback"
+        # Real gap fix: this FORWARD node never passed recording_callback_
+        # url at all, unlike the legacy ring-group/forward path and the
+        # single-level IVR menu path (both compute it via
+        # should_record_forwarded_call before dialing) - any account routed
+        # through a published Call Flow's FORWARD node never got its
+        # forwarded calls recorded, and therefore never got an AI call
+        # summary, even with AI-processing consent on file.
+        call_flow = db.query(CallFlow).filter(CallFlow.id == version.call_flow_id).first()
+        recording_callback_url = (
+            base + "media/voice/recording-callback"
+            if call_flow is not None and media_service.should_record_forwarded_call(db, call_flow.account_id)
+            else None
+        )
         # Also ring the browser dashboard alongside this node's configured
         # phone destinations - same rationale as the legacy forwarding path
         # in _default_call_twiml above.
         destinations = ([f"client:{owner.account_id}"] if owner is not None else []) + action.destinations
-        return telecom.build_ring_group_response(destinations, fallback_url, status_callback_url)
+        return telecom.build_ring_group_response(
+            destinations, fallback_url, status_callback_url, recording_callback_url
+        )
     if action.kind == "ai_receptionist":
         action_url = base + "media/receptionist/respond"
         return telecom.build_gather_response(
@@ -123,7 +140,16 @@ def _default_call_twiml(request: Request, db: Session, owner, to_number: str) ->
     and /ivr-no-input below) - a number with an IVR menu that isn't
     answered still ends up exactly where it would have without one.
     """
-    if owner is not None and media_service.should_forward_call(owner):
+    # Real gap fix: a ring group used to be completely inert unless
+    # forwarding_number was ALSO set, since should_forward_call only ever
+    # checked that one field - an account that configured shared call
+    # handling (a ring group) but never separately filled in the legacy
+    # forwarding_number field got zero forwarding, with nothing warning
+    # them. Computed once, up front, so should_forward_call and the
+    # destinations list below share the same query instead of one deciding
+    # whether to forward and the other separately re-deriving what to ring.
+    ring_group = numbers_service.list_ring_group(db, to_number) if owner is not None else []
+    if owner is not None and media_service.should_forward_call(owner, has_ring_group=bool(ring_group)):
         status_callback_url = str(request.base_url) + "media/voice/status-callback"
         fallback_action_url = str(request.base_url) + "media/voice/forward-fallback"
         recording_callback_url = (
@@ -131,11 +157,8 @@ def _default_call_twiml(request: Request, db: Session, owner, to_number: str) ->
             if media_service.should_record_forwarded_call(db, owner.account_id)
             else None
         )
-        # Enhanced business routing: ring every configured destination
-        # simultaneously if a ring group is set, otherwise fall back to
-        # the plain single forwarding_number - identical behavior to
-        # before this feature existed for any number that never sets one.
-        ring_group = numbers_service.list_ring_group(db, to_number)
+        # Ring every configured destination simultaneously if a ring group
+        # is set, otherwise fall back to the plain single forwarding_number.
         destinations = [d.destination_number for d in ring_group] or [owner.forwarding_number]
         # Also ring the browser (Call from Browser's same Twilio Client
         # identity, account_id) alongside the real phone(s), so whoever's
@@ -194,7 +217,7 @@ async def incoming_call(request: Request, db: Session = Depends(get_db)):
         # Unassigned numbers (call_flow_id is NULL, true for every number
         # that existed before this feature) are completely unaffected.
         action = routing_service.resolve_entry(live_flow_version)
-        twiml = _flow_response(action, live_flow_version, request, to_number, owner)
+        twiml = _flow_response(db, action, live_flow_version, request, to_number, owner)
     elif owner is not None and owner.ivr_greeting:
         # Enhanced business routing (Phase 2) - a simpler single-level DTMF
         # menu, still available for any number that hasn't opted into the
@@ -468,7 +491,9 @@ async def flow_menu_input(request: Request, db: Session = Depends(get_db)):
         )
     action = routing_service.resolve_menu_input(version, node_id, params.get("Digits") or None)
     owner = media_service.find_number_owner(db, params.get("To", ""))
-    return Response(content=_flow_response(action, version, request, params.get("To", ""), owner), media_type="application/xml")
+    return Response(
+        content=_flow_response(db, action, version, request, params.get("To", ""), owner), media_type="application/xml"
+    )
 
 
 @router.post("/flow-forward-fallback")
@@ -492,7 +517,9 @@ async def flow_forward_fallback(request: Request, db: Session = Depends(get_db))
         return Response(content=telecom.build_record_response(callback_url), media_type="application/xml")
     action = routing_service.resolve_forward_failover(version, node_id)
     owner = media_service.find_number_owner(db, params.get("To", ""))
-    return Response(content=_flow_response(action, version, request, params.get("To", ""), owner), media_type="application/xml")
+    return Response(
+        content=_flow_response(db, action, version, request, params.get("To", ""), owner), media_type="application/xml"
+    )
 
 
 @router.post("/forward-fallback")
