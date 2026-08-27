@@ -6,7 +6,9 @@ import {
   listUsage,
   listPlans,
   getSubscription,
-  changeSubscriptionPlan,
+  previewPlanChange,
+  confirmPlanChange,
+  cancelScheduledPlanChange,
   createPlanChangeCheckoutSession,
   setAIReceptionistAddon,
   cancelSubscription,
@@ -23,8 +25,10 @@ import {
   type BillingPeriod,
   type AIUsageRate,
   type AIReceptionistAddonRate,
+  type PlanChangePreview,
 } from "@/lib/api";
 import { getToken } from "@/lib/auth";
+import PlanChangePreviewModal from "@/components/PlanChangePreviewModal";
 
 function formatQuantity(event: UsageEvent): string {
   if (event.unit === "seconds") {
@@ -89,11 +93,14 @@ export default function BillingPage() {
   const [summaryError, setSummaryError] = useState<string | null>(null);
   const [changingPlan, setChangingPlan] = useState<string | null>(null);
   const [planError, setPlanError] = useState<string | null>(null);
-  const [confirmingPlan, setConfirmingPlan] = useState<string | null>(null);
+  const [preview, setPreview] = useState<PlanChangePreview | null>(null);
+  const [previewLoadingFor, setPreviewLoadingFor] = useState<string | null>(null);
   const [planChangedTo, setPlanChangedTo] = useState<string | null>(null);
   const [canceling, setCanceling] = useState(false);
   const [cancelError, setCancelError] = useState<string | null>(null);
   const [confirmingCancel, setConfirmingCancel] = useState(false);
+  const [cancelingScheduled, setCancelingScheduled] = useState(false);
+  const [scheduledCancelError, setScheduledCancelError] = useState<string | null>(null);
 
   const [aiUsageRate, setAiUsageRate] = useState<AIUsageRate | null>(null);
   const [addonRate, setAddonRate] = useState<AIReceptionistAddonRate | null>(null);
@@ -166,31 +173,61 @@ export default function BillingPage() {
       .finally(() => setLogLoading(false));
   }, [token]);
 
-  async function handleChangePlan(planCode: string) {
+  async function handleSelectPlan(planCode: string) {
     if (!token) return;
-    setChangingPlan(planCode);
+    setPreviewLoadingFor(planCode);
     setPlanError(null);
     try {
-      const entry = prices[planCode];
-      const requiresPayment = !!entry && !entry.is_placeholder && entry.amount_minor_units > 0;
+      const p = await previewPlanChange(token, planCode, billingPeriod);
+      setPlanChangedTo(null);
+      setPreview(p);
+    } catch (err) {
+      setPlanError(err instanceof ApiError ? err.message : "Couldn't preview this plan change.");
+    } finally {
+      setPreviewLoadingFor(null);
+    }
+  }
+
+  async function handleConfirmPreview() {
+    if (!token || !preview) return;
+    setChangingPlan(preview.target_plan_code);
+    setPlanError(null);
+    try {
+      const entry = prices[preview.target_plan_code];
+      const requiresPayment =
+        preview.direction === "upgrade" && !!entry && !entry.is_placeholder && entry.amount_minor_units > 0;
       if (requiresPayment) {
         // Real money changes hands here - redirect to Stripe's hosted
-        // Checkout page instead of switching the plan locally. The plan
-        // itself only changes once Stripe confirms payment via the
+        // Checkout page instead of confirming the preview locally. The
+        // plan itself only changes once Stripe confirms payment via the
         // /billing/stripe/checkout-webhook backend route, not on this
         // click - so we navigate away and never reach loadPlanAndUsage.
-        const session = await createPlanChangeCheckoutSession(token, planCode, billingPeriod);
+        const session = await createPlanChangeCheckoutSession(token, preview.target_plan_code, billingPeriod);
         window.location.href = session.url;
         return;
       }
-      await changeSubscriptionPlan(token, planCode, billingPeriod);
+      await confirmPlanChange(token, preview.preview_token);
       await loadPlanAndUsage();
-      setConfirmingPlan(null);
-      setPlanChangedTo(planCode);
+      setPlanChangedTo(preview.direction === "upgrade" ? preview.target_plan_code : null);
+      setPreview(null);
     } catch (err) {
-      setPlanError(err instanceof ApiError ? err.message : "Couldn't change plan.");
+      setPlanError(err instanceof ApiError ? err.message : "Couldn't complete this plan change.");
     } finally {
       setChangingPlan(null);
+    }
+  }
+
+  async function handleCancelScheduledChange() {
+    if (!token) return;
+    setCancelingScheduled(true);
+    setScheduledCancelError(null);
+    try {
+      await cancelScheduledPlanChange(token);
+      await loadPlanAndUsage();
+    } catch (err) {
+      setScheduledCancelError(err instanceof ApiError ? err.message : "Couldn't cancel the scheduled change.");
+    } finally {
+      setCancelingScheduled(false);
     }
   }
 
@@ -365,11 +402,30 @@ export default function BillingPage() {
             You&apos;re now on the {plans.find((p) => p.plan_code === planChangedTo)?.name ?? planChangedTo} plan.
           </p>
         )}
+        {subscription?.scheduled_plan_code && (
+          <div className="text-sm text-amber-800 bg-amber-50 rounded-lg px-3 py-2 flex items-center justify-between gap-3">
+            <span>
+              Moving to {plans.find((p) => p.plan_code === subscription.scheduled_plan_code)?.name ?? subscription.scheduled_plan_code}{" "}
+              on{" "}
+              {subscription.scheduled_change_effective_at
+                ? new Date(subscription.scheduled_change_effective_at).toLocaleDateString()
+                : "your next renewal"}
+              .
+            </span>
+            <button
+              onClick={handleCancelScheduledChange}
+              disabled={cancelingScheduled}
+              className="shrink-0 text-xs font-medium rounded-lg px-3 py-1.5 border border-amber-300 text-amber-800 hover:bg-amber-100 disabled:opacity-60"
+            >
+              {cancelingScheduled ? "Canceling..." : "Cancel"}
+            </button>
+          </div>
+        )}
+        {scheduledCancelError && <p className="text-sm text-red-600 bg-red-50 rounded-lg px-3 py-2">{scheduledCancelError}</p>}
 
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
           {plans.map((plan) => {
             const isCurrent = subscription?.plan_code === plan.plan_code;
-            const isConfirming = confirmingPlan === plan.plan_code;
             return (
               <div
                 key={plan.plan_code}
@@ -398,40 +454,14 @@ export default function BillingPage() {
                     <li>{plan.included_ai_receptionist_minutes.toLocaleString()} AI Receptionist minutes / mo</li>
                   )}
                 </ul>
-                {isAdmin && !isCurrent && !isConfirming && (
+                {isAdmin && !isCurrent && (
                   <button
-                    onClick={() => {
-                      setPlanChangedTo(null);
-                      setConfirmingPlan(plan.plan_code);
-                    }}
+                    onClick={() => handleSelectPlan(plan.plan_code)}
+                    disabled={previewLoadingFor === plan.plan_code}
                     className="w-full text-xs font-medium rounded-lg px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-60 text-white"
                   >
-                    Switch to this plan
+                    {previewLoadingFor === plan.plan_code ? "Loading..." : "Switch to this plan"}
                   </button>
-                )}
-                {isAdmin && isConfirming && (
-                  <div className="space-y-1.5">
-                    <p className="text-xs text-slate-600">
-                      Move from {subscription ? plans.find((p) => p.plan_code === subscription.plan_code)?.name : "your current plan"} to{" "}
-                      {plan.name} ({formatPrice(prices[plan.plan_code])})?
-                    </p>
-                    <div className="flex gap-2">
-                      <button
-                        onClick={() => handleChangePlan(plan.plan_code)}
-                        disabled={changingPlan === plan.plan_code}
-                        className="flex-1 text-xs font-medium rounded-lg px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-60 text-white"
-                      >
-                        {changingPlan === plan.plan_code ? "Switching..." : "Confirm"}
-                      </button>
-                      <button
-                        onClick={() => setConfirmingPlan(null)}
-                        disabled={changingPlan === plan.plan_code}
-                        className="flex-1 text-xs font-medium rounded-lg px-3 py-1.5 border border-slate-300 text-slate-700 hover:bg-slate-50"
-                      >
-                        Cancel
-                      </button>
-                    </div>
-                  </div>
                 )}
               </div>
             );
@@ -511,6 +541,18 @@ export default function BillingPage() {
           ))}
         </div>
       </div>
+
+      {preview && (
+        <PlanChangePreviewModal
+          preview={preview}
+          targetPlanName={plans.find((p) => p.plan_code === preview.target_plan_code)?.name ?? preview.target_plan_code}
+          priceLabel={formatPrice(prices[preview.target_plan_code])}
+          busy={changingPlan === preview.target_plan_code}
+          error={planError}
+          onConfirm={handleConfirmPreview}
+          onClose={() => setPreview(null)}
+        />
+      )}
     </div>
   );
 }

@@ -20,11 +20,42 @@ export type TeamMember = {
 
 export class ApiError extends Error {
   status: number;
+  code?: string;
+  entitlement?: string;
+  currentPlan?: string;
 
-  constructor(message: string, status: number) {
+  constructor(
+    message: string,
+    status: number,
+    extra?: { code?: string; entitlement?: string; currentPlan?: string }
+  ) {
     super(message);
     this.status = status;
+    if (extra) Object.assign(this, extra);
   }
+}
+
+// The backend sends 402 entitlement denials in two different shapes
+// (require_entitlement's HTTPException(detail={"code": ..., ...}), an
+// OBJECT; and EntitlementError subclasses' {"detail": "...", "code": ...},
+// a STRING detail with a sibling code) - naively doing `body.detail` and
+// handing it to `new Error()` stringifies an object into the literal text
+// "[object Object]", which is what real 402s were showing users before
+// this fix. This builds one real, readable ApiError from either shape.
+function apiErrorFromBody(body: Record<string, unknown>, status: number): ApiError {
+  const detail = body.detail;
+  if (detail && typeof detail === "object") {
+    const d = detail as { code?: string; entitlement?: string; current_plan?: string; message?: string };
+    const message =
+      d.message ??
+      (d.entitlement
+        ? `This feature isn't included in your current plan (${d.entitlement}).`
+        : "This action isn't available on your current plan.");
+    return new ApiError(message, status, { code: d.code, entitlement: d.entitlement, currentPlan: d.current_plan });
+  }
+  const message = typeof detail === "string" ? detail : "Request failed";
+  const code = typeof body.code === "string" ? body.code : undefined;
+  return new ApiError(message, status, { code });
 }
 
 async function request<T>(
@@ -45,7 +76,7 @@ async function request<T>(
 
   if (!response.ok) {
     const body = await response.json().catch(() => ({}));
-    throw new ApiError(body.detail ?? "Request failed", response.status);
+    throw apiErrorFromBody(body, response.status);
   }
 
   if (response.status === 204) {
@@ -1266,6 +1297,16 @@ export async function getCallRecordingBlob(token: string, callSid: string): Prom
   return response.blob();
 }
 
+// ZL-COM-ENT-001 v3.0 - routing.transfer (Business+). Blind/cold transfer
+// only - see backend media/service.py's transfer_call docstring.
+export function transferCall(token: string, callSid: string, destination: string): Promise<{ sid: string; status: string }> {
+  return request<{ sid: string; status: string }>(`/media/voice/calls/${callSid}/transfer`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ destination }),
+  });
+}
+
 export async function placeOutboundCall(
   token: string,
   input: { to: string; from: string; message?: string }
@@ -1699,6 +1740,9 @@ export type Subscription = {
   zoikonex_ref: string | null;
   grace_period_ends_at: string | null;
   canceled_at: string | null;
+  scheduled_plan_code: string | null;
+  scheduled_billing_period: BillingPeriod | null;
+  scheduled_change_effective_at: string | null;
 };
 
 // Mirrors backend PriceCatalogEntryResponse. null means no price has ever
@@ -1752,6 +1796,18 @@ export function getSubscription(token: string): Promise<Subscription> {
   });
 }
 
+// ZL-COM-ENT-001 v3.0 - the account's full resolved entitlement snapshot.
+// Deliberately a loose record, not a fixed set of named fields - the
+// register is data-driven on the backend, so a new key shouldn't need a
+// type change here either.
+export type Entitlements = Record<string, boolean | number | string>;
+
+export function getEntitlements(token: string): Promise<Entitlements> {
+  return request<{ entitlements: Entitlements }>("/billing/entitlements", {
+    headers: { Authorization: `Bearer ${token}` },
+  }).then((r) => r.entitlements);
+}
+
 export function changeSubscriptionPlan(
   token: string,
   planCode: string,
@@ -1761,6 +1817,55 @@ export function changeSubscriptionPlan(
     method: "PUT",
     headers: { Authorization: `Bearer ${token}` },
     body: JSON.stringify({ plan_code: planCode, billing_period: billingPeriod }),
+  });
+}
+
+// ZL-COM-ENT-001 v3.0 §7/§8 - the real feature-diff/impact preview shown
+// before a plan change is confirmed, replacing the old bare "are you
+// sure?" click-guard.
+export interface PlanChangePreview {
+  direction: "upgrade" | "downgrade";
+  current_plan_code: string;
+  target_plan_code: string;
+  billing_period: BillingPeriod;
+  effective_at: string | null;
+  entitlement_diff: { gained: string[]; lost: string[]; changed: { key: string; from: unknown; to: unknown }[] };
+  resource_impact: {
+    numbers_owned: number;
+    numbers_over_target_limit: number;
+    team_seats_used: number;
+    team_seats_over_target_limit: number;
+    team_capability_lost: boolean;
+  } | null;
+  ai_receptionist_included_minutes: { current: number; target: number };
+  preview_token: string;
+  expires_in_minutes: number;
+}
+
+export function previewPlanChange(
+  token: string,
+  planCode: string,
+  billingPeriod: BillingPeriod = "monthly"
+): Promise<PlanChangePreview> {
+  return request<PlanChangePreview>("/billing/subscription/plan/preview", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ plan_code: planCode, billing_period: billingPeriod }),
+  });
+}
+
+export function confirmPlanChange(token: string, previewToken: string): Promise<Subscription> {
+  return request<Subscription>("/billing/subscription/plan/confirm", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ preview_token: previewToken }),
+  });
+}
+
+export function cancelScheduledPlanChange(token: string): Promise<Subscription> {
+  return request<Subscription>("/billing/subscription/plan/cancel-scheduled", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
   });
 }
 

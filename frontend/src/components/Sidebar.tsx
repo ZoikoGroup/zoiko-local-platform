@@ -5,7 +5,7 @@ import { usePathname } from "next/navigation";
 import { NAV_ITEMS } from "@/lib/nav";
 import { NAV_ICONS } from "@/components/NavIcons";
 import Logo from "@/components/Logo";
-import type { Subscription } from "@/lib/api";
+import type { Entitlements, Subscription } from "@/lib/api";
 
 // Home and Billing stay open for a trial account no matter what - Billing
 // is literally the upgrade path, and Home's own stat cards need to keep
@@ -22,7 +22,13 @@ function LockIcon({ className }: { className?: string }) {
   );
 }
 
-export default function Sidebar({ subscription }: { subscription: Subscription | null }) {
+export default function Sidebar({
+  subscription,
+  entitlements,
+}: {
+  subscription: Subscription | null;
+  entitlements: Entitlements | null;
+}) {
   const pathname = usePathname();
   const isTrialing = subscription?.status === "trialing";
 
@@ -49,7 +55,10 @@ export default function Sidebar({ subscription }: { subscription: Subscription |
               ? pathname === "/dashboard"
               : pathname?.startsWith(item.href);
           const Icon = NAV_ICONS[item.href];
-          const locked = isTrialing && !ALWAYS_OPEN_HREFS.has(item.href);
+          const requiredEntitlement = "requiredEntitlement" in item ? item.requiredEntitlement : undefined;
+          const lacksEntitlement =
+            requiredEntitlement != null && entitlements != null && !entitlements[requiredEntitlement];
+          const locked = (isTrialing && !ALWAYS_OPEN_HREFS.has(item.href)) || lacksEntitlement;
 
           if (locked) {
             return (

@@ -5,15 +5,18 @@ import { useRouter } from "next/navigation";
 import {
   listPlans,
   getPriceCatalogEntry,
-  changeSubscriptionPlan,
+  previewPlanChange,
+  confirmPlanChange,
   createPlanChangeCheckoutSession,
   ApiError,
   type Plan,
   type PriceCatalogEntry,
   type BillingPeriod,
+  type PlanChangePreview,
 } from "@/lib/api";
 import { getToken } from "@/lib/auth";
 import Logo from "@/components/Logo";
+import PlanChangePreviewModal from "@/components/PlanChangePreviewModal";
 
 // Global Plans, Pricing & Commercial Launch Standard doc §8.2 - Enterprise
 // is sales-led, never a self-serve "switch to this plan" action.
@@ -79,6 +82,8 @@ export default function ChoosePlanPage() {
   const [choosing, setChoosing] = useState<string | null>(null);
   const [chooseError, setChooseError] = useState<string | null>(null);
   const [selectedUseCase, setSelectedUseCase] = useState<string | null>(null);
+  const [preview, setPreview] = useState<PlanChangePreview | null>(null);
+  const [previewLoadingFor, setPreviewLoadingFor] = useState<string | null>(null);
 
   useEffect(() => {
     if (!token) {
@@ -118,26 +123,41 @@ export default function ChoosePlanPage() {
 
   async function handleChoose(planCode: string) {
     if (!token) return;
-    setChoosing(planCode);
+    setPreviewLoadingFor(planCode);
     setChooseError(null);
     try {
-      const entry = prices[planCode];
+      const p = await previewPlanChange(token, planCode, billingPeriod);
+      setPreview(p);
+    } catch (err) {
+      setChooseError(err instanceof ApiError ? err.message : "Couldn't preview this plan.");
+    } finally {
+      setPreviewLoadingFor(null);
+    }
+  }
+
+  async function handleConfirmPreview() {
+    if (!token || !preview) return;
+    setChoosing(preview.target_plan_code);
+    setChooseError(null);
+    try {
+      const entry = prices[preview.target_plan_code];
       const requiresPayment = !!entry && !entry.is_placeholder && entry.amount_minor_units > 0;
       if (requiresPayment) {
-        // Same real-money gate as dashboard/billing's handleChangePlan -
+        // Same real-money gate as dashboard/billing's handleConfirmPreview -
         // a paid plan must go through Stripe's hosted Checkout page before
-        // its entitlements apply, not switch locally for free. The plan
+        // its entitlements apply, not confirm locally for free. The plan
         // only changes once Stripe confirms payment via
         // /billing/stripe/checkout-webhook, not on this click.
-        const session = await createPlanChangeCheckoutSession(token, planCode, billingPeriod);
+        const session = await createPlanChangeCheckoutSession(token, preview.target_plan_code, billingPeriod);
         window.location.href = session.url;
         return;
       }
-      await changeSubscriptionPlan(token, planCode, billingPeriod);
+      await confirmPlanChange(token, preview.preview_token);
       router.push("/dashboard");
     } catch (err) {
       setChooseError(err instanceof ApiError ? err.message : "Couldn't set your plan.");
       setChoosing(null);
+      setPreview(null);
     }
   }
 
@@ -265,12 +285,16 @@ export default function ChoosePlanPage() {
                   ) : (
                     <button
                       onClick={() => handleChoose(plan.plan_code)}
-                      disabled={choosing !== null}
+                      disabled={choosing !== null || previewLoadingFor !== null}
                       className={`w-full text-xs font-medium rounded-lg px-3 py-2 disabled:opacity-60 text-white ${
                         isRecommended ? "bg-indigo-600 hover:bg-indigo-700" : "bg-slate-800 hover:bg-slate-900"
                       }`}
                     >
-                      {choosing === plan.plan_code ? "Setting up..." : `Choose ${plan.name}`}
+                      {previewLoadingFor === plan.plan_code
+                        ? "Loading..."
+                        : choosing === plan.plan_code
+                          ? "Setting up..."
+                          : `Choose ${plan.name}`}
                     </button>
                   )}
                 </div>
@@ -289,6 +313,18 @@ export default function ChoosePlanPage() {
           </button>
         </div>
       </div>
+
+      {preview && (
+        <PlanChangePreviewModal
+          preview={preview}
+          targetPlanName={plans.find((p) => p.plan_code === preview.target_plan_code)?.name ?? preview.target_plan_code}
+          priceLabel={formatPrice(prices[preview.target_plan_code])}
+          busy={choosing === preview.target_plan_code}
+          error={chooseError}
+          onConfirm={handleConfirmPreview}
+          onClose={() => setPreview(null)}
+        />
+      )}
     </div>
   );
 }
