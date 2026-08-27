@@ -48,7 +48,7 @@ export default function StatusPage() {
   }, []);
 
   return (
-    <main className="min-h-screen bg-slate-50 flex flex-col items-center px-6 py-16">
+    <main className="glass-ui min-h-screen bg-slate-50 flex flex-col items-center px-6 py-16">
       <div className="w-full max-w-xl space-y-6">
         <div className="flex items-center gap-2 justify-center">
           <Logo size={32} />

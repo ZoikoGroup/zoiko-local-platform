@@ -324,7 +324,7 @@ export default function GuestJoinPage() {
   }
 
   return (
-    <main className="min-h-screen bg-slate-950 flex items-center justify-center p-6">
+    <main className="glass-dark min-h-screen bg-slate-950 flex items-center justify-center p-6">
       <div className="w-full max-w-2xl">
         <div className="flex items-center gap-2 justify-center mb-6">
           <Logo size={32} />

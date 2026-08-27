@@ -154,7 +154,7 @@ export default function StaffConsoleLayout({ children }: { children: React.React
   // is also required: flex-1 leaves min-height:auto, which refuses to shrink
   // below content height, so overflow-y-auto would never engage without it.
   return (
-    <div className="staff-scope h-screen flex overflow-hidden bg-slate-950 text-slate-200">
+    <div className="staff-scope glass-dark h-screen flex overflow-hidden bg-slate-950 text-slate-200">
       {/* ── SIDEBAR ────────────────────────────────────────────────── */}
       <aside className="hidden w-64 shrink-0 h-full flex-col border-r border-slate-800 bg-slate-900 lg:flex">
         <div className="shrink-0 border-b border-slate-800 px-5 py-4">

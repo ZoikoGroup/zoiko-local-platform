@@ -1,0 +1,477 @@
+/* ==========================================================================
+   ZOIKO LOCAL — GLASS (FROSTED) LAYER, APP-WIDE
+   --------------------------------------------------------------------------
+   iOS-style frosted surfaces + hover motion for every screen in the app.
+   NO COLOUR VALUES CHANGE. Every hue here already exists in globals.css
+   (light) or staff-theme.css (dark). What changes is alpha, blur, shadow
+   depth and a hairline highlight on each panel's top edge — that highlight
+   is what actually makes a surface read as glass rather than a flat box.
+
+   TWO VARIANTS, because the app has two polarities:
+
+     .glass-ui    LIGHT  — beige/white surfaces, orange accent
+                  dashboard, login/signup, pricing, choose-plan, status
+     .glass-dark  DARK   — ink surfaces, teal accent
+                  staff console, staff login, video join room
+
+   HOW THIS WORKS — no page file's markup was restructured.
+   Rules key off the class combinations the pages already use, matched with
+   CSS attribute-word selectors. A Tailwind utility is one class
+   (specificity 0,1,0); these selectors are (0,3,0)+ so they win without
+   !important, and utilities the pages set themselves (StatCard's
+   hover:shadow-md, focus rings) still layer on top.
+
+   This file replaces the earlier dashboard-only app/dashboard/glass.css.
+   One source of truth instead of duplicating the light rules per section.
+   ========================================================================== */
+
+/* ==========================================================================
+   PART 1 — SHARED (both polarities)
+   ========================================================================== */
+
+/* Keep real content above the ambient backdrop pseudo-element. */
+.glass-ui > *,
+.glass-dark > * {
+  position: relative;
+  z-index: 1;
+}
+
+/* Motion is decoration here, never information. */
+.glass-ui button,
+.glass-dark button,
+.glass-ui a[class~="rounded-lg"],
+.glass-ui a[class~="rounded-full"],
+.glass-dark a[class~="rounded-lg"],
+.glass-dark a[class~="rounded-full"] {
+  transition:
+    background-color 0.18s ease,
+    box-shadow 0.2s ease,
+    transform 0.16s cubic-bezier(0.22, 0.61, 0.36, 1),
+    border-color 0.18s ease,
+    color 0.18s ease;
+}
+
+/* Disabled must never lift or glow, or it reads as clickable. */
+.glass-ui button:disabled,
+.glass-dark button:disabled {
+  transform: none !important;
+  box-shadow: none !important;
+}
+
+/* ==========================================================================
+   PART 2 — LIGHT VARIANT (.glass-ui)
+   ========================================================================== */
+
+/* --- ambient backdrop ------------------------------------------------------
+   Glass needs something behind it to refract. On flat beige a frosted panel
+   is indistinguishable from a white one, so this lays down soft pools using
+   the existing orange, green and cream. Fixed, so they don't slide while the
+   content area scrolls. */
+.glass-ui::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  background:
+    radial-gradient(58rem 34rem at 78% -8%, rgb(232 93 60 / 0.14), transparent 70%),
+    radial-gradient(48rem 30rem at 8% 106%, rgb(10 79 74 / 0.16), transparent 72%),
+    radial-gradient(38rem 26rem at 52% 44%, rgb(255 240 213 / 0.5), transparent 75%);
+}
+
+/* --- cards / panels ------------------------------------------------------- */
+.glass-ui [class~="bg-white"][class~="rounded-xl"],
+.glass-ui [class~="bg-white"][class~="rounded-2xl"] {
+  background-color: rgb(255 255 255 / 0.72);
+  -webkit-backdrop-filter: blur(20px) saturate(150%);
+  backdrop-filter: blur(20px) saturate(150%);
+  border-color: rgb(255 255 255 / 0.65);
+  box-shadow:
+    inset 0 1px 0 0 rgb(255 255 255 / 0.85),
+    0 1px 2px rgb(6 50 46 / 0.04),
+    0 12px 28px -12px rgb(6 50 46 / 0.14);
+  transition:
+    transform 0.22s cubic-bezier(0.22, 0.61, 0.36, 1),
+    box-shadow 0.22s ease,
+    background-color 0.22s ease,
+    border-color 0.22s ease;
+}
+
+.glass-ui [class~="bg-white"][class~="rounded-xl"]:hover,
+.glass-ui [class~="bg-white"][class~="rounded-2xl"]:hover {
+  transform: translateY(-2px);
+  background-color: rgb(255 255 255 / 0.84);
+  border-color: rgb(255 255 255 / 0.9);
+  box-shadow:
+    inset 0 1px 0 0 rgb(255 255 255 / 0.95),
+    0 2px 4px rgb(6 50 46 / 0.05),
+    0 22px 44px -16px rgb(6 50 46 / 0.2);
+}
+
+/* A card inside an already-frosted card just turns to mud on a second full
+   blur — lighten instead, and don't lift. */
+.glass-ui [class~="bg-white"] [class~="bg-white"][class~="rounded-xl"],
+.glass-ui [class~="bg-white"] [class~="bg-white"][class~="rounded-2xl"] {
+  background-color: rgb(255 255 255 / 0.5);
+  -webkit-backdrop-filter: blur(8px);
+  backdrop-filter: blur(8px);
+  box-shadow: inset 0 1px 0 0 rgb(255 255 255 / 0.7);
+}
+
+.glass-ui [class~="bg-white"] [class~="bg-white"][class~="rounded-xl"]:hover,
+.glass-ui [class~="bg-white"] [class~="bg-white"][class~="rounded-2xl"]:hover {
+  transform: none;
+  background-color: rgb(255 255 255 / 0.66);
+}
+
+/* --- form controls: light frost only --------------------------------------
+   A heavily blurred input looks broken while you type in it. */
+.glass-ui [class~="bg-white"][class~="border-slate-300"],
+.glass-ui [class~="bg-white"][class~="border-slate-200"] {
+  background-color: rgb(255 255 255 / 0.7);
+  -webkit-backdrop-filter: blur(8px);
+  backdrop-filter: blur(8px);
+  transition:
+    background-color 0.18s ease,
+    border-color 0.18s ease,
+    box-shadow 0.18s ease;
+}
+
+.glass-ui input[class~="bg-white"]:hover:not(:disabled),
+.glass-ui select[class~="bg-white"]:hover:not(:disabled),
+.glass-ui textarea[class~="bg-white"]:hover:not(:disabled) {
+  background-color: rgb(255 255 255 / 0.88);
+  border-color: rgb(6 50 46 / 0.24);
+}
+
+/* Drop the blur on focus so typing is crisp. */
+.glass-ui input[class~="bg-white"]:focus,
+.glass-ui select[class~="bg-white"]:focus,
+.glass-ui textarea[class~="bg-white"]:focus {
+  background-color: rgb(255 255 255 / 0.97);
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+}
+
+/* --- sidebar (dashboard) --------------------------------------------------
+   Tinted, not transparent: persistent chrome can't have page colour
+   bleeding through it or the labels start to swim. */
+.glass-ui aside[class~="bg-slate-950"] {
+  background-color: rgb(5 43 40 / 0.9);
+  -webkit-backdrop-filter: blur(24px) saturate(170%);
+  backdrop-filter: blur(24px) saturate(170%);
+  border-right: 1px solid rgb(255 255 255 / 0.08);
+  box-shadow: inset -1px 0 0 rgb(0 0 0 / 0.15);
+}
+
+.glass-ui aside a {
+  transition:
+    background-color 0.18s ease,
+    color 0.18s ease,
+    transform 0.18s cubic-bezier(0.22, 0.61, 0.36, 1);
+}
+
+.glass-ui aside a:hover {
+  transform: translateX(2px);
+  background-color: rgb(255 255 255 / 0.09);
+  -webkit-backdrop-filter: blur(6px);
+  backdrop-filter: blur(6px);
+}
+
+/* --- sticky topbars / page headers ---------------------------------------
+   Covers the dashboard Topbar (bg-white/80) and the pricing + choose-plan
+   page headers (bg-white with a border-b). */
+.glass-ui [class~="bg-white/80"],
+.glass-ui header[class~="bg-white"],
+.glass-ui [class~="border-b"][class~="bg-white"] {
+  background-color: rgb(246 242 236 / 0.72);
+  -webkit-backdrop-filter: blur(22px) saturate(160%);
+  backdrop-filter: blur(22px) saturate(160%);
+  border-bottom-color: rgb(6 50 46 / 0.09);
+  box-shadow: 0 1px 0 0 rgb(255 255 255 / 0.6);
+}
+
+/* --- buttons -------------------------------------------------------------- */
+.glass-ui button[class~="bg-indigo-600"]:hover:not(:disabled),
+.glass-ui a[class~="bg-indigo-600"]:hover {
+  transform: translateY(-1px);
+  box-shadow:
+    0 4px 10px -2px rgb(232 93 60 / 0.4),
+    0 10px 22px -8px rgb(232 93 60 / 0.35);
+}
+
+.glass-ui button[class~="bg-indigo-600"]:active:not(:disabled) {
+  transform: translateY(0);
+}
+
+/* Secondary/ghost buttons get a frosted fill rather than a flat grey tint,
+   so they match the panels. */
+.glass-ui button[class~="border-slate-300"]:hover:not(:disabled),
+.glass-ui button[class~="border-slate-200"]:hover:not(:disabled) {
+  background-color: rgb(255 255 255 / 0.82);
+  -webkit-backdrop-filter: blur(8px);
+  backdrop-filter: blur(8px);
+  border-color: rgb(6 50 46 / 0.2);
+  box-shadow: 0 6px 14px -8px rgb(6 50 46 / 0.25);
+}
+
+/* --- list rows + tables --------------------------------------------------- */
+.glass-ui [class~="divide-slate-100"] > *,
+.glass-ui [class~="divide-slate-200"] > *,
+.glass-ui tbody tr {
+  transition:
+    background-color 0.16s ease,
+    box-shadow 0.16s ease;
+}
+
+.glass-ui [class~="divide-slate-100"] > *:hover,
+.glass-ui [class~="divide-slate-200"] > *:hover,
+.glass-ui tbody tr:hover {
+  background-color: rgb(255 255 255 / 0.6);
+  box-shadow: inset 3px 0 0 0 rgb(232 93 60 / 0.55);
+}
+
+.glass-ui thead th {
+  background-color: rgb(255 255 255 / 0.45);
+  -webkit-backdrop-filter: blur(8px);
+  backdrop-filter: blur(8px);
+}
+
+/* --- status pills --------------------------------------------------------
+   A flat pastel fill starts to disappear on a translucent card. */
+.glass-ui [class~="rounded-full"][class~="bg-emerald-50"],
+.glass-ui [class~="rounded-full"][class~="bg-amber-50"],
+.glass-ui [class~="rounded-full"][class~="bg-red-50"],
+.glass-ui [class~="rounded-full"][class~="bg-indigo-50"],
+.glass-ui [class~="rounded-full"][class~="bg-slate-100"] {
+  -webkit-backdrop-filter: blur(6px) saturate(160%);
+  backdrop-filter: blur(6px) saturate(160%);
+  box-shadow: inset 0 0 0 1px rgb(255 255 255 / 0.55);
+}
+
+/* ==========================================================================
+   PART 3 — DARK VARIANT (.glass-dark)
+   Staff console, staff login, video join room.
+   Dark glass needs the opposite treatment from light glass: the highlight
+   goes to a faint WHITE inset line at very low alpha, and the shadow has to
+   be much deeper, because a soft shadow is invisible against ink.
+   ========================================================================== */
+
+.glass-dark::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  /* Teal + green pools, matching the staff accent rather than the orange
+     customer accent, so the two apps stay visually distinct. */
+  background:
+    radial-gradient(56rem 32rem at 82% -6%, rgb(15 118 110 / 0.22), transparent 70%),
+    radial-gradient(46rem 30rem at 6% 104%, rgb(10 79 74 / 0.26), transparent 72%),
+    radial-gradient(34rem 24rem at 48% 46%, rgb(45 212 191 / 0.07), transparent 76%);
+}
+
+/* --- cards / panels ------------------------------------------------------- */
+.glass-dark [class~="bg-slate-900"][class~="rounded-xl"],
+.glass-dark [class~="bg-slate-900"][class~="rounded-2xl"],
+.glass-dark [class~="bg-slate-900"][class~="rounded-lg"] {
+  background-color: rgb(16 28 25 / 0.62);
+  -webkit-backdrop-filter: blur(20px) saturate(140%);
+  backdrop-filter: blur(20px) saturate(140%);
+  border-color: rgb(255 255 255 / 0.1);
+  box-shadow:
+    inset 0 1px 0 0 rgb(255 255 255 / 0.07),
+    0 14px 34px -14px rgb(0 0 0 / 0.6);
+  transition:
+    transform 0.22s cubic-bezier(0.22, 0.61, 0.36, 1),
+    box-shadow 0.22s ease,
+    background-color 0.22s ease,
+    border-color 0.22s ease;
+}
+
+.glass-dark [class~="bg-slate-900"][class~="rounded-xl"]:hover,
+.glass-dark [class~="bg-slate-900"][class~="rounded-2xl"]:hover {
+  transform: translateY(-2px);
+  background-color: rgb(16 28 25 / 0.76);
+  border-color: rgb(45 212 191 / 0.3);
+  box-shadow:
+    inset 0 1px 0 0 rgb(255 255 255 / 0.1),
+    0 22px 46px -16px rgb(0 0 0 / 0.7);
+}
+
+/* Small inline chips built from the same classes shouldn't lift. */
+.glass-dark [class~="bg-slate-900"][class~="rounded-lg"]:hover {
+  background-color: rgb(16 28 25 / 0.76);
+}
+
+/* --- shell chrome: sidebar + header + mobile tab strip -------------------- */
+.glass-dark aside[class~="bg-slate-900"],
+.glass-dark header[class~="bg-slate-900"],
+.glass-dark nav[class~="bg-slate-900"] {
+  background-color: rgb(16 28 25 / 0.72);
+  -webkit-backdrop-filter: blur(26px) saturate(160%);
+  backdrop-filter: blur(26px) saturate(160%);
+  border-color: rgb(255 255 255 / 0.09);
+}
+
+.glass-dark aside a {
+  transition:
+    background-color 0.18s ease,
+    color 0.18s ease,
+    transform 0.18s cubic-bezier(0.22, 0.61, 0.36, 1);
+}
+
+.glass-dark aside a:hover {
+  transform: translateX(2px);
+  background-color: rgb(255 255 255 / 0.07);
+  -webkit-backdrop-filter: blur(6px);
+  backdrop-filter: blur(6px);
+}
+
+/* --- form controls -------------------------------------------------------- */
+.glass-dark [class~="bg-slate-800"] {
+  background-color: rgb(26 40 35 / 0.7);
+  -webkit-backdrop-filter: blur(8px);
+  backdrop-filter: blur(8px);
+  border-color: rgb(255 255 255 / 0.12);
+  transition:
+    background-color 0.18s ease,
+    border-color 0.18s ease;
+}
+
+.glass-dark input[class~="bg-slate-800"]:hover:not(:disabled),
+.glass-dark select[class~="bg-slate-800"]:hover:not(:disabled),
+.glass-dark textarea[class~="bg-slate-800"]:hover:not(:disabled) {
+  background-color: rgb(26 40 35 / 0.9);
+  border-color: rgb(255 255 255 / 0.2);
+}
+
+.glass-dark input[class~="bg-slate-800"]:focus,
+.glass-dark select[class~="bg-slate-800"]:focus,
+.glass-dark textarea[class~="bg-slate-800"]:focus {
+  background-color: rgb(20 32 28 / 0.98);
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+}
+
+/* --- buttons: teal accent, not orange ------------------------------------ */
+.glass-dark button[class~="bg-indigo-600"]:hover:not(:disabled) {
+  transform: translateY(-1px);
+  box-shadow:
+    0 4px 10px -2px rgb(15 118 110 / 0.5),
+    0 10px 24px -8px rgb(20 184 166 / 0.35);
+}
+
+.glass-dark button[class~="bg-indigo-600"]:active:not(:disabled) {
+  transform: translateY(0);
+}
+
+.glass-dark button[class~="border-slate-700"]:hover:not(:disabled),
+.glass-dark button[class~="bg-slate-800"]:hover:not(:disabled) {
+  background-color: rgb(36 53 47 / 0.85);
+  -webkit-backdrop-filter: blur(8px);
+  backdrop-filter: blur(8px);
+  border-color: rgb(45 212 191 / 0.35);
+  box-shadow: 0 8px 18px -10px rgb(0 0 0 / 0.7);
+}
+
+/* --- list rows + tables -------------------------------------------------- */
+.glass-dark [class~="divide-slate-800"] > *,
+.glass-dark tbody tr {
+  transition:
+    background-color 0.16s ease,
+    box-shadow 0.16s ease;
+}
+
+.glass-dark [class~="divide-slate-800"] > *:hover,
+.glass-dark tbody tr:hover {
+  background-color: rgb(255 255 255 / 0.045);
+  box-shadow: inset 3px 0 0 0 rgb(45 212 191 / 0.6);
+}
+
+.glass-dark thead th {
+  background-color: rgb(255 255 255 / 0.03);
+  -webkit-backdrop-filter: blur(8px);
+  backdrop-filter: blur(8px);
+}
+
+/* --- status badges ------------------------------------------------------- */
+.glass-dark [class~="rounded-full"][class~="bg-emerald-950"],
+.glass-dark [class~="rounded-full"][class~="bg-amber-950"],
+.glass-dark [class~="rounded-full"][class~="bg-red-950"],
+.glass-dark [class~="rounded-full"][class~="bg-indigo-950"] {
+  -webkit-backdrop-filter: blur(6px) saturate(150%);
+  backdrop-filter: blur(6px) saturate(150%);
+  box-shadow: inset 0 0 0 1px rgb(255 255 255 / 0.08);
+}
+
+/* ==========================================================================
+   PART 4 — ACCESSIBILITY + FALLBACKS
+   ========================================================================== */
+
+@media (prefers-reduced-motion: reduce) {
+  .glass-ui *,
+  .glass-ui *::before,
+  .glass-ui *::after,
+  .glass-dark *,
+  .glass-dark *::before,
+  .glass-dark *::after {
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+  }
+  .glass-ui [class~="bg-white"][class~="rounded-xl"]:hover,
+  .glass-ui aside a:hover,
+  .glass-ui button:hover,
+  .glass-dark [class~="bg-slate-900"][class~="rounded-xl"]:hover,
+  .glass-dark aside a:hover,
+  .glass-dark button:hover {
+    transform: none !important;
+  }
+}
+
+/* Firefox <103 and older Safari have no backdrop-filter. Without this the
+   panels stay translucent with nothing blurring behind them, so text sits
+   directly on the gradient pools and becomes unreadable. Fall back to
+   near-opaque surfaces; keep the shadows. */
+@supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+  .glass-ui [class~="bg-white"][class~="rounded-xl"],
+  .glass-ui [class~="bg-white"][class~="rounded-2xl"],
+  .glass-ui [class~="bg-white"][class~="border-slate-300"] {
+    background-color: rgb(255 255 255 / 0.97);
+  }
+  .glass-ui aside[class~="bg-slate-950"] {
+    background-color: #052b28;
+  }
+  .glass-ui [class~="bg-white/80"],
+  .glass-ui header[class~="bg-white"] {
+    background-color: rgb(246 242 236 / 0.98);
+  }
+  .glass-dark [class~="bg-slate-900"][class~="rounded-xl"],
+  .glass-dark [class~="bg-slate-900"][class~="rounded-lg"],
+  .glass-dark aside[class~="bg-slate-900"],
+  .glass-dark header[class~="bg-slate-900"],
+  .glass-dark nav[class~="bg-slate-900"] {
+    background-color: #101c19;
+  }
+  .glass-dark [class~="bg-slate-800"] {
+    background-color: #1a2823;
+  }
+}
+
+/* Windows/macOS high-contrast: transparency actively harms legibility. */
+@media (prefers-contrast: more) {
+  .glass-ui [class~="bg-white"][class~="rounded-xl"],
+  .glass-ui [class~="bg-white"][class~="border-slate-300"] {
+    background-color: #fff;
+    border-color: #073b37;
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+  }
+  .glass-dark [class~="bg-slate-900"][class~="rounded-xl"],
+  .glass-dark [class~="bg-slate-800"] {
+    background-color: #08110f;
+    border-color: #dde8e5;
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+  }
+}

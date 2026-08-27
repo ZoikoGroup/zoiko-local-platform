@@ -73,7 +73,7 @@ export default function StaffLoginPage() {
     "w-full rounded-lg border border-slate-300 bg-white text-slate-900 px-3.5 py-2.5 text-sm placeholder:text-slate-400 focus:outline-none focus:border-indigo-500 focus:ring-2 focus:ring-indigo-500/30 disabled:bg-slate-50 transition";
 
   return (
-    <main className="staff-scope min-h-screen bg-slate-950 px-4 py-10 flex items-center justify-center">
+    <main className="staff-scope glass-dark min-h-screen bg-slate-950 px-4 py-10 flex items-center justify-center">
       {/* Soft brand glow behind the card - same treatment as the marketing
           hero, keeps the flat green from looking like an error page. */}
       <div

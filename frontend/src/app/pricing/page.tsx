@@ -79,7 +79,7 @@ export default function PricingPage() {
   }, [plans, billingPeriod]);
 
   return (
-    <div className="min-h-screen bg-slate-50">
+    <div className="glass-ui min-h-screen bg-slate-50">
       <header className="border-b border-slate-200 bg-white">
         <div className="max-w-6xl mx-auto px-6 h-16 flex items-center justify-between">
           <Link href="/" className="flex items-center gap-2">

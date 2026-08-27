@@ -74,7 +74,7 @@ export default function DashboardLayout({
   //   - <main> is the only thing that scrolls the beige content area.
   // The Topbar and TrialBanner sit outside <main>, so they stay put.
   return (
-    <div className="h-screen flex overflow-hidden bg-slate-50">
+    <div className="glass-ui h-screen flex overflow-hidden bg-slate-50">
       <Sidebar subscription={subscription} />
       <div className="flex-1 flex flex-col min-w-0 overflow-hidden">
         <Topbar user={user} />

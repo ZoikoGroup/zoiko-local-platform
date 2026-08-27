@@ -135,7 +135,7 @@ export default function ChoosePlanPage() {
   const recommendedPlanCode = USE_CASES.find((u) => u.id === selectedUseCase)?.recommends ?? null;
 
   return (
-    <div className="min-h-screen bg-slate-50">
+    <div className="glass-ui min-h-screen bg-slate-50">
       <div className="max-w-5xl mx-auto px-6 py-12">
         <div className="flex items-center gap-2 mb-10">
           <Logo size={36} />
