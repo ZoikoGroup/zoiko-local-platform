@@ -115,6 +115,23 @@ def test_status_callback_updates_call_duration(client, db_session):
     assert calls[0]["duration"] == 42
 
 
+def test_incoming_call_to_unrecognized_number_does_not_crash(client):
+    # A call to a number we don't own (never purchased, or since released)
+    # has no owning account - record_call's audit log_event call must not
+    # require a real account_id here. Regression test for a real production
+    # bug: log_event(actor_id=None, ...) raised ValueError because neither
+    # actor nor actor_id was set, 500ing every inbound call to an
+    # unrecognized number.
+    url = "http://testserver/media/voice/incoming"
+    params = {
+        "To": "+15550000000", "From": "+15551234567", "CallSid": "CAunrecognized1", "CallStatus": "ringing",
+    }
+    signature = _twilio_signature(url, params)
+    response = client.post("/media/voice/incoming", data=params, headers={"X-Twilio-Signature": signature})
+    assert response.status_code == 200
+    assert "isn't recognized" in response.text
+
+
 def test_incoming_call_forwards_when_configured(client, db_session):
     token = _signup_and_login(client, "voiceforward@example.com")
     account_id = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"}).json()["account_id"]

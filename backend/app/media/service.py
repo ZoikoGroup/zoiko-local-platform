@@ -186,7 +186,7 @@ def record_call(
     _invalidate_calls_cache(account_id)
     log_event(
         db,
-        actor_id=account_id,
+        actor_id=account_id if account_id else "system:unrecognized_number",
         action=f"call.{direction.value}_recorded",
         target_type="call_record",
         target_id=call.id,
