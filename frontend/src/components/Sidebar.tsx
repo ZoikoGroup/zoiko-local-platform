@@ -27,8 +27,11 @@ export default function Sidebar({ subscription }: { subscription: Subscription |
   const isTrialing = subscription?.status === "trialing";
 
   return (
-    <aside className="w-64 shrink-0 bg-slate-950 text-slate-300 flex flex-col">
-      <div className="flex items-center gap-2 px-5 py-5 border-b border-white/10">
+    // h-full pins the sidebar to the shell's viewport height (see the
+    // scroll-ownership note in app/dashboard/layout.tsx) so the nav below
+    // scrolls inside the sidebar instead of the whole page scrolling.
+    <aside className="w-64 shrink-0 h-full bg-slate-950 text-slate-300 flex flex-col">
+      <div className="shrink-0 flex items-center gap-2 px-5 py-5 border-b border-white/10">
         <Logo size={36} className="shadow-sm shadow-indigo-500/30" />
         <div>
           <div className="font-semibold text-white leading-tight">Zoiko Local</div>
@@ -36,7 +39,10 @@ export default function Sidebar({ subscription }: { subscription: Subscription |
         </div>
       </div>
 
-      <nav className="flex-1 px-3 py-4 space-y-0.5 overflow-y-auto">
+      {/* min-h-0 required for the same reason as <main> in the dashboard
+          layout: flex-1 leaves min-height:auto, so without it this nav
+          grows to fit all 19 links and overflows instead of scrolling. */}
+      <nav className="flex-1 min-h-0 px-3 py-4 space-y-0.5 overflow-y-auto overscroll-contain">
         {NAV_ITEMS.map((item) => {
           const active =
             item.href === "/dashboard"

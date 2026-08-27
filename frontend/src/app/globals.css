@@ -1,33 +1,161 @@
 @import "tailwindcss";
 
+/* ==========================================================================
+   ZOIKO LOCAL — GREEN + BEIGE DASHBOARD THEME
+   --------------------------------------------------------------------------
+   Every colour below is sampled from the zoikolocal.com marketing site:
+     beige page          #F6F2EC
+     deep green band     #053936
+     wordmark green      #0A4F4A
+     orange CTA          #E85D3C
+     cream pill          #FFF0D5
+     mint pill           #DFF8EE  (text #1C5955)
+
+   HOW THIS WORKS — read before editing anything:
+   Tailwind v4 exposes its built-in palettes as theme variables
+   (--color-slate-500, --color-indigo-600, ...). Redefining them here
+   re-skins every component that already uses those class names.
+
+   That means NOT ONE LINE of the 20 dashboard page files changed, and
+   Sidebar / Topbar / StatCard / TrialBanner didn't need touching either.
+   The whole theme lives in this file plus the font wiring in layout.tsx.
+
+   The mapping, so the class names still make sense to you:
+     slate-*    -> beige surfaces climbing to deep green (chrome + text)
+     indigo-*   -> terracotta orange  (primary buttons, links, active state)
+     emerald-*  -> mint/green         (success, "active", positive status)
+     amber-*    -> cream/gold         (warnings, trial banner)
+     red-*      -> clay red           (errors — kept clearly red, warmed up)
+     orange-*   -> same terracotta as indigo (only 4 uses, keeps them on-brand)
+     violet-*   -> deep green         (only 2 uses)
+
+   So "bg-slate-950" is now the deep green sidebar, "bg-slate-50" is the
+   beige page, and "bg-indigo-600" is the orange Buy Number button.
+   ========================================================================== */
+
+@theme {
+  /* ---- fonts -------------------------------------------------------- */
+  --font-sans: var(--font-body), ui-sans-serif, system-ui, sans-serif;
+  --font-display: var(--font-heading), var(--font-body), ui-sans-serif, sans-serif;
+  --font-mono: var(--font-geist-mono), ui-monospace, monospace;
+
+  /* ---- NEUTRALS: beige -> deep green (was slate) --------------------- */
+  --color-slate-50:  #f6f2ec; /* page background            (sampled) */
+  --color-slate-100: #efe9df; /* subtle fills, hover rows             */
+  --color-slate-200: #e3dbcd; /* borders, dividers                    */
+  --color-slate-300: #cfc4b2; /* input borders                        */
+  --color-slate-400: #9c9384; /* muted text, placeholder, icons       */
+  --color-slate-500: #6e6b60; /* secondary body text                  */
+  --color-slate-600: #55544a; /* stronger secondary text              */
+  --color-slate-700: #2f4741; /* dark text, leans green               */
+  --color-slate-800: #0a4f4a; /* wordmark green             (sampled) */
+  --color-slate-900: #073b37; /* headings                             */
+  --color-slate-950: #052b28; /* sidebar background                   */
+
+  /* ---- PRIMARY: terracotta orange (was indigo) ----------------------- */
+  --color-indigo-50:  #fdede7;
+  --color-indigo-100: #fbdcd1;
+  --color-indigo-200: #f6bca5;
+  --color-indigo-300: #f19a78;
+  --color-indigo-400: #ef8563;
+  --color-indigo-500: #ec6f4f;
+  --color-indigo-600: #e85d3c; /* buttons / links            (sampled) */
+  --color-indigo-700: #d14c2c; /* hover                                */
+  --color-indigo-800: #b03d22;
+  --color-indigo-900: #8c301b;
+  --color-indigo-950: #4a1810;
+
+  /* ---- SUCCESS: mint / green (was emerald) --------------------------- */
+  --color-emerald-50:  #dff8ee; /* status pill background    (sampled) */
+  --color-emerald-100: #c7f0e0;
+  --color-emerald-200: #a3e4cd;
+  --color-emerald-300: #6fd3b1;
+  --color-emerald-400: #3fbe95;
+  --color-emerald-500: #1fa47c;
+  --color-emerald-600: #148566;
+  --color-emerald-700: #1c5955; /* status pill text          (sampled) */
+  --color-emerald-800: #124440;
+  --color-emerald-900: #0c3330;
+  --color-emerald-950: #06211f;
+
+  /* ---- WARNING: cream / gold (was amber) ---------------------------- */
+  --color-amber-50:  #fff6e5;
+  --color-amber-100: #fff0d5; /* cream pill                 (sampled) */
+  --color-amber-200: #fadfae;
+  --color-amber-300: #f2c878;
+  --color-amber-400: #e8ae47;
+  --color-amber-500: #d9942a;
+  --color-amber-600: #bc7a1c;
+  --color-amber-700: #96601a;
+  --color-amber-800: #744a18;
+  --color-amber-900: #5a3a16;
+  --color-amber-950: #331f0c;
+
+  /* ---- DANGER: clay red (was red) ----------------------------------- */
+  /* Warmed toward the brand without going orange — errors must still
+     read as errors, not as a primary action. */
+  --color-red-50:  #fdecea;
+  --color-red-100: #fbd9d5;
+  --color-red-200: #f5b5ae;
+  --color-red-300: #ec8c81;
+  --color-red-400: #e06455;
+  --color-red-500: #d14634;
+  --color-red-600: #be3a28;
+  --color-red-700: #9e2e20;
+  --color-red-800: #7d251a;
+  --color-red-900: #631f16;
+  --color-red-950: #37100b;
+
+  /* ---- stray families, folded into the palette ---------------------- */
+  --color-orange-50:  #fdede7;
+  --color-orange-700: #d14c2c;
+  --color-violet-600: #0a4f4a;
+  --color-violet-700: #073b37;
+}
+
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
-  /* This app is light-themed only (every component hardcodes slate/
-     indigo/white Tailwind colors, not these CSS vars) - without this,
-     a browser on a dark-mode OS renders native form controls (select,
-     file input, text input) with dark-mode text/background regardless
-     of this page's own light styling, making unstyled control text
-     invisible against light custom backgrounds. */
+  --background: #f6f2ec;
+  --foreground: #073b37;
+  /* Light-themed only. Without this, a browser on a dark-mode OS renders
+     native form controls (select, file input, text input) with dark-mode
+     text on our light custom backgrounds, making the text invisible. */
   color-scheme: light;
 }
 
 @theme inline {
   --color-background: var(--background);
   --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
-}
+/* The previous file flipped --background to #0a0a0a under a dark-mode OS,
+   which fought the beige theme. This app is light-only (see color-scheme
+   above), so that block is deliberately gone. */
 
 body {
   background: var(--background);
   color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  font-family: var(--font-sans);
+}
+
+/* Headings use the display face. Applied here rather than by editing
+   every page file, so no page markup changed. */
+h1,
+h2,
+h3,
+h4,
+h5,
+h6 {
+  font-family: var(--font-display);
+  letter-spacing: -0.015em;
+}
+
+/* Beige surfaces make default browser scrollbars look grey and out of
+   place, most visibly on the sidebar and the main scroll area. */
+* {
+  scrollbar-color: #cfc4b2 transparent;
+  scrollbar-width: thin;
+}
+
+aside * {
+  scrollbar-color: #1c4a45 transparent;
 }
