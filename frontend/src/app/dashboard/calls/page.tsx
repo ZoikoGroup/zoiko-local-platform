@@ -11,6 +11,8 @@ import {
   summarizeVoicemail,
   grantAiProcessingConsent,
   listContacts,
+  getCallRecordingBlob,
+  getVoicemailRecordingBlob,
   ApiError,
   type MyPhoneNumber,
   type CallLogEntry,
@@ -19,6 +21,7 @@ import {
 } from "@/lib/api";
 import { getToken } from "@/lib/auth";
 import { CallRow, type SummaryKey, type SummaryState } from "@/components/CallRow";
+import { useVoiceDevice } from "@/lib/voiceDevice";
 
 export default function CallsPage() {
   const [token] = useState<string | null>(() => getToken());
@@ -39,6 +42,8 @@ export default function CallsPage() {
   const [callSuccess, setCallSuccess] = useState<string | null>(null);
 
   const [summaries, setSummaries] = useState<Record<SummaryKey, SummaryState>>({});
+
+  const { status: browserCallStatus, error: browserCallError, activeCallTo, placeCall, hangUp } = useVoiceDevice();
 
   const loadAll = useCallback(() => {
     if (!token) return;
@@ -112,6 +117,15 @@ export default function CallsPage() {
     } finally {
       setCallBusy(false);
     }
+  }
+
+  async function handleBrowserCall() {
+    if (!fromNumber || !toNumber) return;
+    await placeCall(toNumber, fromNumber);
+  }
+
+  function handleHangUp() {
+    hangUp();
   }
 
   async function handleSummarize(kind: "call" | "voicemail", id: string) {
@@ -222,8 +236,44 @@ export default function CallsPage() {
                 {callBusy ? "Calling..." : "Talk Live"}
               </button>
             </div>
+            <div className="flex flex-wrap items-center gap-3">
+              {browserCallStatus === "in-call" || browserCallStatus === "ringing" || browserCallStatus === "connecting" ? (
+                <button
+                  type="button"
+                  onClick={handleHangUp}
+                  className="bg-red-600 hover:bg-red-700 text-white text-sm font-medium rounded-lg px-4 py-2"
+                >
+                  Hang Up
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  onClick={handleBrowserCall}
+                  disabled={!fromNumber || !toNumber || browserCallStatus === "incoming"}
+                  className="bg-violet-600 hover:bg-violet-700 disabled:opacity-60 text-white text-sm font-medium rounded-lg px-4 py-2"
+                  title="Talk directly through your computer's microphone - no phone needed at all"
+                >
+                  Call from Browser
+                </button>
+              )}
+              {browserCallStatus === "connecting" && (
+                <span className="text-sm text-slate-500">Connecting…</span>
+              )}
+              {browserCallStatus === "ringing" && (
+                <span className="text-sm text-slate-500">Ringing {toNumber}…</span>
+              )}
+              {browserCallStatus === "in-call" && (
+                <span className="text-sm text-emerald-600 font-medium">● Live — talking to {activeCallTo}</span>
+              )}
+              {browserCallStatus === "ended" && (
+                <span className="text-sm text-slate-500">Call ended.</span>
+              )}
+              {browserCallStatus === "error" && browserCallError && (
+                <span className="text-sm text-red-600">{browserCallError}</span>
+              )}
+            </div>
             <p className="text-xs text-slate-500">
-              <strong>Announce</strong> plays a one-way message and hangs up. <strong>Talk Live</strong> rings the real phone you enter above first, then connects you to a real, live, two-way conversation with the "To" number once you pick up.
+              <strong>Announce</strong> plays a one-way message and hangs up. <strong>Talk Live</strong> rings a real phone first, then connects it live to the "To" number. <strong>Call from Browser</strong> uses your computer&apos;s microphone directly — no phone needed at all, talk right here in the tab.
             </p>
             <div>
               <label className="block text-xs font-medium text-slate-500 mb-1">
@@ -261,6 +311,9 @@ export default function CallsPage() {
               duration={c.duration}
               createdAt={c.created_at}
               recordingUrl={c.recording_url}
+              loadRecording={() =>
+                token && c.sid ? getCallRecordingBlob(token, c.sid) : Promise.reject(new Error("Not available"))
+              }
               suspectedSpam={c.is_suspected_spam}
               summaryState={summaries[`call:${c.id}`] ?? { status: "idle" }}
               onSummarize={() => handleSummarize("call", c.id)}
@@ -286,6 +339,9 @@ export default function CallsPage() {
               duration={v.duration}
               createdAt={v.created_at}
               recordingUrl={v.recording_url}
+              loadRecording={() =>
+                token ? getVoicemailRecordingBlob(token, v.id) : Promise.reject(new Error("Not available"))
+              }
               summaryState={summaries[`voicemail:${v.id}`] ?? { status: "idle" }}
               onSummarize={() => handleSummarize("voicemail", v.id)}
               onGrantConsent={() => handleGrantConsent("voicemail", v.id)}

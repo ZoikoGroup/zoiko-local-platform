@@ -783,7 +783,10 @@ def test_call_ending_records_ai_receptionist_minutes_usage_event(client, db_sess
     response = client.post(
         "/media/voice/status-callback", data=status_params, headers={"X-Twilio-Signature": signature}
     )
-    assert response.status_code == 204
+    # /status-callback returns a real empty TwiML doc (200), not a bare 204 -
+    # a bare 204 reaches Twilio with an empty Content-Type header (its error
+    # 12300), confirmed live via a real call's own Notifications log.
+    assert response.status_code == 200
 
     event = (
         db_session.query(UsageEvent)

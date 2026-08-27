@@ -14,6 +14,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, R
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.orm import Session
 
+from app.billing import service as billing_service
 from app.core.database import get_db
 from app.core.deps import get_current_user, require_writer
 from app.integrations.telecom import twilio as telecom
@@ -43,7 +44,7 @@ def _inner_verbs(twiml: str) -> str:
 
 
 def _flow_response(
-    db: Session, action: ResolvedAction, version: CallFlowVersion, request: Request, to_number: str
+    db: Session, action: ResolvedAction, version: CallFlowVersion, request: Request, to_number: str, owner=None
 ) -> str:
     """Turns a resolved call-flow node (Advanced IVR builder, Phase 3) into
     TwiML - the flow equivalent of incoming_call's own if/elif chain below,
@@ -63,7 +64,7 @@ def _flow_response(
         left_action_url = f"{base}media/voice/queue/left"
         if action.overflow_node_id:
             overflow_action = routing_service.resolve_specific_node(version, action.overflow_node_id)
-            overflow_twiml = _flow_response(db, overflow_action, version, request, to_number)
+            overflow_twiml = _flow_response(db, overflow_action, version, request, to_number, owner)
         else:
             overflow_twiml = telecom.build_record_response(base + "media/voicemail/recording-complete")
         return telecom.build_enqueue_response(queue_name, wait_url, left_action_url, _inner_verbs(overflow_twiml))
@@ -83,8 +84,12 @@ def _flow_response(
             if call_flow is not None and media_service.should_record_forwarded_call(db, call_flow.account_id)
             else None
         )
+        # Also ring the browser dashboard alongside this node's configured
+        # phone destinations - same rationale as the legacy forwarding path
+        # in _default_call_twiml above.
+        destinations = ([f"client:{owner.account_id}"] if owner is not None else []) + action.destinations
         return telecom.build_ring_group_response(
-            action.destinations, fallback_url, status_callback_url, recording_callback_url
+            destinations, fallback_url, status_callback_url, recording_callback_url
         )
     if action.kind == "ai_receptionist":
         action_url = base + "media/receptionist/respond"
@@ -155,6 +160,13 @@ def _default_call_twiml(request: Request, db: Session, owner, to_number: str) ->
         # Ring every configured destination simultaneously if a ring group
         # is set, otherwise fall back to the plain single forwarding_number.
         destinations = [d.destination_number for d in ring_group] or [owner.forwarding_number]
+        # Also ring the browser (Call from Browser's same Twilio Client
+        # identity, account_id) alongside the real phone(s), so whoever's
+        # available first - a person at their desk in the dashboard, or a
+        # person with their phone - picks up. Harmless if no browser tab
+        # has the Device registered right now: that leg just never
+        # connects, same as a phone that's switched off.
+        destinations = [f"client:{owner.account_id}"] + destinations
         return telecom.build_ring_group_response(
             destinations, fallback_action_url, status_callback_url, recording_callback_url
         )
@@ -205,7 +217,7 @@ async def incoming_call(request: Request, db: Session = Depends(get_db)):
         # Unassigned numbers (call_flow_id is NULL, true for every number
         # that existed before this feature) are completely unaffected.
         action = routing_service.resolve_entry(live_flow_version)
-        twiml = _flow_response(db, action, live_flow_version, request, to_number)
+        twiml = _flow_response(db, action, live_flow_version, request, to_number, owner)
     elif owner is not None and owner.ivr_greeting:
         # Enhanced business routing (Phase 2) - a simpler single-level DTMF
         # menu, still available for any number that hasn't opted into the
@@ -244,8 +256,9 @@ async def ivr_select(request: Request, db: Session = Depends(get_db)):
             if owner is not None and media_service.should_record_forwarded_call(db, owner.account_id)
             else None
         )
+        destinations = [f"client:{owner.account_id}", option.destination_number] if owner is not None else [option.destination_number]
         twiml = telecom.build_ring_group_response(
-            [option.destination_number], fallback_action_url, status_callback_url, recording_callback_url
+            destinations, fallback_action_url, status_callback_url, recording_callback_url
         )
     return Response(content=twiml, media_type="application/xml")
 
@@ -369,6 +382,75 @@ async def bridge_connect(request: Request, to: str, from_: str = Query(alias="fr
     return Response(content=twiml, media_type="application/xml")
 
 
+@router.get("/browser-token")
+async def browser_token(current_user: User = Depends(require_writer), db: Session = Depends(get_db)):
+    """Issues a short-lived Twilio Voice access token for the browser
+    calling SDK (@twilio/voice-sdk) - the frontend uses this to register a
+    real Twilio Client and place calls directly from the browser, no
+    separate phone involved (unlike /bridge above). Gated the same as
+    every other real write action (require_writer): a Viewer shouldn't be
+    able to place calls, browser or otherwise.
+
+    Deliberately re-checks TRIALING here even though this route is a GET
+    (exempt from app.core.deps.require_paid_or_read_only, since every
+    other GET in this app is read-only) - a token handed out here lets the
+    browser place a real call via /browser-connect, a Twilio webhook with
+    no customer Authorization header at all, so the router-wide trial gate
+    can never see or block that call. Without this explicit check, browser
+    calling would be a real loophole around "trial accounts can view but
+    not perform paid actions.\""""
+    from app.billing.models import SubscriptionStatus
+    from app.billing.service import TrialWriteRestrictedError, get_or_create_subscription
+
+    sub = get_or_create_subscription(db, current_user.account_id)
+    if sub.status == SubscriptionStatus.TRIALING:
+        raise TrialWriteRestrictedError(
+            "Upgrade your plan to use this feature - you can view it during your trial, but changes need a paid plan."
+        )
+
+    token = telecom.build_voice_access_token(identity=current_user.account_id)
+    return {"token": token}
+
+
+@router.post("/browser-connect")
+async def browser_connect(request: Request, db: Session = Depends(get_db)):
+    """Twilio calls this the instant a browser holding a token minted by
+    /browser-token places a call via Device.connect({params: {To,
+    ZoikoFrom}}). `Caller` here is always "client:<account_id>" - the
+    identity Twilio embedded in that token when it was issued, not
+    caller-supplied input being blindly relayed; the browser cannot forge
+    a different identity than the one its token was minted with. Catches
+    every real-call rejection reason and speaks it back instead of
+    returning a JSON error, which Twilio can't render into anything a
+    caller would hear - a webhook must always answer in TwiML."""
+    params = await media_service.verify_twilio_webhook(request)
+    account_id = params.get("Caller", "").removeprefix("client:")
+    to = params.get("To", "")
+    from_number = params.get("ZoikoFrom", "")
+    call_sid = params.get("CallSid", "")
+    status_callback_url = str(request.base_url) + "media/voice/status-callback"
+    try:
+        twiml = media_service.handle_browser_connect(
+            db, account_id=account_id, from_number=from_number, to=to, call_sid=call_sid,
+            status_callback_url=status_callback_url,
+        )
+    except (
+        media_service.CallAuthorizationError,
+        billing_service.EntitlementError,
+        risk_service.DestinationBlockedError,
+        risk_service.VelocityLimitExceededError,
+        risk_service.ConcurrentCallLimitExceededError,
+        risk_service.GeographicDispersionError,
+        risk_service.SpendLimitExceededError,
+        risk_service.CumulativeTrialUsageExceededError,
+        risk_service.AccountKillSwitchTrippedError,
+        KillSwitchTrippedError,
+        TelecomError,
+    ) as e:
+        twiml = telecom.build_say_response(f"Sorry, this call could not be placed. {e}")
+    return Response(content=twiml, media_type="application/xml")
+
+
 @router.post("/status-callback")
 async def status_callback(request: Request, db: Session = Depends(get_db)):
     """Twilio posts here on call completion (outbound calls that were placed
@@ -382,7 +464,12 @@ async def status_callback(request: Request, db: Session = Depends(get_db)):
         status=params.get("CallStatus", "unknown"),
         duration=int(duration_raw) if duration_raw else None,
     )
-    return Response(status_code=204)
+    # A bare 204 confirmed live (via this call's own Notifications) to reach
+    # Twilio with an empty Content-Type header, which its webhook validator
+    # rejects as error 12300 "Invalid Content-Type" - an empty TwiML
+    # document is the standard, safe response shape for a callback Twilio
+    # doesn't otherwise act on.
+    return Response(content=telecom.build_empty_response(), media_type="application/xml")
 
 
 @router.post("/flow-menu-input")
@@ -403,7 +490,8 @@ async def flow_menu_input(request: Request, db: Session = Depends(get_db)):
             media_type="application/xml",
         )
     action = routing_service.resolve_menu_input(version, node_id, params.get("Digits") or None)
-    return Response(content=_flow_response(db, action, version, request, params.get("To", "")), media_type="application/xml")
+    owner = media_service.find_number_owner(db, params.get("To", ""))
+    return Response(content=_flow_response(db, action, version, request, params.get("To", ""), owner), media_type="application/xml")
 
 
 @router.post("/flow-forward-fallback")
@@ -426,7 +514,8 @@ async def flow_forward_fallback(request: Request, db: Session = Depends(get_db))
         callback_url = str(request.base_url) + "media/voicemail/recording-complete"
         return Response(content=telecom.build_record_response(callback_url), media_type="application/xml")
     action = routing_service.resolve_forward_failover(version, node_id)
-    return Response(content=_flow_response(db, action, version, request, params.get("To", "")), media_type="application/xml")
+    owner = media_service.find_number_owner(db, params.get("To", ""))
+    return Response(content=_flow_response(db, action, version, request, params.get("To", ""), owner), media_type="application/xml")
 
 
 @router.post("/forward-fallback")
@@ -512,3 +601,22 @@ async def get_call(
         return telecom.get_call(call_sid)
     except TelecomError as e:
         raise HTTPException(status_code=502, detail=str(e)) from e
+
+
+@router.get("/calls/{call_sid}/recording")
+async def get_call_recording(
+    call_sid: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Streams the recording audio through this backend instead of handing
+    the frontend Twilio's raw recording_url - that URL requires Twilio's
+    own account credentials to fetch, which is why opening it directly in
+    a browser prompts for a login instead of playing audio."""
+    try:
+        content, content_type = media_service.get_call_recording_media(db, current_user, call_sid)
+    except media_service.CallAuthorizationError as e:
+        raise HTTPException(status_code=403, detail=str(e)) from e
+    except TelecomError as e:
+        raise HTTPException(status_code=502, detail=str(e)) from e
+    return Response(content=content, media_type=content_type)

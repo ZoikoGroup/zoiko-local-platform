@@ -5,6 +5,7 @@ import {
   listVoicemails,
   summarizeVoicemail,
   grantAiProcessingConsent,
+  getVoicemailRecordingBlob,
   ApiError,
   type VoicemailEntry,
 } from "@/lib/api";
@@ -85,6 +86,9 @@ export default function VoicemailPage() {
               duration={v.duration}
               createdAt={v.created_at}
               recordingUrl={v.recording_url}
+              loadRecording={() =>
+                token ? getVoicemailRecordingBlob(token, v.id) : Promise.reject(new Error("Not available"))
+              }
               summaryState={summaries[`voicemail:${v.id}`] ?? { status: "idle" }}
               onSummarize={() => handleSummarize(v.id)}
               onGrantConsent={() => handleGrantConsent(v.id)}

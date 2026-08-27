@@ -5,8 +5,10 @@ import { useRouter } from "next/navigation";
 import Sidebar from "@/components/Sidebar";
 import Topbar from "@/components/Topbar";
 import TrialBanner from "@/components/TrialBanner";
+import VoiceCallOverlay from "@/components/VoiceCallOverlay";
 import { ApiError, getCurrentUser, getSubscription, type Subscription, type User } from "@/lib/api";
 import { getToken, clearToken } from "@/lib/auth";
+import { VoiceDeviceProvider } from "@/lib/voiceDevice";
 
 export default function DashboardLayout({
   children,
@@ -74,20 +76,23 @@ export default function DashboardLayout({
   //   - <main> is the only thing that scrolls the beige content area.
   // The Topbar and TrialBanner sit outside <main>, so they stay put.
   return (
-    <div className="h-screen flex overflow-hidden bg-slate-50">
-      <Sidebar subscription={subscription} />
-      <div className="flex-1 flex flex-col min-w-0 overflow-hidden">
-        <Topbar user={user} />
-        <TrialBanner subscription={subscription} />
-        {/* min-h-0 is load-bearing, not cosmetic: `flex-1` is
-            `flex:1 1 0%` but leaves `min-height:auto`, which in a column
-            flex container refuses to shrink below the content's
-            min-content height. Without it, <main> grows to fit its
-            children and overflow-y-auto never engages. */}
-        <main className="flex-1 min-h-0 overflow-y-auto overscroll-contain p-6">
-          {children}
-        </main>
+    <VoiceDeviceProvider>
+      <div className="h-screen flex overflow-hidden bg-slate-50">
+        <Sidebar subscription={subscription} />
+        <div className="flex-1 flex flex-col min-w-0 overflow-hidden">
+          <Topbar user={user} />
+          <TrialBanner subscription={subscription} />
+          {/* min-h-0 is load-bearing, not cosmetic: `flex-1` is
+              `flex:1 1 0%` but leaves `min-height:auto`, which in a column
+              flex container refuses to shrink below the content's
+              min-content height. Without it, <main> grows to fit its
+              children and overflow-y-auto never engages. */}
+          <main className="flex-1 min-h-0 overflow-y-auto overscroll-contain p-6">
+            {children}
+          </main>
+        </div>
       </div>
-    </div>
+      <VoiceCallOverlay />
+    </VoiceDeviceProvider>
   );
 }

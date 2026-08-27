@@ -76,7 +76,10 @@ def test_completed_call_records_a_usage_event(client, db_session, monkeypatch):
     callback_response = client.post(
         "/media/voice/status-callback", data=callback_params, headers={"X-Twilio-Signature": signature}
     )
-    assert callback_response.status_code == 204
+    # /status-callback returns a real empty TwiML doc (200), not a bare 204 -
+    # a bare 204 reaches Twilio with an empty Content-Type header (its error
+    # 12300), confirmed live via a real call's own Notifications log.
+    assert callback_response.status_code == 200
 
     usage_response = client.get("/usage", headers={"Authorization": f"Bearer {token}"})
     assert usage_response.status_code == 200
@@ -103,7 +106,7 @@ def test_duplicate_status_callback_does_not_double_count_usage(client, db_sessio
         response = client.post(
             "/media/voice/status-callback", data=callback_params, headers={"X-Twilio-Signature": signature}
         )
-        assert response.status_code == 204
+        assert response.status_code == 200
 
     usage_response = client.get("/usage", headers={"Authorization": f"Bearer {token}"})
     assert len(usage_response.json()) == 1

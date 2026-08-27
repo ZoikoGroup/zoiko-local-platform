@@ -338,6 +338,48 @@ def place_bridge_call(
     return result
 
 
+def handle_browser_connect(
+    db: Session, *, account_id: str, from_number: str, to: str, call_sid: str, status_callback_url: str | None = None,
+) -> str:
+    """Live two-way calling straight from the browser (@twilio/voice-sdk):
+    called by media.voice.browser_connect, the webhook Twilio hits the
+    instant someone's browser (already holding a token minted for
+    `account_id` - see telecom.build_voice_access_token) places a call via
+    Device.connect(). Unlike place_bridge_call, there's no agent phone to
+    ring first - the browser itself IS the agent leg by the time this
+    runs, so this only has to authorize `from_number` for `account_id` and
+    return TwiML dialing the real destination with from_number as caller
+    ID. Returns TwiML directly (not a dict, unlike every other place_*
+    call here) because the caller is Twilio itself, which only understands
+    TwiML - raises the same CallAuthorizationError/risk exceptions as
+    every other real call so the route can translate them into a clean
+    spoken error instead of dead air."""
+    owner = find_number_owner(db, from_number)
+    if owner is None or owner.account_id != account_id or owner.status != PhoneNumberStatus.ACTIVE:
+        raise CallAuthorizationError(f"{from_number} is not an active number owned by your account")
+    try:
+        assert_caller_id_authorized(db, owner.id)
+    except CallerIdNotAuthorizedError as e:
+        raise CallAuthorizationError(str(e)) from e
+
+    account_owner = db.query(User).filter(User.account_id == account_id, User.role == UserRole.OWNER).first()
+    account_email = account_owner.email if account_owner else ""
+
+    _assert_outbound_call_allowed(db, account_id=account_id, account_email=account_email, to=to, from_number=from_number)
+
+    record_call(
+        db,
+        account_id=account_id,
+        phone_number_id=owner.id,
+        direction=CallDirection.OUTBOUND,
+        from_number=from_number,
+        to_number=to,
+        provider_call_sid=call_sid,
+        status="in-progress",
+    )
+    return telecom.build_bridge_response(to, caller_id=from_number, status_callback_url=status_callback_url)
+
+
 def place_outbound_call(
     db: Session, user: User, to: str, from_number: str, message: str, status_callback_url: str | None = None
 ) -> dict:
@@ -588,6 +630,20 @@ def assert_can_access_call(db: Session, user: User, call_sid: str) -> None:
         raise CallAuthorizationError(f"{call_sid} is not a call owned by your account")
 
 
+def get_call_recording_media(db: Session, user: User, call_sid: str) -> tuple[bytes, str]:
+    """Twilio recording URLs need Twilio's own Basic Auth credentials to
+    fetch (see twilio.get_recording_media's docstring) - a browser opening
+    the stored recording_url directly gets a login prompt instead of
+    audio. This does the same ownership check as assert_can_access_call,
+    then fetches the audio server-side so the frontend never needs to
+    know Twilio credentials exist."""
+    assert_can_access_call(db, user, call_sid)
+    call = db.query(CallRecord).filter(CallRecord.provider_call_sid == call_sid).first()
+    if call is None or not call.recording_url:
+        raise CallAuthorizationError(f"{call_sid} has no recording")
+    return telecom.get_recording_media(call.recording_url)
+
+
 def record_voicemail(
     db: Session,
     *,
@@ -688,6 +744,20 @@ def list_account_voicemails(db: Session, user: User) -> list[Voicemail]:
     )
     cache_set(cache_key, [_serialize_voicemail(v) for v in voicemails], ttl_seconds=_VOICEMAILS_CACHE_TTL_SECONDS)
     return voicemails
+
+
+def get_voicemail_recording_media(db: Session, user: User, voicemail_id: str) -> tuple[bytes, str]:
+    """Same rationale as get_call_recording_media - voicemail.recording_url
+    is also a Twilio-authenticated URL a browser can't fetch directly."""
+    voicemail = db.query(Voicemail).filter(Voicemail.id == voicemail_id).first()
+    if voicemail is None or voicemail.account_id != user.account_id:
+        raise CallAuthorizationError(f"{voicemail_id} is not a voicemail owned by your account")
+    ids = assigned_number_ids(db, user)
+    if ids is not None and voicemail.phone_number_id not in ids:
+        raise CallAuthorizationError(f"{voicemail_id} is not a voicemail owned by your account")
+    if not voicemail.recording_url:
+        raise CallAuthorizationError(f"{voicemail_id} has no recording")
+    return telecom.get_recording_media(voicemail.recording_url)
 
 
 def _find_account_video_session(db: Session, account_id: str, room_name: str) -> VideoSession:

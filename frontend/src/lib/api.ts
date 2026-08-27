@@ -1251,6 +1251,21 @@ export function listCalls(token: string, limit?: number): Promise<CallLogEntry[]
   });
 }
 
+// The stored recording_url is Twilio's own media URL, which needs Twilio's
+// account credentials to fetch - opening it directly in a browser prompts
+// for a login instead of playing audio. This calls our backend's proxy
+// route instead (same Bearer-token pattern as exportAnalyticsCsv), which
+// fetches the audio server-side and streams it back.
+export async function getCallRecordingBlob(token: string, callSid: string): Promise<Blob> {
+  const response = await fetch(`${API_BASE_URL}/media/voice/calls/${callSid}/recording`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!response.ok) {
+    throw new ApiError("Couldn't load this recording.", response.status);
+  }
+  return response.blob();
+}
+
 export async function placeOutboundCall(
   token: string,
   input: { to: string; from: string; message?: string }
@@ -1263,6 +1278,12 @@ export async function placeOutboundCall(
       ...(fingerprint ? { "X-Device-Fingerprint": fingerprint } : {}),
     },
     body: JSON.stringify(input),
+  });
+}
+
+export async function getBrowserVoiceToken(token: string): Promise<{ token: string }> {
+  return request("/media/voice/browser-token", {
+    headers: { Authorization: `Bearer ${token}` },
   });
 }
 
@@ -1293,6 +1314,18 @@ export function listVoicemails(token: string): Promise<VoicemailEntry[]> {
   return request<VoicemailEntry[]>("/media/voicemail", {
     headers: { Authorization: `Bearer ${token}` },
   });
+}
+
+// See getCallRecordingBlob's comment - same reason a voicemail's raw
+// recording_url can't be opened directly in a browser.
+export async function getVoicemailRecordingBlob(token: string, voicemailId: string): Promise<Blob> {
+  const response = await fetch(`${API_BASE_URL}/media/voicemail/${voicemailId}/recording`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!response.ok) {
+    throw new ApiError("Couldn't load this recording.", response.status);
+  }
+  return response.blob();
 }
 
 export type ConversationSummary = {

@@ -32,6 +32,13 @@ def _signup_and_login(client, db_session, email: str) -> str:
         json={"account_name": "Call Flow Test Co", "account_type": "business", "email": email, "password": "supersecret123"},
     )
     token = client.post("/auth/login", json={"email": email, "password": "supersecret123"}).json()["access_token"]
+    # A fresh signup defaults to the free trial - app.core.deps.
+    # require_paid_or_read_only blocks write actions (creating/publishing/
+    # assigning a call flow) for a TRIALING account, and every test in this
+    # file exercises the Call Flow Designer, which also requires the
+    # routing.advanced entitlement (Pro+ only - see ZL-COM-ENT-001 and
+    # app.billing.service.has_entitlement/app.core.deps.require_entitlement)
+    # - upgrade straight to Pro here rather than repeating it at each test.
     account_id = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"}).json()["account_id"]
     billing_service.change_plan(db_session, account_id, "pro", actor="test-setup")
     return token
@@ -246,7 +253,10 @@ def test_menu_digit_routes_to_the_matching_forward_node(client, db_session):
 
     assert response.status_code == 200
     assert "+15552220000" in response.text
-    assert "<Number>" in response.text
+    # Not a bare "<Number>" - build_ring_group_response puts
+    # statusCallback/statusCallbackEvent as attributes on this noun (a real
+    # TwiML-validation fix, not a formatting choice - see its docstring).
+    assert "<Number " in response.text
 
 
 def test_invalid_menu_digit_repeats_the_same_menu(client, db_session):

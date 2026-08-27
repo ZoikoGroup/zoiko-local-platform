@@ -13,6 +13,8 @@ import re
 
 import httpx
 from twilio.base.exceptions import TwilioException, TwilioRestException
+from twilio.jwt.access_token import AccessToken
+from twilio.jwt.access_token.grants import VoiceGrant
 from twilio.request_validator import RequestValidator
 from twilio.rest import Client
 from twilio.twiml.voice_response import VoiceResponse
@@ -247,9 +249,12 @@ def list_owned_numbers() -> list[dict]:
 
 def set_voice_webhook(phone_number_sid: str, public_base_url: str) -> None:
     """(Re)points an already-purchased number's voice webhook + status
-    callback at the given base URL - needed whenever PUBLIC_BASE_URL changes
-    (e.g. a new ngrok tunnel in dev), since buy_number() only sets these at
-    purchase time.
+    callback, AND its SMS webhook, at the given base URL - needed whenever
+    PUBLIC_BASE_URL changes (e.g. a new ngrok tunnel in dev), since
+    buy_number() only sets these at purchase time. Despite the name (kept
+    for backward compatibility with its existing caller), this also covers
+    SMS - without sms_url, Twilio has nowhere to POST an inbound text and
+    /messaging/sms/incoming (a real, working route) never gets called.
     """
     def _primary() -> None:
         try:
@@ -259,6 +264,8 @@ def set_voice_webhook(phone_number_sid: str, public_base_url: str) -> None:
                     voice_method="POST",
                     status_callback=f"{public_base_url}/media/voice/status-callback",
                     status_callback_method="POST",
+                    sms_url=f"{public_base_url}/messaging/sms/incoming",
+                    sms_method="POST",
                 )
         except TwilioException as e:
             raise TelecomError(_clean_twilio_error_message(e)) from e
@@ -291,9 +298,12 @@ def buy_number(phone_number: str, *, bundle_sid: str | None = None) -> dict:
 
     Registers our own voice webhook (the URL Twilio actually calls when
     someone dials this number - without it, a purchased number never reaches
-    /media/voice/incoming at all) plus a status-callback URL for the final
-    completed/duration event, both only when a public base URL is configured
-    (nothing to point at otherwise, e.g. before ngrok is running in dev).
+    /media/voice/incoming at all), a status-callback URL for the final
+    completed/duration event, and an SMS webhook (so a text sent to this
+    number reaches /messaging/sms/incoming instead of going nowhere - that
+    route already exists and works, it just needs Twilio told to call it),
+    all only when a public base URL is configured (nothing to point at
+    otherwise, e.g. before ngrok is running in dev).
 
     bundle_sid: a Twilio-approved Regulatory Bundle (see
     get_bundle_status/submit_bundle_for_review below) - required by Twilio
@@ -307,6 +317,8 @@ def buy_number(phone_number: str, *, bundle_sid: str | None = None) -> dict:
         kwargs["voice_method"] = "POST"
         kwargs["status_callback"] = f"{settings.public_base_url}/media/voice/status-callback"
         kwargs["status_callback_method"] = "POST"
+        kwargs["sms_url"] = f"{settings.public_base_url}/messaging/sms/incoming"
+        kwargs["sms_method"] = "POST"
 
     def _primary() -> dict:
         try:
@@ -563,6 +575,33 @@ def build_forward_response(
     return str(response)
 
 
+def build_voice_access_token(identity: str) -> str:
+    """Short-lived (1hr) Twilio Voice access token for the browser calling
+    SDK (@twilio/voice-sdk) - lets the browser register as a real Twilio
+    Client and place calls directly, no separate phone involved (unlike
+    place_bridge_call's call-bridging, which needs a real phone to ring
+    first). `identity` is opaque to Twilio - just a value we choose now
+    and read back later - see media.service.handle_browser_connect,
+    where it's the account_id, so that webhook can run the exact same
+    billing/risk checks as every other real outbound call. Uses a
+    dedicated signing key (twilio_voice_api_key_sid/secret), never the
+    general-purpose twilio_api_key_sid/secret - different scope entirely
+    (client-side Voice grants vs. server-side REST API calls).
+
+    incoming_allow=True so this same identity/token also lets the browser
+    receive real inbound calls - build_ring_group_response dials
+    "client:<account_id>" alongside the number's configured phone
+    destinations on every inbound call, and Twilio only actually delivers
+    that leg to a browser tab that's registered a Device with a token
+    carrying this grant."""
+    token = AccessToken(
+        settings.twilio_account_sid, settings.twilio_voice_api_key_sid,
+        settings.twilio_voice_api_key_secret, identity=identity, ttl=3600,
+    )
+    token.add_grant(VoiceGrant(outgoing_application_sid=settings.twilio_twiml_app_sid, incoming_allow=True))
+    return token.to_jwt()
+
+
 def build_bridge_response(destination: str, caller_id: str, status_callback_url: str | None = None) -> str:
     """Builds TwiML that dials `destination` with `caller_id` shown as the
     caller's number, for the second leg of a call-bridge: the platform has
@@ -573,12 +612,19 @@ def build_bridge_response(destination: str, caller_id: str, status_callback_url:
     """
     response = VoiceResponse()
     dial_kwargs: dict = {"caller_id": caller_id}
+    number_kwargs: dict = {}
     if status_callback_url:
-        # See build_forward_response's comment: action, not statusCallback/
-        # statusCallbackEvent, is the real <Dial>-level completion callback
-        # Twilio actually honors.
+        # action belongs on <Dial> itself; status_callback/status_callback_event
+        # are only valid on the nested <Number> noun - Twilio's XML validator
+        # rejects them on <Dial> (confirmed live via a real call's Notifications:
+        # "Attribute 'statusCallback' is not allowed to appear in element
+        # 'Dial'" - tolerated as a warning, not fatal, but still real invalid
+        # TwiML worth fixing outright).
         dial_kwargs["action"] = status_callback_url
-    response.dial(destination, **dial_kwargs)
+        number_kwargs["status_callback"] = status_callback_url
+        number_kwargs["status_callback_event"] = "completed"
+    dial = response.dial(**dial_kwargs)
+    dial.number(destination, **number_kwargs)
     return str(response)
 
 
@@ -607,20 +653,37 @@ def build_ring_group_response(
     /forward-fallback route (enhanced business routing, routes to
     voicemail), both of which only fire when the dial genuinely wasn't
     answered.
+
+    A destination prefixed "client:" (e.g. "client:<account_id>", the same
+    identity build_voice_access_token issues browser tokens under) rings
+    a registered browser tab instead of a phone - see media/voice.py's
+    _default_call_twiml and _flow_response, which both prepend this
+    destination alongside the number's configured phone destinations.
+    Mixed real numbers and browser clients ring simultaneously in the same
+    ring group; whichever answers first wins, same as multiple phone
+    numbers already do.
     """
     response = VoiceResponse()
     dial_kwargs = {"action": fallback_action_url}
-    if status_callback_url:
-        dial_kwargs["status_callback"] = status_callback_url
-        dial_kwargs["status_callback_event"] = "completed"
     if recording_callback_url:
         dial_kwargs["record"] = "record-from-answer-dual"
         dial_kwargs["recording_status_callback"] = recording_callback_url
         dial_kwargs["recording_status_callback_method"] = "POST"
         dial_kwargs["recording_status_callback_event"] = "completed"
     dial = response.dial(**dial_kwargs)
+    # action belongs on <Dial> itself; status_callback/status_callback_event
+    # are only valid on the nested <Number>/<Client> nouns - Twilio's XML
+    # validator rejects them on <Dial> (confirmed live via a real call's
+    # Notifications log - see build_bridge_response's identical fix).
+    noun_kwargs: dict = {}
+    if status_callback_url:
+        noun_kwargs["status_callback"] = status_callback_url
+        noun_kwargs["status_callback_event"] = "completed"
     for destination in destinations:
-        dial.number(destination)
+        if destination.startswith("client:"):
+            dial.client(identity=destination.removeprefix("client:"), **noun_kwargs)
+        else:
+            dial.number(destination, **noun_kwargs)
     return str(response)
 
 
@@ -779,8 +842,22 @@ def build_record_response(callback_url: str) -> str:
 
 def download_recording(recording_url: str) -> bytes:
     """Recording media URLs require the same Basic Auth as the REST API —
-    unauthenticated fetches get a 401, so this can't just be a plain GET."""
-    def _primary() -> bytes:
+    unauthenticated fetches get a 401, so this can't just be a plain GET.
+    Used where only the audio bytes matter (e.g. handing them to Whisper
+    for transcription) - see get_recording_media below for callers that
+    also need to know the real content type (e.g. serving it to a
+    browser's <audio> player)."""
+    content, _content_type = get_recording_media(recording_url)
+    return content
+
+
+def get_recording_media(recording_url: str) -> tuple[bytes, str]:
+    """Same authenticated fetch as download_recording, but also returns
+    Twilio's real Content-Type header (its recordings default to
+    audio/x-wav) - a browser <audio>/<a> player needs the correct MIME
+    type to play the response voice/voicemail.py streams back, not just
+    the raw bytes."""
+    def _primary() -> tuple[bytes, str]:
         try:
             with trace_provider_call("twilio", "download_recording"):
                 response = httpx.get(
@@ -789,10 +866,11 @@ def download_recording(recording_url: str) -> bytes:
                 response.raise_for_status()
         except httpx.HTTPError as e:
             raise TelecomError(f"Could not download recording: {e}") from e
-        return response.content
+        return response.content, response.headers.get("content-type", "audio/x-wav")
 
     secondary_fn = (
-        (lambda: secondary.download_recording(recording_url)) if settings.telecom_failover_enabled else None
+        (lambda: (secondary.download_recording(recording_url), "audio/x-wav"))
+        if settings.telecom_failover_enabled else None
     )
     return with_failover(_breaker, _primary, secondary_fn, TelecomError, _is_provider_failure)
 

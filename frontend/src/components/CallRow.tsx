@@ -1,5 +1,6 @@
 "use client";
 
+import { useState } from "react";
 import type { ConversationSummary } from "@/lib/api";
 
 export type SummaryKey = string; // `${kind}:${id}`
@@ -23,6 +24,7 @@ export function CallRow({
   duration,
   createdAt,
   recordingUrl,
+  loadRecording,
   suspectedSpam,
   summaryState,
   onSummarize,
@@ -33,11 +35,33 @@ export function CallRow({
   duration: number | null;
   createdAt: string;
   recordingUrl: string | null;
+  // Fetches the recording as a Blob through our own backend (see
+  // getCallRecordingBlob/getVoicemailRecordingBlob) - the raw Twilio URL
+  // in recordingUrl needs Twilio's own credentials to fetch directly, so
+  // Play can't just be a plain <a href> to it.
+  loadRecording: () => Promise<Blob>;
   suspectedSpam?: boolean;
   summaryState: SummaryState;
   onSummarize: () => void;
   onGrantConsent: () => void;
 }) {
+  const [playError, setPlayError] = useState<string | null>(null);
+
+  async function handlePlay() {
+    setPlayError(null);
+    // Open the tab synchronously (within the click gesture) so popup
+    // blockers don't kill it while the recording loads asynchronously.
+    const win = window.open("", "_blank");
+    try {
+      const blob = await loadRecording();
+      const url = URL.createObjectURL(blob);
+      if (win) win.location.href = url;
+    } catch {
+      win?.close();
+      setPlayError("Couldn't load this recording.");
+    }
+  }
+
   return (
     <div className="rounded-lg border border-slate-200 px-4 py-3 space-y-2">
       <div className="flex items-center justify-between gap-4">
@@ -59,14 +83,13 @@ export function CallRow({
         </div>
         <div className="flex items-center gap-3 shrink-0">
           {recordingUrl && (
-            <a
-              href={recordingUrl}
-              target="_blank"
-              rel="noopener noreferrer"
+            <button
+              type="button"
+              onClick={handlePlay}
               className="text-xs font-medium text-indigo-600 hover:text-indigo-800"
             >
               Play
-            </a>
+            </button>
           )}
           {recordingUrl && summaryState.status !== "done" && (
             <button
@@ -80,6 +103,8 @@ export function CallRow({
           {!recordingUrl && <span className="text-xs text-slate-400">No recording</span>}
         </div>
       </div>
+
+      {playError && <p className="text-xs text-red-600">{playError}</p>}
 
       {summaryState.status === "consent_required" && (
         <div className="text-xs bg-amber-50 text-amber-700 rounded-lg px-3 py-2 flex items-center justify-between gap-3">
