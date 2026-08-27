@@ -83,6 +83,30 @@ export function VoiceDeviceProvider({ children }: { children: ReactNode }) {
     });
   }, []);
 
+  // Twilio Access Tokens carry a fixed lifetime (build_voice_access_token
+  // issues them with ttl=3600, 1 hour) - a Device kept alive for the whole
+  // dashboard session (see this provider's own docstring) will otherwise
+  // hit a dead token well before the tab closes. AccessTokenInvalid (20101)
+  // and AccessTokenExpired (20104) are the two codes Twilio actually raises
+  // for this; treated as recoverable by tearing the Device down so the next
+  // reconnect attempt mints a fresh token, rather than leaving the banner
+  // stuck showing a permanent error until the page is manually refreshed.
+  const RECOVERABLE_ERROR_CODES = new Set([20101, 20104]);
+  const reconnectingRef = useRef(false);
+
+  const ensureDeviceRef = useRef<(() => Promise<Device>) | null>(null);
+
+  const scheduleReconnect = useCallback(() => {
+    if (reconnectingRef.current) return;
+    reconnectingRef.current = true;
+    setTimeout(() => {
+      reconnectingRef.current = false;
+      ensureDeviceRef.current?.().catch((err) => {
+        setError(err instanceof Error ? err.message : "Couldn't reconnect browser calling.");
+      });
+    }, 2000);
+  }, []);
+
   const ensureDevice = useCallback(async (): Promise<Device> => {
     if (deviceRef.current) return deviceRef.current;
     const token = getToken();
@@ -91,9 +115,26 @@ export function VoiceDeviceProvider({ children }: { children: ReactNode }) {
     const newDevice = new Device(voiceToken, {
       codecPreferences: [Call.Codec.Opus, Call.Codec.PCMU],
     });
+    newDevice.on("tokenWillExpire", async () => {
+      try {
+        const authToken = getToken();
+        if (!authToken) return;
+        const { token: freshVoiceToken } = await getBrowserVoiceToken(authToken);
+        newDevice.updateToken(freshVoiceToken);
+      } catch {
+        // Best-effort - if the refresh itself fails, the token will
+        // eventually expire for real and the "error" handler below
+        // recovers by tearing down and reconnecting from scratch.
+      }
+    });
     newDevice.on("error", (err) => {
       setError(err.message || "A browser calling error occurred.");
       setStatus("error");
+      if (RECOVERABLE_ERROR_CODES.has(err.code) && deviceRef.current === newDevice) {
+        deviceRef.current = null;
+        newDevice.destroy();
+        scheduleReconnect();
+      }
     });
     newDevice.on("incoming", (call) => {
       incomingCallRef.current = call;
@@ -112,7 +153,11 @@ export function VoiceDeviceProvider({ children }: { children: ReactNode }) {
     await newDevice.register();
     deviceRef.current = newDevice;
     return newDevice;
-  }, []);
+  }, [scheduleReconnect]);
+
+  useEffect(() => {
+    ensureDeviceRef.current = ensureDevice;
+  }, [ensureDevice]);
 
   useEffect(() => {
     if (!getToken()) return;
