@@ -12,6 +12,7 @@ import {
   type ProviderLatencySummary,
 } from "@/lib/api";
 import { clearStaffToken, useStaffToken } from "@/lib/staffAuth";
+import { useStaffRole } from "@/lib/staffRole";
 
 const PROVIDER_LABELS: Record<string, string> = {
   twilio: "Twilio (telecom)",
@@ -40,6 +41,8 @@ function statusLabel(configured: boolean, ok: boolean): string {
 export default function StaffProvidersPage() {
   const router = useRouter();
   const { token, ready } = useStaffToken();
+  const { role } = useStaffRole();
+  const isSuperAdmin = role === "super_admin";
   const [providers, setProviders] = useState<ProviderStatus[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -128,6 +131,15 @@ export default function StaffProvidersPage() {
             <div>
               <div className="text-sm text-white font-medium">{PROVIDER_LABELS[p.name] ?? p.name}</div>
               {p.detail && <div className="text-xs text-slate-400 mt-0.5">{p.detail}</div>}
+              {/* Circuit-breaker/failover state - resilience-config detail
+                  that matters to whoever's accountable for provider
+                  outages, not a routine "is it up" lookup. */}
+              {isSuperAdmin && p.circuit_state && (
+                <div className="text-[10.5px] font-mono text-slate-600 mt-1">
+                  circuit:{p.circuit_state}
+                  {p.failover_enabled !== undefined && ` · failover:${p.failover_enabled ? "on" : "off"}`}
+                </div>
+              )}
             </div>
             <span className={`text-xs font-medium rounded-full px-2.5 py-1 shrink-0 ${statusStyle(p.configured, p.ok)}`}>
               {statusLabel(p.configured, p.ok)}

@@ -13,6 +13,7 @@ from app.consent.service import has_active_consent
 from app.core.config import settings
 from app.events.service import (
     publish_number_activated,
+    publish_number_purchase_confirmed,
     publish_number_reserved,
     publish_number_suspended,
 )
@@ -1217,6 +1218,13 @@ def purchase_number(db: Session, account_id: str, e164: str) -> PhoneNumber:
         target_type="phone_number", target_id=number.id, metadata={"e164": e164, "provider_sid": bought["sid"]},
     )
     publish_number_activated(account_id, number_id=number.id, e164=e164)
+    # Real gap fix: this event existed (added specifically for numbering
+    # purchase completion per CLAUDE.md's event-coverage history) but had
+    # zero call sites anywhere - it never actually fired. payment_intent_id
+    # is None here since this direct-purchase path has no Stripe intent
+    # threaded through it (see publish_number_purchase_confirmed's own
+    # docstring on when a real one would be available).
+    publish_number_purchase_confirmed(account_id, number_id=number.id, e164=e164)
 
     # Commercial Billing Operating Standard doc §R6 - a real Twilio
     # purchase IS itself a legitimate verification/authorization source,
@@ -1546,6 +1554,7 @@ def retry_provisioning(db: Session, staff_id: str, number_id: str) -> PhoneNumbe
     # silent drift between two independently-maintained copies of the same
     # transition.
     publish_number_activated(number.account_id, number_id=number.id, e164=number.e164)
+    publish_number_purchase_confirmed(number.account_id, number_id=number.id, e164=number.e164)
     _auto_verify_caller_identity(db, number, verification_source="platform_provisioned_purchase")
 
     from app.risk.service import step_up_risk_state_after_purchase

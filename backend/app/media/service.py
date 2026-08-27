@@ -15,6 +15,8 @@ from app.consent.service import has_active_consent
 from app.events.service import (
     publish_call_ended,
     publish_call_started,
+    publish_receptionist_call_captured,
+    publish_receptionist_call_escalated,
     publish_video_room_created,
     publish_video_room_ended,
     publish_video_session_ended,
@@ -340,6 +342,7 @@ def place_bridge_call(
 
 def handle_browser_connect(
     db: Session, *, account_id: str, from_number: str, to: str, call_sid: str, status_callback_url: str | None = None,
+    recording_callback_url: str | None = None,
 ) -> str:
     """Live two-way calling straight from the browser (@twilio/voice-sdk):
     called by media.voice.browser_connect, the webhook Twilio hits the
@@ -365,7 +368,7 @@ def handle_browser_connect(
     account_owner = db.query(User).filter(User.account_id == account_id, User.role == UserRole.OWNER).first()
     account_email = account_owner.email if account_owner else ""
 
-    _assert_outbound_call_allowed(db, account_id=account_id, account_email=account_email, to=to, from_number=from_number)
+    assert_outbound_call_allowed(db, account_id=account_id, account_email=account_email, to=to, from_number=from_number)
 
     record_call(
         db,
@@ -377,7 +380,10 @@ def handle_browser_connect(
         provider_call_sid=call_sid,
         status="in-progress",
     )
-    return telecom.build_bridge_response(to, caller_id=from_number, status_callback_url=status_callback_url)
+    return telecom.build_bridge_response(
+        to, caller_id=from_number, status_callback_url=status_callback_url,
+        recording_callback_url=recording_callback_url,
+    )
 
 
 def place_outbound_call(
@@ -1584,6 +1590,10 @@ def capture_receptionist_call(
         target_type="receptionist_call", target_id=call.id,
         metadata={"urgency": urgency.value if urgency else None, "guardrail_flags": guardrail_flags, "is_likely_spam": is_likely_spam},
     )
+    publish_receptionist_call_captured(
+        owner.account_id, receptionist_call_id=call.id,
+        urgency=urgency.value if urgency else None, is_likely_spam=is_likely_spam,
+    )
     return call
 
 
@@ -1705,6 +1715,9 @@ def mark_receptionist_call_escalated(db: Session, receptionist_call_id: str, esc
         db, actor_id=call.account_id, action="receptionist.call_escalated",
         target_type="receptionist_call", target_id=call.id,
         metadata={"escalated_to_user_id": escalated_to_user_id},
+    )
+    publish_receptionist_call_escalated(
+        call.account_id, receptionist_call_id=call.id, escalated_to_user_id=escalated_to_user_id,
     )
 
 

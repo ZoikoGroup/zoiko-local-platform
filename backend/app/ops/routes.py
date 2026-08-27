@@ -260,6 +260,17 @@ def deactivate_kill_switch(
     return service.set_kill_switch(db, scope, False, actor=staff.id)
 
 
+@router.get("/event-outbox")
+def get_event_outbox_summary(
+    db: Session = Depends(get_db),
+    _staff: PlatformStaff = Depends(get_current_staff),
+):
+    """Any staff role can view the backlog (diagnostic, same posture as
+    kill-switches above); the flush action itself stays SUPER_ADMIN only,
+    below."""
+    return service.get_event_outbox_summary(db)
+
+
 @router.post("/event-outbox/flush", response_model=EventOutboxFlushResponse)
 def flush_event_outbox(
     db: Session = Depends(get_db),

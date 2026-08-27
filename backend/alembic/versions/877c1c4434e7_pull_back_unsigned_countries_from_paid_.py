@@ -37,7 +37,19 @@ from sqlalchemy.orm import Session
 revision: str = '877c1c4434e7'
 down_revision: Union[str, None] = '679061a79e97'
 branch_labels: Union[str, Sequence[str], None] = None
-depends_on: Union[str, Sequence[str], None] = None
+# Real gap fix: this migration calls set_market_activation_status (the live
+# app.numbering.numbers.service function), whose SupportedCountry query
+# selects every column on the CURRENT ORM model - including
+# customer_type_restrictions, added by 5c748e686bbf on an entirely
+# separate branch with no ancestry relationship to this one. With no
+# explicit dependency, Alembic's topological sort is free to order this
+# migration BEFORE 5c748e686bbf, and confirmed live that replaying the
+# full chain from an empty database in one continuous run does exactly
+# that - "column supported_countries.customer_type_restrictions does not
+# exist". depends_on is Alembic's own documented mechanism for a
+# cross-branch ordering requirement like this, independent of down_revision
+# ancestry.
+depends_on: Union[str, Sequence[str], None] = ('5c748e686bbf',)
 
 _REASON = (
     "Pulled back from PAID_OPEN: no legal/tax/telecom/privacy review was ever recorded for this "

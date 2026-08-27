@@ -4,6 +4,7 @@ Gateway rule, this is the ONLY file allowed to import the `livekit` SDK
 directly — everything else calls the functions below instead.
 """
 
+import aiohttp
 from livekit import api as livekit_api
 
 from app.core.config import settings
@@ -55,7 +56,19 @@ def _client() -> livekit_api.LiveKitAPI:
 
 async def health_check() -> dict:
     """Real reachability check - lists rooms (empty result is fine, this
-    is just confirming the credentials and endpoint are live)."""
+    is just confirming the credentials and endpoint are live).
+
+    Real gap fix: TwirpError alone only covers a reachable server
+    responding with a protocol-level error - it does NOT cover the
+    underlying aiohttp transport failing before any response comes back
+    (DNS resolution failure, connection refused, timeout). Confirmed live:
+    a transient DNS blip resolving livekit.cloud raised an uncaught
+    aiohttp.ClientConnectorError straight through this function, which
+    ops/routes.py's provider_status never expected a raised exception
+    from - it 500'd the ENTIRE /ops/provider-status endpoint (every other
+    provider's status included) instead of reporting just this one
+    provider as unreachable, same as every other Provider Gateway's
+    health_check already degrades for its own network failures."""
     if not (settings.livekit_url and settings.livekit_api_key and settings.livekit_api_secret):
         return {"configured": False, "ok": False, "detail": None}
     try:
@@ -65,7 +78,7 @@ async def health_check() -> dict:
             return {"configured": True, "ok": True, "detail": None}
         finally:
             await client.aclose()
-    except livekit_api.TwirpError as e:
+    except (livekit_api.TwirpError, aiohttp.ClientError) as e:
         return {"configured": True, "ok": False, "detail": str(e)}
 
 

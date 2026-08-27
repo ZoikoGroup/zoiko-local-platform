@@ -18,6 +18,7 @@ import {
   type BlockedDestination,
 } from "@/lib/api";
 import { clearStaffToken, useStaffToken } from "@/lib/staffAuth";
+import { useStaffRole } from "@/lib/staffRole";
 
 const CASE_STATUS_TABS = ["open", "confirmed", "cleared", "all"] as const;
 type CaseStatusTab = (typeof CASE_STATUS_TABS)[number];
@@ -38,6 +39,8 @@ type Section = (typeof SECTIONS)[number];
 export default function StaffFraudPage() {
   const router = useRouter();
   const { token, ready } = useStaffToken();
+  const { role } = useStaffRole();
+  const isSuperAdmin = role === "super_admin";
   const [section, setSection] = useState<Section>("cases");
   const [error, setError] = useState<string | null>(null);
 
@@ -45,12 +48,22 @@ export default function StaffFraudPage() {
     if (ready && !token) router.replace("/staff/login");
   }, [ready, token, router]);
 
+  // Scoring Rules (risk.manage_fraud_rules) and Blocked Destinations
+  // (risk.manage_blocked_destinations) are both SUPER_ADMIN-exclusive
+  // capabilities - a COMPLIANCE_OFFICER can reach this page at all only
+  // via risk.resolve_fraud_case, which the Review Queue tab uses, so the
+  // other two tabs would just 403 on every action if shown. `section`
+  // defaults to "cases" (always visible to every role) and only ever
+  // moves to a tab that was rendered - i.e. actually clickable for the
+  // current role - so it can never end up pointed at a hidden one.
+  const visibleSections = isSuperAdmin ? SECTIONS : (["cases"] as const);
+
   if (!token) return null;
 
   return (
     <>
       <div className="flex gap-1 bg-slate-900 border border-slate-800 rounded-lg p-1 w-fit">
-        {SECTIONS.map((s) => (
+        {visibleSections.map((s) => (
           <button
             key={s}
             onClick={() => setSection(s)}
@@ -70,8 +83,10 @@ export default function StaffFraudPage() {
       )}
 
       {section === "cases" && <FraudCasesSection token={token} onError={setError} />}
-      {section === "rules" && <FraudRulesSection token={token} onError={setError} />}
-      {section === "destinations" && <BlockedDestinationsSection token={token} onError={setError} />}
+      {isSuperAdmin && section === "rules" && <FraudRulesSection token={token} onError={setError} />}
+      {isSuperAdmin && section === "destinations" && (
+        <BlockedDestinationsSection token={token} onError={setError} />
+      )}
     </>
   );
 }

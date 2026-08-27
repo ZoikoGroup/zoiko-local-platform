@@ -335,6 +335,40 @@ class KillSwitchTrippedError(Exception):
     Operating Standard doc §32.1)."""
 
 
+def get_event_outbox_summary(db: Session) -> dict:
+    """Backlog visibility for the producer-side durability outbox (see
+    app.events.models.EventOutbox's docstring) - separate from the actual
+    POST /ops/event-outbox/flush action (ops.manage_event_outbox,
+    SUPER_ADMIN only), same "GET is diagnostic, open to any staff role"
+    split as every other ops status endpoint in this file. Before this,
+    the only way to know whether anything even NEEDED flushing was to
+    query the table directly - the flush button existed with zero
+    visibility into what it would do.
+
+    oldest_pending_age_seconds surfaces how long the oldest unpublished
+    row has been waiting - a growing number here means publishing is
+    stuck (Kafka down, or the flush sweep isn't running), not just "a
+    normal trickle of recent events." failing_count (attempt_count >= 3)
+    flags rows that have been retried repeatedly without success -
+    exactly the events a flush by itself won't fix if the underlying
+    cause is still broken.
+    """
+    from app.events.models import EventOutbox
+
+    pending = db.query(EventOutbox).filter(EventOutbox.published_at.is_(None))
+    pending_count = pending.count()
+    oldest = pending.order_by(EventOutbox.created_at.asc()).first()
+    oldest_pending_age_seconds = (
+        (datetime.now(timezone.utc) - oldest.created_at).total_seconds() if oldest else None
+    )
+    failing_count = pending.filter(EventOutbox.attempt_count >= 3).count()
+    return {
+        "pending_count": pending_count,
+        "failing_count": failing_count,
+        "oldest_pending_age_seconds": oldest_pending_age_seconds,
+    }
+
+
 def list_kill_switches(db: Session) -> list[PlatformKillSwitch]:
     return db.query(PlatformKillSwitch).order_by(PlatformKillSwitch.scope.asc()).all()
 

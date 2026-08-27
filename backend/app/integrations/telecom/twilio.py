@@ -602,13 +602,26 @@ def build_voice_access_token(identity: str) -> str:
     return token.to_jwt()
 
 
-def build_bridge_response(destination: str, caller_id: str, status_callback_url: str | None = None) -> str:
+def build_bridge_response(
+    destination: str, caller_id: str, status_callback_url: str | None = None,
+    recording_callback_url: str | None = None,
+) -> str:
     """Builds TwiML that dials `destination` with `caller_id` shown as the
     caller's number, for the second leg of a call-bridge: the platform has
     already called the agent's own real phone and they've answered (that's
     what triggers Twilio to request this response), so this is what
     connects them live to the actual customer. caller_id is set so the
     customer sees the Zoiko Local number, not the agent's personal one.
+
+    Real gap fix: this genuinely two-way, live-connected leg (unlike the
+    outbound demo endpoint's one-way <Say>) had no recording_callback_url
+    parameter at all, unlike build_forward_response - every click-to-call
+    bridge and browser-to-browser call went completely uncaptured, with no
+    AI summary possible even with AI-processing consent on file. Same
+    record-from-answer-dual + recording_status_callback shape as
+    build_forward_response, just on <Dial> itself alongside the existing
+    action/caller_id attributes (record/recording_status_callback are
+    <Dial>-level attributes, not <Number>-level).
     """
     response = VoiceResponse()
     dial_kwargs: dict = {"caller_id": caller_id}
@@ -623,6 +636,11 @@ def build_bridge_response(destination: str, caller_id: str, status_callback_url:
         dial_kwargs["action"] = status_callback_url
         number_kwargs["status_callback"] = status_callback_url
         number_kwargs["status_callback_event"] = "completed"
+    if recording_callback_url:
+        dial_kwargs["record"] = "record-from-answer-dual"
+        dial_kwargs["recording_status_callback"] = recording_callback_url
+        dial_kwargs["recording_status_callback_method"] = "POST"
+        dial_kwargs["recording_status_callback_event"] = "completed"
     dial = response.dial(**dial_kwargs)
     dial.number(destination, **number_kwargs)
     return str(response)

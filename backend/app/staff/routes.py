@@ -48,13 +48,21 @@ from app.staff.models import PlatformStaff, PlatformStaffRole
 from app.staff.schemas import (
     AccessMatrixEntryResponse,
     AccountOverviewResponse,
+    CreateStaffMemberRequest,
     SetAccountLegalHoldRequest,
     SetAccountTestFlagRequest,
     StaffLoginRequest,
+    StaffResponse,
     StaffTokenResponse,
     UpdateAccountBillingClassificationRequest,
 )
-from app.staff.service import LastGrantRemovalError, list_access_matrix
+from app.staff.service import (
+    LastActiveSuperAdminError,
+    LastGrantRemovalError,
+    StaffEmailAlreadyExistsError,
+    StaffNotFoundError,
+    list_access_matrix,
+)
 from app.usage.schemas import (
     AIUsageRateResponse,
     CallingRateResponse,
@@ -86,6 +94,99 @@ def login(request: Request, payload: StaffLoginRequest, db: Session = Depends(ge
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid email or password")
     token = create_access_token(subject=staff.id, scope="staff")
     return StaffTokenResponse(access_token=token)
+
+
+@router.get("/me", response_model=StaffResponse)
+def get_current_staff_profile(staff: PlatformStaff = Depends(get_current_staff)):
+    """Login (POST /staff/login) returns only a bare access token - no
+    role/email - so the frontend has had no way to know who's logged in or
+    what they can do beyond waiting for a 403. This is the source of truth
+    the console UI reads to show/hide sections (SUPER_ADMIN vs SUPPORT vs
+    COMPLIANCE_OFFICER), cross-checked against GET /staff/access-matrix
+    for which capabilities that role actually has - never hardcoded
+    per-role UI rules that could drift from the real grant table."""
+    return StaffResponse(
+        id=staff.id, email=staff.email, role=staff.role.value, is_active=staff.is_active, created_at=staff.created_at
+    )
+
+
+@router.get("/team", response_model=list[StaffResponse])
+def list_staff_team(
+    db: Session = Depends(get_db),
+    _staff: PlatformStaff = Depends(get_current_staff),
+):
+    """Any staff role can see who else has console access (diagnostic,
+    same posture as GET /staff/accounts); creating or deactivating a
+    member is the sensitive action, gated below by
+    staff.manage_staff_accounts."""
+    return service.list_staff_team(db)
+
+
+@router.post("/team", response_model=StaffResponse, status_code=status.HTTP_201_CREATED)
+def create_staff_team_member(
+    payload: CreateStaffMemberRequest,
+    db: Session = Depends(get_db),
+    staff: PlatformStaff = Depends(require_capability("staff.manage_staff_accounts")),
+):
+    """The gap that made the billing maker-checker flow (request vs.
+    approve, self-approval blocked - see app.billing.service.
+    SelfApprovalNotAllowedError) impossible to actually exercise:
+    bootstrap_initial_super_admin creates exactly one account at first
+    boot, and nothing since then could create a second one short of
+    direct database access. This is that missing route."""
+    try:
+        role = PlatformStaffRole(payload.role)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Unknown role {payload.role!r} - expected one of {[r.value for r in PlatformStaffRole]}",
+        )
+    try:
+        return service.create_staff_member(db, email=payload.email, password=payload.password, role=role, actor=staff.id)
+    except StaffEmailAlreadyExistsError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e
+
+
+@router.put("/team/{staff_id}/deactivate", response_model=StaffResponse)
+def deactivate_staff_team_member(
+    staff_id: str,
+    db: Session = Depends(get_db),
+    staff: PlatformStaff = Depends(require_capability("staff.manage_staff_accounts")),
+):
+    try:
+        return service.deactivate_staff_member(db, staff_id, actor=staff.id)
+    except StaffNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
+    except LastActiveSuperAdminError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e
+
+
+@router.put("/team/{staff_id}/reactivate", response_model=StaffResponse)
+def reactivate_staff_team_member(
+    staff_id: str,
+    db: Session = Depends(get_db),
+    staff: PlatformStaff = Depends(require_capability("staff.manage_staff_accounts")),
+):
+    try:
+        return service.reactivate_staff_member(db, staff_id, actor=staff.id)
+    except StaffNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
+
+
+@router.get("/platform-metrics")
+def get_platform_metrics(
+    db: Session = Depends(get_db),
+    _staff: PlatformStaff = Depends(get_current_staff),
+):
+    """Platform-wide call volume + subscription/revenue snapshot for the
+    Super Admin Overview dashboard. Any staff role can call this (same
+    "GET is diagnostic" posture as every other reporting endpoint in this
+    file) - the console UI is what restricts it to SUPER_ADMIN, same
+    pattern as the extra account/audit/provider detail added there."""
+    return {
+        "calls": service.get_platform_call_metrics(db),
+        "billing": service.get_platform_billing_metrics(db),
+    }
 
 
 @router.get("/accounts", response_model=list[AccountOverviewResponse])

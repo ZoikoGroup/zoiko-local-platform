@@ -1,5 +1,13 @@
 @import "tailwindcss";
 
+/* Enables the `dark:` variant, but ONLY under a `.dark` class - never
+   activated automatically by OS/browser preference. Scoped in practice to
+   the staff console (see staff-theme.css), which toggles `.dark` on its
+   own root wrapper; the customer dashboard never applies that class, so
+   defining the variant here has zero effect on it (this app is otherwise
+   deliberately light-only - see the color-scheme comment below). */
+@custom-variant dark (&:where(.dark, .dark *));
+
 :root {
   --background: #ffffff;
   --foreground: #171717;
