@@ -9,7 +9,17 @@ def _signup_and_login(client, email: str, account_name: str = "CRM Test Co") -> 
         "/auth/signup",
         json={"account_name": account_name, "account_type": "business", "email": email, "password": "supersecret123"},
     )
-    return client.post("/auth/login", json={"email": email, "password": "supersecret123"}).json()["access_token"]
+    token = client.post("/auth/login", json={"email": email, "password": "supersecret123"}).json()["access_token"]
+    # A fresh signup defaults to the free trial - app.core.deps.
+    # require_paid_or_read_only blocks write actions (creating a contact,
+    # which is what drives most of this file's CRM-sync assertions) for a
+    # TRIALING account. Upgrade to a real paid plan here rather than adding
+    # this to every individual test, same pattern as test_voice.py.
+    client.put(
+        "/billing/subscription/plan", json={"plan_code": "starter", "billing_period": "monthly"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    return token
 
 
 def _insert_real_connection(db_session, account_id: str, provider: CrmProvider = CrmProvider.HUBSPOT) -> CrmConnection:

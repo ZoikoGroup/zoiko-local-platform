@@ -10,6 +10,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
+from app.billing.service import EntitlementRequiredError
 from app.core.config import settings
 from app.core.database import get_db
 from app.core.deps import get_current_user, require_writer
@@ -236,6 +237,11 @@ async def start_recording(
         raise HTTPException(status_code=403, detail=str(e)) from e
     except media_service.ConfidentialModeRecordingBlockedError as e:
         raise HTTPException(status_code=403, detail=str(e)) from e
+    except EntitlementRequiredError as e:
+        raise HTTPException(
+            status_code=status.HTTP_402_PAYMENT_REQUIRED,
+            detail={"code": "ENTITLEMENT_REQUIRED", "entitlement": e.key, "current_plan": e.plan_code},
+        ) from e
     except VideoError as e:
         raise HTTPException(status_code=502, detail=str(e)) from e
     return {"room_name": session.room_name, "recording": True}

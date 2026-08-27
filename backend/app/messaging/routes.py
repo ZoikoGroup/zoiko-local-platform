@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from sqlalchemy.orm import Session
 
+from app.billing.service import EntitlementRequiredError
 from app.core.database import get_db
 from app.core.deps import get_current_user, require_writer
 from app.integrations.telecom.twilio import TelecomError
@@ -24,6 +25,11 @@ def _send(payload: SendMessageRequest, db: Session, current_user: User, channel:
         return service.send_message(
             db, current_user.account_id, current_user.id, payload.phone_number_id, payload.to, payload.body, channel
         )
+    except EntitlementRequiredError as e:
+        raise HTTPException(
+            status_code=status.HTTP_402_PAYMENT_REQUIRED,
+            detail={"code": "ENTITLEMENT_REQUIRED", "entitlement": e.key, "current_plan": e.plan_code},
+        ) from e
     except NumberNotOwnedError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"number {e} not found on this account") from e
     except ChannelNotEnabledError as e:

@@ -136,9 +136,16 @@ def test_public_status_never_leaks_provider_names_or_error_detail(client, monkey
 
 
 def test_public_status_is_cached_between_requests(client, monkeypatch):
-    from app.ops import service
+    # Real gap fix: this cache moved from a per-process module-level dict
+    # (service._public_status_cache, which no longer exists) to Redis - a
+    # module dict meant each of this app's WEB_CONCURRENCY=4 uvicorn
+    # workers re-ran the real provider health checks on its own clock, up
+    # to 4x more often than the TTL implies (see get_public_status's own
+    # docstring). Clear the real cache key instead of the stale attribute.
+    from app.integrations.cache.redis import cache_delete
+    from app.ops.service import _PUBLIC_STATUS_CACHE_KEY
 
-    service._public_status_cache = None
+    cache_delete(_PUBLIC_STATUS_CACHE_KEY)
     call_count = 0
 
     def _counting_health_check():

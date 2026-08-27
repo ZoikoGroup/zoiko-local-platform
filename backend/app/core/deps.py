@@ -309,6 +309,50 @@ def require_entitlement_for_api_key(key: str):
     return _dependency
 
 
+def require_entitlement_scope(key: str, min_scope: str):
+    """Same purpose as require_entitlement, but for the enum-typed 'scope
+    ladder' keys ZL-COM-ENT-001 v3.0 introduces (developer.api.scope,
+    developer.webhooks.scope: none < limited < standard < advanced <
+    contracted) - a plain boolean check can't express "at least limited"."""
+
+    def _dependency(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> User:
+        from app.billing.service import get_or_create_subscription, has_entitlement_scope
+
+        if not has_entitlement_scope(db, current_user.account_id, key, min_scope):
+            sub = get_or_create_subscription(db, current_user.account_id)
+            raise HTTPException(
+                status_code=status.HTTP_402_PAYMENT_REQUIRED,
+                detail={
+                    "code": "ENTITLEMENT_REQUIRED", "entitlement": key,
+                    "required_scope": min_scope, "current_plan": sub.plan_code,
+                },
+            )
+        return current_user
+
+    return _dependency
+
+
+def require_entitlement_scope_for_api_key(key: str, min_scope: str):
+    """Same as require_entitlement_scope above, but for the /public/v1
+    surface - see require_entitlement_for_api_key."""
+
+    def _dependency(account_id: str = Depends(get_api_key_account_id), db: Session = Depends(get_db)) -> str:
+        from app.billing.service import get_or_create_subscription, has_entitlement_scope
+
+        if not has_entitlement_scope(db, account_id, key, min_scope):
+            sub = get_or_create_subscription(db, account_id)
+            raise HTTPException(
+                status_code=status.HTTP_402_PAYMENT_REQUIRED,
+                detail={
+                    "code": "ENTITLEMENT_REQUIRED", "entitlement": key,
+                    "required_scope": min_scope, "current_plan": sub.plan_code,
+                },
+            )
+        return account_id
+
+    return _dependency
+
+
 def require_capability(capability: str):
     """Data-driven segregation of duties (Commercial Billing Operating
     Standard doc's "formal RBAC/segregation-of-duties matrix" ask) - see

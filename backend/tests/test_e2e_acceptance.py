@@ -367,8 +367,20 @@ def test_customer_is_notified_when_provisioning_fails(client, db_session, monkey
     def _reject_purchase(e164: str, bundle_sid=None):
         raise TelecomError("carrier rejected this number")
 
+    from app.billing.models import SubscriptionStatus
+    from app.billing.service import get_or_create_subscription
+
     token, account_id = _signup_and_login(client, "e2erefund@example.com")
     headers = {"Authorization": f"Bearer {token}"}
+
+    # app.core.deps.require_paid_or_read_only blocks write actions (number
+    # reservation, checkout) for a TRIALING account; this test is about the
+    # carrier-rejection/refund path, not trial-gating, so clear it directly
+    # (same pattern as test_risk.py's _clear_billing_trial_gate).
+    sub = get_or_create_subscription(db_session, account_id)
+    sub.status = SubscriptionStatus.ACTIVE
+    sub.trial_ends_at = None
+    db_session.commit()
 
     assert client.post(
         "/compliance/consent", json={"consent_type": "emergency_calling_acknowledged"}, headers=headers,

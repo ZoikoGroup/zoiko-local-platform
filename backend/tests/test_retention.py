@@ -39,14 +39,25 @@ def test_list_policies_returns_default_90_days_when_unconfigured(client):
     assert response.json() == {"voicemail": 90, "call_recording": 90, "video_recording": 90}
 
 
-def test_member_cannot_set_retention_policy(client):
+def test_member_cannot_set_retention_policy(client, db_session):
     owner_token = _signup_and_login(client, "retentionowner1@example.com", account_type="business")
     headers = {"Authorization": f"Bearer {owner_token}"}
-    client.post(
+
+    # team.members.enabled (ZL-COM-ENT-001 §7) is Business+ only - a fresh
+    # signup defaults to free_trial, which would 402 the invite below
+    # before this test ever reaches its actual point (a member, once
+    # added, is blocked from retention policy specifically).
+    from app.billing import service as billing_service
+
+    account_id = client.get("/auth/me", headers=headers).json()["account_id"]
+    billing_service.change_plan(db_session, account_id, "business", actor="test-setup")
+
+    invite = client.post(
         "/team/members",
         json={"email": "retentionmember1@example.com", "password": "supersecret123", "role": "member"},
         headers=headers,
     )
+    assert invite.status_code == 201, invite.text
     member_token = client.post(
         "/auth/login", json={"email": "retentionmember1@example.com", "password": "supersecret123"}
     ).json()["access_token"]
@@ -361,6 +372,7 @@ def _make_conversation_summary(db_session, account_id: str) -> "ConversationSumm
     summary = ConversationSummary(
         account_id=account_id, source_type=SummarySourceType.VOICEMAIL, source_id=new_uuid(),
         transcript="hello this is a real transcript", summary="caller left a message",
+        model_version="test-fixture",
     )
     db_session.add(summary)
     db_session.commit()
@@ -485,11 +497,19 @@ def test_resolve_erasure_request_completing_refuses_when_account_under_legal_hol
     from app.retention.models import ErasureRequestStatus
     from app.retention.service import AccountUnderLegalHoldError, create_erasure_request, resolve_erasure_request
 
-    account = Account(name="Resolve Erasure Hold Co", account_type=AccountType.INDIVIDUAL, legal_hold=True)
+    # create_erasure_request itself now also refuses to open a request
+    # against an account already under legal hold - so to isolate the
+    # thing this test actually checks (resolve_erasure_request refuses
+    # too), the hold has to start AFTER the request already exists, not
+    # before it.
+    account = Account(name="Resolve Erasure Hold Co", account_type=AccountType.INDIVIDUAL)
     db_session.add(account)
     db_session.commit()
 
     request = create_erasure_request(db_session, account_id=account.id, requested_by=account.id, notes="delete me")
+
+    account.legal_hold = True
+    db_session.commit()
 
     try:
         resolve_erasure_request(

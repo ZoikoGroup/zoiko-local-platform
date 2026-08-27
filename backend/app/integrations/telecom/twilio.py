@@ -523,6 +523,24 @@ def get_call(call_sid: str) -> dict:
     return with_failover(_breaker, _primary, secondary_fn, TelecomError, _is_provider_failure)
 
 
+def redirect_call(call_sid: str, twiml: str) -> dict:
+    """ZL-COM-ENT-001 v3.0 - blind/cold call transfer (routing.transfer):
+    redirects an in-progress call's live leg to fresh TwiML. Deliberately
+    Twilio-only, no secondary-provider failover, unlike most functions in
+    this file (settings.telecom_failover_enabled is not consulted here) -
+    a mid-call REST-triggered redirect failing over to a different carrier
+    mid-conversation is a materially different (and much riskier) failure
+    mode than failing over a call that hasn't started yet, and the
+    secondary provider has no way to take over a live Twilio-owned call
+    leg regardless."""
+    try:
+        with trace_provider_call("twilio", "redirect_call"):
+            call = _client().calls(call_sid).update(twiml=twiml)
+    except TwilioException as e:
+        raise TelecomError(_clean_twilio_error_message(e)) from e
+    return {"sid": call.sid, "status": call.status}
+
+
 def list_calls(limit: int = 20) -> list[dict]:
     """Read-only, confirmed live-working with zero owned numbers and zero
     calls made (returns an empty list, not an error).
@@ -632,7 +650,12 @@ def build_bridge_response(
         # rejects them on <Dial> (confirmed live via a real call's Notifications:
         # "Attribute 'statusCallback' is not allowed to appear in element
         # 'Dial'" - tolerated as a warning, not fatal, but still real invalid
-        # TwiML worth fixing outright).
+        # TwiML worth fixing outright). anilupdated independently hit the same
+        # bug and fixed it by dropping status_callback/status_callback_event
+        # entirely (relying on action alone) - kept this branch's fix instead
+        # since it was verified live against a real bridged call and still
+        # gets per-leg CallStatus/CallDuration on this URL, which action alone
+        # (DialCallStatus/DialCallDuration, describing the parent leg) doesn't.
         dial_kwargs["action"] = status_callback_url
         number_kwargs["status_callback"] = status_callback_url
         number_kwargs["status_callback_event"] = "completed"

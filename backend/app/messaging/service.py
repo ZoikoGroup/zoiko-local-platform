@@ -13,6 +13,7 @@ from datetime import datetime
 from sqlalchemy.orm import Session
 
 from app.audit.service import log_event
+from app.billing import service as billing_service
 from app.events.service import publish_message_received, publish_message_sent
 from app.integrations.cache.redis import cache_delete, cache_get, cache_set
 from app.integrations.telecom import twilio as telecom
@@ -88,6 +89,9 @@ def _send_via_provider(channel: MessagingChannel, to: str, from_number: str, bod
 def send_message(
     db: Session, account_id: str, actor_id: str, phone_number_id: str, to: str, body: str, channel: MessagingChannel
 ) -> Message:
+    # ZL-COM-ENT-001 v3.0 - plan-tier gate, additive to (not a replacement
+    # for) the per-number whatsapp_enabled/sms_enabled approval check below.
+    billing_service.assert_entitlement(db, account_id, "messaging.enabled")
     number = _get_owned_number_for_channel(db, account_id, phone_number_id, channel)
     conversation = _get_or_create_conversation(db, account_id, phone_number_id, to, channel)
     if conversation.opted_out:

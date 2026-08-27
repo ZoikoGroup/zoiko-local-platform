@@ -29,6 +29,7 @@ export function CallRow({
   summaryState,
   onSummarize,
   onGrantConsent,
+  onTransfer,
 }: {
   label: string;
   status: string;
@@ -44,8 +45,34 @@ export function CallRow({
   summaryState: SummaryState;
   onSummarize: () => void;
   onGrantConsent: () => void;
+  // Omitted on the Voicemail page (there's nothing live to transfer there)
+  // - only the Calls page passes this. Only ever actionable while
+  // status === "in-progress"; there's no live push channel telling this
+  // row when that changes, so it reflects whatever the last list/refresh
+  // fetched, not a real-time state.
+  onTransfer?: (destination: string) => Promise<void>;
 }) {
   const [playError, setPlayError] = useState<string | null>(null);
+  const [transferring, setTransferring] = useState(false);
+  const [transferDestination, setTransferDestination] = useState("");
+  const [transferBusy, setTransferBusy] = useState(false);
+  const [transferError, setTransferError] = useState<string | null>(null);
+  const [transferDone, setTransferDone] = useState(false);
+
+  async function handleTransfer() {
+    if (!onTransfer || !transferDestination.trim()) return;
+    setTransferBusy(true);
+    setTransferError(null);
+    try {
+      await onTransfer(transferDestination.trim());
+      setTransferring(false);
+      setTransferDone(true);
+    } catch (err) {
+      setTransferError(err instanceof Error ? err.message : "Couldn't transfer this call.");
+    } finally {
+      setTransferBusy(false);
+    }
+  }
 
   async function handlePlay() {
     setPlayError(null);
@@ -101,10 +128,51 @@ export function CallRow({
             </button>
           )}
           {!recordingUrl && <span className="text-xs text-slate-400">No recording</span>}
+          {onTransfer && status === "in-progress" && !transferring && !transferDone && (
+            <button
+              type="button"
+              onClick={() => setTransferring(true)}
+              className="text-xs font-medium text-indigo-600 hover:text-indigo-800"
+            >
+              Transfer
+            </button>
+          )}
         </div>
       </div>
 
       {playError && <p className="text-xs text-red-600">{playError}</p>}
+      {transferDone && <p className="text-xs text-emerald-600">Call transferred.</p>}
+
+      {transferring && (
+        <div className="flex items-center gap-2">
+          <input
+            value={transferDestination}
+            onChange={(e) => setTransferDestination(e.target.value)}
+            placeholder="+1..."
+            className="flex-1 rounded-lg border border-slate-300 px-2.5 py-1.5 text-xs placeholder:text-slate-400"
+          />
+          <button
+            type="button"
+            onClick={handleTransfer}
+            disabled={transferBusy || !transferDestination.trim()}
+            className="text-xs font-medium rounded-lg px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-60 text-white"
+          >
+            {transferBusy ? "Transferring..." : "Confirm"}
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              setTransferring(false);
+              setTransferError(null);
+            }}
+            disabled={transferBusy}
+            className="text-xs font-medium rounded-lg px-3 py-1.5 border border-slate-300 text-slate-700 hover:bg-slate-50"
+          >
+            Cancel
+          </button>
+        </div>
+      )}
+      {transferError && <p className="text-xs text-red-600">{transferError}</p>}
 
       {summaryState.status === "consent_required" && (
         <div className="text-xs bg-amber-50 text-amber-700 rounded-lg px-3 py-2 flex items-center justify-between gap-3">

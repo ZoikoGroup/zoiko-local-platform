@@ -115,6 +115,23 @@ def test_status_callback_updates_call_duration(client, db_session):
     assert calls[0]["duration"] == 42
 
 
+def test_incoming_call_to_unrecognized_number_does_not_crash(client):
+    # A call to a number we don't own (never purchased, or since released)
+    # has no owning account - record_call's audit log_event call must not
+    # require a real account_id here. Regression test for a real production
+    # bug: log_event(actor_id=None, ...) raised ValueError because neither
+    # actor nor actor_id was set, 500ing every inbound call to an
+    # unrecognized number.
+    url = "http://testserver/media/voice/incoming"
+    params = {
+        "To": "+15550000000", "From": "+15551234567", "CallSid": "CAunrecognized1", "CallStatus": "ringing",
+    }
+    signature = _twilio_signature(url, params)
+    response = client.post("/media/voice/incoming", data=params, headers={"X-Twilio-Signature": signature})
+    assert response.status_code == 200
+    assert "isn't recognized" in response.text
+
+
 def test_incoming_call_forwards_when_configured(client, db_session):
     token = _signup_and_login(client, "voiceforward@example.com")
     account_id = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"}).json()["account_id"]
@@ -294,11 +311,61 @@ def test_incoming_call_goes_to_voicemail_outside_business_hours(client, db_sessi
     assert "<Dial" not in response.text
 
 
-def test_free_trial_account_cannot_set_business_hours(client, db_session):
+def test_incoming_call_declines_voicemail_when_not_entitled(client, db_session):
+    """ZL-COM-ENT-001 v3.0 - voicemail.enabled is seeded True on every real
+    plan, so this is defense-in-depth for an account with no seeded rows
+    at all (free_trial), not an expected path in practice. A number
+    normally can't be owned by a free_trial account (purchase requires a
+    paid plan) - inserted directly here to exercise the denial branch in
+    isolation regardless of how such a number came to exist."""
+    # Deliberately not _signup_and_login - that helper upgrades to starter
+    # (which grants voicemail.enabled) to keep every OTHER test in this
+    # file about call-routing mechanics, not trial-gating; this test needs
+    # the real, ungraded free_trial account specifically.
+    client.post(
+        "/auth/signup",
+        json={
+            "account_name": "Voicemail Denied Co", "account_type": "business",
+            "email": "voicemaildenied@example.com", "password": "supersecret123",
+        },
+    )
+    token = client.post(
+        "/auth/login", json={"email": "voicemaildenied@example.com", "password": "supersecret123"}
+    ).json()["access_token"]
+    account_id = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"}).json()["account_id"]
+    from app.billing import service as billing_service
+
+    sub = billing_service.get_or_create_subscription(db_session, account_id)
+    assert sub.plan_code == "free_trial"
+    number = PhoneNumber(
+        e164="+15550002222", country="US", status=PhoneNumberStatus.ACTIVE, account_id=account_id
+    )
+    db_session.add(number)
+    db_session.commit()
+
+    incoming_url = "http://testserver/media/voice/incoming"
+    incoming_params = {
+        "To": "+15550002222", "From": "+15559990000", "CallSid": "CAvmdenied1", "CallStatus": "ringing",
+    }
+    signature = _twilio_signature(incoming_url, incoming_params)
+    response = client.post(
+        "/media/voice/incoming", data=incoming_params, headers={"X-Twilio-Signature": signature}
+    )
+    assert response.status_code == 200
+    assert "<Record" not in response.text
+    assert "no one is available" in response.text
+
+
+def test_starter_plan_account_cannot_set_business_hours(client, db_session):
     """ZL-COM-ENT-001 §7 matrix: business-hours routing is Business+ only -
     configuring hours at all (not just leaving them unset) is the gated
-    capability, so a free_trial account must be denied with a real
-    entitlement code."""
+    capability. Uses the shared _signup_and_login (upgrades to starter)
+    rather than a real free_trial account: app.core.deps.
+    require_paid_or_read_only's router-wide gate blocks every write for a
+    genuinely TRIALING account with a plain-string error (not the
+    dict-shaped ENTITLEMENT_REQUIRED body this test checks), so the
+    specific-entitlement path this test exercises only reaches on an
+    already-paid plan that simply lacks routing.business_hours."""
     token = _signup_and_login(client, "voicehoursdenied@example.com")
     account_id = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"}).json()["account_id"]
     number = PhoneNumber(
@@ -321,7 +388,7 @@ def test_free_trial_account_cannot_set_business_hours(client, db_session):
     body = denied.json()["detail"]
     assert body["code"] == "ENTITLEMENT_REQUIRED"
     assert body["entitlement"] == "routing.business_hours"
-    assert body["current_plan"] == "free_trial"
+    assert body["current_plan"] == "starter"
 
 
 def _signup_and_login_with_account(client, email: str) -> tuple[str, str]:
@@ -570,3 +637,96 @@ def test_get_call_succeeds_for_the_owning_account(client, db_session, monkeypatc
     )
     assert response.status_code == 200
     assert response.json()["sid"] == call.provider_call_sid
+
+
+def test_browser_call_to_another_zoiko_number_routes_through_their_configured_handling(client, db_session):
+    """ZL-COM-ENT-001 v3.0 - voice.app_to_app. A browser call to a number
+    owned by a DIFFERENT Zoiko account must route through THAT account's
+    own real call handling (here: their configured forwarding number),
+    not a bare client-to-client bridge that would skip it entirely."""
+    from app.media import service as media_service
+    from app.numbering.numbers.models import CallerIdentity, CallerIdentityStatus
+    from datetime import datetime, timezone
+
+    caller_token = _signup_and_login(client, "apptoappcaller@example.com")
+    caller_account_id = client.get("/auth/me", headers={"Authorization": f"Bearer {caller_token}"}).json()["account_id"]
+    caller_number = PhoneNumber(
+        e164="+15550031111", country="US", status=PhoneNumberStatus.ACTIVE, account_id=caller_account_id,
+    )
+    db_session.add(caller_number)
+    db_session.commit()
+    db_session.add(CallerIdentity(
+        phone_number_id=caller_number.id, account_id=caller_account_id, status=CallerIdentityStatus.VERIFIED,
+        verification_source="test-fixture", verified_at=datetime.now(timezone.utc),
+    ))
+    db_session.commit()
+
+    callee_token = _signup_and_login(client, "apptoappcallee@example.com")
+    callee_account_id = client.get("/auth/me", headers={"Authorization": f"Bearer {callee_token}"}).json()["account_id"]
+    callee_number = PhoneNumber(
+        e164="+15550032222", country="US", status=PhoneNumberStatus.ACTIVE, account_id=callee_account_id,
+    )
+    db_session.add(callee_number)
+    db_session.commit()
+    client.put(
+        "/numbers/+15550032222/routing",
+        json={"forwarding_number": "+15559998888"},
+        headers={"Authorization": f"Bearer {callee_token}"},
+    )
+
+    result = media_service.handle_browser_connect(
+        db_session, account_id=caller_account_id, from_number="+15550031111", to="+15550032222",
+        call_sid="CAapptoapp1",
+    )
+    assert result["mode"] == "app_to_app"
+    assert result["owner"].account_id == callee_account_id
+
+
+def test_browser_call_falls_back_to_pstn_when_caller_lacks_app_to_app_entitlement(client, db_session):
+    """A caller on a plan/state without voice.app_to_app (free_trial - no
+    seeded rows at all) still reaches the destination normally, over
+    PSTN - the entitlement gates an optimization, not the call itself."""
+    from app.media import service as media_service
+    from app.numbering.numbers.models import CallerIdentity, CallerIdentityStatus
+    from datetime import datetime, timezone
+
+    # Deliberately not upgraded off free_trial - the account this whole
+    # test is about. A number normally can't be owned by a free_trial
+    # account (purchase requires a paid plan) - inserted directly to
+    # isolate testing this specific fallback branch.
+    client.post(
+        "/auth/signup",
+        json={
+            "account_name": "App To App Fallback Co", "account_type": "business",
+            "email": "apptoappfallback@example.com", "password": "supersecret123",
+        },
+    )
+    caller_token = client.post(
+        "/auth/login", json={"email": "apptoappfallback@example.com", "password": "supersecret123"}
+    ).json()["access_token"]
+    caller_account_id = client.get("/auth/me", headers={"Authorization": f"Bearer {caller_token}"}).json()["account_id"]
+    caller_number = PhoneNumber(
+        e164="+15550033333", country="US", status=PhoneNumberStatus.ACTIVE, account_id=caller_account_id,
+    )
+    db_session.add(caller_number)
+    db_session.commit()
+    db_session.add(CallerIdentity(
+        phone_number_id=caller_number.id, account_id=caller_account_id, status=CallerIdentityStatus.VERIFIED,
+        verification_source="test-fixture", verified_at=datetime.now(timezone.utc),
+    ))
+    db_session.commit()
+
+    callee_token = _signup_and_login(client, "apptoappfallbackcallee@example.com")
+    callee_account_id = client.get("/auth/me", headers={"Authorization": f"Bearer {callee_token}"}).json()["account_id"]
+    callee_number = PhoneNumber(
+        e164="+15550034444", country="US", status=PhoneNumberStatus.ACTIVE, account_id=callee_account_id,
+    )
+    db_session.add(callee_number)
+    db_session.commit()
+
+    result = media_service.handle_browser_connect(
+        db_session, account_id=caller_account_id, from_number="+15550033333", to="+15550034444",
+        call_sid="CAapptoappfallback1",
+    )
+    assert result["mode"] == "pstn_bridge"
+    assert result["destination"] == "+15550034444"

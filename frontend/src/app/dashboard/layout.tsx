@@ -6,7 +6,15 @@ import Sidebar from "@/components/Sidebar";
 import Topbar from "@/components/Topbar";
 import TrialBanner from "@/components/TrialBanner";
 import VoiceCallOverlay from "@/components/VoiceCallOverlay";
-import { ApiError, getCurrentUser, getSubscription, type Subscription, type User } from "@/lib/api";
+import {
+  ApiError,
+  getCurrentUser,
+  getEntitlements,
+  getSubscription,
+  type Entitlements,
+  type Subscription,
+  type User,
+} from "@/lib/api";
 import { getToken, clearToken } from "@/lib/auth";
 import { VoiceDeviceProvider } from "@/lib/voiceDevice";
 
@@ -18,6 +26,7 @@ export default function DashboardLayout({
   const router = useRouter();
   const [user, setUser] = useState<User | null>(null);
   const [subscription, setSubscription] = useState<Subscription | null>(null);
+  const [entitlements, setEntitlements] = useState<Entitlements | null>(null);
   const [checking, setChecking] = useState(true);
 
   useEffect(() => {
@@ -51,6 +60,13 @@ export default function DashboardLayout({
         // lock/show anything" rather than fail the whole dashboard over a
         // transient billing-service hiccup.
       });
+
+    // Same "fetch once, pass down" reasoning as subscription above -
+    // Sidebar treats a null value as "don't entitlement-lock anything"
+    // (the existing trial lock still applies on its own).
+    getEntitlements(token)
+      .then(setEntitlements)
+      .catch(() => {});
   }, [router]);
 
   if (checking) {
@@ -78,7 +94,7 @@ export default function DashboardLayout({
   return (
     <VoiceDeviceProvider>
       <div className="h-screen flex overflow-hidden bg-slate-50">
-        <Sidebar subscription={subscription} />
+        <Sidebar subscription={subscription} entitlements={entitlements} />
         <div className="flex-1 flex flex-col min-w-0 overflow-hidden">
           <Topbar user={user} />
           <TrialBanner subscription={subscription} />

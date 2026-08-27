@@ -88,10 +88,17 @@ def test_empty_destinations_clears_the_ring_group(client, db_session):
     assert response.json() == []
 
 
-def test_free_trial_account_cannot_set_a_multi_destination_ring_group(client, db_session):
+def test_starter_plan_account_cannot_set_a_multi_destination_ring_group(client, db_session):
     """ZL-COM-ENT-001 §7 matrix: shared call handling (2+ destinations
     ringing at once) is Business+ only - a single destination is just
-    personal forwarding and stays available to every plan."""
+    personal forwarding and stays available to every plan. Uses the shared
+    _signup_and_login (upgrades to starter) rather than a real free_trial
+    account: app.core.deps.require_paid_or_read_only's router-wide gate
+    blocks every write for a genuinely TRIALING account - including the
+    single-destination call below - so this test's actual premise (single
+    succeeds, multi specifically doesn't) can only be exercised on an
+    already-paid plan that simply lacks the routing.shared_handling
+    entitlement, which starter is."""
     token = _signup_and_login(client, "ring-freetrial1@example.com")
     _make_active_number(client, db_session, token, "+15550009991")
     headers = {"Authorization": f"Bearer {token}"}
@@ -109,8 +116,8 @@ def test_free_trial_account_cannot_set_a_multi_destination_ring_group(client, db
     assert denied.status_code == 402, denied.text
     body = denied.json()["detail"]
     assert body["code"] == "ENTITLEMENT_REQUIRED"
-    assert body["entitlement"] == "routing.shared_handling"
-    assert body["current_plan"] == "free_trial"
+    assert body["entitlement"] == "routing.shared"
+    assert body["current_plan"] == "starter"
 
 
 def test_ring_group_size_is_capped(client, db_session):

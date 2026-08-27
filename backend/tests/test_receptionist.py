@@ -513,7 +513,7 @@ def test_build_receptionist_reply_response_omits_record_without_a_callback_url()
 
     twiml = telecom.build_receptionist_reply_response(
         "Thanks, connecting you now.", forward_to="+15551117777",
-        status_callback_url="http://testserver/media/voice/status-callback",
+        fallback_action_url="http://testserver/media/receptionist/escalation-fallback",
         recording_callback_url=None,
     )
     assert "<Dial" in twiml

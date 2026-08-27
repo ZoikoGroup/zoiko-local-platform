@@ -13,6 +13,7 @@ import {
   listContacts,
   getCallRecordingBlob,
   getVoicemailRecordingBlob,
+  transferCall,
   ApiError,
   type MyPhoneNumber,
   type CallLogEntry,
@@ -318,6 +319,13 @@ export default function CallsPage() {
               summaryState={summaries[`call:${c.id}`] ?? { status: "idle" }}
               onSummarize={() => handleSummarize("call", c.id)}
               onGrantConsent={() => handleGrantConsent("call", c.id)}
+              onTransfer={
+                token && c.sid
+                  ? async (destination) => {
+                      await transferCall(token, c.sid!, destination);
+                    }
+                  : undefined
+              }
             />
           ))}
         </div>

@@ -7,6 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
+from app.billing.service import EntitlementRequiredError
 from app.core.database import get_db
 from app.core.deps import get_current_staff, get_current_user, require_writer
 from app.integrations.llm.groq import LLMError
@@ -58,6 +59,11 @@ def summarize_voicemail(
         raise HTTPException(status_code=403, detail=str(e)) from e
     except service.ConsentRequiredError as e:
         raise HTTPException(status_code=403, detail=str(e)) from e
+    except EntitlementRequiredError as e:
+        raise HTTPException(
+            status_code=status.HTTP_402_PAYMENT_REQUIRED,
+            detail={"code": "ENTITLEMENT_REQUIRED", "entitlement": e.key, "current_plan": e.plan_code},
+        ) from e
     # BillingSuspendedError no longer caught here - subclasses
     # EntitlementError, handled by the global entitlement_error_handler.
     except KillSwitchTrippedError as e:
@@ -79,6 +85,11 @@ def summarize_call(
         raise HTTPException(status_code=403, detail=str(e)) from e
     except service.ConsentRequiredError as e:
         raise HTTPException(status_code=403, detail=str(e)) from e
+    except EntitlementRequiredError as e:
+        raise HTTPException(
+            status_code=status.HTTP_402_PAYMENT_REQUIRED,
+            detail={"code": "ENTITLEMENT_REQUIRED", "entitlement": e.key, "current_plan": e.plan_code},
+        ) from e
     except service.NotRecordedError as e:
         raise HTTPException(status_code=409, detail=str(e)) from e
     # BillingSuspendedError no longer caught here - subclasses
@@ -102,6 +113,11 @@ def summarize_video_session(
         raise HTTPException(status_code=403, detail=str(e)) from e
     except service.ConsentRequiredError as e:
         raise HTTPException(status_code=403, detail=str(e)) from e
+    except EntitlementRequiredError as e:
+        raise HTTPException(
+            status_code=status.HTTP_402_PAYMENT_REQUIRED,
+            detail={"code": "ENTITLEMENT_REQUIRED", "entitlement": e.key, "current_plan": e.plan_code},
+        ) from e
     except service.NotRecordedError as e:
         raise HTTPException(status_code=409, detail=str(e)) from e
     # BillingSuspendedError no longer caught here - subclasses

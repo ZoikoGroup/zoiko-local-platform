@@ -55,6 +55,22 @@ export function VoiceDeviceProvider({ children }: { children: ReactNode }) {
   const [incomingFrom, setIncomingFrom] = useState<string | null>(null);
   const [activeCallTo, setActiveCallTo] = useState<string | null>(null);
 
+  // 31000-range codes the Voice SDK raises on the Call itself (not the
+  // Device) when the underlying WebRTC media connection to Twilio's edge
+  // drops or never establishes - always a network path problem between
+  // the browser and Twilio (weak wifi/mobile signal, a VPN, or a firewall
+  // blocking WebRTC/UDP), never something this app's backend controls, so
+  // there's no reconnect to attempt here - just a clearer message than the
+  // raw SDK string ("ConnectionError (31005): ...").
+  const CALL_CONNECTION_ERROR_CODES = new Set([31003, 31005, 31009]);
+
+  const describeCallError = useCallback((err: { code?: number; message?: string }) => {
+    if (err.code !== undefined && CALL_CONNECTION_ERROR_CODES.has(err.code)) {
+      return "The call dropped because of a network problem reaching Twilio - weak wifi/mobile signal, a VPN, or a firewall blocking the call. Check your connection and try again.";
+    }
+    return err.message || "The call ended with an error.";
+  }, []);
+
   const attachActiveCall = useCallback((call: Call, to: string | null) => {
     activeCallRef.current = call;
     setActiveCallTo(to);
@@ -74,14 +90,14 @@ export function VoiceDeviceProvider({ children }: { children: ReactNode }) {
       setStatus("idle");
     });
     call.on("error", (err) => {
-      setError(err.message || "The call ended with an error.");
+      setError(describeCallError(err));
       activeCallRef.current = null;
       incomingCallRef.current = null;
       setActiveCallTo(null);
       setIncomingFrom(null);
       setStatus("error");
     });
-  }, []);
+  }, [describeCallError]);
 
   // Twilio Access Tokens carry a fixed lifetime (build_voice_access_token
   // issues them with ttl=3600, 1 hour) - a Device kept alive for the whole

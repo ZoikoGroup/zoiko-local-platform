@@ -46,7 +46,7 @@ def test_free_trial_account_cannot_create_an_api_key(client):
     assert response.status_code == 402
     body = response.json()["detail"]
     assert body["code"] == "ENTITLEMENT_REQUIRED"
-    assert body["entitlement"] == "developer.api"
+    assert body["entitlement"] == "developer.api.scope"
     assert body["current_plan"] == "free_trial"
 
 
@@ -356,13 +356,19 @@ def _mock_webhook_delivery(monkeypatch):
     monkeypatch.setattr("app.webhooks.service.httpx.post", lambda *a, **kw: FakeResponse())
 
 
-def test_free_trial_account_cannot_create_a_webhook(client, db_session, monkeypatch):
-    """Real gap fix: developer.webhooks is a Pro+ entitlement
-    (ZL-COM-ENT-001 §7), gated separately from developer.api at the
-    /public/v1/webhooks route itself (require_entitlement_for_api_key) -
-    an account has to be Pro+ to even hold a key in the first place, but
-    this proves the webhooks-specific gate is real and not just implied
-    by key ownership."""
+def test_starter_plan_account_cannot_create_a_webhook(client, db_session, monkeypatch):
+    """Real gap fix: developer.webhooks.scope requires at least "limited"
+    (ZL-COM-ENT-001 v3.0 Appendix A), gated separately from
+    developer.api.scope at the /public/v1/webhooks route itself
+    (require_entitlement_scope_for_api_key) - an account has to hold at
+    least "limited" API scope to even hold a key in the first place. Both
+    scope keys are seeded identically per plan (see the v3.0 seed
+    migration), so a starter downgrade fails both; FastAPI evaluates the
+    route's dependencies in declaration order and developer.api.scope is
+    declared first, so its 402 is what a caller actually sees here, not
+    developer.webhooks.scope's - proving the two are checked as genuinely
+    separate dependencies (not one implying the other) still requires a
+    plan that grants one but not the other, which doesn't exist yet."""
     _mock_webhook_delivery(monkeypatch)
     token = _signup_login_and_upgrade_to_pro(client, db_session, "api-webhook0@example.com")
     headers = {"Authorization": f"Bearer {token}"}
@@ -380,7 +386,7 @@ def test_free_trial_account_cannot_create_a_webhook(client, db_session, monkeypa
     assert response.status_code == 402
     body = response.json()["detail"]
     assert body["code"] == "ENTITLEMENT_REQUIRED"
-    assert body["entitlement"] == "developer.webhooks"
+    assert body["entitlement"] == "developer.api.scope"
 
 
 def test_public_api_can_create_list_and_delete_a_webhook(client, db_session, monkeypatch):

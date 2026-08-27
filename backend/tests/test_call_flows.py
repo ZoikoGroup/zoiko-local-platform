@@ -32,13 +32,6 @@ def _signup_and_login(client, db_session, email: str) -> str:
         json={"account_name": "Call Flow Test Co", "account_type": "business", "email": email, "password": "supersecret123"},
     )
     token = client.post("/auth/login", json={"email": email, "password": "supersecret123"}).json()["access_token"]
-    # A fresh signup defaults to the free trial - app.core.deps.
-    # require_paid_or_read_only blocks write actions (creating/publishing/
-    # assigning a call flow) for a TRIALING account, and every test in this
-    # file exercises the Call Flow Designer, which also requires the
-    # routing.advanced entitlement (Pro+ only - see ZL-COM-ENT-001 and
-    # app.billing.service.has_entitlement/app.core.deps.require_entitlement)
-    # - upgrade straight to Pro here rather than repeating it at each test.
     account_id = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"}).json()["account_id"]
     billing_service.change_plan(db_session, account_id, "pro", actor="test-setup")
     return token
@@ -79,11 +72,17 @@ def _create_and_publish_flow(client, headers, name="Main Line", nodes=None, entr
     return flow["id"]
 
 
-def test_free_trial_account_cannot_create_or_publish_a_call_flow(client, db_session):
+def test_starter_plan_account_cannot_create_or_publish_a_call_flow(client, db_session):
     """Real gap fix: routing.advanced is a Pro+ entitlement
     (ZL-COM-ENT-001 §7) - before this gate existed, any plan (including
     free_trial) could build and publish the Advanced IVR / Call Flow
-    Designer."""
+    Designer. Not a real free_trial account: app.core.deps.
+    require_paid_or_read_only's router-wide gate blocks every write for a
+    genuinely TRIALING account with a plain-string error (not the
+    dict-shaped ENTITLEMENT_REQUIRED body this test checks), so the
+    specific-entitlement path only reaches on an already-paid plan that
+    simply lacks routing.advanced - starter, one tier below the Pro+ this
+    gate requires."""
     client.post(
         "/auth/signup",
         json={
@@ -95,13 +94,16 @@ def test_free_trial_account_cannot_create_or_publish_a_call_flow(client, db_sess
         "/auth/login", json={"email": "flow-freetrial1@example.com", "password": "supersecret123"}
     ).json()["access_token"]
     headers = {"Authorization": f"Bearer {token}"}
+    client.put(
+        "/billing/subscription/plan", json={"plan_code": "starter", "billing_period": "monthly"}, headers=headers
+    )
 
     create_response = client.post("/call-flows", json={"name": "Nope"}, headers=headers)
     assert create_response.status_code == 402
     body = create_response.json()["detail"]
     assert body["code"] == "ENTITLEMENT_REQUIRED"
     assert body["entitlement"] == "routing.advanced"
-    assert body["current_plan"] == "free_trial"
+    assert body["current_plan"] == "starter"
 
 
 def test_create_flow_has_an_empty_draft(client, db_session):

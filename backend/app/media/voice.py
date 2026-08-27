@@ -10,7 +10,7 @@ never imports the twilio SDK directly, per the Provider Gateway rule.
 
 from urllib.parse import quote
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response, status
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.orm import Session
 
@@ -172,13 +172,53 @@ def _default_call_twiml(request: Request, db: Session, owner, to_number: str) ->
         )
     elif owner is not None and owner.ai_receptionist_enabled:
         return _ai_receptionist_greeting_twiml(request)
-    elif owner is not None:
+    elif owner is not None and billing_service.has_entitlement(db, owner.account_id, "voicemail.enabled"):
         callback_url = str(request.base_url) + "media/voicemail/recording-complete"
         return telecom.build_record_response(callback_url)
+    elif owner is not None:
+        # ZL-COM-ENT-001 v3.0 - voicemail.enabled is seeded True on every
+        # real plan today, so this should never actually fire in practice;
+        # defense-in-depth for free_trial/enterprise (no seeded rows,
+        # deny-by-default) rather than an expected path. Inside a live
+        # Twilio webhook - fails closed/silent (has_entitlement above), not
+        # a raise.
+        return telecom.build_say_response(
+            "Sorry, no one is available to take your call right now. Goodbye."
+        )
     else:
         return telecom.build_say_response(
             "Thanks for calling Zoiko Local. This number isn't recognized."
         )
+
+
+def _resolve_call_twiml(request: Request, db: Session, owner, to_number: str) -> str:
+    """The real, full call-handling decision for a number: advanced IVR
+    builder flow, then simple single-level IVR, then forwarding/ring
+    group/AI receptionist/voicemail (_default_call_twiml). Shared by
+    incoming_call (a real Twilio inbound webhook) and browser_connect's
+    app-to-app branch (ZL-COM-ENT-001 v3.0 voice.app_to_app - a browser
+    call to another Zoiko account's number routes through that account's
+    real configured handling, not a bare client-to-client bridge that
+    would bypass it entirely - see media.service.handle_browser_connect's
+    docstring)."""
+    live_flow_version = routing_service.get_live_version(db, owner) if owner is not None else None
+
+    if live_flow_version is not None:
+        # Advanced IVR builder (Phase 3) - a number with an assigned, published
+        # call flow is routed entirely through it, bypassing the legacy
+        # forwarding/ring-group/AI-receptionist/voicemail branches below.
+        # Unassigned numbers (call_flow_id is NULL, true for every number
+        # that existed before this feature) are completely unaffected.
+        action = routing_service.resolve_entry(live_flow_version)
+        return _flow_response(db, action, live_flow_version, request, to_number, owner)
+    elif owner is not None and owner.ivr_greeting:
+        # Enhanced business routing (Phase 2) - a simpler single-level DTMF
+        # menu, still available for any number that hasn't opted into the
+        # full Phase 3 call-flow builder above.
+        action_url = str(request.base_url) + "media/voice/ivr-select"
+        no_input_url = str(request.base_url) + "media/voice/ivr-no-input"
+        return telecom.build_ivr_menu_response(owner.ivr_greeting, action_url, no_input_url)
+    return _default_call_twiml(request, db, owner, to_number)
 
 
 @router.post("/incoming")
@@ -208,25 +248,7 @@ async def incoming_call(request: Request, db: Session = Depends(get_db)):
         status=params.get("CallStatus", "unknown"),
     )
 
-    live_flow_version = routing_service.get_live_version(db, owner) if owner is not None else None
-
-    if live_flow_version is not None:
-        # Advanced IVR builder (Phase 3) - a number with an assigned, published
-        # call flow is routed entirely through it, bypassing the legacy
-        # forwarding/ring-group/AI-receptionist/voicemail branches below.
-        # Unassigned numbers (call_flow_id is NULL, true for every number
-        # that existed before this feature) are completely unaffected.
-        action = routing_service.resolve_entry(live_flow_version)
-        twiml = _flow_response(db, action, live_flow_version, request, to_number, owner)
-    elif owner is not None and owner.ivr_greeting:
-        # Enhanced business routing (Phase 2) - a simpler single-level DTMF
-        # menu, still available for any number that hasn't opted into the
-        # full Phase 3 call-flow builder above.
-        action_url = str(request.base_url) + "media/voice/ivr-select"
-        no_input_url = str(request.base_url) + "media/voice/ivr-no-input"
-        twiml = telecom.build_ivr_menu_response(owner.ivr_greeting, action_url, no_input_url)
-    else:
-        twiml = _default_call_twiml(request, db, owner, to_number)
+    twiml = _resolve_call_twiml(request, db, owner, to_number)
     return Response(content=twiml, media_type="application/xml")
 
 
@@ -451,10 +473,20 @@ async def browser_connect(request: Request, db: Session = Depends(get_db)):
         else None
     )
     try:
-        twiml = media_service.handle_browser_connect(
+        result = media_service.handle_browser_connect(
             db, account_id=account_id, from_number=from_number, to=to, call_sid=call_sid,
-            status_callback_url=status_callback_url, recording_callback_url=recording_callback_url,
+            status_callback_url=status_callback_url,
         )
+        if result["mode"] == "app_to_app":
+            # ZL-COM-ENT-001 v3.0 voice.app_to_app - route through the
+            # receiving account's own real call handling, same as a real
+            # inbound call to their number (see _resolve_call_twiml).
+            twiml = _resolve_call_twiml(request, db, result["owner"], to)
+        else:
+            twiml = telecom.build_bridge_response(
+                result["destination"], caller_id=result["caller_id"], status_callback_url=status_callback_url,
+                recording_callback_url=recording_callback_url,
+            )
     except (
         media_service.CallAuthorizationError,
         billing_service.EntitlementError,
@@ -512,7 +544,9 @@ async def flow_menu_input(request: Request, db: Session = Depends(get_db)):
         )
     action = routing_service.resolve_menu_input(version, node_id, params.get("Digits") or None)
     owner = media_service.find_number_owner(db, params.get("To", ""))
-    return Response(content=_flow_response(db, action, version, request, params.get("To", ""), owner), media_type="application/xml")
+    return Response(
+        content=_flow_response(db, action, version, request, params.get("To", ""), owner), media_type="application/xml"
+    )
 
 
 @router.post("/flow-forward-fallback")
@@ -536,7 +570,9 @@ async def flow_forward_fallback(request: Request, db: Session = Depends(get_db))
         return Response(content=telecom.build_record_response(callback_url), media_type="application/xml")
     action = routing_service.resolve_forward_failover(version, node_id)
     owner = media_service.find_number_owner(db, params.get("To", ""))
-    return Response(content=_flow_response(db, action, version, request, params.get("To", ""), owner), media_type="application/xml")
+    return Response(
+        content=_flow_response(db, action, version, request, params.get("To", ""), owner), media_type="application/xml"
+    )
 
 
 @router.post("/forward-fallback")
@@ -641,3 +677,34 @@ async def get_call_recording(
     except TelecomError as e:
         raise HTTPException(status_code=502, detail=str(e)) from e
     return Response(content=content, media_type=content_type)
+
+
+class TransferCallRequest(BaseModel):
+    destination: str
+
+
+@router.post("/calls/{call_sid}/transfer")
+async def transfer_call(
+    call_sid: str,
+    payload: TransferCallRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_writer),
+):
+    """ZL-COM-ENT-001 v3.0 - routing.transfer (Business+). Blind/cold
+    transfer - redirects the call to a new destination, dropping the
+    transferring leg. No live in-call push channel exists in this
+    codebase (no websocket infra) - the frontend acts against whatever
+    call state it last polled/fetched, same as the rest of the Calls UI."""
+    try:
+        return media_service.transfer_call(db, current_user, call_sid, payload.destination)
+    except media_service.CallAuthorizationError as e:
+        raise HTTPException(status_code=403, detail=str(e)) from e
+    except billing_service.EntitlementRequiredError as e:
+        raise HTTPException(
+            status_code=status.HTTP_402_PAYMENT_REQUIRED,
+            detail={"code": "ENTITLEMENT_REQUIRED", "entitlement": e.key, "current_plan": e.plan_code},
+        ) from e
+    except media_service.CallNotTransferableError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e
+    except TelecomError as e:
+        raise HTTPException(status_code=502, detail=str(e)) from e

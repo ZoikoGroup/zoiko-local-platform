@@ -54,6 +54,10 @@ def _require_consent(db: Session, account_id: str, action: str, jurisdiction: st
             f"AI processing consent is required before summarizing {action} — "
             "grant it via POST /compliance/consent first"
         )
+    # ZL-COM-ENT-001 v3.0 - plan-tier gate, additive to (not a replacement
+    # for) the AI_PROCESSING consent check above. Single choke point covers
+    # voicemail/call/video summarization, all of which call this function.
+    billing_service.assert_entitlement(db, account_id, "transcription.policy_enabled")
 
 
 def _phone_number_country(db: Session, phone_number_id: str | None) -> str:

@@ -124,6 +124,170 @@ def test_change_plan_rejects_an_unknown_plan_code(db_session):
         pass
 
 
+def _make_account_on_plan(db_session, name: str, plan_code: str) -> Account:
+    account = Account(name=name, account_type=AccountType.INDIVIDUAL)
+    db_session.add(account)
+    db_session.flush()
+    service.change_plan(db_session, account.id, plan_code, actor="test-setup")
+    return account
+
+
+def test_preview_plan_change_upgrade_shows_gained_entitlements(db_session):
+    account = _make_account_on_plan(db_session, "Preview Upgrade Co", "starter")
+    preview = service.preview_plan_change(db_session, account.id, "pro")
+    assert preview["direction"] == "upgrade"
+    assert "routing.advanced" in preview["entitlement_diff"]["gained"]
+    assert "reporting.advanced" in preview["entitlement_diff"]["gained"]
+    assert preview["resource_impact"] is None  # only computed for downgrades
+    assert preview["preview_token"]
+
+
+def test_preview_plan_change_downgrade_shows_lost_entitlements_and_resource_impact(db_session):
+    from app.numbering.identity.models import User, UserRole
+
+    account = _make_account_on_plan(db_session, "Preview Downgrade Co", "business")
+    db_session.add(User(account_id=account.id, email="owner@previewdown.example.com", role=UserRole.OWNER))
+    db_session.add(User(account_id=account.id, email="member@previewdown.example.com", role=UserRole.MEMBER))
+    db_session.commit()
+
+    preview = service.preview_plan_change(db_session, account.id, "starter")
+    assert preview["direction"] == "downgrade"
+    assert "team.enabled" in preview["entitlement_diff"]["lost"]
+    assert preview["resource_impact"]["team_seats_used"] == 2
+    # Starter's numeric max_team_seats (5) isn't actually exceeded by 2
+    # seats - the real loss here is the boolean team.enabled capability
+    # itself (Starter is single-user per the doc), a distinct signal from
+    # "over the numeric cap."
+    assert preview["resource_impact"]["team_seats_over_target_limit"] == 0
+    assert preview["resource_impact"]["team_capability_lost"] is True
+    assert preview["effective_at"] is not None
+
+
+def test_preview_plan_change_preserves_ai_addon_provenance_across_upgrade(db_session):
+    """ZL-COM-ENT-001 v3.0 §7.2's own example: Business + AI add-on (100
+    included minutes) upgrading to Pro (50 base minutes) should show a
+    total of 150, not 50 (lost) or 100 (double-counted/unstacked)."""
+    account = _make_account_on_plan(db_session, "AI Provenance Co", "business")
+    service.set_ai_receptionist_addon(db_session, account.id, enabled=True, actor="test-setup")
+
+    preview = service.preview_plan_change(db_session, account.id, "pro")
+    assert preview["ai_receptionist_included_minutes"]["current"] == 100  # business base 0 + addon 100
+    assert preview["ai_receptionist_included_minutes"]["target"] == 150  # pro base 50 + addon 100
+
+
+def test_confirm_plan_change_upgrade_applies_immediately(db_session):
+    account = _make_account_on_plan(db_session, "Confirm Upgrade Co", "starter")
+    preview = service.preview_plan_change(db_session, account.id, "pro")
+
+    sub = service.confirm_plan_change(db_session, account.id, preview["preview_token"], actor="test-actor")
+    assert sub.plan_code == "pro"
+    assert sub.scheduled_plan_code is None
+
+
+def test_confirm_plan_change_downgrade_schedules_instead_of_applying(db_session):
+    account = _make_account_on_plan(db_session, "Confirm Downgrade Co", "pro")
+    preview = service.preview_plan_change(db_session, account.id, "starter")
+
+    sub = service.confirm_plan_change(db_session, account.id, preview["preview_token"], actor="test-actor")
+    assert sub.plan_code == "pro"  # unchanged - not applied yet
+    assert sub.scheduled_plan_code == "starter"
+    assert sub.scheduled_change_effective_at == sub.current_period_end
+
+
+def test_confirm_plan_change_rejects_a_forged_or_expired_token(db_session):
+    account = _make_account_on_plan(db_session, "Confirm Forged Token Co", "starter")
+    try:
+        service.confirm_plan_change(db_session, account.id, "not-a-real-token", actor="test-actor")
+        assert False, "expected PlanChangePreviewExpiredError"
+    except service.PlanChangePreviewExpiredError:
+        pass
+
+
+def test_confirm_plan_change_rejects_a_stale_preview(db_session):
+    """Real account state changed (a team member was added, changing the
+    downgrade's resource impact) between preview and confirm - must not
+    silently commit against outdated impact analysis."""
+    from app.numbering.identity.models import User, UserRole
+
+    account = _make_account_on_plan(db_session, "Stale Preview Co", "pro")
+    preview = service.preview_plan_change(db_session, account.id, "starter")
+
+    db_session.add(User(account_id=account.id, email="owner@stalepreview.example.com", role=UserRole.OWNER))
+    db_session.add(User(account_id=account.id, email="newmember@stalepreview.example.com", role=UserRole.MEMBER))
+    db_session.commit()
+
+    try:
+        service.confirm_plan_change(db_session, account.id, preview["preview_token"], actor="test-actor")
+        assert False, "expected PlanChangePreviewStaleError"
+    except service.PlanChangePreviewStaleError:
+        pass
+
+
+def test_cancel_scheduled_plan_change_clears_the_schedule(db_session):
+    account = _make_account_on_plan(db_session, "Cancel Scheduled Co", "pro")
+    preview = service.preview_plan_change(db_session, account.id, "starter")
+    service.confirm_plan_change(db_session, account.id, preview["preview_token"], actor="test-actor")
+
+    sub = service.cancel_scheduled_plan_change(db_session, account.id, actor="test-actor")
+    assert sub.plan_code == "pro"
+    assert sub.scheduled_plan_code is None
+    assert sub.scheduled_change_effective_at is None
+
+
+def test_cancel_scheduled_plan_change_raises_when_nothing_is_scheduled(db_session):
+    account = _make_account_on_plan(db_session, "Nothing Scheduled Co", "pro")
+    try:
+        service.cancel_scheduled_plan_change(db_session, account.id, actor="test-actor")
+        assert False, "expected NoScheduledPlanChangeError"
+    except service.NoScheduledPlanChangeError:
+        pass
+
+
+def test_get_or_create_subscription_applies_a_due_scheduled_plan_change(db_session):
+    """The lazy-rollover choke point (same one that already rolls
+    current_period_start/end forward on read) must also apply a scheduled
+    downgrade once its effective_at has passed - real regression coverage
+    for the single highest-risk change in this milestone, since this
+    function is called on nearly every authenticated request."""
+    account = _make_account_on_plan(db_session, "Due Schedule Co", "pro")
+    preview = service.preview_plan_change(db_session, account.id, "starter")
+    sub = service.confirm_plan_change(db_session, account.id, preview["preview_token"], actor="test-actor")
+
+    # Force the boundary into the past, as if the period had already rolled.
+    sub.scheduled_change_effective_at = datetime.now(timezone.utc) - timedelta(days=1)
+    sub.current_period_end = datetime.now(timezone.utc) - timedelta(days=1)
+    db_session.commit()
+
+    refreshed = service.get_or_create_subscription(db_session, account.id)
+    assert refreshed.plan_code == "starter"
+    assert refreshed.scheduled_plan_code is None
+    assert refreshed.scheduled_change_effective_at is None
+
+
+def test_get_or_create_subscription_leaves_a_future_scheduled_change_untouched(db_session):
+    account = _make_account_on_plan(db_session, "Future Schedule Co", "pro")
+    preview = service.preview_plan_change(db_session, account.id, "starter")
+    service.confirm_plan_change(db_session, account.id, preview["preview_token"], actor="test-actor")
+
+    refreshed = service.get_or_create_subscription(db_session, account.id)
+    assert refreshed.plan_code == "pro"  # still unchanged - boundary hasn't passed
+    assert refreshed.scheduled_plan_code == "starter"
+
+
+def test_get_or_create_subscription_rollover_is_unaffected_with_nothing_scheduled(db_session):
+    """Regression guard on the shared choke point - an account with no
+    scheduled change still rolls its period forward exactly as before."""
+    account = _make_account_on_plan(db_session, "Plain Rollover Co", "pro")
+    sub = service.get_or_create_subscription(db_session, account.id)
+    lapsed_period_end = datetime.now(timezone.utc) - timedelta(days=1)
+    sub.current_period_end = lapsed_period_end
+    db_session.commit()
+
+    refreshed = service.get_or_create_subscription(db_session, account.id)
+    assert refreshed.plan_code == "pro"
+    assert refreshed.current_period_end > lapsed_period_end
+
+
 def test_usage_summary_reflects_recorded_usage(db_session):
     from app.usage.service import record_usage_event
 
@@ -170,6 +334,16 @@ def test_seat_quota_allows_up_to_the_limit_then_blocks(db_session):
     service.change_plan(db_session, account.id, "business", actor="test-actor")
     db_session.query(Plan).filter(Plan.plan_code == "business").update({"max_team_seats": 5})
     db_session.commit()
+    # get_plan's own docstring: "plans are only ever seeded via migration,
+    # never mutated at runtime, so there's no invalidation path needed" -
+    # a real assumption its Redis cache relies on, which this test's direct
+    # UPDATE above violates on purpose for test convenience. Without this,
+    # change_plan's own earlier get_plan("business") call already cached
+    # the real seeded max_team_seats=20, and every later add_team_member
+    # call below would see that stale value instead of the lowered 5.
+    from app.integrations.cache.redis import cache_delete
+
+    cache_delete("plan:business")
 
     # Owner isn't created via this helper in this test, so seed a User row
     # directly to represent them (matches how other service-level tests in
@@ -591,6 +765,12 @@ def test_team_member_add_blocked_once_seat_quota_is_reached(client, db_session):
     service.change_plan(db_session, owner_account_id, "business", actor="test-setup")
     db_session.query(Plan).filter(Plan.plan_code == "business").update({"max_team_seats": 5})
     db_session.commit()
+    # See test_seat_quota_allows_up_to_the_limit_then_blocks's comment -
+    # get_plan's Redis cache assumes plans are never mutated at runtime,
+    # which this test's direct UPDATE above deliberately violates.
+    from app.integrations.cache.redis import cache_delete
+
+    cache_delete("plan:business")
 
     for i in range(4):
         response = client.post(
