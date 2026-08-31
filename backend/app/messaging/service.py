@@ -8,6 +8,7 @@ registration; this app only records that approval happened, the same
 pattern ai_receptionist_enabled already uses for a different capability.
 """
 
+import logging
 from datetime import datetime
 
 from sqlalchemy.orm import Session
@@ -24,6 +25,15 @@ from app.numbering.numbers.models import PhoneNumber
 
 _OPT_OUT_KEYWORDS = {"stop", "unsubscribe", "cancel", "end", "quit"}
 _OPT_IN_KEYWORDS = {"start", "unstop", "subscribe"}
+
+logger = logging.getLogger("zoiko.messaging")
+
+# Twilio's real status-callback value for a message that failed to reach
+# the handset - this app's MessageStatus enum never had it, so it silently
+# fell through update_message_status's ValueError below with no logging,
+# leaving the message stuck at its previous status (e.g. "sent") forever,
+# indistinguishable from a real success.
+_STATUS_ALIASES = {"undelivered": MessageStatus.FAILED}
 
 
 class NumberNotOwnedError(Exception):
@@ -175,10 +185,17 @@ def update_message_status(db: Session, provider_message_sid: str, status: str) -
     message = db.query(Message).filter(Message.provider_message_sid == provider_message_sid).first()
     if message is None:
         return
-    try:
-        message.status = MessageStatus(status)
-    except ValueError:
-        return
+    if status in _STATUS_ALIASES:
+        message.status = _STATUS_ALIASES[status]
+    else:
+        try:
+            message.status = MessageStatus(status)
+        except ValueError:
+            logger.warning(
+                "Unrecognized Twilio message status %r for message %s (provider_message_sid=%s) - ignoring.",
+                status, message.id, provider_message_sid,
+            )
+            return
     db.commit()
     _invalidate_messages_cache(message.conversation_id)
 

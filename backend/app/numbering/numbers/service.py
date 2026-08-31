@@ -888,6 +888,17 @@ def approve_number_eligibility_case(db: Session, case_id: str, *, actor: str, no
         db, actor=actor, action="number.eligibility_case_approved",
         target=f"number_eligibility_case:{case.id}", before={"status": before_status}, after={"status": case.status},
     )
+    # This manual staff override path never notified the customer, unlike
+    # the Twilio-bundle-driven path (_apply_bundle_status_result) - a staff
+    # approval left the customer with no signal to go back and complete the
+    # purchase, same gap notify_number_eligibility_approved's own docstring
+    # describes fixing for the automated path.
+    owner = db.query(User).filter(User.account_id == case.account_id, User.role == UserRole.OWNER).first()
+    if owner is not None:
+        notify_number_eligibility_approved(
+            db, account_id=case.account_id, account_email=owner.email,
+            country=case.country, number_type=case.number_type,
+        )
     return case
 
 
@@ -903,6 +914,12 @@ def reject_number_eligibility_case(db: Session, case_id: str, *, actor: str, not
         db, actor=actor, action="number.eligibility_case_rejected",
         target=f"number_eligibility_case:{case.id}", before={"status": before_status}, after={"status": case.status},
     )
+    owner = db.query(User).filter(User.account_id == case.account_id, User.role == UserRole.OWNER).first()
+    if owner is not None:
+        notify_number_eligibility_rejected(
+            db, account_id=case.account_id, account_email=owner.email,
+            country=case.country, number_type=case.number_type, rejection_reason=notes or "",
+        )
     return case
 
 
@@ -1110,6 +1127,20 @@ def _assert_purchase_eligible(db: Session, account_id: str, number: PhoneNumber,
                 target_type="phone_number", target_id=number.id,
                 metadata={"e164": e164, "country": number.country, "number_type": number.number_type},
             )
+            # Unlike the KYC gate above, this one never told the customer -
+            # they'd see the number stuck in COMPLIANCE_PENDING with no
+            # explanation of what to do about it. Reuses the same "please
+            # submit evidence" notification, since both gates mean the same
+            # thing to the customer (purchase blocked pending a case).
+            owner = db.query(User).filter(User.account_id == account_id, User.role == UserRole.OWNER).first()
+            if owner is not None:
+                notify_number_verification_required(
+                    db, account_id=account_id, account_email=owner.email, e164=e164,
+                    action_summary=(
+                        f"An approved market-eligibility case for {number.number_type} numbers "
+                        f"in {number.country}"
+                    ),
+                )
             raise NumberEligibilityRequiredError(
                 f"An approved market-eligibility case for {number.number_type} numbers in {number.country} "
                 "is required before purchasing this number"
@@ -1523,6 +1554,18 @@ def retry_provisioning(db: Session, staff_id: str, number_id: str) -> PhoneNumbe
     number = _assert_is_stuck(number, number_id)
 
     number.status = PhoneNumberStatus.PROVISIONING
+    # Load-bearing, not cosmetic: with_for_update()'s row lock only holds
+    # until this commit below, and _assert_is_stuck treats a stale/None
+    # provisioning_started_at as still recoverable. Without refreshing it
+    # here (purchase_number does this for the same reason - see its own
+    # PURCHASE_PENDING transition above), a second concurrent retry_
+    # provisioning call for the same number (staff double-click, or two
+    # staff members) would pass _assert_is_stuck again the instant this
+    # transaction commits and race telecom.buy_number() against this one -
+    # whichever finishes second and fails would reset the number back to
+    # RESERVED, silently clobbering the other call's successful ACTIVE
+    # provisioning and orphaning a real provider-owned number.
+    number.provisioning_started_at = datetime.now(timezone.utc)
     db.commit()
     log_event(
         db, actor_id=staff_id, action="number.provisioning_retried",
@@ -2030,7 +2073,7 @@ def set_ring_group(db: Session, user: User, e164: str, destinations: list[str]) 
     db.commit()
 
     log_event(
-        db, actor_id=user.account_id, action="number.ring_group_updated",
+        db, actor_id=user.id, action="number.ring_group_updated",
         target_type="phone_number", target_id=number.id, metadata={"e164": e164, "destinations": destinations},
     )
     return list_ring_group(db, e164)
@@ -2086,7 +2129,7 @@ def set_ivr_menu(
     _invalidate_numbers_cache(user.account_id)
 
     log_event(
-        db, actor_id=user.account_id, action="number.ivr_menu_updated",
+        db, actor_id=user.id, action="number.ivr_menu_updated",
         target_type="phone_number", target_id=number.id, metadata={"e164": e164, "options": options},
     )
     return get_ivr_menu(db, e164)
@@ -2117,7 +2160,7 @@ def clear_ivr_menu(db: Session, user: User, e164: str) -> None:
     _invalidate_numbers_cache(user.account_id)
 
     log_event(
-        db, actor_id=user.account_id, action="number.ivr_menu_cleared",
+        db, actor_id=user.id, action="number.ivr_menu_cleared",
         target_type="phone_number", target_id=number.id, metadata={"e164": e164},
     )
 

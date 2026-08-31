@@ -192,6 +192,7 @@ async def queue_agent_connect(request: Request, db: Session = Depends(get_db)):
     once the agent's phone actually answers. Bridges them into the real
     Twilio queue and marks the oldest still-open call in our own log as
     answered by this agent."""
+    await media_service.verify_twilio_webhook(request)
     queue_id = request.query_params.get("queue_id", "")
     agent_user_id = request.query_params.get("agent_user_id", "")
     preferred_log_id = request.query_params.get("queue_call_log_id")

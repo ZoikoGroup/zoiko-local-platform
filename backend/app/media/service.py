@@ -868,7 +868,7 @@ async def create_video_session(
     db.refresh(session)
     _invalidate_video_sessions_cache(account_id)
     log_event(
-        db, actor_id=account_id, action="video.session.started",
+        db, actor_id=host_user_id, action="video.session.started",
         target_type="video_session", target_id=session.id,
         metadata={"room_name": room_name, "confidential": confidential},
     )
@@ -900,7 +900,7 @@ async def end_video_session(db: Session, user: User, room_name: str) -> VideoSes
     db.refresh(session)
     _invalidate_video_sessions_cache(user.account_id)
     log_event(
-        db, actor_id=user.account_id, action="video.session.ended",
+        db, actor_id=user.id, action="video.session.ended",
         target_type="video_session", target_id=session.id, metadata={"room_name": room_name},
     )
     publish_video_room_ended(user.account_id, room_name=room_name)
@@ -970,7 +970,7 @@ async def start_video_recording(db: Session, user: User, room_name: str) -> Vide
     db.refresh(session)
     _invalidate_video_sessions_cache(user.account_id)
     log_event(
-        db, actor_id=user.account_id, action="video.recording_started",
+        db, actor_id=user.id, action="video.recording_started",
         target_type="video_session", target_id=session.id, metadata={"room_name": room_name},
     )
     return session
@@ -992,7 +992,7 @@ async def stop_video_recording(db: Session, user: User, room_name: str) -> Video
 
     await video.stop_room_recording(session.recording_egress_id)
     log_event(
-        db, actor_id=user.account_id, action="video.recording_stopped",
+        db, actor_id=user.id, action="video.recording_stopped",
         target_type="video_session", target_id=session.id, metadata={"room_name": room_name},
     )
     return session
@@ -1615,7 +1615,18 @@ def capture_receptionist_call(
     Groq failure degrades to a plain captured message (raw_transcript is
     always saved) rather than breaking the live call — the caller must
     still get a TwiML response either way.
+
+    Idempotent against a redelivered /respond webhook for the same call_sid
+    (Twilio can retry a Gather action URL on a slow response/network blip,
+    same risk every other Twilio webhook in this codebase already guards
+    against) - call_sid is unique on ReceptionistCall, so a second insert
+    would otherwise raise an unhandled IntegrityError instead of just
+    returning the row already captured on the first delivery.
     """
+    existing = db.query(ReceptionistCall).filter(ReceptionistCall.call_sid == call_sid).first()
+    if existing is not None:
+        return existing
+
     owner = find_number_owner(db, to_number)
     if owner is None:
         return None

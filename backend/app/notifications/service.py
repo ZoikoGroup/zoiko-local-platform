@@ -408,6 +408,7 @@ def send_notification(
         delivery.error = f"Suppressed: {suppression.reason.value} on file for this address"
     elif is_opted_out:
         delivery.status = NotificationDeliveryStatus.SUPPRESSED
+        delivery.error = "Suppressed: account has opted out of this notification category"
     elif is_quiet_hours:
         delivery.status = NotificationDeliveryStatus.SUPPRESSED
         delivery.error = "Suppressed: sent during the account's configured quiet hours"
@@ -1410,7 +1411,8 @@ def notify_payment_failed(
 
 
 def notify_payment_reminder(
-    db: Session, *, account_id: str, account_email: str, plan_name: str, grace_period_ends_at: str
+    db: Session, *, account_id: str, account_email: str, plan_name: str, grace_period_ends_at: str,
+    idempotency_key: str | None = None,
 ) -> None:
     send_notification(
         db, event_name="billing.payment_reminder", account_id=account_id, recipient_email=account_email,
@@ -1424,6 +1426,7 @@ def notify_payment_reminder(
                 "Outbound calling, video, number purchases, and AI features will pause"
             ),
         },
+        idempotency_key=idempotency_key,
     )
 
 

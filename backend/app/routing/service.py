@@ -124,7 +124,7 @@ def create_flow(db: Session, account_id: str, name: str, actor_id: str) -> CallF
     db.add(draft)
     db.commit()
     _invalidate_flows_cache(account_id)
-    log_event(db, actor_id=account_id, action="call_flow.created", target_type="call_flow", target_id=flow.id,
+    log_event(db, actor_id=actor_id, action="call_flow.created", target_type="call_flow", target_id=flow.id,
                metadata={"name": name})
     return flow
 
@@ -348,7 +348,7 @@ def publish_flow(db: Session, account_id: str, call_flow_id: str, actor_id: str)
     db.commit()
 
     _invalidate_flows_cache(account_id)
-    log_event(db, actor_id=account_id, action="call_flow.published", target_type="call_flow", target_id=flow.id,
+    log_event(db, actor_id=actor_id, action="call_flow.published", target_type="call_flow", target_id=flow.id,
                metadata={"version": published_version.version})
     publish_call_flow_published(account_id, call_flow_id=flow.id, version=published_version.version)
 
@@ -398,7 +398,7 @@ def rollback_flow(db: Session, account_id: str, call_flow_id: str, target_versio
     db.commit()
 
     _invalidate_flows_cache(account_id)
-    log_event(db, actor_id=account_id, action="call_flow.rolled_back", target_type="call_flow", target_id=flow.id,
+    log_event(db, actor_id=actor_id, action="call_flow.rolled_back", target_type="call_flow", target_id=flow.id,
                metadata={"restored_version": target_version, "new_version": rolled_back.version})
     publish_call_flow_rolled_back(
         account_id, call_flow_id=flow.id, restored_version=target_version, new_version=rolled_back.version,
@@ -413,7 +413,9 @@ def rollback_flow(db: Session, account_id: str, call_flow_id: str, target_versio
     return rolled_back
 
 
-def assign_to_number(db: Session, account_id: str, call_flow_id: str | None, phone_number_id: str) -> PhoneNumber:
+def assign_to_number(
+    db: Session, account_id: str, call_flow_id: str | None, phone_number_id: str, actor_id: str,
+) -> PhoneNumber:
     number = db.query(PhoneNumber).filter(PhoneNumber.id == phone_number_id, PhoneNumber.account_id == account_id).first()
     if number is None:
         raise NumberNotOwnedError(phone_number_id)
@@ -422,7 +424,7 @@ def assign_to_number(db: Session, account_id: str, call_flow_id: str | None, pho
     number.call_flow_id = call_flow_id
     db.commit()
     _invalidate_flows_cache(account_id)
-    log_event(db, actor_id=account_id, action="call_flow.assigned", target_type="phone_number", target_id=number.id,
+    log_event(db, actor_id=actor_id, action="call_flow.assigned", target_type="phone_number", target_id=number.id,
                metadata={"call_flow_id": call_flow_id})
     return number
 

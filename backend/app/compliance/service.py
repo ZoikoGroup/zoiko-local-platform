@@ -487,7 +487,14 @@ def expire_overdue_cases(db: Session) -> dict[str, int]:
 
         log_event(
             db,
-            actor_id=case.account_id,
+            # Not case.account_id: this is an automated sweep, not
+            # something the customer's own account did - every other
+            # system-triggered action in this codebase uses a "system:*"
+            # actor (see risk_engine/billing_lifecycle/kill_switch_expiry).
+            # log_event's own _resolve_account_id already derives the
+            # correct account_id from the compliance_case:{id} target, so
+            # nothing is lost by not passing the account id as the actor.
+            actor="system:compliance_expiry",
             action="compliance.case_expired",
             target_type="compliance_case",
             target_id=case.id,
@@ -513,10 +520,10 @@ def start_kyc_verification(db: Session, case: ComplianceCase, *, actor: str) -> 
     The Stripe webhook (handle_stripe_identity_webhook) is what actually
     approves/rejects the case - this call only starts the process.
 
-    Allowed from PENDING (first attempt or resuming an unfinished one) and
-    REJECTED (retry after a real failure - the gap a customer would
-    otherwise be stuck on with no self-service way forward). Blocked from
-    APPROVED."""
+    Allowed from PENDING (first attempt or resuming an unfinished one),
+    REJECTED, and EXPIRED (retry after a real failure or an overdue-case
+    sweep - the gap a customer would otherwise be stuck on with no
+    self-service way forward). Blocked from APPROVED."""
     if case.status == ComplianceCaseStatus.APPROVED:
         raise KYCAlreadyApprovedError(f"Case {case.id} is already approved - verification cannot be restarted")
 
@@ -525,10 +532,14 @@ def start_kyc_verification(db: Session, case: ComplianceCase, *, actor: str) -> 
     verification_url = session["url"]
 
     case.kyc_inquiry_id = inquiry_id
-    if case.status == ComplianceCaseStatus.REJECTED:
-        # A retry in progress isn't accurately "rejected" anymore - leaving
-        # the old status would show a stale verdict in the UI while the
-        # new attempt is still pending a fresh decision.
+    if case.status in (ComplianceCaseStatus.REJECTED, ComplianceCaseStatus.EXPIRED):
+        # A retry in progress isn't accurately "rejected"/"expired" anymore
+        # - leaving the old status would show a stale verdict in the UI
+        # AND would permanently break handle_stripe_identity_webhook below,
+        # which only acts on a PENDING case: without this reset, a customer
+        # who restarts verification on an EXPIRED case can complete real
+        # Stripe Identity verification but the webhook would silently no-op
+        # forever, leaving the case stuck EXPIRED with no way to approve it.
         case.status = ComplianceCaseStatus.PENDING
     db.commit()
     _invalidate_cases_cache(case.account_id)

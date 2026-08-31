@@ -277,13 +277,22 @@ def get_active_price_catalog_entry(
     against it immediately in development) without requiring every
     test/dev workflow to also call activate. run_billing_cycle's own
     status/is_placeholder checks are what actually keep a non-ACTIVE entry
-    from being charged outside development."""
+    from being charged outside development.
+
+    An ACTIVE entry whose effective_to has already passed is treated as
+    not currently active (falls through to the created_at fallback below,
+    same as if nothing had ever been activated) - effective_from/
+    effective_to exist specifically to bound when a version may be sold,
+    and were being stored but never read anywhere, so a price book that
+    rolled off its effective window kept being charged indefinitely."""
+    now = _db_now(db)
     active = (
         db.query(PriceCatalogEntry)
         .filter(
             PriceCatalogEntry.plan_code == plan_code, PriceCatalogEntry.market == market,
             PriceCatalogEntry.billing_period == billing_period,
             PriceCatalogEntry.status == CatalogEntryStatus.ACTIVE,
+            (PriceCatalogEntry.effective_to.is_(None)) | (PriceCatalogEntry.effective_to > now),
         )
         .first()
     )
@@ -575,23 +584,19 @@ def get_or_create_subscription(db: Session, account_id: str) -> Subscription:
         return sub
 
     changed = False
-    if sub.current_period_end < now:
-        sub.current_period_start, sub.current_period_end = _new_period(now, sub.billing_period)
-        changed = True
-    if sub.status == SubscriptionStatus.TRIALING and sub.trial_ends_at is not None and sub.trial_ends_at < now:
-        # No payment processor exists to actually charge anyone yet (see
-        # Subscription's docstring) - the honest Phase-1 behavior is to
-        # keep the account working past trial end, not silently lock it
-        # out with no way to pay. ZoikoNex sync will replace this once built.
-        sub.status = SubscriptionStatus.ACTIVE
-        changed = True
     # ZL-COM-ENT-001 v3.0 §8 - a scheduled downgrade (confirm_plan_change)
-    # applies here, lazily, the same no-scheduler pattern the two checks
-    # above already use - the only choke point in this codebase that
-    # already does time-based state transition on read. Guarded to a cheap
-    # is-not-None check so the near-total majority of accounts (nothing
-    # scheduled) pay no extra cost. Applied in the SAME commit as the
-    # period rollover above, not a second read-modify-write.
+    # applies here, lazily, the same no-scheduler pattern the period-
+    # rollover check below already uses - the only choke point in this
+    # codebase that already does time-based state transition on read.
+    # Guarded to a cheap is-not-None check so the near-total majority of
+    # accounts (nothing scheduled) pay no extra cost. Applied BEFORE the
+    # period-rollover check below, not after: scheduled_change_effective_at
+    # is always set to the exact current_period_end a change is due at (see
+    # confirm_plan_change), so both blocks fire in the same lazy read -
+    # rolling the period over first, while sub.billing_period still holds
+    # the OLD value, would compute the new period using the wrong length
+    # (e.g. an annual->monthly downgrade would roll into a fresh 365-day
+    # period instead of a 30-day one).
     applied_scheduled_change = False
     if (
         sub.scheduled_plan_code is not None
@@ -606,6 +611,16 @@ def get_or_create_subscription(db: Session, account_id: str) -> Subscription:
         sub.scheduled_change_effective_at = None
         changed = True
         applied_scheduled_change = True
+    if sub.current_period_end < now:
+        sub.current_period_start, sub.current_period_end = _new_period(now, sub.billing_period)
+        changed = True
+    if sub.status == SubscriptionStatus.TRIALING and sub.trial_ends_at is not None and sub.trial_ends_at < now:
+        # No payment processor exists to actually charge anyone yet (see
+        # Subscription's docstring) - the honest Phase-1 behavior is to
+        # keep the account working past trial end, not silently lock it
+        # out with no way to pay. ZoikoNex sync will replace this once built.
+        sub.status = SubscriptionStatus.ACTIVE
+        changed = True
     if changed:
         db.commit()
         db.refresh(sub)
@@ -644,9 +659,19 @@ def change_plan(
     plan = get_plan(db, plan_code)  # raises PlanNotFoundError for an invalid code
     sub = get_or_create_subscription(db, account_id)
     before_plan = sub.plan_code
+    billing_period_changed = sub.billing_period != billing_period
 
     sub.plan_code = plan.plan_code
     sub.billing_period = billing_period
+    if billing_period_changed:
+        # Without this, an immediate monthly->annual upgrade keeps the old
+        # (short) current_period_end until the next natural rollover, so
+        # usage windows/invoices/downgrade previews show a period far
+        # shorter than what the customer is now actually paying for - see
+        # _PERIOD_LENGTHS' own docstring on why current_period_end is
+        # supposed to reflect the real billing_period.
+        now = _db_now(db)
+        sub.current_period_start, sub.current_period_end = _new_period(now, billing_period)
     if sub.status == SubscriptionStatus.TRIALING:
         # Deliberately choosing a plan ends the trial early - matches how
         # every real subscription product treats an explicit upgrade.
@@ -956,7 +981,7 @@ def create_plan_change_checkout_session(
     plan = get_plan(db, plan_code)  # raises PlanNotFoundError for an invalid code
 
     price = get_active_price_catalog_entry(db, plan_code, billing_period=billing_period)
-    if price is None or price.is_placeholder:
+    if price is None or price.is_placeholder or price.status != CatalogEntryStatus.ACTIVE:
         raise PriceUnavailableForCheckoutError(
             f"No real, non-placeholder ACTIVE price is configured for {plan_code}/{billing_period.value}"
         )
@@ -1429,6 +1454,7 @@ def _apply_payment_event(
             notify_payment_reminder(
                 db, account_id=account_id, account_email=owner.email, plan_name=plan.name,
                 grace_period_ends_at=sub.grace_period_ends_at.strftime("%Y-%m-%d") if sub.grace_period_ends_at else "",
+                idempotency_key=notif_idempotency_key,
             )
         elif event_type == "payment_restored":
             notify_service_restored(
@@ -1532,10 +1558,15 @@ def handle_stripe_subscription_payment_webhook(
     by handle_stripe_checkout_completed when the original Checkout
     completed - see that field's docstring on Subscription). Returns None
     if no local Subscription references this Stripe subscription (e.g. one
-    this app didn't create)."""
+    this app didn't create), or the subscription is already in a terminal
+    state (CANCELED/TERMINATED) - Stripe can redeliver invoice.payment_
+    failed/invoice.paid after a subscription was already canceled locally
+    (e.g. via handle_stripe_subscription_deleted_webhook or terminate_
+    subscription), and applying a late payment event would resurrect a
+    canceled subscription back to PAST_DUE/ACTIVE."""
     sub = db.query(Subscription).filter(Subscription.stripe_subscription_id == stripe_subscription_id).first()
-    if sub is None:
-        return None
+    if sub is None or sub.status in (SubscriptionStatus.CANCELED, SubscriptionStatus.TERMINATED):
+        return sub
     notif_idempotency_key = f"stripe:{stripe_event_id}:{event_type}" if stripe_event_id else None
     return _apply_payment_event(
         db, sub, event_type, actor="stripe_checkout_webhook",
@@ -2509,7 +2540,24 @@ def run_billing_cycle(db: Session, account_id: str, *, actor: str) -> dict:
                     currency=currency_code,
                 )
             except Exception:
-                pass
+                # Unlike the analogous Stripe-cancel failure above, this was
+                # logging nothing at all - a persistent bug in the invoice
+                # email pipeline would be permanently invisible even though
+                # the billing cycle itself (already committed above) keeps
+                # succeeding every period.
+                logger.exception(
+                    "Failed to send invoice-available notification for invoice %s, account %s.",
+                    invoice["invoice_id"], account_id,
+                )
+                send_internal_alert(
+                    db, event_name="bill_int.invoice_notification_failed",
+                    summary=(
+                        f"Invoice {invoice['invoice_id']} was issued for account {account_id}, but the "
+                        f"customer-facing invoice-available notification failed to send."
+                    ),
+                    console_link=f"{settings.public_base_url}/staff/accounts",
+                    tenant_reference=account_id,
+                )
     else:
         issued = {"status": live_invoice["status"]}
         payment_amount_minor_units = live_invoice.get("total_minor_units") or amount_minor_units
@@ -2571,7 +2619,22 @@ def run_billing_cycle(db: Session, account_id: str, *, actor: str) -> dict:
                     payment_method_masked="on file with ZoikoNex",
                 )
             except Exception:
-                pass
+                # Same rationale as the invoice-available swallow above -
+                # this was logging nothing, so a broken payment-succeeded
+                # email pipeline would be permanently invisible.
+                logger.exception(
+                    "Failed to send payment-succeeded notification for invoice %s, account %s.",
+                    invoice["invoice_id"], account_id,
+                )
+                send_internal_alert(
+                    db, event_name="bill_int.payment_notification_failed",
+                    summary=(
+                        f"Payment was captured for invoice {invoice['invoice_id']} on account {account_id}, "
+                        f"but the customer-facing payment-succeeded notification failed to send."
+                    ),
+                    console_link=f"{settings.public_base_url}/staff/accounts",
+                    tenant_reference=account_id,
+                )
     except zoikonex_adapter.ZoikoNexCaptureFailedError as e:
         # Confirmed real ZoikoNex-side bug (evidence-ledger gRPC marshaling) -
         # authorised is a genuinely successful, reportable outcome on its own.
