@@ -45,7 +45,7 @@ async def list_voicemails(
         {
             "id": v.id,
             "from": v.from_number,
-            "recording_url": v.recording_url,
+            "recording_url": media_service.public_recording_url(v.recording_url),
             "duration": v.duration,
             "created_at": v.created_at,
         }

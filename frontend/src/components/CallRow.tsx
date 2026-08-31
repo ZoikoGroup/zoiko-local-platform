@@ -30,6 +30,7 @@ export function CallRow({
   onSummarize,
   onGrantConsent,
   onTransfer,
+  onEraseContent,
 }: {
   label: string;
   status: string;
@@ -51,6 +52,11 @@ export function CallRow({
   // row when that changes, so it reflects whatever the last list/refresh
   // fetched, not a real-time state.
   onTransfer?: (destination: string) => Promise<void>;
+  // Erases this call's recording + AI summary/transcript - e.g. it
+  // captured something personal - without touching any other call. Only
+  // meaningful when there's a recording or a done summary to erase, so
+  // pages that never load either (unlikely) can omit it.
+  onEraseContent?: () => Promise<void>;
 }) {
   const [playError, setPlayError] = useState<string | null>(null);
   const [transferring, setTransferring] = useState(false);
@@ -58,6 +64,25 @@ export function CallRow({
   const [transferBusy, setTransferBusy] = useState(false);
   const [transferError, setTransferError] = useState<string | null>(null);
   const [transferDone, setTransferDone] = useState(false);
+  const [confirmingErase, setConfirmingErase] = useState(false);
+  const [eraseBusy, setEraseBusy] = useState(false);
+  const [eraseError, setEraseError] = useState<string | null>(null);
+  const [erased, setErased] = useState(false);
+
+  async function handleEraseContent() {
+    if (!onEraseContent) return;
+    setEraseBusy(true);
+    setEraseError(null);
+    try {
+      await onEraseContent();
+      setConfirmingErase(false);
+      setErased(true);
+    } catch (err) {
+      setEraseError(err instanceof Error ? err.message : "Couldn't erase this call's content.");
+    } finally {
+      setEraseBusy(false);
+    }
+  }
 
   async function handleTransfer() {
     if (!onTransfer || !transferDestination.trim()) return;
@@ -137,11 +162,52 @@ export function CallRow({
               Transfer
             </button>
           )}
+          {onEraseContent && !erased && !confirmingErase && (recordingUrl || summaryState.status === "done") && (
+            <button
+              type="button"
+              onClick={() => setConfirmingErase(true)}
+              className="text-xs font-medium text-red-600 hover:text-red-800"
+            >
+              Delete recording &amp; summary
+            </button>
+          )}
         </div>
       </div>
 
       {playError && <p className="text-xs text-red-600">{playError}</p>}
       {transferDone && <p className="text-xs text-emerald-600">Call transferred.</p>}
+      {erased && <p className="text-xs text-emerald-600">Recording and AI summary erased.</p>}
+
+      {confirmingErase && (
+        <div className="text-xs bg-red-50 text-red-800 rounded-lg px-3 py-2 space-y-2">
+          <p>
+            Permanently delete this call&apos;s recording and AI summary? The call itself stays in your history
+            (date, duration, who called) - just with no audio or AI content attached. This can&apos;t be undone.
+          </p>
+          <div className="flex gap-2">
+            <button
+              type="button"
+              onClick={handleEraseContent}
+              disabled={eraseBusy}
+              className="text-xs font-medium rounded-lg px-3 py-1.5 bg-red-600 hover:bg-red-700 disabled:opacity-60 text-white"
+            >
+              {eraseBusy ? "Deleting..." : "Yes, delete it"}
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setConfirmingErase(false);
+                setEraseError(null);
+              }}
+              disabled={eraseBusy}
+              className="text-xs font-medium rounded-lg px-3 py-1.5 border border-red-300 text-red-700 hover:bg-red-100"
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
+      )}
+      {eraseError && <p className="text-xs text-red-600">{eraseError}</p>}
 
       {transferring && (
         <div className="flex items-center gap-2">

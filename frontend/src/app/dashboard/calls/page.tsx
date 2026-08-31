@@ -14,6 +14,7 @@ import {
   getCallRecordingBlob,
   getVoicemailRecordingBlob,
   transferCall,
+  eraseCallContent,
   ApiError,
   type MyPhoneNumber,
   type CallLogEntry,
@@ -323,6 +324,13 @@ export default function CallsPage() {
                 token && c.sid
                   ? async (destination) => {
                       await transferCall(token, c.sid!, destination);
+                    }
+                  : undefined
+              }
+              onEraseContent={
+                token
+                  ? async () => {
+                      await eraseCallContent(token, c.id);
                     }
                   : undefined
               }

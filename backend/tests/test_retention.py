@@ -521,3 +521,118 @@ def test_resolve_erasure_request_completing_refuses_when_account_under_legal_hol
 
     db_session.refresh(request)
     assert request.status == ErasureRequestStatus.PENDING  # never advanced past PENDING
+
+
+def test_erase_single_call_content_erases_recording_and_summary_only_for_that_call(db_session, monkeypatch):
+    """The precise, single-record version of erase_account_data - a
+    customer wants ONE call's recording/AI content gone (e.g. it captured
+    something personal) without touching anything else on the account,
+    including a second, unrelated call's own recording/summary."""
+    from app.intelligence.models import ConversationSummary, SummarySourceType
+    from app.numbering.identity.models import Account, AccountType
+    from app.retention.service import erase_single_call_content
+
+    deleted_sids = []
+    monkeypatch.setattr(
+        "app.retention.service.telecom.delete_recording", lambda sid: deleted_sids.append(sid)
+    )
+
+    account = Account(name="Erase Single Call Co", account_type=AccountType.INDIVIDUAL)
+    db_session.add(account)
+    db_session.commit()
+
+    target_call = CallRecord(
+        account_id=account.id, phone_number_id=None, direction=CallDirection.INBOUND,
+        from_number="+15559990000", to_number="+15550001111", provider_call_sid="CAerasetarget1",
+        status="completed", duration=660,
+        recording_url="https://api.twilio.com/2010-04-01/Accounts/ACxxx/Recordings/REtargetsid",
+    )
+    other_call = CallRecord(
+        account_id=account.id, phone_number_id=None, direction=CallDirection.INBOUND,
+        from_number="+15559991111", to_number="+15550001111", provider_call_sid="CAeraseother1",
+        status="completed", duration=120,
+        recording_url="https://api.twilio.com/2010-04-01/Accounts/ACxxx/Recordings/REothersid",
+    )
+    db_session.add_all([target_call, other_call])
+    db_session.commit()
+
+    target_summary = ConversationSummary(
+        account_id=account.id, source_type=SummarySourceType.CALL, source_id=target_call.id,
+        transcript="a real personal conversation", summary="personal call summary",
+        model_version="test-fixture",
+    )
+    other_summary = ConversationSummary(
+        account_id=account.id, source_type=SummarySourceType.CALL, source_id=other_call.id,
+        transcript="an unrelated call", summary="unrelated call summary",
+        model_version="test-fixture",
+    )
+    db_session.add_all([target_summary, other_summary])
+    db_session.commit()
+
+    result = erase_single_call_content(db_session, account.id, target_call.id, actor="owner-1")
+
+    assert result == {"recording_erased": True, "summaries_deleted": 1}
+    assert deleted_sids == ["REtargetsid"]  # only the target call's recording, never the other one
+
+    db_session.refresh(target_call)
+    assert target_call.recording_url == "[erased - right to erasure]"
+    # Bare entry preserved - not the "erase everything" cascade.
+    assert target_call.from_number == "+15559990000"
+    assert target_call.duration == 660
+    assert target_call.status == "completed"
+
+    db_session.refresh(other_call)
+    assert other_call.recording_url == "https://api.twilio.com/2010-04-01/Accounts/ACxxx/Recordings/REothersid"
+
+    remaining_summaries = db_session.query(ConversationSummary).filter(
+        ConversationSummary.account_id == account.id
+    ).all()
+    assert len(remaining_summaries) == 1
+    assert remaining_summaries[0].id == other_summary.id
+
+
+def test_erase_single_call_content_rejects_a_call_owned_by_another_account(db_session):
+    from app.numbering.identity.models import Account, AccountType
+    from app.retention.service import CallNotFoundError, erase_single_call_content
+
+    owner_account = Account(name="Real Owner Co", account_type=AccountType.INDIVIDUAL)
+    other_account = Account(name="Other Account Co", account_type=AccountType.INDIVIDUAL)
+    db_session.add_all([owner_account, other_account])
+    db_session.commit()
+
+    call = CallRecord(
+        account_id=owner_account.id, phone_number_id=None, direction=CallDirection.INBOUND,
+        from_number="+15559990000", to_number="+15550001111", provider_call_sid="CAeraseauth1",
+        status="completed", duration=60,
+    )
+    db_session.add(call)
+    db_session.commit()
+
+    try:
+        erase_single_call_content(db_session, other_account.id, call.id, actor="attacker")
+        assert False, "expected CallNotFoundError"
+    except CallNotFoundError:
+        pass
+
+
+def test_erase_single_call_content_raises_when_account_under_legal_hold(db_session):
+    from app.numbering.identity.models import Account, AccountType
+    from app.retention.service import AccountUnderLegalHoldError, erase_single_call_content
+
+    account = Account(name="Legal Hold Single Call Co", account_type=AccountType.INDIVIDUAL, legal_hold=True)
+    db_session.add(account)
+    db_session.commit()
+
+    call = CallRecord(
+        account_id=account.id, phone_number_id=None, direction=CallDirection.INBOUND,
+        from_number="+15559990000", to_number="+15550001111", provider_call_sid="CAeraselegal1",
+        status="completed", duration=60,
+    )
+    db_session.add(call)
+    db_session.commit()
+
+    try:
+        erase_single_call_content(db_session, account.id, call.id, actor="owner-1")
+        assert False, "expected AccountUnderLegalHoldError"
+    except AccountUnderLegalHoldError:
+        pass

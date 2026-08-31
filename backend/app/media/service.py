@@ -62,7 +62,7 @@ from app.numbering.numbers.service import (
 )
 from app.ops.models import KillSwitchScope
 from app.ops.service import assert_kill_switch_not_active
-from app.retention.service import PURGED_MARKER, RECORDING_FAILED_MARKER
+from app.retention.service import ERASED_MARKER, PURGED_MARKER, RECORDING_FAILED_MARKER
 from app.risk import service as risk_service
 from app.usage import service as usage_service
 
@@ -605,6 +605,22 @@ def _calls_cache_key(account_id: str, limit: int) -> str:
 # a live query would; Members fall through to a direct query every time
 # instead, same as before this cache existed.
 _CALLS_CACHE_TTL_SECONDS = 15
+
+
+def public_recording_url(recording_url: str | None) -> str | None:
+    """A purged/erased recording's column value is one of the internal
+    marker strings (PURGED_MARKER/ERASED_MARKER/RECORDING_FAILED_MARKER),
+    not a real URL - those must never reach the frontend as if they were
+    a playable recording_url, or Play/Summarize would show up for audio
+    that no longer exists. media.service.get_call_recording_media already
+    guards this on the fetch path (raises TelecomError for a marker); this
+    is the matching guard for the list/read side. Same check
+    should_forward_call/video's own inline version at line ~1417 already
+    does for video sessions - factored out here so call/voicemail listings
+    use the identical rule instead of a second, driftable copy."""
+    if not recording_url or recording_url in (PURGED_MARKER, ERASED_MARKER, RECORDING_FAILED_MARKER):
+        return None
+    return recording_url
 
 
 def _serialize_call(c: CallRecord) -> dict:
