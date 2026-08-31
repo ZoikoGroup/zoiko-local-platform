@@ -444,6 +444,23 @@ def test_rejecting_a_case_notifies_the_account_owner_with_reason(client, db_sess
     )
 
 
+def test_opening_a_case_notifies_the_account_owner(client, db_session, monkeypatch, caplog):
+    """Real gap fix: open_compliance_case previously only wrote an audit
+    event + published a Kafka event - the account owner had no way to
+    learn a new verification requirement now blocks their service short
+    of noticing a blocked purchase and digging into the dashboard."""
+    monkeypatch.setattr("app.core.config.settings.resend_api_key", "")
+    customer_token = _signup_and_login(client, "notifyopen@example.com")
+
+    with caplog.at_level(logging.INFO, logger="zoiko.notifications"):
+        _open_case(client, {"Authorization": f"Bearer {customer_token}"}, jurisdiction="GB")
+
+    assert any(
+        "notifyopen@example.com" in record.message and "Regulatory information is required" in record.message
+        for record in caplog.records
+    )
+
+
 def _stripe_identity_webhook_body_and_signature(
     secret: str, session_id: str, status: str, last_error: dict | None = None
 ) -> tuple[bytes, str]:

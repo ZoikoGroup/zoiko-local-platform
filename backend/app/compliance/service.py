@@ -17,6 +17,7 @@ from app.integrations.storage import s3 as storage
 from app.notifications.service import (
     notify_compliance_case_approved,
     notify_compliance_case_rejected,
+    notify_compliance_information_required,
     notify_organization_verification_submitted,
 )
 
@@ -175,6 +176,14 @@ def open_compliance_case(
     publish_compliance_case_required(
         account_id, case_id=case.id, jurisdiction=case.jurisdiction, requirement_type=requirement_type,
     )
+
+    owner_email = _account_owner_email(db, account_id)
+    if owner_email:
+        notify_compliance_information_required(
+            db, account_id=account_id, account_email=owner_email,
+            jurisdiction=case.jurisdiction, requirement_type=requirement_type, case_reference=case.id,
+        )
+
     return case
 
 

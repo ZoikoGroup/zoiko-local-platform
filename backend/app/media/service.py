@@ -30,6 +30,7 @@ from app.intelligence.guardrails import check_for_disallowed_commitments
 from app.intelligence.service import qualify_caller
 from app.notifications.service import (
     notify_high_risk_destination_blocked,
+    notify_missed_call,
     notify_receptionist_callback_requested,
     notify_video_guest_waiting,
     notify_voicemail_received,
@@ -1806,7 +1807,16 @@ def mark_receptionist_escalation_missed(db: Session, receptionist_call_id: str) 
     the human never picked up. `escalated` stays True (the platform DID
     attempt the escalation) - this only records that the attempt went
     unanswered, so staff reviewing the call summary can see it fell
-    through to voicemail rather than assuming a human actually handled it."""
+    through to voicemail rather than assuming a human actually handled it.
+
+    Real gap fix: this used to only log_event, with nothing ever telling
+    the specific team member (owner.escalation_user_id) an urgent call was
+    routed to them and they missed it - they'd only find out by noticing
+    the voicemail the account owner gets. voice.missed_call was seeded but
+    had zero call sites anywhere in this codebase; this is the one place a
+    genuinely unambiguous "this exact person didn't pick up" signal exists
+    (see notify_missed_call's docstring for why it's not wired more
+    broadly)."""
     call = db.query(ReceptionistCall).filter(ReceptionistCall.id == receptionist_call_id).first()
     if call is None:
         return
@@ -1814,6 +1824,15 @@ def mark_receptionist_escalation_missed(db: Session, receptionist_call_id: str) 
         db, actor_id=call.account_id, action="receptionist.escalation_missed",
         target_type="receptionist_call", target_id=call.id,
     )
+
+    number = db.query(PhoneNumber).filter(PhoneNumber.id == call.phone_number_id).first()
+    if number is not None and number.escalation_user_id:
+        target = db.query(User).filter(User.id == number.escalation_user_id).first()
+        if target is not None:
+            notify_missed_call(
+                db, account_id=call.account_id, recipient_email=target.email,
+                e164=number.e164, from_number=call.caller_number,
+            )
 
 
 def route_receptionist_call(

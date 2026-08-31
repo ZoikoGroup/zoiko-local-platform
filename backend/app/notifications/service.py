@@ -1119,6 +1119,30 @@ def notify_compliance_case_rejected(
     )
 
 
+def notify_compliance_information_required(
+    db: Session, *, account_id: str, account_email: str, jurisdiction: str, requirement_type: str, case_reference: str
+) -> None:
+    """open_compliance_case (app.compliance.service) previously only wrote
+    an audit event + published a Kafka event when a new case opened - the
+    account had no way to learn a verification/document requirement now
+    blocks their service short of noticing a blocked purchase and digging
+    into the dashboard. compliance.regulatory_information_requested is the
+    CRITICAL-priority template that already exists for exactly this."""
+    requirement_label = requirement_type.replace("_", " ")
+    send_notification(
+        db,
+        event_name="compliance.regulatory_information_requested",
+        account_id=account_id,
+        recipient_email=account_email,
+        context={
+            "user_display_name": account_email,
+            "case_scope_summary": f"{requirement_label} verification for {jurisdiction}",
+            "case_reference": case_reference,
+            "case_action_summary": f"submit {requirement_label} documentation for {jurisdiction}",
+        },
+    )
+
+
 def notify_porting_request_submitted(
     db: Session, *, account_id: str, account_email: str, phone_number: str, port_reference: str
 ) -> None:
@@ -1320,6 +1344,32 @@ def notify_voicemail_received(
             "voicemail_received_local": _now_str(),
             "call_caller_display_safe": _mask_number(from_number),
             "voicemail_duration": f"{duration}s" if duration is not None else "unknown",
+        },
+    )
+
+
+def notify_missed_call(
+    db: Session, *, account_id: str, recipient_email: str, e164: str, from_number: str
+) -> None:
+    """voice.missed_call was seeded but had zero call sites anywhere in the
+    codebase - a genuinely reliable "nobody picked up, and nothing else
+    caught it" signal turns out to be narrower than it first looks: every
+    ordinary unanswered ring-group call already falls through to either
+    the AI Receptionist or voicemail (both already notify), so there's no
+    safe generic hook. The one place this IS unambiguous:
+    media.service.mark_receptionist_escalation_missed - a HIGH-urgency
+    call was live-dialed straight to one specific team member
+    (escalation_user_id) and they personally didn't pick up. The account
+    owner already gets a voicemail-received email for the same call (it
+    falls through to voicemail); this is a distinct, additional alert to
+    the specific person who was supposed to answer, not a duplicate."""
+    send_notification(
+        db, event_name="voice.missed_call", account_id=account_id, recipient_email=recipient_email,
+        context={
+            "user_display_name": recipient_email,
+            "number_masked_or_formatted": _mask_number(e164),
+            "call_started_local": _now_str(),
+            "call_caller_display_safe": _mask_number(from_number),
         },
     )
 

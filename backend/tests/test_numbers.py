@@ -385,6 +385,72 @@ def test_cancel_leaves_number_active_when_twilio_release_fails(client, monkeypat
     assert still_active["status"] == "active"
 
 
+def test_platform_kill_switch_blocks_cancelling_a_number(client, db_session, monkeypatch):
+    """Commercial Billing Operating Standard doc §32.1's "number release"
+    kill-switch scope - a tripped switch must stop cancel_number before any
+    Twilio release call, and leave the number untouched once deactivated."""
+    _stub_buy_number(monkeypatch)
+    released = []
+    monkeypatch.setattr(
+        "app.numbering.numbers.service.telecom.release_number", lambda sid: released.append(sid)
+    )
+    token = _signup_and_login(client, "killswitchcancel1@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    _reserve(client, headers, "+15550004242")
+    client.post("/numbers/purchase", json={"e164": "+15550004242"}, headers=headers)
+
+    staff_token = _create_staff_and_login(client, db_session, "killswitchcancelstaff1@zoikolocal.com")
+
+    activate = client.post(
+        "/ops/kill-switches/number_release/activate",
+        json={"reason": "test lockdown"}, headers={"Authorization": f"Bearer {staff_token}"},
+    )
+    assert activate.status_code == 200, activate.text
+    assert activate.json()["is_active"] is True
+
+    blocked = client.post("/numbers/+15550004242/cancel", headers=headers)
+    assert blocked.status_code == 503
+    assert released == []
+
+    still_active = next(n for n in client.get("/numbers", headers=headers).json() if n["e164"] == "+15550004242")
+    assert still_active["status"] == "active"
+
+    deactivate = client.post(
+        "/ops/kill-switches/number_release/deactivate",
+        headers={"Authorization": f"Bearer {staff_token}"},
+    )
+    assert deactivate.status_code == 200, deactivate.text
+
+    allowed = client.post("/numbers/+15550004242/cancel", headers=headers)
+    assert allowed.status_code == 200, allowed.text
+    assert released == ["PN_fake_sid"]
+
+
+def test_account_kill_switch_blocks_cancelling_a_number_for_one_account(client, db_session, monkeypatch):
+    _stub_buy_number(monkeypatch)
+    released = []
+    monkeypatch.setattr(
+        "app.numbering.numbers.service.telecom.release_number", lambda sid: released.append(sid)
+    )
+    token = _signup_and_login(client, "killswitchcancel2@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    account_id = client.get("/auth/me", headers=headers).json()["account_id"]
+    _reserve(client, headers, "+15550004343")
+    client.post("/numbers/purchase", json={"e164": "+15550004343"}, headers=headers)
+
+    staff_token = _create_staff_and_login(client, db_session, "killswitchcancelstaff2@zoikolocal.com")
+
+    activate = client.post(
+        f"/risk/accounts/{account_id}/kill-switches/number_release/activate",
+        json={"reason": "test lockdown"}, headers={"Authorization": f"Bearer {staff_token}"},
+    )
+    assert activate.status_code == 200, activate.text
+
+    blocked = client.post("/numbers/+15550004343/cancel", headers=headers)
+    assert blocked.status_code == 503
+    assert released == []
+
+
 def test_purchase_blocked_by_compliance_persists_compliance_pending_status(client, db_session, monkeypatch):
     """The docs' "Compliance Pending" lifecycle state must be a real,
     visible, persisted state - not just a one-off error response - so the

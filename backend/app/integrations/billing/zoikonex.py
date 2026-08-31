@@ -64,6 +64,7 @@ import base64
 import hashlib
 import hmac
 import json
+import logging
 import math
 import time
 import uuid
@@ -76,6 +77,8 @@ from app.core.config import settings
 from app.integrations.cache.redis import cache_delete
 from app.observability.service import trace_provider_call
 from app.usage.models import DEFAULT_RATE_COUNTRY, AIUsageRate, CallingRate, NumberRate
+
+logger = logging.getLogger("zoiko.billing")
 
 
 class ZoikoNexError(Exception):
@@ -664,10 +667,21 @@ def determine_tax_for_invoice_line(*, invoice_id: str, taxable_amount_minor_unit
     """Real ZoikoNex tax determination (tax-jurisdiction's /v1/tax-decisions)
     - genuinely wired, but always resolves to 0 tax against
     TAX_PLACEHOLDER_JURISDICTION_CODE's 0%% policy until real jurisdiction
-    policies exist (see that constant's docstring). Returns {} (no-op,
-    tax_amount_minor_units left unset) rather than raising on failure -
-    tax determination must never block invoicing, same non-blocking
-    posture as every other ZoikoNex call in this module."""
+    policies exist (see that constant's docstring). That 0%% policy IS the
+    approved interim fallback the Commercial Billing Operating Standard
+    doc's tax rule (§14 J1: "unknown treatment blocks finalization or
+    routes to approved fallback/manual review") already calls for - every
+    invoice really does get a real tax-decision call and a real
+    tax_decision_id, it just resolves to zero until Legal/Finance decides
+    real policies. Returns {} (no-op, tax_amount_minor_units left unset)
+    rather than raising on a GENUINE failure (ZoikoNex unreachable/erroring,
+    not "unknown jurisdiction" - jurisdiction is never actually unknown
+    here) - tax determination must never block invoicing outright, same
+    non-blocking posture as every other ZoikoNex call in this module.
+    That failure is no longer silent though - logged so it's actually
+    discoverable (real gap fix: previously nothing recorded that an
+    invoice line went out with no tax_amount_minor_units set at all,
+    distinct from - and worse than - the normal, intentional 0-tax case)."""
     try:
         _ensure_tax_placeholder_policy()
         result = _request(
@@ -681,7 +695,12 @@ def determine_tax_for_invoice_line(*, invoice_id: str, taxable_amount_minor_unit
                 "currency_code": currency_code,
             },
         )
-    except ZoikoNexError:
+    except ZoikoNexError as e:
+        logger.warning(
+            "Tax determination failed for invoice %s (amount=%s %s) - line item will be issued with NO "
+            "tax_amount_minor_units set, not the usual 0-tax placeholder result: %s",
+            invoice_id, taxable_amount_minor_units, currency_code, e,
+        )
         return {}
     return {
         "tax_decision_id": result.get("tax_decision_id"),

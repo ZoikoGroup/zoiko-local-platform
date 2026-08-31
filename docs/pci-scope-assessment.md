@@ -8,21 +8,29 @@ ever required) needs to review and formally accept this before it's relied on
 for an actual audit, a payment-processor application, or a customer security
 questionnaire.
 
-**Revised** after `app/integrations/billing/stripe_checkout.py` shipped —
-this doc's original version (see git history) predates that integration and
-concluded Zoiko Local was out of PCI scope *because no payment collection
-existed at all*. That's no longer the case: real payment collection exists
-today, for one specific flow. The conclusion below is still favorable, but
-for a different reason.
+**Revised twice.** First, after `app/integrations/billing/stripe_checkout.py`
+shipped — this doc's original version (see git history) predates that
+integration and concluded Zoiko Local was out of PCI scope *because no
+payment collection existed at all*. That's no longer the case: real payment
+collection exists today, for one specific flow. Second, after
+`app/integrations/billing/zoikonex.py` stopped being a mock — it's now a
+real, tested client (built and tested end-to-end against a locally
+self-hosted copy of the ZoikoNex backend, not a live production ZoikoNex
+instance — see that file's own docstring for exactly what's been tested and
+what two ZoikoNex-side bugs still block full end-to-end billing). The
+conclusion below is still favorable, but the reasoning for the ZoikoNex leg
+has changed from "no card concept because nothing is real" to "no card
+concept because even the real integration only ever handles a tokenized
+placeholder, never a card number."
 
 ## Bottom line
 
 **Zoiko Local is in minimal PCI-DSS scope (SAQ-A territory, for a QSA to
 confirm) for the one real payment flow that exists — number-purchase
-checkout — and out of scope for everything else**, which still has no
-payment collection at all (subscription/plan billing continues to route
-through the disclosed mock ZoikoNex adapter, with no card, payment method,
-or charge concept).
+checkout — and out of scope for everything else**, including subscription/
+plan billing: that flow is now a real, tested ZoikoNex client rather than a
+mock, but it still never handles a real card number (see below), and isn't
+connected to a live ZoikoNex production instance regardless.
 
 ## Why
 
@@ -30,10 +38,25 @@ Per the Commercial Billing Operating Standard doc's three-record-separation
 doctrine: Zoiko Local owns *service* truth (numbers, calls, AI state) and
 never invents a price or touches money itself. `app/billing/`
 (`Subscription`, `Plan`) still has **no price fields** — see `Plan`'s
-docstring: "No price fields — no payment processing exists here at all." For
-subscription/plan billing, `app/integrations/billing/zoikonex.py` remains an
-explicitly-disclosed **mock**: fake reference IDs, no HTTP calls, no concept
-of a card. That part of this assessment is unchanged.
+docstring: "No price fields — no payment processing exists here at all."
+
+For subscription/plan billing, `app/integrations/billing/zoikonex.py` is a
+**real, tested integration** as of 2026-08 (OAuth2 client_credentials
+against ZoikoNex's own identity-tenancy service, real HTTP calls, real
+payment-intent creation/authorization tested end-to-end against ZoikoNex's
+own dev-only simulated payment gateway) — it is no longer accurate to call
+this a mock, and this doc's earlier "mock adapter... no concept of a card"
+language is stale. What hasn't changed, and is the actual reason this stays
+out of PCI scope: `create_payment_intent` (`zoikonex.py`, around line 897)
+sends a hardcoded `payment_method_token: "pm_test_card"` — a pre-tokenized
+placeholder, by explicit design ("real card data is never accepted or
+stored anywhere in this codebase," per that function's own comment) — not a
+real card number collected from a customer. No frontend form, API payload,
+or database column anywhere in this flow carries cardholder data. Separately
+and independently of the PCI question: this integration is also not yet
+connected to any live production ZoikoNex instance (only tested against a
+local self-hosted copy) — a real gap, but a connectivity/credentials one,
+not a card-data-handling one.
 
 Number purchases are different: `app/integrations/billing/stripe_checkout.py`
 is a **real, live-tested integration against a real (test-mode) Stripe
@@ -67,12 +90,16 @@ Concretely, nothing in this repo, including the new checkout flow:
 
 ## What would change this assessment
 
-- **Subscription/plan billing gaining real payment collection** (ZoikoNex
-  becoming a real, callable service, or a direct processor integration for
-  recurring billing) — redo this assessment for that flow specifically when
-  it's built. If it follows the same hosted/redirect or client-side
-  tokenization pattern as `stripe_checkout.py`, the outcome should look
-  similar; if not, re-derive from first principles.
+- **The ZoikoNex payment-intent flow moving off its hardcoded
+  `pm_test_card` token onto anything that accepts a real card number or
+  payment-method reference from a customer** — redo this assessment for
+  that flow specifically when it happens. If it follows the same hosted/
+  redirect or client-side tokenization pattern as `stripe_checkout.py`, the
+  outcome should look similar; if not, re-derive from first principles.
+  (Connecting the existing ZoikoNex client to a live production ZoikoNex
+  instance, on its own, does NOT change this assessment — same
+  `pm_test_card`-style tokenized call shape either way, unless the payload
+  itself changes.)
 - **Any flow, existing or new, where a card number is submitted to, or
   passes through, a Zoiko Local server or database** — full PCI-DSS scope
   would apply to that server. Nothing today does this; keep it that way.
