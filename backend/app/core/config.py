@@ -85,8 +85,17 @@ class Settings(BaseSettings):
     # (call status callbacks) that can't be constructed from a request object
     public_base_url: str = ""
     # The customer-facing web app's origin - used to build links inside
-    # emails (password reset, etc.) that must point at the frontend, not
-    # this API. Defaults to the local Next.js dev server.
+    # emails (password reset, CRM integration connect links) and Stripe
+    # Checkout success/cancel redirects that must point at the frontend,
+    # not this API. Defaults to the local Next.js dev server. Real
+    # production bug fixed 2026-08-27: this key was never declared in
+    # render.yaml, so Render had no value for it and this default silently
+    # won - every real Stripe checkout sent the customer's browser to
+    # localhost after a real payment completed, and every password-reset
+    # email/CRM connect link pointed at localhost too. The payment itself
+    # was never affected (Stripe confirms via a separate server-to-server
+    # webhook, not this redirect) - only these customer-facing links were
+    # broken. See render.yaml's FRONTEND_BASE_URL entry.
     frontend_base_url: str = "http://localhost:3000"
 
     livekit_url: str = ""
@@ -136,12 +145,6 @@ class Settings(BaseSettings):
     # custom card form) is the locked architectural decision here.
     stripe_payments_secret_key: str = ""
     stripe_payments_webhook_secret: str = ""
-
-    # Where Stripe Checkout redirects the customer back to after payment
-    # (success or cancel) - the deployed Next.js frontend origin, or
-    # localhost:3000 in dev. Distinct from public_base_url above, which is
-    # this API's own address for provider webhooks to call back into.
-    frontend_base_url: str = "http://localhost:3000"
 
     # ZoikoNex (integrations/billing) - real client, wired against the
     # ZoikoNex backend's own documented API (services/*/API.INTEGRATION.md

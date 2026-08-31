@@ -63,6 +63,18 @@ services:
       - key: PUBLIC_BASE_URL
         sync: false # this service's own real Render URL, e.g. https://zoiko-local-api.onrender.com
 
+      # Real production bug fixed 2026-08-27: this key was never declared
+      # here at all, so Render had no value for it and app.core.config's
+      # default (http://localhost:3000) silently won - every real Stripe
+      # checkout (billing.service.create_plan_change_checkout_session /
+      # numbering.numbers.service's number-purchase checkout) sent the
+      # customer's browser to localhost after a real payment completed.
+      # The payment itself was never affected (Stripe confirms via the
+      # separate server-to-server /stripe/checkout-webhook, not this
+      # redirect) - only the post-payment landing page was broken.
+      - key: FRONTEND_BASE_URL
+        sync: false # the real deployed frontend origin, e.g. https://frontend-zoiko-local.vercel.app - no trailing slash
+
       # LiveKit (integrations/video)
       - key: LIVEKIT_URL
         sync: false
