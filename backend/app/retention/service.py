@@ -13,7 +13,7 @@ from app.integrations.cache.redis import cache_delete, cache_get, cache_set
 from app.integrations.storage.s3 import StorageError, delete_object
 from app.integrations.telecom import twilio as telecom
 from app.integrations.telecom.twilio import TelecomError
-from app.intelligence.models import ConversationSummary
+from app.intelligence.models import ConversationSummary, SummarySourceType
 from app.media.models import CallRecord, ReceptionistCall, VideoSession, Voicemail
 from app.numbering.identity.models import Account
 from app.retention.models import ArtifactType, ErasureRequest, ErasureRequestStatus, RetentionPolicy
@@ -376,6 +376,73 @@ def erase_account_data(db: Session, account_id: str, *, actor: str) -> dict[str,
         db, actor_id=account_id, action="retention.account_data_erased",
         target_type="account", target_id=account_id, metadata={**result, "erased_by": actor},
     )
+    return result
+
+
+class CallNotFoundError(Exception):
+    """Raised by erase_single_call_content when call_id doesn't exist or
+    doesn't belong to account_id - same ownership-scoping posture as
+    media.service.assert_can_access_call, so this can never touch another
+    account's data."""
+
+
+def erase_single_call_content(db: Session, account_id: str, call_id: str, *, actor: str) -> dict:
+    """A single-record version of erase_account_data's cascade, for when a
+    customer wants ONE specific call's sensitive content gone (e.g. it
+    accidentally captured a personal conversation) without erasing
+    anything else on the account - erase_account_data is deliberately
+    all-or-nothing per account and would be far too broad for this case.
+
+    Erases the recording (real Twilio delete, same as erase_account_data)
+    and deletes the call's AI conversation summary/transcript. Deliberately
+    does NOT touch the CallRecord row's from_number/to_number/duration/
+    status/created_at - same "billing/audit history isn't erasable PII"
+    reasoning erase_account_data's own docstring already documents; the
+    call still shows up in Calls with a bare entry, just with no audio or
+    AI-generated content attached to it anymore."""
+    call = db.query(CallRecord).filter(CallRecord.id == call_id, CallRecord.account_id == account_id).first()
+    if call is None:
+        raise CallNotFoundError(f"No call {call_id!r} owned by account {account_id!r}")
+    if is_account_under_legal_hold(db, account_id):
+        raise AccountUnderLegalHoldError(
+            f"Account {account_id!r} is under legal hold - clear the hold before this call's content can be erased."
+        )
+
+    recording_erased = False
+    if call.recording_url and call.recording_url not in (PURGED_MARKER, ERASED_MARKER):
+        try:
+            telecom.delete_recording(telecom.recording_sid_from_url(call.recording_url))
+        except TelecomError as e:
+            log_event(
+                db, actor_id=account_id, action="retention.purge_failed",
+                target_type="call_record", target_id=call.id, reason=str(e),
+            )
+            raise
+        call.recording_url = ERASED_MARKER
+        recording_erased = True
+
+    summaries_deleted = (
+        db.query(ConversationSummary)
+        .filter(
+            ConversationSummary.account_id == account_id,
+            ConversationSummary.source_type == SummarySourceType.CALL,
+            ConversationSummary.source_id == call.id,
+        )
+        .delete(synchronize_session=False)
+    )
+    db.commit()
+
+    if account_id:
+        from app.media.service import _invalidate_calls_cache
+
+        _invalidate_calls_cache(account_id)
+
+    result = {"recording_erased": recording_erased, "summaries_deleted": summaries_deleted}
+    log_event(
+        db, actor_id=account_id, action="retention.call_content_erased",
+        target_type="call_record", target_id=call.id, metadata={**result, "erased_by": actor},
+    )
+    publish_retention_recording_purged(account_id, artifact_type="call_recording", target_id=call.id)
     return result
 
 

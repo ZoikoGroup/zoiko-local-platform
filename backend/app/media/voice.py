@@ -614,7 +614,7 @@ async def list_calls(
             "from": c.from_number,
             "direction": c.direction.value,
             "duration": c.duration,
-            "recording_url": c.recording_url,
+            "recording_url": media_service.public_recording_url(c.recording_url),
             "is_suspected_spam": c.is_suspected_spam,
             "created_at": c.created_at,
         }

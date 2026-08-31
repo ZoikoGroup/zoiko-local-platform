@@ -129,3 +129,29 @@ def resolve_erasure_request(
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e)) from e
+
+
+@router.post("/calls/{call_id}/erase-content")
+def erase_call_content(
+    call_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin),
+):
+    """Erases one specific call's recording and AI summary/transcript -
+    e.g. it captured something personal that shouldn't be retained -
+    without touching any other data on the account (unlike POST
+    /retention/erasure-request, which is a whole-account, staff-reviewed
+    request). The call itself stays in the account's call history as a
+    bare entry (who/when/how long), just with no audio or AI-generated
+    content attached anymore. Owner/Admin only, scoped to the caller's own
+    account - can never reach another account's call."""
+    from app.integrations.telecom.twilio import TelecomError
+
+    try:
+        return service.erase_single_call_content(db, current_user.account_id, call_id, actor=current_user.id)
+    except service.CallNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
+    except service.AccountUnderLegalHoldError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e
+    except TelecomError as e:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(e)) from e

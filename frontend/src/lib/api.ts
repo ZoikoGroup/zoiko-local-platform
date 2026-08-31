@@ -1307,6 +1307,17 @@ export function transferCall(token: string, callSid: string, destination: string
   });
 }
 
+// Erases one specific call's recording + AI summary/transcript - e.g. it
+// captured something personal - without touching anything else on the
+// account. The call stays in the log as a bare entry (who/when/how long).
+// See backend retention/service.py's erase_single_call_content docstring.
+export function eraseCallContent(token: string, callId: string): Promise<{ recording_erased: boolean; summaries_deleted: number }> {
+  return request<{ recording_erased: boolean; summaries_deleted: number }>(`/retention/calls/${callId}/erase-content`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
 export async function placeOutboundCall(
   token: string,
   input: { to: string; from: string; message?: string }
