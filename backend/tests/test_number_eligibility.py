@@ -13,10 +13,19 @@ def _signup_and_login(client, email: str) -> str:
     )
     response = client.post("/auth/login", json={"email": email, "password": "supersecret123"})
     token = response.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+    # Real gap fix: number purchase now requires email_verified (Production
+    # Readiness Standard doc §5's "Identity" trial-abuse control) - same
+    # "not what this file tests, so eliminate the gate" posture as the plan
+    # upgrade below.
+    from app.core.security import create_access_token
+
+    user_id = client.get("/auth/me", headers=headers).json()["id"]
+    client.post("/auth/verify-email", json={"token": create_access_token(subject=user_id, scope="email_verification")})
     client.post(
         "/compliance/consent",
         json={"consent_type": "emergency_calling_acknowledged"},
-        headers={"Authorization": f"Bearer {token}"},
+        headers=headers,
     )
     # A fresh signup defaults to the free trial - app.core.deps.
     # require_paid_or_read_only now blocks write actions (reserve/purchase)

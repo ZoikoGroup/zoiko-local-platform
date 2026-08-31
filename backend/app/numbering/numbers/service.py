@@ -377,6 +377,12 @@ class ComplianceRequiredError(Exception):
     "Compliance Pending" lifecycle state, enforced at the point of purchase."""
 
 
+class EmailVerificationRequiredError(Exception):
+    """Raised when the account owner hasn't verified their email yet -
+    required before ANY number purchase (Production Readiness Standard
+    doc §5's "Identity" trial-abuse control)."""
+
+
 class EmergencyDisclosureRequiredError(Exception):
     """Raised when the account hasn't acknowledged the emergency-calling
     limitation disclosure yet - required before ANY number purchase, every
@@ -1048,6 +1054,21 @@ def _assert_purchase_eligible(db: Session, account_id: str, number: PhoneNumber,
     purchase_number itself as defense-in-depth against the case's status
     changing in the gap between checkout-session creation and the
     payment webhook actually firing."""
+    # Production Readiness Standard doc §5 "Identity" trial-abuse control -
+    # the cheapest possible check, ahead of market/quota/billing, since an
+    # unverified email means we don't even know this signup is real yet. A
+    # scripted signup with a disposable address (rate-limited to 5/min but
+    # otherwise unthrottled) previously got a real Twilio number with no
+    # identity check at all. Checks the ACCOUNT OWNER specifically (not
+    # whichever user is placing the order) - a business account's owner is
+    # who's accountable for it, same pattern the KYC/eligibility gates
+    # below already use for their own owner lookups.
+    owner_for_verification = db.query(User).filter(User.account_id == account_id, User.role == UserRole.OWNER).first()
+    if owner_for_verification is not None and not owner_for_verification.email_verified:
+        raise EmailVerificationRequiredError(
+            "Verify your email address before purchasing a number — check your inbox for the "
+            "verification link, or request a new one via POST /auth/resend-verification"
+        )
     # Production Readiness Standard doc §6.2 - re-checked here too (already
     # checked once at reserve_number time) as the same defense-in-depth
     # against the market being suspended in the gap between reservation

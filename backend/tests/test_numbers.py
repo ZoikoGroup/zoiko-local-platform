@@ -16,6 +16,14 @@ def _signup_and_login(client, email: str, account_type: str = "individual") -> s
     response = client.post("/auth/login", json={"email": email, "password": "supersecret123"})
     token = response.json()["access_token"]
     headers = {"Authorization": f"Bearer {token}"}
+    # Real gap fix: number purchase now requires email_verified (Production
+    # Readiness Standard doc §5's "Identity" trial-abuse control) - a fresh
+    # test signup starts unverified, same as a real one, so verify it here
+    # rather than in every individual test.
+    from app.core.security import create_access_token
+
+    user_id = client.get("/auth/me", headers=headers).json()["id"]
+    client.post("/auth/verify-email", json={"token": create_access_token(subject=user_id, scope="email_verification")})
     # Baseline for every test account here - the emergency-calling
     # disclosure gate is tested explicitly in its own tests below.
     client.post(

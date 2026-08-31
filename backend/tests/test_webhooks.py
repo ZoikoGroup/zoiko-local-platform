@@ -7,8 +7,23 @@ def _signup_and_login(client, email: str, account_name: str = "Webhook Test Co")
     return response.json()["access_token"]
 
 
-def test_owner_can_create_a_webhook_endpoint(client):
-    token = _signup_and_login(client, "wh-owner1@example.com")
+def _signup_login_and_upgrade(client, db_session, email: str, account_name: str = "Webhook Test Co") -> str:
+    """Real gap fix (ZL-COM-ENT-001): webhooks are gated on
+    developer.webhooks.scope >= limited (Starter = none, Business+ =
+    limited), same as the /public/v1 API-key surface already required -
+    the dashboard route creating a webhook with no entitlement check at
+    all was the actual gap. Every test that creates a webhook endpoint
+    needs a plan that grants this scope first."""
+    from app.billing import service as billing_service
+
+    token = _signup_and_login(client, email, account_name)
+    account_id = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"}).json()["account_id"]
+    billing_service.change_plan(db_session, account_id, "business", actor="test-setup")
+    return token
+
+
+def test_owner_can_create_a_webhook_endpoint(client, db_session):
+    token = _signup_login_and_upgrade(client, db_session, "wh-owner1@example.com")
     response = client.post(
         "/webhooks/endpoints",
         json={"url": "https://example.com/hook", "description": "My CRM"},
@@ -22,7 +37,7 @@ def test_owner_can_create_a_webhook_endpoint(client):
     assert len(body["secret"]) == 64
 
 
-def test_creating_an_endpoint_notifies_the_owner(client, monkeypatch):
+def test_creating_an_endpoint_notifies_the_owner(client, db_session, monkeypatch):
     monkeypatch.setattr("app.core.config.settings.resend_api_key", "")
 
     class FakeResponse:
@@ -31,7 +46,7 @@ def test_creating_an_endpoint_notifies_the_owner(client, monkeypatch):
 
     monkeypatch.setattr("app.webhooks.service.httpx.post", lambda *a, **kw: FakeResponse())
 
-    token = _signup_and_login(client, "wh-owner1b@example.com")
+    token = _signup_login_and_upgrade(client, db_session, "wh-owner1b@example.com")
     headers = {"Authorization": f"Bearer {token}"}
     client.post("/webhooks/endpoints", json={"url": "https://example.com/hook"}, headers=headers)
 
@@ -41,8 +56,8 @@ def test_creating_an_endpoint_notifies_the_owner(client, monkeypatch):
     assert matches[0]["status"] == "sent"
 
 
-def test_creating_an_endpoint_rejects_non_https_urls(client):
-    token = _signup_and_login(client, "wh-owner2@example.com")
+def test_creating_an_endpoint_rejects_non_https_urls(client, db_session):
+    token = _signup_login_and_upgrade(client, db_session, "wh-owner2@example.com")
     response = client.post(
         "/webhooks/endpoints", json={"url": "http://example.com/hook"},
         headers={"Authorization": f"Bearer {token}"},
@@ -76,8 +91,8 @@ def test_member_cannot_create_a_webhook_endpoint(client, db_session):
     assert response.status_code == 403
 
 
-def test_list_endpoints_does_not_include_the_secret(client):
-    token = _signup_and_login(client, "wh-owner4@example.com")
+def test_list_endpoints_does_not_include_the_secret(client, db_session):
+    token = _signup_login_and_upgrade(client, db_session, "wh-owner4@example.com")
     client.post(
         "/webhooks/endpoints", json={"url": "https://example.com/hook"},
         headers={"Authorization": f"Bearer {token}"},
@@ -89,8 +104,8 @@ def test_list_endpoints_does_not_include_the_secret(client):
     assert "secret" not in body[0]
 
 
-def test_owner_can_delete_their_own_endpoint(client):
-    token = _signup_and_login(client, "wh-owner5@example.com")
+def test_owner_can_delete_their_own_endpoint(client, db_session):
+    token = _signup_login_and_upgrade(client, db_session, "wh-owner5@example.com")
     created = client.post(
         "/webhooks/endpoints", json={"url": "https://example.com/hook"},
         headers={"Authorization": f"Bearer {token}"},
@@ -103,8 +118,8 @@ def test_owner_can_delete_their_own_endpoint(client):
     assert listed == []
 
 
-def test_cannot_delete_another_accounts_endpoint(client):
-    owner_a_token = _signup_and_login(client, "wh-owner6a@example.com")
+def test_cannot_delete_another_accounts_endpoint(client, db_session):
+    owner_a_token = _signup_login_and_upgrade(client, db_session, "wh-owner6a@example.com")
     owner_b_token = _signup_and_login(client, "wh-owner6b@example.com")
 
     created = client.post(
@@ -118,8 +133,8 @@ def test_cannot_delete_another_accounts_endpoint(client):
     assert response.status_code == 403
 
 
-def test_endpoint_limit_is_enforced(client):
-    token = _signup_and_login(client, "wh-owner7@example.com")
+def test_endpoint_limit_is_enforced(client, db_session):
+    token = _signup_login_and_upgrade(client, db_session, "wh-owner7@example.com")
     headers = {"Authorization": f"Bearer {token}"}
     for i in range(10):
         response = client.post("/webhooks/endpoints", json={"url": f"https://example.com/hook{i}"}, headers=headers)
@@ -154,7 +169,7 @@ def test_dispatch_sends_a_signed_post_to_a_registered_endpoint(client, db_sessio
     # otherwise fire against this fake URL before this test ever gets to it.
     monkeypatch.setattr("app.webhooks.service.httpx.post", fake_post)
 
-    token = _signup_and_login(client, "wh-dispatch1@example.com")
+    token = _signup_login_and_upgrade(client, db_session, "wh-dispatch1@example.com")
     created = client.post(
         "/webhooks/endpoints", json={"url": "https://example.com/hook"},
         headers={"Authorization": f"Bearer {token}"},
@@ -199,7 +214,7 @@ def test_dispatch_records_a_failed_delivery_without_raising(client, db_session, 
 
     monkeypatch.setattr("app.webhooks.service.httpx.post", fake_post)
 
-    token = _signup_and_login(client, "wh-dispatch2@example.com")
+    token = _signup_login_and_upgrade(client, db_session, "wh-dispatch2@example.com")
     client.post(
         "/webhooks/endpoints", json={"url": "https://example.com/hook"},
         headers={"Authorization": f"Bearer {token}"},
@@ -234,7 +249,7 @@ def test_inactive_endpoint_receives_no_deliveries(client, db_session, monkeypatc
 
     monkeypatch.setattr("app.webhooks.service.httpx.post", lambda *a, **kw: FakeResponse())
 
-    token = _signup_and_login(client, "wh-inactive@example.com")
+    token = _signup_login_and_upgrade(client, db_session, "wh-inactive@example.com")
     client.post(
         "/webhooks/endpoints", json={"url": "https://example.com/hook"},
         headers={"Authorization": f"Bearer {token}"},

@@ -100,7 +100,6 @@ def connect_crm(db: Session, *, account_id: str, provider: str, actor: str) -> C
     publish_crm_connected(account_id, provider=provider_enum.value)
 
     from app.numbering.identity.models import Account, User, UserRole
-
     actor_user = db.query(User).filter(User.id == actor).first()
     owner = db.query(User).filter(User.account_id == account_id, User.role == UserRole.OWNER).first()
     if owner is not None:

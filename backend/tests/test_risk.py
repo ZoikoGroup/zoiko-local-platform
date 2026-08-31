@@ -21,7 +21,15 @@ def _signup_and_login(client, email: str) -> str:
         },
     )
     response = client.post("/auth/login", json={"email": email, "password": "supersecret123"})
-    return response.json()["access_token"]
+    token = response.json()["access_token"]
+    # Real gap fix: number purchase now requires email_verified (Production
+    # Readiness Standard doc §5's "Identity" trial-abuse control).
+    from app.core.security import create_access_token
+
+    headers = {"Authorization": f"Bearer {token}"}
+    user_id = client.get("/auth/me", headers=headers).json()["id"]
+    client.post("/auth/verify-email", json={"token": create_access_token(subject=user_id, scope="email_verification")})
+    return token
 
 
 def _clear_billing_trial_gate(db_session, account_id: str) -> None:

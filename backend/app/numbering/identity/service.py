@@ -17,6 +17,7 @@ from app.notifications.service import (
     notify_account_activated,
     notify_administrator_added,
     notify_administrator_removed,
+    notify_email_verification_requested,
     notify_mfa_disabled,
     notify_mfa_enabled,
     notify_password_changed,
@@ -27,6 +28,9 @@ from app.numbering.identity.models import Account, AccountType, User, UserRole
 from app.risk.service import check_fingerprint_on_signup
 
 PASSWORD_RESET_TOKEN_EXPIRE_MINUTES = 30
+# Email Communications System doc §5.3's normative token lifetime for
+# ZLOC-EM-AUTH-001 "Verify Email Address": 24 hours, single use.
+EMAIL_VERIFICATION_TOKEN_EXPIRE_MINUTES = 60 * 24
 
 # Computed once at import time (a one-time bcrypt cost, same as hashing any
 # real password) - see authenticate_user's docstring for why this needs to
@@ -70,7 +74,56 @@ def create_account_with_owner(
     # docstring). Optional: a client that sends no fingerprint header is a
     # no-op here, not an error.
     check_fingerprint_on_signup(db, fingerprint_hash=device_fingerprint_hash, account_id=account.id)
+    send_email_verification(db, user)
     return user
+
+
+def send_email_verification(db: Session, user: User) -> None:
+    """Production Readiness Standard doc §5 "Identity" - a fresh signup
+    starts email_verified=False; this issues the ZLOC-EM-AUTH-001 link.
+    Shared by create_account_with_owner (first send) and
+    resend_email_verification below (re-send after the 24h link expires)."""
+    token = create_access_token(
+        subject=user.id, scope="email_verification", expire_minutes=EMAIL_VERIFICATION_TOKEN_EXPIRE_MINUTES,
+    )
+    notify_email_verification_requested(db, account_id=user.account_id, user_email=user.email, token=token)
+
+
+class InvalidVerificationTokenError(Exception):
+    """Raised for an expired, malformed, or already-used email verification
+    token - same "one generic error, don't let the caller distinguish why"
+    posture as InvalidResetTokenError."""
+
+
+def verify_email(db: Session, token: str) -> User:
+    payload = decode_access_token(token)
+    if payload is None or payload.get("scope") != "email_verification":
+        raise InvalidVerificationTokenError("This verification link is invalid or has expired.")
+
+    user = db.query(User).filter(User.id == payload["sub"]).first()
+    if user is None:
+        raise InvalidVerificationTokenError("This verification link is invalid or has expired.")
+
+    # Naturally single-use: verifying an already-verified account is a
+    # harmless no-op, not an error - a customer who clicks an old link
+    # again (or double-clicks) after already verifying shouldn't see a
+    # confusing failure.
+    if not user.email_verified:
+        user.email_verified = True
+        db.commit()
+        db.refresh(user)
+        log_event(db, actor=user.id, action="user.email_verified", target=f"user:{user.id}")
+    return user
+
+
+def resend_email_verification(db: Session, email: str) -> None:
+    """Same anti-enumeration posture as request_password_reset - always
+    succeeds from the caller's perspective regardless of whether the email
+    matches an account or is already verified."""
+    user = db.query(User).filter(User.email == email).first()
+    if user is None or user.email_verified:
+        return
+    send_email_verification(db, user)
 
 
 def authenticate_user(db: Session, email: str, password: str) -> User | None:
@@ -185,6 +238,11 @@ def find_or_create_user_from_google(db: Session, email: str, name: str | None) -
         email=email,
         hashed_password=None,
         role=UserRole.OWNER,
+        # Google already proved ownership of this address via its own
+        # id_token email_verified claim (checked in the /auth/google route
+        # before this function is ever called) - making them verify again
+        # here would be pointless.
+        email_verified=True,
     )
     db.add(user)
     db.commit()

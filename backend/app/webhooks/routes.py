@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
-from app.core.deps import get_current_user, require_admin
+from app.core.deps import get_current_user, require_admin, require_entitlement_scope
 from app.numbering.identity.models import User
 from app.webhooks import service
 from app.webhooks.schemas import (
@@ -20,6 +20,15 @@ def create_endpoint(
     payload: CreateWebhookEndpointRequest,
     db: Session = Depends(get_db),
     current_user: User = Depends(require_admin),
+    # Real gap fix: this dashboard route had no entitlement check at all,
+    # unlike its /public/v1 API-key twin (public_api/routes.py's
+    # create_webhook), which requires developer.webhooks.scope >= limited
+    # (Starter = none, Business+ = limited/standard/advanced per
+    # ZL-COM-ENT-001 v3.0). Any customer on any plan, including Starter,
+    # could create real, working webhook endpoints for free through the
+    # dashboard. Scoped to NEW creation only - existing endpoints already
+    # created under the old, unguarded behavior are left untouched.
+    _entitlement: User = Depends(require_entitlement_scope("developer.webhooks.scope", min_scope="limited")),
 ):
     try:
         endpoint, secret = service.create_endpoint(

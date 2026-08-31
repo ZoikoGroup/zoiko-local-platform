@@ -90,6 +90,12 @@ def run() -> None:
         while True:
             for message in consumer:
                 handle_message(message.topic, message.value)
+                # Manual commit, now that get_consumer disables auto-commit
+                # (see its docstring) - only advances the offset once this
+                # message has actually been persisted or exhausted retries
+                # into the DLQ, so a crash before this point redelivers the
+                # message on restart instead of silently skipping it.
+                consumer.commit()
     except KeyboardInterrupt:
         logger.info("event-log consumer shutting down")
     finally:

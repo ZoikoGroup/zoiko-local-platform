@@ -1120,6 +1120,27 @@ def notify_compliance_case_rejected(
     )
 
 
+def notify_compliance_reverification_due(
+    db: Session, *, account_id: str, account_email: str, jurisdiction: str, requirement_type: str, due_at: str,
+) -> None:
+    """ZLOC-EM-COMP-013 "Consent or Legal Basis Expiring" - an approved KYC/
+    KYB case's periodic re-verification cadence (see compliance.service's
+    REVERIFICATION_INTERVAL_DAYS and flag_cases_due_for_reverification).
+    Detection/notification only - does not itself change the case's status
+    or restrict anything."""
+    send_notification(
+        db,
+        event_name="compliance.consent_or_legal_basis_expiring",
+        account_id=account_id,
+        recipient_email=account_email,
+        context={
+            "user_display_name": account_email,
+            "case_scope_summary": f"your {requirement_type.replace('_', ' ')} verification for {jurisdiction}",
+            "case_review_deadline": due_at,
+        },
+    )
+
+
 def notify_porting_request_submitted(
     db: Session, *, account_id: str, account_email: str, phone_number: str, port_reference: str
 ) -> None:
@@ -1220,6 +1241,21 @@ def notify_password_reset_requested(db: Session, *, account_id: str, user_email:
         account_id=account_id,
         recipient_email=user_email,
         context={"reset_url": reset_url, "user_display_name": user_email},
+    )
+
+
+def notify_email_verification_requested(db: Session, *, account_id: str, user_email: str, token: str) -> None:
+    verify_url = f"{settings.frontend_base_url}/verify-email?token={token}"
+    send_notification(
+        db,
+        event_name="auth.verify_email_address",
+        account_id=account_id,
+        recipient_email=user_email,
+        context={
+            "user_display_name": user_email,
+            "verify_url": verify_url,
+            "link_expiry_duration": "24 hours",
+        },
     )
 
 

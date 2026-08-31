@@ -15,11 +15,13 @@ from app.numbering.identity.schemas import (
     MfaCodeRequest,
     MfaLoginRequest,
     MfaSetupResponse,
+    ResendVerificationRequest,
     ResetPasswordRequest,
     SetPhoneNumberRequest,
     SignupRequest,
     TokenResponse,
     UserResponse,
+    VerifyEmailRequest,
 )
 from app.risk import service as risk_service
 
@@ -72,6 +74,23 @@ def login(
 
     token = create_access_token(subject=user.id, scope="customer")
     return LoginResponse(access_token=token)
+
+
+@router.post("/verify-email", response_model=UserResponse)
+def verify_email(payload: VerifyEmailRequest, db: Session = Depends(get_db)):
+    try:
+        return service.verify_email(db, payload.token)
+    except service.InvalidVerificationTokenError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
+
+
+@router.post("/resend-verification", status_code=status.HTTP_204_NO_CONTENT)
+@limiter.limit("5/minute")
+def resend_verification(request: Request, payload: ResendVerificationRequest, db: Session = Depends(get_db)):
+    """Always 204, whether or not the email matches an account or is
+    already verified - same anti-enumeration posture as /forgot-password."""
+    service.resend_email_verification(db, payload.email)
+    return None
 
 
 @router.post("/forgot-password", status_code=status.HTTP_204_NO_CONTENT)

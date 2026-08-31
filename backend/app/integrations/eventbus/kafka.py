@@ -113,12 +113,25 @@ def publish(topic: str, key: str | None, payload: dict) -> None:
 def get_consumer(topics: list[str], group_id: str) -> KafkaConsumer:
     """Factory for a consumer - callers own its lifecycle (iterate, then
     .close()). Not used by the request/response path; for background
-    workers and tests that need to prove an event was actually delivered."""
+    workers and tests that need to prove an event was actually delivered.
+
+    Real gap fix: enable_auto_commit was left at kafka-python's default
+    (True, committing on a ~5s background timer) - the offset could advance
+    past a message before app.events.consumer.handle_message actually
+    finished persisting it. A consumer crash mid-batch would then resume
+    AFTER the already-committed offset on restart, silently skipping
+    whatever hadn't been durably written yet - the opposite of
+    persist_event's own "replaying a partition must not create a
+    duplicate row" comment, which assumes redelivery-on-restart is the
+    only failure mode, not silent loss. Callers must now commit()
+    explicitly once a message is actually done (persisted or sent to the
+    DLQ) - see app.events.consumer.run."""
     return KafkaConsumer(
         *topics,
         bootstrap_servers=settings.kafka_bootstrap_servers,
         group_id=group_id,
         auto_offset_reset="earliest",
+        enable_auto_commit=False,
         value_deserializer=lambda v: json.loads(v.decode("utf-8")),
         key_deserializer=lambda k: k.decode("utf-8") if k else None,
         consumer_timeout_ms=10_000,

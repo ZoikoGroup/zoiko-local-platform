@@ -17,6 +17,7 @@ from app.integrations.storage import s3 as storage
 from app.notifications.service import (
     notify_compliance_case_approved,
     notify_compliance_case_rejected,
+    notify_compliance_reverification_due,
     notify_organization_verification_submitted,
 )
 
@@ -32,6 +33,15 @@ _MAX_DOCUMENT_SIZE_BYTES = 10 * 1024 * 1024
 # treated as stale rather than left open forever - see
 # sweep_expired_compliance_cases.
 COMPLIANCE_CASE_EXPIRY_DAYS = 90
+
+# Same "reasonable default, clearly labeled, not invented precision"
+# posture as COMPLIANCE_CASE_EXPIRY_DAYS above - neither the Email
+# Communications System doc's ZLOC-EM-COMP-013 template nor the Phase 1
+# Roadmap names an exact cadence for re-verifying an already-APPROVED KYC/
+# KYB case, only that the capability should exist. 365 days matches the
+# standard annual KYC/AML re-screening interval most compliance regimes
+# already use, not a number invented for this codebase specifically.
+REVERIFICATION_INTERVAL_DAYS = 365
 
 # Stripe Identity VerificationSession status -> our case status. "requires_input"
 # is overloaded - confirmed live against a real submission: it's BOTH the
@@ -308,7 +318,16 @@ def submit_document(
     (same Provider Gateway used for recordings) and records its metadata on
     the case - the storage key is server-generated from the case id, never
     taken from client input, so a case's documents can't be pointed at an
-    arbitrary bucket path."""
+    arbitrary bucket path.
+
+    Real gap fix: this had no terminal-status guard at all, unlike approve_
+    case/reject_case. Blocks only APPROVED (uploading more evidence to an
+    already-passed case is pointless) - deliberately NOT the stricter
+    "PENDING only" rule those two use, since start_kyc_verification allows
+    restarting from REJECTED/EXPIRED, and a customer preparing that retry
+    needs to be able to upload fresh evidence first."""
+    if case.status == ComplianceCaseStatus.APPROVED:
+        raise KYCAlreadyApprovedError(f"Case {case.id} is already approved - no further documents are needed")
     if content_type not in _ALLOWED_DOCUMENT_CONTENT_TYPES:
         raise UnsupportedDocumentTypeError(
             f"{content_type} is not an accepted document type - upload a PDF, JPEG, or PNG"
@@ -383,6 +402,7 @@ def approve_case(db: Session, case: ComplianceCase, *, actor: str) -> Compliance
         )
     before_status = case.status
     case.status = ComplianceCaseStatus.APPROVED
+    case.reverification_due_at = datetime.now(timezone.utc) + timedelta(days=REVERIFICATION_INTERVAL_DAYS)
     db.commit()
     db.refresh(case)
     _invalidate_cases_cache(case.account_id)
@@ -508,10 +528,59 @@ def expire_overdue_cases(db: Session) -> dict[str, int]:
     return {"expired": len(overdue)}
 
 
+def flag_cases_due_for_reverification(db: Session) -> dict[str, int]:
+    """Finds every APPROVED case whose reverification_due_at has passed and
+    sends the customer a real notice (ZLOC-EM-COMP-013) - the periodic KYC/
+    KYB re-screening cadence neither doc names an exact interval or
+    automatic consequence for (see REVERIFICATION_INTERVAL_DAYS). Called
+    from app.ops.scheduled_reconciliation's daily run, same posture as
+    expire_overdue_cases above.
+
+    Deliberately detection/notification only: the case's status is left
+    APPROVED and nothing is restricted. Re-arms reverification_due_at for
+    another full interval after notifying, rather than adding a separate
+    "last_notified_at" field, so the same case doesn't send this notice
+    again every day until someone actually acts on it - once per interval
+    is enough for a notice with no automatic consequence attached."""
+    now = datetime.now(timezone.utc)
+    due = (
+        db.query(ComplianceCase)
+        .filter(
+            ComplianceCase.status == ComplianceCaseStatus.APPROVED,
+            ComplianceCase.reverification_due_at.isnot(None),
+            ComplianceCase.reverification_due_at < now,
+        )
+        .all()
+    )
+    for case in due:
+        case.reverification_due_at = now + timedelta(days=REVERIFICATION_INTERVAL_DAYS)
+        db.commit()
+
+        log_event(
+            db,
+            actor="system:compliance_reverification",
+            action="compliance.reverification_flagged",
+            target_type="compliance_case",
+            target_id=case.id,
+            metadata={"jurisdiction": case.jurisdiction, "requirement_type": case.requirement_type},
+        )
+        owner_email = _account_owner_email(db, case.account_id)
+        if owner_email:
+            notify_compliance_reverification_due(
+                db, account_id=case.account_id, account_email=owner_email,
+                jurisdiction=case.jurisdiction, requirement_type=case.requirement_type,
+                due_at=now.date().isoformat(),
+            )
+
+    return {"flagged": len(due)}
+
+
 class KYCAlreadyApprovedError(Exception):
     """Raised when someone tries to restart verification on a case that's
     already passed - re-verifying an approved case is pointless and risks
-    a flaky retry overwriting a correct decision with a worse one."""
+    a flaky retry overwriting a correct decision with a worse one. Also
+    raised by submit_document for the same reason - uploading more
+    evidence to an already-approved case has nothing left to do."""
 
 
 def start_kyc_verification(db: Session, case: ComplianceCase, *, actor: str) -> dict:

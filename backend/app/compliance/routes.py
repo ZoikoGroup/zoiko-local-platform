@@ -13,7 +13,7 @@ from app.compliance.schemas import (
     KYCVerificationStart,
 )
 from app.core.database import get_db
-from app.core.deps import get_current_staff, get_current_user, require_admin, require_capability, require_writer
+from app.core.deps import get_current_staff, get_current_user, require_admin, require_capability
 from app.integrations.kyc.stripe_identity import KYCError, construct_webhook_event
 from app.integrations.storage.s3 import StorageError
 from app.numbering.identity.models import User
@@ -135,6 +135,8 @@ async def submit_document(
         )
     except (service.UnsupportedDocumentTypeError, service.DocumentTooLargeError) as e:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e)) from e
+    except service.KYCAlreadyApprovedError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e
     except StorageError as e:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(e)) from e
 
@@ -180,7 +182,13 @@ def staff_get_document_download_url(
 def start_kyc(
     case_id: str,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_writer),
+    # Real gap fix: was require_writer, letting a plain Member kick off a
+    # real, real-cost Stripe Identity verification session on a case they
+    # can't open or upload documents to themselves (create_case and
+    # submit_document are both require_admin). Tightened to match its
+    # siblings - every case-management action on a KYC case now needs the
+    # same bar.
+    current_user: User = Depends(require_admin),
 ):
     case = _get_case_or_404(db, case_id)
     if case.account_id != current_user.account_id:

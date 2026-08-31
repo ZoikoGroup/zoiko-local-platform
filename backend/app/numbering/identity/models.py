@@ -143,6 +143,13 @@ class User(Base):
     # proves they can generate a valid code - see /auth/mfa/enable.
     mfa_secret: Mapped[str | None] = mapped_column(String(64), nullable=True)
     mfa_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # Production Readiness Standard doc §5 "Identity" trial-abuse control -
+    # a fresh signup starts unverified; existing rows backfill to True (see
+    # the migration) so this is additive, not a retroactive lockout. A
+    # Google-only user (hashed_password is None) is verified immediately at
+    # signup (see find_or_create_user_from_google) - Google already proved
+    # ownership of that address via its own id_token email_verified claim.
+    email_verified: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     account: Mapped["Account"] = relationship("Account", back_populates="users")

@@ -33,17 +33,34 @@ would show up in the checked/published counts logged below.
 sync_all_pending_eligibility_cases (Twilio Regulatory Bundle KYC) is the
 scheduled fallback for the customer-triggered "check status" button - an
 approval/rejection isn't missed just because nobody came back to check.
+
+list_stuck_provisioning (Production Readiness Standard doc's automatic
+No-Go trigger: "Billing can succeed while provisioning fails without an
+automated recovery path and admin alert") previously had neither - a
+number stuck in PURCHASE_PENDING/PROVISIONING sat invisible until a staff
+member happened to query for it. This surfaces the backlog as a real
+internal alert (matching the Email Comms System doc's ZLOC-EM-NUM-INT-001
+"Number Provisioning Backlog" alert) instead of auto-retrying: a stuck
+number might mean the original purchase attempt actually succeeded at
+Twilio but crashed before updating our own status, and blindly re-running
+telecom.buy_number() here could double-purchase/double-charge - staff
+review via the existing retry_provisioning endpoint stays required.
 """
 
 import logging
 import sys
 
 from app.billing.service import run_zoikonex_reconciliation
-from app.compliance.service import expire_overdue_cases
+from app.compliance.service import expire_overdue_cases, flag_cases_due_for_reverification
 from app.core.database import SessionLocal
 from app.events.service import flush_pending_outbox_events
 from app.media.service import sweep_stale_video_recordings
-from app.numbering.numbers.service import list_due_renewals, sync_all_pending_eligibility_cases
+from app.notifications.service import send_internal_alert
+from app.numbering.numbers.service import (
+    list_due_renewals,
+    list_stuck_provisioning,
+    sync_all_pending_eligibility_cases,
+)
 from app.ops.service import expire_overdue_kill_switches
 from app.retention.service import purge_expired_recordings
 
@@ -81,6 +98,9 @@ def main() -> int:
         expired = expire_overdue_cases(db)
         logger.info("compliance_cases_expired count=%d", expired["expired"])
 
+        reverification = flag_cases_due_for_reverification(db)
+        logger.info("compliance_cases_flagged_for_reverification count=%d", reverification["flagged"])
+
         expired_switches = expire_overdue_kill_switches(db)
         logger.info(
             "kill_switches_expired platform=%d account=%d",
@@ -111,6 +131,24 @@ def main() -> int:
         )
         if eligibility["failed"] > 0:
             exit_code = 1
+
+        stuck = list_stuck_provisioning(db)
+        logger.info("numbers_stuck_provisioning count=%d", len(stuck))
+        if stuck:
+            exit_code = 1
+            from app.core.config import settings
+
+            send_internal_alert(
+                db, event_name="num_int.provisioning_backlog",
+                summary=(
+                    f"{len(stuck)} number(s) stuck in PURCHASE_PENDING/PROVISIONING beyond the recovery "
+                    f"threshold - oldest: {stuck[0].e164} ({stuck[0].country}, started "
+                    f"{stuck[0].provisioning_started_at}). Review and retry via the Provisioning Recovery "
+                    f"console - do not re-run the purchase automatically, as the original attempt may have "
+                    f"already succeeded at the provider."
+                ),
+                console_link=f"{settings.public_base_url}/staff/provisioning",
+            )
 
         outbox_published = outbox_failed = 0
         for _ in range(_MAX_OUTBOX_FLUSH_BATCHES):
