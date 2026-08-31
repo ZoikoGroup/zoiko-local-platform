@@ -356,6 +356,10 @@ def cancel_number(
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e
     except TelecomError as e:
         raise _telecom_error_response(e) from e
+    except KillSwitchTrippedError as e:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e)) from e
+    except AccountKillSwitchTrippedError as e:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e)) from e
 
 
 @router.post("/{e164}/sync-webhook", response_model=PhoneNumberResponse)

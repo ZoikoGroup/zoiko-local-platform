@@ -1,3 +1,5 @@
+import logging
+
 import pytest
 from twilio.request_validator import RequestValidator
 
@@ -1161,3 +1163,79 @@ def test_receptionist_callback_preference_persisted_without_using_callback_menu(
     assert len(calls) == 1
     assert calls[0]["callback_preference"] == "email"
     assert calls[0]["callback_requested"] is False
+
+
+def test_missed_escalation_notifies_the_nominated_team_member(client, db_session, monkeypatch, caplog):
+    """Real gap fix: mark_receptionist_escalation_missed previously only
+    log_event'd - the specific team member an urgent call was routed to
+    (escalation_user_id) had no way to learn they'd missed it short of
+    checking the dashboard, even though the account owner already gets a
+    voicemail-received email for the same call. This proves the escalation
+    target - not just the account owner - gets notified when they don't
+    pick up."""
+    from app.billing import service as billing_service
+
+    monkeypatch.setattr("app.core.config.settings.resend_api_key", "")
+    owner_token, account_id = _signup_and_login(client, "receptionistmissedesc1@example.com")
+    owner_headers = {"Authorization": f"Bearer {owner_token}"}
+    billing_service.change_plan(db_session, account_id, "business", actor="test-setup")
+
+    client.post(
+        "/team/members",
+        json={"email": "receptionistmissedescteammate1@example.com", "password": "supersecret123", "role": "member"},
+        headers=owner_headers,
+    )
+    members = client.get("/team/members", headers=owner_headers).json()
+    teammate_id = next(m["id"] for m in members if m["email"] == "receptionistmissedescteammate1@example.com")
+
+    number = PhoneNumber(
+        e164="+15550099999", country="US", status=PhoneNumberStatus.ACTIVE, account_id=account_id,
+        ai_receptionist_enabled=True, escalation_user_id=teammate_id, escalation_phone_number="+15551119999",
+    )
+    db_session.add(number)
+    db_session.commit()
+
+    client.post(
+        "/compliance/consent", json={"consent_type": "ai_processing"}, headers=owner_headers,
+    )
+    monkeypatch.setattr(
+        "app.media.service.qualify_caller",
+        lambda db, account_id, transcript, jurisdiction=None: (
+            {
+                "name": "Jordan", "company": "Acme", "reason": "production system is down",
+                "summary": "Jordan called about a production outage.", "urgency": "high",
+                "callback_preference": None,
+            },
+            "groq/test",
+        ),
+    )
+
+    respond_url = "http://testserver/media/receptionist/respond"
+    respond_params = {
+        "CallSid": "CArecmissedesc1", "To": "+15550099999", "From": "+15559991234",
+        "SpeechResult": "This is Jordan from Acme, our production system is down, extremely urgent.",
+    }
+    response = client.post(
+        "/media/receptionist/respond", data=respond_params,
+        headers={"X-Twilio-Signature": _twilio_signature(respond_url, respond_params)},
+    )
+    assert "<Dial" in response.text
+
+    calls = client.get("/media/receptionist/calls", headers=owner_headers).json()
+    assert len(calls) == 1
+    assert calls[0]["escalated"] is True
+    call_id = calls[0]["id"]
+
+    fallback_url = f"http://testserver/media/receptionist/escalation-fallback?receptionist_call_id={call_id}"
+    fallback_params = {"CallSid": "CArecmissedesc1", "DialCallStatus": "no-answer"}
+    with caplog.at_level(logging.INFO, logger="zoiko.notifications"):
+        client.post(
+            f"/media/receptionist/escalation-fallback?receptionist_call_id={call_id}",
+            data=fallback_params,
+            headers={"X-Twilio-Signature": _twilio_signature(fallback_url, fallback_params)},
+        )
+
+    assert any(
+        "receptionistmissedescteammate1@example.com" in record.message and "missed" in record.message.lower()
+        for record in caplog.records
+    )

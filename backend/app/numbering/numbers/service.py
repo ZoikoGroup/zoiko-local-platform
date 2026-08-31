@@ -1895,7 +1895,16 @@ def release_numbers_for_account_by_system(
     A single number's Twilio release failing doesn't abort the rest - the
     account is being torn down regardless, and leaving 9 of 10 numbers
     stuck ACTIVE because the 10th's provider call failed would be worse
-    than one number needing a manual follow-up release."""
+    than one number needing a manual follow-up release.
+
+    Deliberately NOT gated on KillSwitchScope.NUMBER_RELEASE (unlike
+    cancel_number above) - this only runs as the tail end of an already-
+    decided, already-audited system workflow (subscription termination),
+    same precedent as suspend_numbers_for_account_by_system below having no
+    kill-switch check of its own. The switch exists to let an incident stop
+    new customer-initiated or automated release actions; it isn't meant to
+    leave a terminated account's numbers stuck ACTIVE (and billing) because
+    an unrelated switch happens to be tripped."""
     numbers = (
         db.query(PhoneNumber)
         .filter(
@@ -1947,6 +1956,15 @@ def cancel_number(db: Session, user: User, e164: str) -> PhoneNumber:
     ):
         raise NumberConflictError(f"{e164} must be an active or suspended number owned by your account to cancel")
     assert_number_access(number, user)
+
+    # Commercial Billing Operating Standard doc §32.1 - "number release" is
+    # its own named kill-switch scope, distinct from NUMBER_PROVISIONING,
+    # so an incident can freeze cancellations (e.g. a bug wrongly releasing
+    # numbers) without also freezing new purchases, or vice versa.
+    assert_kill_switch_not_active(db, KillSwitchScope.NUMBER_RELEASE)
+    from app.risk.service import assert_account_kill_switch_not_active
+
+    assert_account_kill_switch_not_active(db, user.account_id, KillSwitchScope.NUMBER_RELEASE)
 
     # Release on Twilio *before* marking cancelled locally - if this fails,
     # the number stays ACTIVE/SUSPENDED here too, so the customer isn't left

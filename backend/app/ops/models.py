@@ -86,6 +86,7 @@ class SyntheticCheckRun(Base):
 
 class KillSwitchScope(str, enum.Enum):
     NUMBER_PROVISIONING = "number_provisioning"
+    NUMBER_RELEASE = "number_release"
     OUTBOUND_CALLING = "outbound_calling"
     AI_PROCESSING = "ai_processing"
     PAYMENTS_BILLING = "payments_billing"
