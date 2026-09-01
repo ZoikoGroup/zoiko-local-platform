@@ -2,6 +2,7 @@ import base64
 import hashlib
 import hmac
 import json
+import time
 
 from app.notifications.models import NotificationDeliveryStatus, SuppressionReason
 from app.notifications.service import (
@@ -286,7 +287,10 @@ def test_resend_webhook_updates_delivery_status_on_bounce(client, db_session, mo
     body = json.dumps(
         {"type": "email.bounced", "data": {"email_id": "resend_bounce_target", "to": ["webhookbounce@example.com"]}}
     ).encode()
-    svix_id, svix_timestamp = "msg_2", "1700000001"
+    # Real timestamp, not a fixed historical one - _verify_resend_signature
+    # rejects anything outside its replay window (real anti-replay
+    # protection), which a hardcoded old value would always fail.
+    svix_id, svix_timestamp = "msg_2", str(int(time.time()))
     signature = _resend_signature(_TEST_WEBHOOK_SECRET, svix_id, svix_timestamp, body)
 
     response = client.post(
@@ -321,7 +325,7 @@ def test_resend_webhook_delivered_updates_status(client, db_session, monkeypatch
     body = json.dumps(
         {"type": "email.delivered", "data": {"email_id": "resend_delivered_target", "to": ["webhookdelivered@example.com"]}}
     ).encode()
-    svix_id, svix_timestamp = "msg_3", "1700000002"
+    svix_id, svix_timestamp = "msg_3", str(int(time.time()))
     signature = _resend_signature(_TEST_WEBHOOK_SECRET, svix_id, svix_timestamp, body)
 
     response = client.post(

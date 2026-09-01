@@ -48,3 +48,21 @@ export function useStaffToken(): { token: string | null; ready: boolean } {
   );
   return { token, ready };
 }
+
+/**
+ * Reads the `sub` claim (the logged-in staff member's own id) straight out
+ * of the JWT payload, client-side - no signature verification, since this
+ * is only ever used for a UX nicety (e.g. hiding your own "deactivate"
+ * button on the team page). The real enforcement of "can't deactivate
+ * yourself" lives server-side in app.staff.service.set_staff_active
+ * regardless of what this returns.
+ */
+export function getOwnStaffIdFromToken(token: string): string | null {
+  try {
+    const payload = token.split(".")[1];
+    const decoded = JSON.parse(atob(payload.replace(/-/g, "+").replace(/_/g, "/")));
+    return typeof decoded.sub === "string" ? decoded.sub : null;
+  } catch {
+    return null;
+  }
+}

@@ -47,6 +47,7 @@ def _serialize_user(user: User) -> dict:
         "role": user.role.value,
         "mfa_secret": user.mfa_secret,
         "mfa_enabled": user.mfa_enabled,
+        "email_verified": user.email_verified,
         "created_at": user.created_at.isoformat() if user.created_at else None,
     }
 
@@ -61,6 +62,13 @@ def _deserialize_user(data: dict) -> User:
         role=UserRole(data["role"]),
         mfa_secret=data["mfa_secret"],
         mfa_enabled=data["mfa_enabled"],
+        # get(), not [] - a cache entry written by an older deploy (before
+        # this field existed) shouldn't 500 every /auth/me until its TTL
+        # (30s) expires; falls back to the real DB default (see User model)
+        # rather than leaving it unset, which crashed response validation
+        # ("email_verified" is a non-nullable bool) - found live via this
+        # exact repro during the anilupdated merge.
+        email_verified=data.get("email_verified", False),
         created_at=datetime.fromisoformat(data["created_at"]) if data["created_at"] else None,
     )
 

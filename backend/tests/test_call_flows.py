@@ -255,10 +255,10 @@ def test_menu_digit_routes_to_the_matching_forward_node(client, db_session):
 
     assert response.status_code == 200
     assert "+15552220000" in response.text
-    # Not a bare "<Number>" - build_ring_group_response puts
-    # statusCallback/statusCallbackEvent as attributes on this noun (a real
-    # TwiML-validation fix, not a formatting choice - see its docstring).
-    assert "<Number " in response.text
+    # build_ring_group_response no longer attaches a per-leg statusCallback
+    # (real bug fix: that callback fires with the CHILD leg's CallSid,
+    # which never matches any CallRecord - see that function's docstring).
+    assert "<Number>" in response.text
 
 
 def test_invalid_menu_digit_repeats_the_same_menu(client, db_session):

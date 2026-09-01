@@ -659,6 +659,59 @@ export function revokeCapability(staffToken: string, capability: string, role: s
   );
 }
 
+// Who has staff console access, and at what role: listStaffTeam/
+// createStaffTeamMember/deactivateStaffTeamMember/reactivateStaffTeamMember
+// (defined further up, near getCurrentStaff) already cover this - staff.
+// manage_staff_accounts, not a second /staff/members surface.
+
+// Platform-wide emergency kill switches (Commercial Billing Operating
+// Standard doc §32.1) - "stop new harm without destroying customer
+// evidence or unrelated service" during an incident. Activating/
+// deactivating requires the ops.manage_kill_switches capability (Super
+// Admin only, by default); any staff role can view current state.
+
+export const KILL_SWITCH_SCOPES = [
+  "number_provisioning",
+  "number_release",
+  "outbound_calling",
+  "ai_processing",
+  "payments_billing",
+] as const;
+
+export type KillSwitch = {
+  id: string;
+  scope: string;
+  is_active: boolean;
+  reason: string | null;
+  activated_by: string | null;
+  activated_at: string | null;
+  deactivated_at: string | null;
+  expires_at: string | null;
+};
+
+export function listKillSwitches(staffToken: string): Promise<KillSwitch[]> {
+  return request<KillSwitch[]>("/ops/kill-switches", {
+    headers: { Authorization: `Bearer ${staffToken}` },
+  });
+}
+
+export function activateKillSwitch(
+  staffToken: string, scope: string, reason: string | null, expiresAt: string | null
+): Promise<KillSwitch> {
+  return request<KillSwitch>(`/ops/kill-switches/${scope}/activate`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${staffToken}` },
+    body: JSON.stringify({ reason, expires_at: expiresAt }),
+  });
+}
+
+export function deactivateKillSwitch(staffToken: string, scope: string): Promise<KillSwitch> {
+  return request<KillSwitch>(`/ops/kill-switches/${scope}/deactivate`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${staffToken}` },
+  });
+}
+
 export type StaffNumberSearchResult = {
   id: string;
   e164: string;
@@ -884,24 +937,8 @@ export function listIncidents(limit: number = 50): Promise<Incident[]> {
   return request<Incident[]>(`/ops/incidents?limit=${limit}`);
 }
 
-// --- Kill switches (staff-only, platform-wide or per-account) ---
-
-export type KillSwitch = {
-  id: string;
-  scope: string;
-  is_active: boolean;
-  reason: string | null;
-  activated_by: string | null;
-  activated_at: string | null;
-  deactivated_at: string | null;
-  expires_at: string | null;
-};
-
-export function listKillSwitches(staffToken: string): Promise<KillSwitch[]> {
-  return request<KillSwitch[]>("/ops/kill-switches", {
-    headers: { Authorization: `Bearer ${staffToken}` },
-  });
-}
+// Kill switches: type/listKillSwitches/activateKillSwitch/deactivateKillSwitch
+// are defined once, near the other staff-only endpoints above.
 
 export function createIncident(
   staffToken: string,

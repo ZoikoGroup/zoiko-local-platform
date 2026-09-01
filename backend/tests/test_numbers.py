@@ -622,6 +622,14 @@ def test_purchase_is_blocked_without_the_emergency_calling_disclosure_acknowledg
         "/auth/login", json={"email": "nodisclosure@example.com", "password": "supersecret123"}
     ).json()["access_token"]
     headers = {"Authorization": f"Bearer {token}"}
+    # Email verification is checked ahead of the emergency-calling
+    # disclosure (the cheapest possible gate, per purchase_number's own
+    # comment) - must be satisfied first so this test actually reaches
+    # the disclosure check it's named for, not a different 403.
+    from app.core.security import create_access_token
+
+    user_id = client.get("/auth/me", headers=headers).json()["id"]
+    client.post("/auth/verify-email", json={"token": create_access_token(subject=user_id, scope="email_verification")})
     client.put("/billing/subscription/plan", json={"plan_code": "starter", "billing_period": "monthly"}, headers=headers)
 
     _reserve(client, headers, "+15550009911")
@@ -644,6 +652,10 @@ def test_purchase_succeeds_once_emergency_calling_disclosure_is_acknowledged(cli
         "/auth/login", json={"email": "disclosureok@example.com", "password": "supersecret123"}
     ).json()["access_token"]
     headers = {"Authorization": f"Bearer {token}"}
+    from app.core.security import create_access_token
+
+    user_id = client.get("/auth/me", headers=headers).json()["id"]
+    client.post("/auth/verify-email", json={"token": create_access_token(subject=user_id, scope="email_verification")})
     client.put("/billing/subscription/plan", json={"plan_code": "starter", "billing_period": "monthly"}, headers=headers)
 
     _reserve(client, headers, "+15550009922")

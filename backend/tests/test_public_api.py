@@ -439,7 +439,7 @@ def test_public_api_cannot_delete_another_accounts_webhook(client, db_session, m
     ).json()["raw_key"]
 
     endpoint = client.post(
-        "/public/v1/webhooks", json={"url": "https://a.example.com/hook"},
+        "/public/v1/webhooks", json={"url": "https://example.com/hook"},
         headers={"Authorization": f"Bearer {key_a}"},
     ).json()
 

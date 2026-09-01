@@ -47,7 +47,11 @@ class LastGrantRemovalError(Exception):
 def create_staff(db: Session, email: str, password: str, role: PlatformStaffRole) -> PlatformStaff:
     """role has no default - there's no public staff signup endpoint (staff
     are provisioned internally, see app/seed.py), so every call site must
-    consciously pick a role rather than silently inheriting a default."""
+    consciously pick a role rather than silently inheriting a default.
+    Deliberately stays bare (no actor/audit logging) - bootstrap_initial_
+    super_admin and create_staff_member (its console-driven wrapper) each
+    log their own event under a different actor shape, so hardcoding one
+    audit shape here would fit neither caller cleanly."""
     existing = db.query(PlatformStaff).filter(PlatformStaff.email == email).first()
     if existing:
         raise ValueError("A staff account with this email already exists")

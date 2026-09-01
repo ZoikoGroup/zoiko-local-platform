@@ -243,18 +243,19 @@ def test_notification_delivery_is_recorded_and_listable(client, db_session, monk
         },
     )
 
-    # Two deliveries now: signup itself sends auth.account_activated, plus
-    # the number.activated sent explicitly above - the account's
-    # notification list is account-wide, not filtered to one event.
+    # Three deliveries now: signup itself sends both auth.account_activated
+    # and auth.verify_email_address, plus the number.activated sent
+    # explicitly above - the account's notification list is account-wide,
+    # not filtered to one event.
     deliveries = list_account_notifications(db_session, account_id)
-    assert len(deliveries) == 2
+    assert len(deliveries) == 3
     number_activated = next(d for d in deliveries if d.event_name == "number.activated")
     assert number_activated.status == "sent"
 
     response = client.get("/notifications/me", headers={"Authorization": f"Bearer {token}"})
     assert response.status_code == 200
     body = response.json()
-    assert len(body) == 2
+    assert len(body) == 3
     number_activated_row = next(r for r in body if r["subject"] == "+15550009999 is active on Zoiko Local")
     assert number_activated_row["channel"] == "email"
     assert number_activated_row["read_at"] is None
@@ -343,11 +344,12 @@ def test_mark_all_notifications_read(client, db_session, monkeypatch):
         },
     )
 
-    # 3, not 2 - signup itself sends auth.account_activated in addition to
-    # the two number.activated notifications sent explicitly above.
+    # 4, not 2 - signup itself sends both auth.account_activated and
+    # auth.verify_email_address, in addition to the two number.activated
+    # notifications sent explicitly above.
     response = client.post("/notifications/read-all", headers={"Authorization": f"Bearer {token}"})
     assert response.status_code == 200
-    assert response.json()["marked_read"] == 3
+    assert response.json()["marked_read"] == 4
 
     listed = client.get("/notifications/me", headers={"Authorization": f"Bearer {token}"}).json()
     assert all(n["read_at"] is not None for n in listed)

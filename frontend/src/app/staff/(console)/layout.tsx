@@ -84,6 +84,7 @@ const NAV_GROUPS: { group: string; items: NavItem[] }[] = [
           "billing.manage_ai_usage_rates",
         ],
       },
+      { href: "/staff/kill-switches", label: "Kill Switches", icon: "power", capabilities: ["ops.manage_kill_switches"] },
     ],
   },
   {
@@ -120,6 +121,7 @@ type IconName =
   | "receipt"
   | "history"
   | "grid"
+  | "power"
   | "sun"
   | "moon"
   | "userPlus";
@@ -186,6 +188,12 @@ const ICON_PATHS: Record<IconName, React.ReactNode> = {
       <rect x="13" y="4" width="7" height="7" rx="1.4" />
       <rect x="4" y="13" width="7" height="7" rx="1.4" />
       <rect x="13" y="13" width="7" height="7" rx="1.4" />
+    </>
+  ),
+  power: (
+    <>
+      <path d="M12 3v8" />
+      <path d="M7 5.5a8 8 0 105-2.5" />
     </>
   ),
   sun: (
