@@ -3,7 +3,7 @@ import uuid
 from datetime import datetime
 
 from pgvector.sqlalchemy import Vector
-from sqlalchemy import JSON, DateTime, Enum, ForeignKey, Index, Integer, String, Text, UniqueConstraint, func
+from sqlalchemy import JSON, Boolean, DateTime, Enum, ForeignKey, Index, Integer, String, Text, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -62,6 +62,26 @@ class AIJob(Base):
     )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class GuardrailRule(Base):
+    """AI Receptionist disallowed-commitment patterns (see
+    app/intelligence/guardrails.py's check_for_disallowed_commitments) -
+    stored as data per the architecture rule ("Compliance rules are stored
+    as data, never hardcoded if-statements"), replacing what used to be
+    module-level Python regex constants (_PRICING_PATTERNS/_LEGAL_PATTERNS/
+    _MEDICAL_PATTERNS). One row per pattern; a category (e.g.
+    "pricing_commitment") has many rows. Global/platform-wide, not scoped to
+    an account - same scope as compliance.models.ComplianceRule.
+    """
+
+    __tablename__ = "guardrail_rules"
+
+    id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=new_uuid)
+    category: Mapped[str] = mapped_column(String(50), nullable=False, index=True)
+    pattern: Mapped[str] = mapped_column(Text, nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
 class ConversationSummary(Base):

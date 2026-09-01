@@ -47,6 +47,7 @@ from app.events.service import (
 from app.integrations.billing import zoikonex as zoikonex_adapter
 from app.integrations.cache.redis import cache_get, cache_set
 from app.integrations.telecom import twilio as telecom
+from app.notifications.models import NotificationDelivery
 from app.notifications.service import (
     notify_credit_or_refund_processed,
     notify_invoice_available,
@@ -644,7 +645,8 @@ def _invalidate_plan_change_side_effects(db: Session, sub: Subscription) -> None
     sub = sync_subscription_to_zoikonex(db, sub)
     log_event(
         db, actor="system:billing_lifecycle", action="subscription.plan_change_applied",
-        target=f"subscription:{sub.id}", after={"plan_code": sub.plan_code, "billing_period": sub.billing_period.value},
+        target=f"subscription:{sub.id}", account_id=sub.account_id,
+        after={"plan_code": sub.plan_code, "billing_period": sub.billing_period.value},
     )
     publish_event_durably(
         db, "zoiko.billing", "subscription.plan_change_applied", sub.account_id,
@@ -697,6 +699,7 @@ def change_plan(
 
     log_event(
         db, actor=actor, action="subscription.plan_changed", target=f"subscription:{sub.id}",
+        account_id=account_id,
         before={"plan_code": before_plan}, after={"plan_code": sub.plan_code},
     )
 
@@ -930,6 +933,7 @@ def confirm_plan_change(db: Session, account_id: str, preview_token: str, *, act
         db.commit()
         log_event(
             db, actor=actor, action="subscription.downgrade_scheduled", target=f"subscription:{sub.id}",
+            account_id=account_id,
             before={"plan_code": current_plan.plan_code},
             after={"scheduled_plan_code": target_plan.plan_code, "effective_at": sub.scheduled_change_effective_at.isoformat()},
         )
@@ -959,6 +963,7 @@ def cancel_scheduled_plan_change(db: Session, account_id: str, *, actor: str) ->
     db.commit()
     log_event(
         db, actor=actor, action="subscription.plan_change_cancelled", target=f"subscription:{sub.id}",
+        account_id=account_id,
         before={"scheduled_plan_code": cancelled_plan_code},
     )
     return sub
@@ -1008,7 +1013,7 @@ def create_plan_change_checkout_session(
 
     log_event(
         db, actor=actor, action="subscription.plan_change_checkout_created",
-        target=f"subscription_checkout:{record.id}",
+        target=f"subscription_checkout:{record.id}", account_id=account_id,
         after={"plan_code": plan.plan_code, "billing_period": billing_period.value, "stripe_session_id": session["id"]},
     )
     return session
@@ -1410,6 +1415,31 @@ def _apply_payment_event(
     if event_type not in _PAYMENT_EVENT_TYPES:
         raise InvalidPaymentEventError(f"Unknown payment event type: {event_type!r}")
 
+    # Idempotency guard on the STATE MUTATION itself, not just the
+    # downstream notification send below. handle_zoikonex_payment_webhook
+    # already dedupes via ZoikoNexSyncEvent.external_event_id before ever
+    # calling this function, but handle_stripe_subscription_payment_webhook
+    # had no equivalent - Stripe redelivers webhook events at-least-once,
+    # so a redelivered payment_failed unconditionally reset
+    # grace_period_ends_at forward again on every retry, meaning
+    # assert_billing_not_suspended could never actually trip for a
+    # chronically non-paying account. Reuses the same NotificationDelivery.
+    # idempotency_key ledger the notify_* calls below already dedupe
+    # against (no new table needed): if a delivery already exists for this
+    # exact key, this exact event was already fully applied end-to-end, so
+    # skip the whole mutation and return the subscription unchanged. Note
+    # this relies on the notify_* call actually running (i.e. an OWNER user
+    # exists for the account) - the same pre-existing dependency the
+    # notification-only dedupe already had.
+    if notif_idempotency_key is not None:
+        already_applied = (
+            db.query(NotificationDelivery)
+            .filter(NotificationDelivery.idempotency_key == notif_idempotency_key)
+            .first()
+        )
+        if already_applied is not None:
+            return sub
+
     account_id = sub.account_id
     now = _db_now(db)
     before_status = sub.status
@@ -1427,7 +1457,7 @@ def _apply_payment_event(
     db.refresh(sub)
 
     log_event(
-        db, actor=actor, action=action, target=f"subscription:{sub.id}",
+        db, actor=actor, action=action, target=f"subscription:{sub.id}", account_id=account_id,
         before={"status": before_status.value}, after={"status": sub.status.value, "event_type": event_type},
     )
     publish_subscription_payment_event(
@@ -1595,7 +1625,7 @@ def handle_stripe_subscription_deleted_webhook(db: Session, *, stripe_subscripti
     sync_subscription_to_zoikonex(db, sub)
     log_event(
         db, actor="stripe_checkout_webhook", action="billing.subscription_canceled_by_stripe",
-        target=f"subscription:{sub.id}",
+        target=f"subscription:{sub.id}", account_id=sub.account_id,
     )
     publish_subscription_canceled(sub.account_id, subscription_id=sub.id, reason="stripe_subscription_deleted")
     return sub
@@ -1683,6 +1713,7 @@ def cancel_subscription(db: Session, account_id: str, *, actor: str, reason: str
     sync_subscription_to_zoikonex(db, sub)
     log_event(
         db, actor=actor, action="billing.subscription_canceled", target=f"subscription:{sub.id}",
+        account_id=account_id,
         after={"reason": reason},
     )
     publish_subscription_canceled(account_id, subscription_id=sub.id, reason=reason)
@@ -1745,6 +1776,7 @@ def terminate_subscription(db: Session, account_id: str, *, actor: str, reason: 
 
     log_event(
         db, actor=actor, action="billing.subscription_terminated", target=f"subscription:{sub.id}",
+        account_id=account_id,
         before={"status": before_status.value},
         after={"status": sub.status.value, "reason": reason, "numbers_released": len(released)},
     )
@@ -2210,7 +2242,7 @@ def resolve_zoikonex_reconciliation_exception(
 
     log_event(
         db, actor=actor, action="zoikonex.reconciliation_exception_resolved",
-        target=f"zoikonex_reconciliation_exception:{exc.id}",
+        target=f"zoikonex_reconciliation_exception:{exc.id}", account_id=exc.account_id,
         after={"exception_type": exc.exception_type.value, "subject_id": exc.subject_id, "reason": reason},
     )
     return exc
@@ -2538,6 +2570,13 @@ def run_billing_cycle(db: Session, account_id: str, *, actor: str) -> dict:
                     tax=f"{tax_amount_minor_units / 100:.2f}",
                     total=f"{(line_item_total_minor_units + tax_amount_minor_units) / 100:.2f}",
                     currency=currency_code,
+                    # Same notif_idempotency_key convention as
+                    # _apply_payment_event above - invoice["invoice_id"] is
+                    # itself deterministic per (sub.id, current_period_start)
+                    # (see create_invoice's own comment), so this guards
+                    # against a concurrent/retried run_billing_cycle
+                    # execution for the same period double-sending this.
+                    idempotency_key=f"invoice_available:{invoice['invoice_id']}",
                 )
             except Exception:
                 # Unlike the analogous Stripe-cancel failure above, this was
@@ -2617,6 +2656,11 @@ def run_billing_cycle(db: Session, account_id: str, *, actor: str) -> dict:
                     description=f"{plan.name} plan - {sub.billing_period.value} subscription",
                     payment_date=_db_now(db).date().isoformat(),
                     payment_method_masked="on file with ZoikoNex",
+                    # Same rationale as notify_invoice_available's
+                    # idempotency_key above - guards a concurrent/retried
+                    # run_billing_cycle execution against double-sending
+                    # this for the same invoice/period.
+                    idempotency_key=f"payment_succeeded:{invoice['invoice_id']}",
                 )
             except Exception:
                 # Same rationale as the invoice-available swallow above -
@@ -2651,7 +2695,7 @@ def run_billing_cycle(db: Session, account_id: str, *, actor: str) -> dict:
     db.commit()
 
     log_event(
-        db, actor=actor, action="billing.cycle_run", target=f"subscription:{sub.id}",
+        db, actor=actor, action="billing.cycle_run", target=f"subscription:{sub.id}", account_id=account_id,
         after={"invoice_id": invoice["invoice_id"], "payment_status": result["payment_status"]},
     )
     return result
@@ -2683,6 +2727,7 @@ def issue_invoice_credit_note(
     db.commit()
     log_event(
         db, actor=actor, action="billing.credit_note_issued", target=f"invoice:{invoice_id}",
+        account_id=account_id,
         after={"credit_note_id": result["credit_note_id"], "amount_minor_units": amount_minor_units, "reason": reason},
     )
     return result
@@ -2709,6 +2754,7 @@ def issue_invoice_debit_note(
     db.commit()
     log_event(
         db, actor=actor, action="billing.debit_note_issued", target=f"invoice:{invoice_id}",
+        account_id=account_id,
         after={"debit_note_id": result["debit_note_id"], "amount_minor_units": amount_minor_units, "reason": reason},
     )
     return result
@@ -2740,6 +2786,7 @@ def refund_zoikonex_payment(
     db.commit()
     log_event(
         db, actor=actor, action="billing.payment_refunded", target=f"payment_intent:{payment_intent_id}",
+        account_id=account_id,
         after={"refund_id": result["refund_id"], "amount_minor_units": amount_minor_units, "reason": reason},
     )
     return result
@@ -2820,7 +2867,7 @@ def set_ai_receptionist_addon(db: Session, account_id: str, *, enabled: bool, ac
     db.refresh(sub)
     log_event(
         db, actor_id=actor, action="billing.ai_receptionist_addon_changed",
-        target_type="subscription", target_id=sub.id,
+        target_type="subscription", target_id=sub.id, account_id=account_id,
         metadata={"account_id": account_id, "previous": previous, "enabled": enabled},
     )
     return sub
@@ -2931,7 +2978,7 @@ def request_billing_action(
     db.refresh(request)
     log_event(
         db, actor=requested_by, action="billing.action_requested",
-        target=f"billing_action_request:{request.id}",
+        target=f"billing_action_request:{request.id}", account_id=payload.get("account_id"),
         after={"action_type": action_type.value, "payload": payload},
     )
     return request
@@ -2999,7 +3046,7 @@ def approve_billing_action(db: Session, request_id: str, *, actor: str) -> Billi
     db.refresh(request)
     log_event(
         db, actor=actor, action="billing.action_approved",
-        target=f"billing_action_request:{request.id}",
+        target=f"billing_action_request:{request.id}", account_id=request.payload.get("account_id"),
         after={"action_type": request.action_type.value, "result": result},
     )
     return request
@@ -3025,7 +3072,7 @@ def reject_billing_action(db: Session, request_id: str, *, actor: str, reason: s
     db.refresh(request)
     log_event(
         db, actor=actor, action="billing.action_rejected",
-        target=f"billing_action_request:{request.id}",
+        target=f"billing_action_request:{request.id}", account_id=request.payload.get("account_id"),
         after={"action_type": request.action_type.value, "reason": reason},
     )
     return request

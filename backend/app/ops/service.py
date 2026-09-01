@@ -230,11 +230,18 @@ def _list_active_subscribers(db: Session) -> list:
     return db.query(User).filter(User.account_id.in_(account_ids), User.email.isnot(None)).all()
 
 
-def create_incident(db: Session, *, title: str, affected_service: str, impact_summary: str) -> Incident:
+def create_incident(
+    db: Session, *, title: str, affected_service: str, impact_summary: str, actor: str = "staff_console"
+) -> Incident:
     incident = Incident(title=title, affected_service=affected_service, impact_summary=impact_summary)
     db.add(incident)
     db.commit()
     db.refresh(incident)
+    log_event(
+        db, actor=actor, action="ops.incident_created", target=f"incident:{incident.id}",
+        after={"title": title, "affected_service": affected_service, "impact_summary": impact_summary,
+               "status": incident.status.value},
+    )
     publish_incident_declared(incident_id=incident.id, title=title, affected_service=affected_service)
     for user in _list_active_subscribers(db):
         notify_incident_declared(
@@ -254,7 +261,7 @@ class IncidentAlreadyResolvedError(Exception):
 
 def update_incident(
     db: Session, incident_id: str, *, status: IncidentStatus, impact_summary: str | None = None,
-    mitigation_summary: str | None = None,
+    mitigation_summary: str | None = None, actor: str = "staff_console",
 ) -> Incident:
     incident = db.query(Incident).filter(Incident.id == incident_id).first()
     if incident is None:
@@ -262,6 +269,10 @@ def update_incident(
     if incident.status == IncidentStatus.RESOLVED:
         raise IncidentAlreadyResolvedError(f"Incident {incident_id} is already resolved")
 
+    before = {
+        "status": incident.status.value, "impact_summary": incident.impact_summary,
+        "mitigation_summary": incident.mitigation_summary,
+    }
     incident.status = status
     if impact_summary is not None:
         incident.impact_summary = impact_summary
@@ -269,6 +280,14 @@ def update_incident(
         incident.mitigation_summary = mitigation_summary
     db.commit()
     db.refresh(incident)
+    log_event(
+        db, actor=actor, action="ops.incident_updated", target=f"incident:{incident.id}",
+        before=before,
+        after={
+            "status": incident.status.value, "impact_summary": incident.impact_summary,
+            "mitigation_summary": incident.mitigation_summary,
+        },
+    )
     for user in _list_active_subscribers(db):
         notify_incident_update(
             db, account_id=user.account_id, account_email=user.email, incident_reference=incident.id,
@@ -278,17 +297,23 @@ def update_incident(
     return incident
 
 
-def resolve_incident(db: Session, incident_id: str) -> Incident:
+def resolve_incident(db: Session, incident_id: str, *, actor: str = "staff_console") -> Incident:
     incident = db.query(Incident).filter(Incident.id == incident_id).first()
     if incident is None:
         raise IncidentNotFoundError(f"No such incident {incident_id!r}")
     if incident.status == IncidentStatus.RESOLVED:
         raise IncidentAlreadyResolvedError(f"Incident {incident_id} is already resolved")
 
+    before_status = incident.status.value
     incident.status = IncidentStatus.RESOLVED
     incident.resolved_at = sa.func.now()
     db.commit()
     db.refresh(incident)
+    log_event(
+        db, actor=actor, action="ops.incident_resolved", target=f"incident:{incident.id}",
+        before={"status": before_status},
+        after={"status": incident.status.value, "resolved_at": incident.resolved_at.isoformat()},
+    )
     publish_incident_resolved(incident_id=incident.id)
     duration = incident.resolved_at - incident.started_at
     for user in _list_active_subscribers(db):
@@ -450,7 +475,7 @@ def expire_overdue_kill_switches(db: Session) -> dict[str, int]:
         switch.deactivated_at = now
         log_event(
             db, actor="system:kill_switch_expiry", action="risk.account_kill_switch_deactivated",
-            target=f"account_kill_switch:{switch.id}",
+            target=f"account_kill_switch:{switch.id}", account_id=switch.account_id,
             after={"reason": "expired", "account_id": switch.account_id, "expires_at": switch.expires_at.isoformat()},
         )
         # The manual deactivation path (risk/service.py:592) publishes this

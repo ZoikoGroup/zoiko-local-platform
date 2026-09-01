@@ -65,6 +65,7 @@ def save_draft(
         return service.save_draft(
             db, current_user.account_id, call_flow_id, payload.entry_node_id,
             [node.model_dump(mode="json") for node in payload.nodes],
+            actor_id=current_user.id,
         )
     except CallFlowNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e

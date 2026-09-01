@@ -287,14 +287,38 @@ def pull_next_caller(db: Session, queue: CallQueue, agent: User, base_url: str) 
     if not agent.phone_number:
         raise AgentPhoneNotSetError(agent.id)
 
+    # with_for_update(skip_locked=True): two agents concurrently hitting
+    # POST /queues/{id}/pull-next must not both select the same waiting
+    # caller. skip_locked means a second concurrent pull simply doesn't see
+    # a row already locked by a first in-flight pull (rather than blocking
+    # on it and then double-dispatching once the first commits). Filtering
+    # on agent_user_id.is_(None) too (not just left_at/answered_at) lets us
+    # reserve the row by setting agent_user_id below, immediately, in the
+    # same transaction as the lock - so a second pull genuinely cannot
+    # select this row again even after this transaction commits, well
+    # before the real outbound Twilio call is placed. agent_user_id (not
+    # answered_at) is the reservation marker: answered_at is set later, by
+    # mark_answered() once the agent's phone actually answers (see
+    # media/voice/queue/agent-connect), and that lookup filters on
+    # answered_at.is_(None) - setting answered_at here would make that
+    # later lookup fail to find this row.
     oldest = (
         db.query(QueueCallLog)
-        .filter(QueueCallLog.queue_id == queue.id, QueueCallLog.left_at.is_(None), QueueCallLog.answered_at.is_(None))
+        .filter(
+            QueueCallLog.queue_id == queue.id,
+            QueueCallLog.left_at.is_(None),
+            QueueCallLog.answered_at.is_(None),
+            QueueCallLog.agent_user_id.is_(None),
+        )
         .order_by(QueueCallLog.entered_at.asc())
+        .with_for_update(skip_locked=True)
         .first()
     )
     if oldest is None:
         raise NoWaitingCallerError(queue.id)
+
+    oldest.agent_user_id = agent.id
+    db.commit()
 
     agent_connect_url = (
         f"{base_url}media/voice/queue/agent-connect"
@@ -314,17 +338,27 @@ def pull_next_caller(db: Session, queue: CallQueue, agent: User, base_url: str) 
 
     from_number = oldest.phone_number_e164 or agent.phone_number
     owner = db.query(User).filter(User.account_id == queue.account_id, User.role == UserRole.OWNER).first()
-    assert_outbound_call_allowed(
-        db, account_id=queue.account_id, account_email=owner.email if owner else "",
-        to=agent.phone_number, from_number=from_number,
-    )
-
-    result = telecom.place_call(
-        to=agent.phone_number,
-        from_=from_number,
-        twiml_url=agent_connect_url,
-        status_callback_url=status_callback_url,
-    )
+    try:
+        assert_outbound_call_allowed(
+            db, account_id=queue.account_id, account_email=owner.email if owner else "",
+            to=agent.phone_number, from_number=from_number,
+        )
+        result = telecom.place_call(
+            to=agent.phone_number,
+            from_=from_number,
+            twiml_url=agent_connect_url,
+            status_callback_url=status_callback_url,
+        )
+    except Exception:
+        # Release the reservation made above so this caller isn't stuck
+        # un-pullable (agent_user_id would otherwise stay set forever) just
+        # because this particular dispatch attempt was blocked by a
+        # kill-switch/billing/risk gate or a Twilio error - the caller is
+        # still genuinely waiting and should be eligible for the very next
+        # pull (by this agent or another).
+        oldest.agent_user_id = None
+        db.commit()
+        raise
     # Without a CallRecord, this call is invisible to assert_outbound_
     # velocity_ok's own count on every subsequent pull, and to usage/
     # billing metering - both of which key off CallRecord, not just the

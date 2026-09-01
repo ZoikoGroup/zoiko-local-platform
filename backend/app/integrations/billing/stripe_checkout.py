@@ -34,6 +34,28 @@ class PaymentError(Exception):
     """Raised instead of letting a stripe SDK exception escape this module."""
 
 
+def _is_provider_failure(e: Exception) -> bool:
+    """Passed as with_failover's is_breaker_failure - _breaker is a single
+    process-wide instance shared by every Stripe payment operation on the
+    platform, so what counts as a "failure" here matters beyond just this
+    one request. Every PaymentError raised in this module wraps the
+    original stripe.error.StripeError via `from e`, so e.__cause__ is that
+    original exception.
+
+    A StripeError carries the real HTTP status Stripe returned via
+    `.http_status` (e.g. CardError -> a declined card, 402; InvalidRequestError
+    -> 4xx; APIConnectionError -> None; APIError -> 5xx). A 4xx means
+    Stripe understood and rejected THIS specific request (a declined card
+    is the textbook example - it says nothing about whether Stripe itself
+    is healthy) - failing over a declined card to a secondary would just
+    charge the same declined card again at real vendor cost. Only a 5xx (or
+    no status at all - a connection-level failure with nothing HTTP to
+    inspect) should count as a real provider-health signal - same
+    conservative default as twilio.py's _is_provider_failure."""
+    status = getattr(getattr(e, "__cause__", None), "http_status", None)
+    return status is None or status >= 500
+
+
 def health_check() -> dict:
     """Real reachability check. Deliberately NOT stripe.Account.retrieve
     (the pattern app.integrations.kyc.stripe_identity's health_check uses)
@@ -86,7 +108,7 @@ def create_checkout_session(
             raise PaymentError(f"Stripe create checkout session failed: {e}") from e
         return {"id": session.id, "url": session.url}
 
-    return with_failover(_breaker, _primary, None, PaymentError)
+    return with_failover(_breaker, _primary, None, PaymentError, _is_provider_failure)
 
 
 def create_subscription_checkout_session(
@@ -128,7 +150,7 @@ def create_subscription_checkout_session(
             raise PaymentError(f"Stripe create subscription checkout session failed: {e}") from e
         return {"id": session.id, "url": session.url}
 
-    return with_failover(_breaker, _primary, None, PaymentError)
+    return with_failover(_breaker, _primary, None, PaymentError, _is_provider_failure)
 
 
 def cancel_subscription(stripe_subscription_id: str) -> dict:
@@ -152,7 +174,7 @@ def cancel_subscription(stripe_subscription_id: str) -> dict:
             raise PaymentError(f"Stripe cancel subscription failed: {e}") from e
         return {"id": subscription.id, "status": subscription.status}
 
-    return with_failover(_breaker, _primary, None, PaymentError)
+    return with_failover(_breaker, _primary, None, PaymentError, _is_provider_failure)
 
 
 def refund_payment(payment_intent_id: str) -> dict:
@@ -181,7 +203,7 @@ def refund_payment(payment_intent_id: str) -> dict:
             raise PaymentError(f"Stripe refund failed: {e}") from e
         return {"id": refund.id, "status": refund.status, "amount": refund.amount, "currency": refund.currency}
 
-    return with_failover(_breaker, _primary, None, PaymentError)
+    return with_failover(_breaker, _primary, None, PaymentError, _is_provider_failure)
 
 
 def construct_webhook_event(payload: bytes, signature_header: str) -> stripe.Event:

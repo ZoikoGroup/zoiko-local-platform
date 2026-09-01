@@ -227,11 +227,15 @@ def search_available_numbers(country: str, number_type: str = "local", area_code
             for n in numbers
         ]
 
-    secondary_fn = (
-        (lambda: secondary.search_available_numbers(country, number_type, area_code, contains, limit))
-        if settings.telecom_failover_enabled else None
-    )
-    return with_failover(_breaker, _primary, secondary_fn, TelecomError, _is_provider_failure)
+    # Vonage failover deliberately disabled here (matches buy_number's own
+    # disable below) - search and buy must stay in sync on which secondary
+    # providers are actually wired end-to-end, or a customer can search
+    # (falls over to Vonage while the Twilio breaker is OPEN), reserve, and
+    # try to purchase a Vonage-only number that buy_number's secondary_fn=None
+    # can never fulfill, failing immediately at the worst possible moment
+    # (after they've already picked a number). Remove this override in
+    # lockstep with buy_number's, not independently.
+    return with_failover(_breaker, _primary, None, TelecomError, _is_provider_failure)
 
 
 def list_owned_numbers() -> list[dict]:
@@ -611,7 +615,20 @@ def build_voice_access_token(identity: str) -> str:
     "client:<account_id>" alongside the number's configured phone
     destinations on every inbound call, and Twilio only actually delivers
     that leg to a browser tab that's registered a Device with a token
-    carrying this grant."""
+    carrying this grant.
+
+    Real gap fix: without this upfront check, a missing
+    twilio_voice_api_key_sid/secret let Twilio's own AccessToken.to_jwt()
+    raise a bare ValueError straight out of this function - not a
+    TelecomError, so the calling route's `except TelecomError` never
+    caught it. That bare ValueError then had no registered FastAPI
+    exception handler, so it fell through to Starlette's default
+    ServerErrorMiddleware, which sits OUTSIDE this app's CORSMiddleware -
+    the resulting 500 had no CORS headers, and the browser reported a
+    confusing "blocked by CORS policy" error instead of the real,
+    fixable cause (missing Voice API key configuration)."""
+    if not settings.twilio_voice_api_key_sid or not settings.twilio_voice_api_key_secret:
+        raise TelecomError("Browser calling is not configured (missing Voice API key) - contact support")
     token = AccessToken(
         settings.twilio_account_sid, settings.twilio_voice_api_key_sid,
         settings.twilio_voice_api_key_secret, identity=identity, ttl=3600,
@@ -640,32 +657,36 @@ def build_bridge_response(
     build_forward_response, just on <Dial> itself alongside the existing
     action/caller_id attributes (record/recording_status_callback are
     <Dial>-level attributes, not <Number>-level).
+
+    Real gap fix: this used to also attach a per-leg status_callback/
+    status_callback_event to the nested <Number> noun. That's syntactically
+    legal TwiML (unlike putting it on <Dial> itself), but Twilio fires that
+    callback carrying the CHILD leg's own CallSid - which never matches any
+    CallRecord.provider_call_sid (always the parent/inbound or
+    agent-outbound SID) - so update_call_status always looked it up, found
+    nothing, and returned None. Nothing was ever captured from this webhook
+    traffic; it was pure dead weight (an extra outbound webhook call per
+    bridged call for no effect). Removed - action (already on <Dial>) is
+    the only mechanism here that's actually wired to anything. The real,
+    working per-call-completion capture for forwarded/bridged calls is the
+    phone-number-level status_callback set at buy_number/set_voice_webhook
+    time, which finalizes the parent CallRecord - untouched by this fix.
     """
     response = VoiceResponse()
     dial_kwargs: dict = {"caller_id": caller_id}
-    number_kwargs: dict = {}
     if status_callback_url:
-        # action belongs on <Dial> itself; status_callback/status_callback_event
-        # are only valid on the nested <Number> noun - Twilio's XML validator
-        # rejects them on <Dial> (confirmed live via a real call's Notifications:
-        # "Attribute 'statusCallback' is not allowed to appear in element
-        # 'Dial'" - tolerated as a warning, not fatal, but still real invalid
-        # TwiML worth fixing outright). anilupdated independently hit the same
-        # bug and fixed it by dropping status_callback/status_callback_event
-        # entirely (relying on action alone) - kept this branch's fix instead
-        # since it was verified live against a real bridged call and still
-        # gets per-leg CallStatus/CallDuration on this URL, which action alone
-        # (DialCallStatus/DialCallDuration, describing the parent leg) doesn't.
+        # action belongs on <Dial> itself - the only status_callback
+        # mechanism here that's ever actually consulted by anything (see
+        # docstring above for why a nested <Number>'s own status_callback
+        # was removed rather than fixed).
         dial_kwargs["action"] = status_callback_url
-        number_kwargs["status_callback"] = status_callback_url
-        number_kwargs["status_callback_event"] = "completed"
     if recording_callback_url:
         dial_kwargs["record"] = "record-from-answer-dual"
         dial_kwargs["recording_status_callback"] = recording_callback_url
         dial_kwargs["recording_status_callback_method"] = "POST"
         dial_kwargs["recording_status_callback_event"] = "completed"
     dial = response.dial(**dial_kwargs)
-    dial.number(destination, **number_kwargs)
+    dial.number(destination)
     return str(response)
 
 
@@ -703,6 +724,16 @@ def build_ring_group_response(
     Mixed real numbers and browser clients ring simultaneously in the same
     ring group; whichever answers first wins, same as multiple phone
     numbers already do.
+
+    Real gap fix: this used to also attach a per-leg status_callback/
+    status_callback_event to each nested <Number>/<Client> noun. Twilio
+    fires that callback carrying the CHILD leg's own CallSid - which never
+    matches any CallRecord.provider_call_sid (always the parent/inbound or
+    agent-outbound SID) - so update_call_status always looked it up, found
+    nothing, and returned None; nothing was ever captured from this webhook
+    traffic (see build_bridge_response's identical fix/docstring for the
+    full explanation). Removed - fallback_action_url (already on <Dial>) is
+    the only mechanism here that's actually wired to anything.
     """
     response = VoiceResponse()
     dial_kwargs = {"action": fallback_action_url}
@@ -712,19 +743,11 @@ def build_ring_group_response(
         dial_kwargs["recording_status_callback_method"] = "POST"
         dial_kwargs["recording_status_callback_event"] = "completed"
     dial = response.dial(**dial_kwargs)
-    # action belongs on <Dial> itself; status_callback/status_callback_event
-    # are only valid on the nested <Number>/<Client> nouns - Twilio's XML
-    # validator rejects them on <Dial> (confirmed live via a real call's
-    # Notifications log - see build_bridge_response's identical fix).
-    noun_kwargs: dict = {}
-    if status_callback_url:
-        noun_kwargs["status_callback"] = status_callback_url
-        noun_kwargs["status_callback_event"] = "completed"
     for destination in destinations:
         if destination.startswith("client:"):
-            dial.client(identity=destination.removeprefix("client:"), **noun_kwargs)
+            dial.client(identity=destination.removeprefix("client:"))
         else:
-            dial.number(destination, **noun_kwargs)
+            dial.number(destination)
     return str(response)
 
 

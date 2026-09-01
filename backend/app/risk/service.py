@@ -812,6 +812,32 @@ def resolve_fraud_case(
             db, case.account_id, AccountRiskState.SUSPENDED_FRAUD,
             actor=actor, reason=f"fraud case {case.id} confirmed: {notes or 'no notes'}",
         )
+        # A confirmed fraud case must actually suspend the account's numbers,
+        # not just its risk_state - risk_state alone only blocks *new*
+        # outbound calls via the concurrent-call-limit table; inbound calling
+        # and billing keep running otherwise. Mirrors maybe_auto_suspend_for_
+        # risk's full treatment (suspend numbers, publish event, notify the
+        # owner) so a human-confirmed case gets the same real consequence an
+        # automatic threshold-crossing already gets.
+        suspended = suspend_numbers_for_account_by_system(
+            db, case.account_id, reason=f"risk: fraud case {case.id} confirmed by staff",
+        )
+        if suspended:
+            score = compute_account_risk_score(db, case.account_id)
+            log_event(
+                db, actor="system:risk_engine", action="risk.account_auto_suspended",
+                target=f"account:{case.account_id}",
+                after={"fraud_case_id": case.id, "score": score, "numbers_suspended": [n.e164 for n in suspended]},
+            )
+            publish_account_auto_suspended(
+                case.account_id, score=score, numbers_suspended=[n.e164 for n in suspended],
+            )
+            owner = _get_account_owner(db, case.account_id)
+            if owner is not None:
+                notify_account_suspended_for_risk(
+                    db, account_id=case.account_id, account_email=owner.email,
+                    reason_category=f"fraud case confirmed: {notes or 'no notes'}", case_reference=case.id,
+                )
     return case
 
 

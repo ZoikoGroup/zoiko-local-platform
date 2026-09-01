@@ -343,6 +343,31 @@ def _render_html_email(subject: str, body_text: str, unsubscribe_url: str | None
 </html>"""
 
 
+# Real gap: sync_activity_to_crm's contact_phone ends up passed straight
+# through to the real CRM provider (see crm.service.upsert_contact) as the
+# contact's phone field - it needs an actual dialable number, not a masked
+# display string like "91******1234". Every notify_* wrapper below builds
+# its own context dict using whatever key name its own template happens to
+# reference (grepped across every context={...}/context = {...} in this
+# file), so there is no single canonical key - only the un-masked ones are
+# usable here. Checked in priority order, preferring the rawest/most
+# canonical form first; masked-only context (e.g. call_source_masked,
+# call_caller_display_safe, number_masked_or_formatted, caller_number,
+# call_destination_masked, message_destination_masked) is deliberately
+# skipped rather than passed through, since pushing a masked value into a
+# real CRM's phone field would create a garbage/unmatchable contact record -
+# worse than just not associating one for that event.
+_CRM_PHONE_CONTEXT_KEYS = ("e164", "phone_number", "number_formatted")
+
+
+def _resolve_phone_for_crm(context: dict) -> str | None:
+    for key in _CRM_PHONE_CONTEXT_KEYS:
+        value = context.get(key)
+        if value:
+            return value
+    return None
+
+
 def send_notification(
     db: Session,
     *,
@@ -481,7 +506,7 @@ def send_notification(
 
         dispatch_webhook_event(db, account_id=account_id, event_type=event_name, payload=context)
         sync_activity_to_crm(
-            db, account_id=account_id, event_type=event_name, contact_phone=context.get("e164"),
+            db, account_id=account_id, event_type=event_name, contact_phone=_resolve_phone_for_crm(context),
         )
 
     log_event(
@@ -619,13 +644,28 @@ class WebhookSignatureError(Exception):
     payload is discarded without being processed."""
 
 
+_SIGNATURE_REPLAY_WINDOW_SECONDS = 5 * 60
+
+
 def _verify_resend_signature(payload: bytes, svix_id: str, svix_timestamp: str, svix_signature: str) -> bool:
     """Resend signs webhooks the same way as Svix's other webhook products:
     HMAC-SHA256 over "{id}.{timestamp}.{body}" using the base64-decoded
     portion of the whsec_... secret, compared against each space-separated
     "v1,<sig>" entry in the svix-signature header. Always False while
-    RESEND_WEBHOOK_SECRET is blank (no webhook endpoint registered yet)."""
+    RESEND_WEBHOOK_SECRET is blank (no webhook endpoint registered yet).
+
+    Also rejects a stale/future svix-timestamp (standard Svix verification
+    guidance) - the HMAC alone proves the payload+timestamp pair was signed
+    by Resend, but never proves *when*, so without this a captured, still-
+    validly-signed payload could be replayed indefinitely."""
     if not settings.resend_webhook_secret:
+        return False
+    try:
+        timestamp_seconds = int(svix_timestamp)
+    except (TypeError, ValueError):
+        return False
+    now_seconds = datetime.now(timezone.utc).timestamp()
+    if abs(now_seconds - timestamp_seconds) > _SIGNATURE_REPLAY_WINDOW_SECONDS:
         return False
     secret = settings.resend_webhook_secret
     secret_bytes = base64.b64decode(secret.split("_", 1)[1] if secret.startswith("whsec_") else secret)
@@ -1518,12 +1558,16 @@ def notify_payment_reminder(
 
 def notify_invoice_available(
     db: Session, *, account_id: str, account_email: str, invoice_reference: str, billing_period: str,
-    subtotal: str, tax: str, total: str, currency: str,
+    subtotal: str, tax: str, total: str, currency: str, idempotency_key: str | None = None,
 ) -> None:
     """The 'billing.invoice_available' template was seeded but never
     called from anywhere - run_billing_cycle issued real invoices with no
     customer-facing evidence that one existed. This is the receipt/invoice
-    leg of the Production Readiness acceptance chain (Table 22)."""
+    leg of the Production Readiness acceptance chain (Table 22).
+
+    idempotency_key: same optional pass-through as notify_payment_failed/
+    notify_payment_reminder above - a concurrent/retried run_billing_cycle
+    execution for the same invoice must not double-send this."""
     send_notification(
         db, event_name="billing.invoice_available", account_id=account_id, recipient_email=account_email,
         context={
@@ -1535,15 +1579,20 @@ def notify_invoice_available(
             "transaction_total": total,
             "transaction_currency": currency,
         },
+        idempotency_key=idempotency_key,
     )
 
 
 def notify_payment_succeeded(
     db: Session, *, account_id: str, account_email: str, total: str, currency: str, description: str,
-    payment_date: str, payment_method_masked: str,
+    payment_date: str, payment_method_masked: str, idempotency_key: str | None = None,
 ) -> None:
     """Same gap as notify_invoice_available above - 'billing.payment_succeeded'
-    was seeded but run_billing_cycle's successful capture never triggered it."""
+    was seeded but run_billing_cycle's successful capture never triggered it.
+
+    idempotency_key: same optional pass-through as notify_payment_failed/
+    notify_payment_reminder above - a concurrent/retried run_billing_cycle
+    execution for the same invoice must not double-send this."""
     send_notification(
         db, event_name="billing.payment_succeeded", account_id=account_id, recipient_email=account_email,
         context={
@@ -1554,6 +1603,7 @@ def notify_payment_succeeded(
             "transaction_date": payment_date,
             "transaction_payment_method_masked": payment_method_masked,
         },
+        idempotency_key=idempotency_key,
     )
 
 

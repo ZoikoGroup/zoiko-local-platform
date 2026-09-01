@@ -87,6 +87,33 @@ class LLMError(Exception):
     """Raised instead of letting an httpx/vendor-specific exception escape this module."""
 
 
+def _is_provider_failure(e: Exception) -> bool:
+    """Passed as with_failover's is_breaker_failure - _breaker is a single
+    process-wide instance shared by every LLM request on the platform
+    (summarization AND receptionist qualification), so what counts as a
+    "failure" here matters beyond just this one request. An LLMError raised
+    in this module wraps one of two very different original exceptions via
+    `from e` (e.__cause__):
+
+    - an httpx.HTTPError: an httpx.HTTPStatusError carries the real HTTP
+      status Groq returned via `.response.status_code` - a 4xx means Groq
+      understood and rejected THIS specific request, not that Groq itself
+      is unhealthy. An httpx.RequestError (timeout/connection/DNS failure)
+      has no `.response` at all - nothing HTTP to inspect, which does count
+      as a real provider-health signal. Mirrors twilio.py's
+      _is_provider_failure: 5xx or no status at all trips the breaker, 4xx
+      doesn't.
+    - a json.JSONDecodeError: Groq answered successfully (HTTP 200) but the
+      model's own completion wasn't valid JSON for THIS transcript - a
+      one-off model-output quirk, not a signal Groq itself is down. Never a
+      breaker failure."""
+    cause = getattr(e, "__cause__", None)
+    if isinstance(cause, json.JSONDecodeError):
+        return False
+    status = getattr(getattr(cause, "response", None), "status_code", None)
+    return status is None or status >= 500
+
+
 # Imported after LLMError is defined - _secondary_stub imports it back from
 # this module, which would otherwise be a circular import.
 from app.integrations.llm import _secondary_stub as secondary  # noqa: E402
@@ -132,7 +159,7 @@ def extract_conversation_summary(transcript: str) -> dict:
     secondary_fn = (
         (lambda: secondary.extract_conversation_summary(transcript)) if settings.llm_failover_enabled else None
     )
-    return with_failover(_breaker, _primary, secondary_fn, LLMError)
+    return with_failover(_breaker, _primary, secondary_fn, LLMError, _is_provider_failure)
 
 
 def extract_receptionist_qualification(transcript: str) -> dict:
@@ -169,4 +196,4 @@ def extract_receptionist_qualification(transcript: str) -> dict:
     secondary_fn = (
         (lambda: secondary.extract_receptionist_qualification(transcript)) if settings.llm_failover_enabled else None
     )
-    return with_failover(_breaker, _primary, secondary_fn, LLMError)
+    return with_failover(_breaker, _primary, secondary_fn, LLMError, _is_provider_failure)

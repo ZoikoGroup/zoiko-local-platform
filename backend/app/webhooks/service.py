@@ -1,10 +1,13 @@
 import hashlib
 import hmac
+import ipaddress
 import json
 import logging
 import secrets
+import socket
 import threading
 from datetime import datetime, timezone
+from urllib.parse import urlparse
 
 import httpx
 from sqlalchemy.orm import Session
@@ -33,10 +36,45 @@ class InvalidWebhookUrlError(Exception):
 
 
 def _assert_valid_url(url: str) -> None:
+    """Real gap: an account admin can register any https:// URL, and this
+    backend then makes a real outbound HTTP call to it on every event (see
+    _deliver_to_endpoints) - with no check against private/loopback/
+    link-local/cloud-metadata ranges, that's blind SSRF against internal
+    infrastructure (e.g. 169.254.169.254's cloud metadata endpoint, 127.0.0.1,
+    RFC1918 ranges) using this backend as the requester. Resolves the
+    hostname and rejects the URL if ANY resolved address isn't a genuine
+    public address. Called both at registration time (create_endpoint) and
+    again at delivery time (_deliver_to_endpoints) - DNS for a
+    previously-valid hostname can change between the two (DNS rebinding),
+    so registration-time validation alone isn't enough."""
     if not url.startswith("https://"):
         raise InvalidWebhookUrlError("Webhook URL must start with https://")
     if len(url) > 2048:
         raise InvalidWebhookUrlError("Webhook URL is too long")
+
+    hostname = urlparse(url).hostname
+    if not hostname:
+        raise InvalidWebhookUrlError("Webhook URL has no resolvable hostname")
+
+    try:
+        resolved = socket.getaddrinfo(hostname, None)
+    except socket.gaierror as e:
+        raise InvalidWebhookUrlError(f"Webhook URL host {hostname!r} could not be resolved") from e
+
+    for _family, _type, _proto, _canonname, sockaddr in resolved:
+        ip = ipaddress.ip_address(sockaddr[0])
+        if (
+            ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_multicast
+            or ip.is_reserved
+            or ip.is_unspecified
+        ):
+            raise InvalidWebhookUrlError(
+                f"Webhook URL host {hostname!r} resolves to a non-public address ({sockaddr[0]}) "
+                "and cannot be used as a webhook destination"
+            )
 
 
 def create_endpoint(db: Session, *, account_id: str, url: str, description: str | None, actor: str) -> tuple[WebhookEndpoint, str]:
@@ -185,6 +223,12 @@ def _deliver_to_endpoints(
                 endpoint_id=endpoint_id, event_type=event_type, payload=body_dict, status=WebhookDeliveryStatus.FAILED,
             )
             try:
+                # Re-validated here, not just at create_endpoint time - the
+                # hostname's DNS can change between registration and this
+                # delivery (DNS rebinding onto an internal address), and
+                # _assert_valid_url is cheap (one extra getaddrinfo call) next
+                # to the network round-trip below.
+                _assert_valid_url(url)
                 response = httpx.post(
                     url,
                     content=body,
@@ -200,6 +244,9 @@ def _deliver_to_endpoints(
                     delivery.status = WebhookDeliveryStatus.DELIVERED
                 else:
                     delivery.error = f"Endpoint returned HTTP {response.status_code}"
+            except InvalidWebhookUrlError as e:
+                delivery.error = str(e)
+                logger.warning("Webhook delivery to endpoint %s skipped: %s", endpoint_id, e)
             except httpx.HTTPError as e:
                 delivery.error = str(e)
                 logger.warning("Webhook delivery to endpoint %s failed: %s", endpoint_id, e)

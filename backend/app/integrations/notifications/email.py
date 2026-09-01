@@ -28,6 +28,28 @@ class EmailError(Exception):
     """Raised instead of letting an httpx/Resend-specific exception escape this module."""
 
 
+def _is_provider_failure(e: Exception) -> bool:
+    """Passed as with_failover's is_breaker_failure - _breaker is a single
+    process-wide instance shared by every outbound email on the platform,
+    so what counts as a "failure" here matters beyond just this one
+    request. Every EmailError raised in this module wraps the original
+    httpx exception via `from e`, so e.__cause__ is that original
+    exception.
+
+    An httpx.HTTPStatusError carries the real HTTP status Resend returned
+    via `.response.status_code`. A 4xx means Resend understood and rejected
+    THIS specific request (e.g. a malformed/undeliverable recipient
+    address) - an expected, per-request outcome that says nothing about
+    whether Resend itself is healthy. An httpx.RequestError (timeout,
+    connection failure, DNS failure, ...) has no `.response` at all -
+    nothing HTTP to inspect, which does count as a real provider-health
+    signal. Only a 5xx (or no status at all) should trip the shared breaker
+    - same conservative default as twilio.py's _is_provider_failure."""
+    cause = getattr(e, "__cause__", None)
+    status = getattr(getattr(cause, "response", None), "status_code", None)
+    return status is None or status >= 500
+
+
 # Imported after EmailError is defined - _secondary_stub imports it back
 # from this module, which would otherwise be a circular import.
 from app.integrations.notifications import _email_secondary_stub as secondary  # noqa: E402
@@ -124,4 +146,4 @@ def send_email(
         if settings.email_failover_enabled
         else None
     )
-    return with_failover(_breaker, _primary, secondary_fn, EmailError)
+    return with_failover(_breaker, _primary, secondary_fn, EmailError, _is_provider_failure)

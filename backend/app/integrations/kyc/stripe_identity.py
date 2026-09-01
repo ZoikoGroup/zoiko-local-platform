@@ -22,6 +22,26 @@ class KYCError(Exception):
     """Raised instead of letting a stripe SDK exception escape this module."""
 
 
+def _is_provider_failure(e: Exception) -> bool:
+    """Passed as with_failover's is_breaker_failure - _breaker is a single
+    process-wide instance shared by every KYC verification request on the
+    platform, so what counts as a "failure" here matters beyond just this
+    one request. Every KYCError raised in this module wraps the original
+    stripe.error.StripeError via `from e`, so e.__cause__ is that original
+    exception.
+
+    A StripeError carries the real HTTP status Stripe returned via
+    `.http_status` (e.g. InvalidRequestError -> 4xx, APIConnectionError ->
+    None, APIError -> 5xx). A 4xx means Stripe understood and rejected THIS
+    specific request - an expected, per-request outcome that says nothing
+    about whether Stripe itself is healthy. Only a 5xx (or no status at all
+    - a connection-level failure with nothing HTTP to inspect) should count
+    as a real provider-health signal - same conservative default as
+    twilio.py's _is_provider_failure."""
+    status = getattr(getattr(e, "__cause__", None), "http_status", None)
+    return status is None or status >= 500
+
+
 # Imported after KYCError is defined - _secondary_stub imports it back from
 # this module, which would otherwise be a circular import.
 from app.integrations.kyc import _secondary_stub as secondary  # noqa: E402
@@ -64,7 +84,7 @@ def create_verification_session(reference_id: str) -> dict:
     secondary_fn = (
         (lambda: secondary.create_verification_session(reference_id)) if settings.kyc_failover_enabled else None
     )
-    return with_failover(_breaker, _primary, secondary_fn, KYCError)
+    return with_failover(_breaker, _primary, secondary_fn, KYCError, _is_provider_failure)
 
 
 def construct_webhook_event(payload: bytes, signature_header: str) -> stripe.Event:

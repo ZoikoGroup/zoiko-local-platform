@@ -25,9 +25,29 @@ class StorageError(Exception):
     """Raised instead of letting a boto3/botocore exception escape this module."""
 
 
-# Imported after StorageError is defined - _secondary_stub imports it back
-# from this module, which would otherwise be a circular import.
-from app.integrations.storage import _secondary_stub as secondary  # noqa: E402
+def _is_provider_failure(e: Exception) -> bool:
+    """Passed as with_failover's is_breaker_failure - _breaker is a single
+    process-wide instance shared by every storage operation on the
+    platform, so what counts as a "failure" here matters beyond just this
+    one request. Every StorageError raised in this module wraps the
+    original botocore exception via `from e`, so e.__cause__ is that
+    original exception.
+
+    A ClientError carries the real HTTP status S3 returned via
+    `.response["ResponseMetadata"]["HTTPStatusCode"]` (e.g. NoSuchKey,
+    AccessDenied, InvalidBucketName - all 4xx). A 4xx means the bucket
+    understood and rejected THIS specific request - an expected,
+    per-request outcome that says nothing about whether the storage
+    provider itself is healthy. A BotoCoreError (e.g. EndpointConnectionError,
+    ConnectTimeoutError) has no `.response` at all - a connection/timeout-
+    level failure with nothing HTTP to inspect, which does count as a real
+    provider-health signal. Only a 5xx (or no status at all) should trip
+    the shared breaker - same conservative default as twilio.py's
+    _is_provider_failure."""
+    cause = getattr(e, "__cause__", None)
+    response = getattr(cause, "response", None)
+    status = response.get("ResponseMetadata", {}).get("HTTPStatusCode") if response else None
+    return status is None or status >= 500
 
 
 def _client():
@@ -79,8 +99,16 @@ def delete_object(key: str) -> None:
         except (BotoCoreError, ClientError) as e:
             raise StorageError(str(e)) from e
 
-    secondary_fn = (lambda: secondary.delete_object(key)) if settings.storage_failover_enabled else None
-    with_failover(_breaker, _primary, secondary_fn, StorageError)
+    # No secondary_fn: real gap fix - objects are never replicated to the
+    # secondary bucket by upload_object (it only ever writes to the primary),
+    # and S3's delete-on-nonexistent-key is not an error. Failing over here
+    # would let this "succeed" against an empty secondary bucket while the
+    # real file survives untouched on the (temporarily unreachable) primary
+    # - a caller like retention/service.py would then wrongly mark the
+    # recording as purged. Same posture as buy_number's deliberate
+    # secondary_fn=None in twilio.py for an operation the secondary can't
+    # actually fulfill correctly.
+    with_failover(_breaker, _primary, None, StorageError, _is_provider_failure)
 
 
 def download_object(key: str) -> bytes:
@@ -96,8 +124,12 @@ def download_object(key: str) -> bytes:
         except (BotoCoreError, ClientError) as e:
             raise StorageError(str(e)) from e
 
-    secondary_fn = (lambda: secondary.download_object(key)) if settings.storage_failover_enabled else None
-    return with_failover(_breaker, _primary, secondary_fn, StorageError)
+    # No secondary_fn: objects are never replicated to the secondary bucket
+    # by upload_object - falling over here would silently return whatever
+    # (nothing, or stale data) happens to exist under this key in the
+    # secondary bucket instead of a clear error that the primary is down.
+    # Same rationale as delete_object's own secondary_fn=None above.
+    return with_failover(_breaker, _primary, None, StorageError, _is_provider_failure)
 
 
 def generate_presigned_url(key: str, expires_in: int = 3600) -> str:
@@ -113,7 +145,8 @@ def generate_presigned_url(key: str, expires_in: int = 3600) -> str:
         except (BotoCoreError, ClientError) as e:
             raise StorageError(str(e)) from e
 
-    secondary_fn = (
-        (lambda: secondary.generate_presigned_url(key, expires_in)) if settings.storage_failover_enabled else None
-    )
-    return with_failover(_breaker, _primary, secondary_fn, StorageError)
+    # No secondary_fn: objects are never replicated to the secondary bucket
+    # by upload_object - a presigned URL for the secondary bucket would
+    # point a browser/client at a key that was never written there. Same
+    # rationale as delete_object's own secondary_fn=None above.
+    return with_failover(_breaker, _primary, None, StorageError, _is_provider_failure)

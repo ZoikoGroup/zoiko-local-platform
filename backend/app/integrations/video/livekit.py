@@ -22,6 +22,28 @@ class VideoError(Exception):
     """Raised instead of letting a livekit-specific exception escape this module."""
 
 
+def _is_provider_failure(e: Exception) -> bool:
+    """Passed as with_failover_async's is_breaker_failure - _breaker is a
+    single process-wide instance shared by every video operation (every
+    room, for every account on the platform), so what counts as a
+    "failure" here matters beyond just this one request. Every VideoError
+    raised in this module wraps the original exception via `from e`, so
+    e.__cause__ is that original exception.
+
+    LiveKit's TwirpError (actually the SDK's `ServerError` class) carries
+    the real HTTP status LiveKit returned via its `.status` property. A 4xx
+    means LiveKit understood and rejected THIS specific request (e.g.
+    end_room's own "not_found" case, already handled separately before this
+    is even reached) - an expected, per-request outcome that says nothing
+    about whether LiveKit itself is healthy. Only a 5xx (or no status at
+    all - a connection/timeout-level failure, or the plain ValueError
+    _client() raises when LiveKit isn't configured, with nothing HTTP to
+    inspect) should count as a real provider-health signal - same
+    conservative default as twilio.py's _is_provider_failure."""
+    status = getattr(getattr(e, "__cause__", None), "status", None)
+    return status is None or status >= 500
+
+
 # Imported after VideoError is defined - _secondary_stub imports it back
 # from this module, which would otherwise be a circular import.
 from app.integrations.video import _secondary_stub as secondary  # noqa: E402
@@ -111,7 +133,7 @@ async def create_room(room_name: str, max_participants: int = MAX_PARTICIPANTS) 
     secondary_fn = (
         (lambda: secondary.create_room(room_name, max_participants)) if settings.video_failover_enabled else None
     )
-    return await with_failover_async(_breaker, _primary, secondary_fn, VideoError)
+    return await with_failover_async(_breaker, _primary, secondary_fn, VideoError, _is_provider_failure)
 
 
 async def end_room(room_name: str) -> None:
@@ -138,7 +160,7 @@ async def end_room(room_name: str) -> None:
             await client.aclose()
 
     secondary_fn = (lambda: secondary.end_room(room_name)) if settings.video_failover_enabled else None
-    await with_failover_async(_breaker, _primary, secondary_fn, VideoError)
+    await with_failover_async(_breaker, _primary, secondary_fn, VideoError, _is_provider_failure)
 
 
 async def start_room_recording(room_name: str, object_key: str) -> str:

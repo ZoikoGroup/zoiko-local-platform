@@ -46,6 +46,7 @@ from app.numbering.numbers.models import (
     NumberEligibilityRule,
     PhoneNumber,
     PhoneNumberStatus,
+    PhoneNumberSuspensionSource,
     RingGroupDestination,
     SupportedCountry,
 )
@@ -688,8 +689,23 @@ def submit_number_eligibility_bundle(
     API for GB local/individual, 2026-08-22). Requires at least one
     document already uploaded via submit_number_eligibility_document.
     Real, no-mock - every Twilio call here is a genuine API call, same
-    discipline as every other Provider Gateway integration this session."""
-    case = _get_eligibility_case(db, case_id)
+    discipline as every other Provider Gateway integration this session.
+
+    Locked with with_for_update() (same convention as reserve_number's
+    "Atomicity law") before the double-submission checks below - without
+    it, two genuinely concurrent submissions for the same case can both
+    read twilio_bundle_sid as unset and each go on to create a real,
+    separate Twilio EndUser/SupportingDocument/Bundle, silently orphaning
+    one of them (exactly what NumberEligibilityBundleAlreadySubmittedError's
+    docstring says this guard exists to prevent)."""
+    case = (
+        db.query(NumberEligibilityCase)
+        .filter(NumberEligibilityCase.id == case_id)
+        .with_for_update()
+        .first()
+    )
+    if case is None:
+        raise NumberEligibilityCaseNotFoundError(f"No eligibility case with id {case_id}")
     if case.account_id != account_id:
         raise NumberEligibilityCaseNotFoundError(f"No eligibility case with id {case_id}")
     if not case.documents:
@@ -1570,9 +1586,17 @@ def _assert_is_stuck(number: PhoneNumber | None, number_id: str) -> PhoneNumber:
 def retry_provisioning(db: Session, staff_id: str, number_id: str) -> PhoneNumber:
     """Staff recovery action - re-attempts the provider purchase for a
     number stranded mid-flight. Reuses the exact same success/failure
-    transitions as purchase_number's tail, just actor-attributed to staff."""
+    transitions as purchase_number's tail, just actor-attributed to staff.
+
+    Gated on the same kill switches as purchase_number: this still places a
+    real telecom.buy_number() call, so a switch tripped specifically to stop
+    new purchases during an incident must also stop staff-triggered retries -
+    otherwise "retry provisioning" is a standing bypass of the switch."""
     number = db.query(PhoneNumber).filter(PhoneNumber.id == number_id).with_for_update().first()
     number = _assert_is_stuck(number, number_id)
+    assert_kill_switch_not_active(db, KillSwitchScope.NUMBER_PROVISIONING)
+    from app.risk.service import assert_account_kill_switch_not_active
+    assert_account_kill_switch_not_active(db, number.account_id, KillSwitchScope.NUMBER_PROVISIONING)
 
     number.status = PhoneNumberStatus.PROVISIONING
     # Load-bearing, not cosmetic: with_for_update()'s row lock only holds
@@ -1765,6 +1789,7 @@ def suspend_number(db: Session, user: User, e164: str, reason: str | None = None
     assert_number_access(number, user)
 
     number.status = PhoneNumberStatus.SUSPENDED
+    number.suspended_by = PhoneNumberSuspensionSource.CUSTOMER
     db.commit()
     db.refresh(number)
     _invalidate_numbers_cache(user.account_id)
@@ -1799,6 +1824,7 @@ def suspend_numbers_for_account_by_system(db: Session, account_id: str, *, reaso
     )
     for number in numbers:
         number.status = PhoneNumberStatus.SUSPENDED
+        number.suspended_by = PhoneNumberSuspensionSource.SYSTEM
     db.commit()
     if numbers:
         _invalidate_numbers_cache(account_id)
@@ -1842,16 +1868,25 @@ def reactivate_numbers_for_account_by_staff(
     """Staff-initiated reversal of a suspension - the review/reversal half
     of the risk engine's auto-suspend workflow (a false positive or a
     resolved dispute shouldn't need engineering intervention to undo).
-    Reactivates every SUSPENDED number on the account; numbers already
-    cancelled or never suspended are left alone."""
+    Reactivates every SYSTEM-suspended number on the account; numbers
+    already cancelled, never suspended, or suspended by the CUSTOMER
+    themselves (via suspend_number, not this risk workflow) are left
+    alone - see PhoneNumberSuspensionSource's docstring for why a plain
+    status == SUSPENDED filter used to also reactivate numbers the
+    customer had voluntarily suspended."""
     numbers = (
         db.query(PhoneNumber)
-        .filter(PhoneNumber.account_id == account_id, PhoneNumber.status == PhoneNumberStatus.SUSPENDED)
+        .filter(
+            PhoneNumber.account_id == account_id,
+            PhoneNumber.status == PhoneNumberStatus.SUSPENDED,
+            PhoneNumber.suspended_by == PhoneNumberSuspensionSource.SYSTEM,
+        )
         .with_for_update()
         .all()
     )
     for number in numbers:
         number.status = PhoneNumberStatus.ACTIVE
+        number.suspended_by = None
     db.commit()
     if numbers:
         _invalidate_numbers_cache(account_id)

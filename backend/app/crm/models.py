@@ -43,6 +43,14 @@ class CrmConnection(Base):
     provider: Mapped[CrmProvider] = mapped_column(Enum(CrmProvider, name="crm_provider_enum"), nullable=False)
     external_ref: Mapped[str] = mapped_column(String(100), nullable=False)
     external_account_label: Mapped[str] = mapped_column(String(255), nullable=False)
+    # Every table needs a UUID primary key + created_at (project convention)
+    # - this table only had connected_at (semantically "when this specific
+    # connection/provider was linked", which is overwritten in spirit each
+    # time the account reconnects, possibly to a different provider), never
+    # a true immutable row-creation timestamp. Same server_default=func.now()
+    # style as connected_at and every other created_at column in this
+    # codebase.
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
     connected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     disconnected_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     # Real OAuth token storage - only ever populated for a real integration

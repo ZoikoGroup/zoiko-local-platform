@@ -8,7 +8,14 @@ PLACEHOLDER_JWT_SECRET_KEY = "change-me-in-real-env"
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file="../.env")
+    # extra="ignore": the repo-root .env intentionally carries a few
+    # reference-only values no code reads (e.g. ZOIKONEX_SUPERADMIN_*, a
+    # human login for ZoikoNex's own separate staff console - see the
+    # comment above those lines in .env) so they're safely recorded
+    # instead of floating in chat history. pydantic-settings' default
+    # extra="forbid" was crashing Settings() on startup over exactly the
+    # env vars its own neighboring comment says are deliberately unused.
+    model_config = SettingsConfigDict(env_file="../.env", extra="ignore")
 
     database_url: str = "postgresql+psycopg2://zoiko:zoiko@localhost:5435/zoiko_local"
     # loadtest.py's actual finding: Postgres itself was NOT the bottleneck

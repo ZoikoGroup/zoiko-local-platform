@@ -1658,8 +1658,19 @@ def capture_receptionist_call(
     urgency_raw = qualification.get("urgency")
     urgency = ReceptionistUrgency(urgency_raw) if urgency_raw in ("low", "medium", "high") else None
     # Guardrail check on the AI's OWN generated text, not the caller's raw
-    # transcript - see app/intelligence/guardrails.py.
-    guardrail_flags = check_for_disallowed_commitments(qualification.get("summary"), qualification.get("reason"))
+    # transcript - see app/intelligence/guardrails.py. Scans every
+    # LLM-extracted field surfaced to staff, not just summary/reason - a
+    # disallowed commitment can just as easily land in spam_reason,
+    # callback_preference, or the extracted name/company.
+    guardrail_flags = check_for_disallowed_commitments(
+        db,
+        qualification.get("summary"),
+        qualification.get("reason"),
+        qualification.get("spam_reason"),
+        qualification.get("callback_preference"),
+        qualification.get("name"),
+        qualification.get("company"),
+    )
     is_likely_spam = bool(qualification.get("is_likely_spam"))
     spam_reason = qualification.get("spam_reason") if is_likely_spam else None
 
@@ -1749,7 +1760,15 @@ def record_receptionist_followup(db: Session, call: ReceptionistCall, followup_t
     if qualification:
         urgency_raw = qualification.get("urgency")
         urgency = ReceptionistUrgency(urgency_raw) if urgency_raw in ("low", "medium", "high") else call.urgency
-        guardrail_flags = check_for_disallowed_commitments(qualification.get("summary"), qualification.get("reason"))
+        guardrail_flags = check_for_disallowed_commitments(
+            db,
+            qualification.get("summary"),
+            qualification.get("reason"),
+            qualification.get("spam_reason"),
+            qualification.get("callback_preference"),
+            qualification.get("name"),
+            qualification.get("company"),
+        )
         is_likely_spam = bool(qualification.get("is_likely_spam"))
 
         call.caller_name = qualification.get("name") or call.caller_name

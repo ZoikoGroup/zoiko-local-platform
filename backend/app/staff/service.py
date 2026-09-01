@@ -388,6 +388,7 @@ def update_account_billing_classification(
     db.refresh(account)
     log_event(
         db, actor=actor, action="account.billing_classification_updated", target=f"account:{account.id}",
+        account_id=account.id,
         before=before,
         after={"billing_classification": billing_classification.value, "billing_source": billing_source.value},
     )
@@ -417,6 +418,7 @@ def set_account_test_flag(db: Session, account_id: str, *, is_test: bool, actor:
     db.refresh(account)
     log_event(
         db, actor=actor, action="account.test_flag_updated", target=f"account:{account.id}",
+        account_id=account.id,
         reason=reason, before={"is_test": previous}, after={"is_test": is_test},
     )
     return account
@@ -452,6 +454,7 @@ def set_account_legal_hold(
     db.refresh(account)
     log_event(
         db, actor=actor, action="account.legal_hold_changed", target=f"account:{account.id}",
+        account_id=account.id,
         before=previous, after={"legal_hold": account.legal_hold, "legal_hold_reference": account.legal_hold_reference},
     )
     return account

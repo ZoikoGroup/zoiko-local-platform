@@ -73,7 +73,33 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 def main() -> int:
     db = SessionLocal()
     exit_code = 0
-    try:
+    failed_steps: list[str] = []
+
+    def _run_step(step_name: str, fn) -> None:
+        """Runs one job step in isolation - a failure here (an exception
+        raised by the step itself) is logged and recorded against
+        failed_steps, but never stops the remaining steps from running.
+        Before this, every step ran inside one shared try/except around the
+        whole function body, so a failure in an early step (e.g. the
+        external ZoikoNex reconciliation call) silently skipped every LATER
+        step for the rest of that day's run - including the legally-relevant
+        retention purge and compliance case expiry."""
+        nonlocal exit_code
+        try:
+            fn()
+        except Exception:
+            logger.exception("scheduled_reconciliation step failed step=%s", step_name)
+            failed_steps.append(step_name)
+            exit_code = 1
+            # A failure mid-transaction leaves the session's transaction in
+            # a rolled-back-but-not-yet-reset state - without this, every
+            # later step's first query would itself raise
+            # "This Session's transaction has been rolled back", masking
+            # the real per-step isolation this function exists to provide.
+            db.rollback()
+
+    def _zoikonex_reconciliation() -> None:
+        nonlocal exit_code
         run = run_zoikonex_reconciliation(db)
         logger.info(
             "zoikonex_reconciliation_run id=%s total_subscriptions=%d unsynced_subscriptions=%d "
@@ -86,6 +112,8 @@ def main() -> int:
         if run.exceptions_found > 0:
             exit_code = 1
 
+    def _due_renewals() -> None:
+        nonlocal exit_code
         # list_due_renewals is a staff-visible worklist, not an automated
         # charge (there's no real per-number payment gateway yet - see its
         # own docstring) - this job only surfaces the count for visibility,
@@ -95,18 +123,23 @@ def main() -> int:
         if due:
             exit_code = 1
 
+    def _expire_compliance_cases() -> None:
         expired = expire_overdue_cases(db)
         logger.info("compliance_cases_expired count=%d", expired["expired"])
 
+    def _flag_reverification() -> None:
         reverification = flag_cases_due_for_reverification(db)
         logger.info("compliance_cases_flagged_for_reverification count=%d", reverification["flagged"])
 
+    def _expire_kill_switches() -> None:
         expired_switches = expire_overdue_kill_switches(db)
         logger.info(
             "kill_switches_expired platform=%d account=%d",
             expired_switches["platform"], expired_switches["account"],
         )
 
+    def _purge_recordings() -> None:
+        nonlocal exit_code
         purged = purge_expired_recordings(db)
         total_failed = sum(bucket["failed"] for bucket in purged.values())
         logger.info(
@@ -116,9 +149,12 @@ def main() -> int:
         if total_failed > 0:
             exit_code = 1
 
+    def _sweep_stale_video() -> None:
         swept = sweep_stale_video_recordings(db)
         logger.info("stale_video_recordings_swept count=%d", swept["swept"])
 
+    def _sync_eligibility() -> None:
+        nonlocal exit_code
         # sync_number_eligibility_bundle_status only fires when a customer
         # clicks "check status" - this is the automated fallback (see that
         # function's docstring) so a Twilio approval/rejection is never
@@ -132,6 +168,8 @@ def main() -> int:
         if eligibility["failed"] > 0:
             exit_code = 1
 
+    def _stuck_provisioning() -> None:
+        nonlocal exit_code
         stuck = list_stuck_provisioning(db)
         logger.info("numbers_stuck_provisioning count=%d", len(stuck))
         if stuck:
@@ -150,6 +188,8 @@ def main() -> int:
                 console_link=f"{settings.public_base_url}/staff/provisioning",
             )
 
+    def _flush_outbox() -> None:
+        nonlocal exit_code
         outbox_published = outbox_failed = 0
         for _ in range(_MAX_OUTBOX_FLUSH_BATCHES):
             result = flush_pending_outbox_events(db)
@@ -160,11 +200,23 @@ def main() -> int:
         logger.info("event_outbox_flushed published=%d failed=%d", outbox_published, outbox_failed)
         if outbox_failed > 0:
             exit_code = 1
-    except Exception:
-        logger.exception("scheduled_reconciliation run failed")
-        exit_code = 1
+
+    try:
+        _run_step("zoikonex_reconciliation", _zoikonex_reconciliation)
+        _run_step("due_renewals", _due_renewals)
+        _run_step("expire_compliance_cases", _expire_compliance_cases)
+        _run_step("flag_reverification", _flag_reverification)
+        _run_step("expire_kill_switches", _expire_kill_switches)
+        _run_step("purge_recordings", _purge_recordings)
+        _run_step("sweep_stale_video", _sweep_stale_video)
+        _run_step("sync_eligibility", _sync_eligibility)
+        _run_step("stuck_provisioning", _stuck_provisioning)
+        _run_step("flush_outbox", _flush_outbox)
     finally:
         db.close()
+
+    if failed_steps:
+        logger.error("scheduled_reconciliation run had failing steps steps=%s", ",".join(failed_steps))
     return exit_code
 
 

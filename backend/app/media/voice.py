@@ -446,7 +446,10 @@ async def browser_token(current_user: User = Depends(require_writer), db: Sessio
             "Upgrade your plan to use this feature - you can view it during your trial, but changes need a paid plan."
         )
 
-    token = telecom.build_voice_access_token(identity=current_user.account_id)
+    try:
+        token = telecom.build_voice_access_token(identity=current_user.account_id)
+    except TelecomError as e:
+        raise HTTPException(status_code=502, detail=str(e)) from e
     return {"token": token}
 
 

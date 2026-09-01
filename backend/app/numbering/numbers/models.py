@@ -111,6 +111,22 @@ class PhoneNumberStatus(str, enum.Enum):
     CANCELLED = "cancelled"
 
 
+class PhoneNumberSuspensionSource(str, enum.Enum):
+    """Distinguishes WHO put a SUSPENDED number into that state - a
+    customer voluntarily suspending their own number (suspend_number) reads
+    identically to the risk engine auto-suspending it
+    (suspend_numbers_for_account_by_system) under plain status ==
+    SUSPENDED alone, which meant staff reinstating a risk-suspended account
+    (reactivate_numbers_for_account_by_staff) was also reactivating numbers
+    the customer had chosen to suspend themselves. NULL for any number
+    suspended before this column existed (unknown source - left alone by
+    the staff reactivation filter, same fail-safe posture as not touching
+    a customer-suspended number)."""
+
+    CUSTOMER = "customer"
+    SYSTEM = "system"
+
+
 class PhoneNumber(Base):
     __tablename__ = "phone_numbers"
 
@@ -249,6 +265,16 @@ class PhoneNumber(Base):
     # (architecture doc: "Separate regulated workstream"), which happens
     # out-of-band; this flag just records that it's done for this number.
     sms_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
+    # Distinguishes a customer-chosen suspension (suspend_number) from a
+    # risk-engine-driven one (suspend_numbers_for_account_by_system) - see
+    # PhoneNumberSuspensionSource's docstring. NULL whenever status isn't
+    # SUSPENDED (or for pre-existing suspended rows from before this column
+    # existed); reactivate_numbers_for_account_by_staff only reactivates
+    # numbers where this is SYSTEM, leaving customer-suspended numbers alone.
+    suspended_by: Mapped[PhoneNumberSuspensionSource | None] = mapped_column(
+        Enum(PhoneNumberSuspensionSource, name="phone_number_suspension_source_enum"), nullable=True
+    )
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
