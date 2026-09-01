@@ -241,3 +241,63 @@ def test_storage_delete_object_reraises_when_not_configured_and_no_secondary(mon
 
     with pytest.raises(s3.StorageError, match="not configured"):
         s3.delete_object("some/key.mp4")
+
+
+def test_storage_delete_download_presign_never_fail_over_even_when_enabled(monkeypatch):
+    """Real gap fix: upload_object only ever writes to the PRIMARY bucket -
+    objects are never replicated to the secondary. delete_object/
+    download_object/generate_presigned_url used to fail over anyway when
+    storage_failover_enabled=True, which could make delete_object "succeed"
+    against an empty secondary bucket while the real file survived
+    untouched on a temporarily-unreachable primary - a caller like
+    retention.service would then wrongly mark the recording as purged.
+    Fixed by making these three ops secondary_fn=None unconditionally, same
+    as buy_number's deliberate no-failover posture elsewhere in this
+    codebase. This proves it holds even with storage_failover_enabled=True
+    and even against a genuine 5xx (the exact case with_failover would
+    otherwise treat as a real provider-health failure worth falling over)."""
+    from botocore.exceptions import ClientError
+
+    from app.integrations.storage import _secondary_stub, s3
+
+    monkeypatch.setattr(s3.settings, "s3_bucket", "test-bucket")
+    monkeypatch.setattr(s3.settings, "s3_access_key_id", "fake-key-id")
+    monkeypatch.setattr(s3.settings, "s3_secret_access_key", "fake-secret")
+    monkeypatch.setattr(s3.settings, "storage_failover_enabled", True)
+    monkeypatch.setattr(s3, "_breaker", CircuitBreaker("storage-test"))
+
+    secondary_calls = []
+    monkeypatch.setattr(_secondary_stub, "delete_object", lambda key: secondary_calls.append(("delete", key)))
+    monkeypatch.setattr(_secondary_stub, "download_object", lambda key: secondary_calls.append(("download", key)))
+    monkeypatch.setattr(
+        _secondary_stub, "generate_presigned_url",
+        lambda key, expires_in=3600: secondary_calls.append(("presign", key)),
+    )
+
+    def _boom(*args, **kwargs):
+        # A genuine 5xx - is_breaker_failure would classify this as a real
+        # provider-health signal, exactly the case that would normally
+        # trigger failover if a secondary_fn were configured.
+        raise ClientError(
+            {"Error": {"Code": "InternalError", "Message": "boom"}, "ResponseMetadata": {"HTTPStatusCode": 500}},
+            "DeleteObject",
+        )
+
+    class _FakeClient:
+        delete_object = staticmethod(_boom)
+        get_object = staticmethod(_boom)
+        generate_presigned_url = staticmethod(_boom)
+
+    monkeypatch.setattr(s3, "_client", lambda: _FakeClient())
+
+    with pytest.raises(s3.StorageError):
+        s3.delete_object("some/key.mp4")
+    with pytest.raises(s3.StorageError):
+        s3.download_object("some/key.mp4")
+    with pytest.raises(s3.StorageError):
+        s3.generate_presigned_url("some/key.mp4")
+
+    assert secondary_calls == [], (
+        f"the secondary storage stub must never be called for delete/download/presign, since objects "
+        f"aren't replicated to it - got: {secondary_calls}"
+    )

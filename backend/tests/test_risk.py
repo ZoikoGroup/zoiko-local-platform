@@ -1091,6 +1091,68 @@ def test_staff_reinstatement_restores_baseline_risk_state(client, db_session):
     assert account.risk_state == AccountRiskState.PAID_NORMAL
 
 
+def test_staff_reinstatement_does_not_reactivate_a_customers_own_voluntary_suspension(client, db_session):
+    """Real gap fix: PhoneNumber.status == SUSPENDED used to be set by both
+    a customer voluntarily suspending their own number (suspend_number) and
+    the risk engine auto-suspending the whole account
+    (suspend_numbers_for_account_by_system), with nothing distinguishing
+    why - reactivate_numbers_for_account_by_staff reactivated every
+    SUSPENDED number on the account unconditionally, so a customer's own
+    voluntary suspension got silently undone by an unrelated staff
+    reinstatement. suspended_by now records which path suspended a number;
+    reinstatement must only touch numbers where suspended_by == SYSTEM."""
+    from app.risk.models import RiskSignalType
+    from app.risk.service import record_risk_signal
+    from app.numbering.numbers.models import PhoneNumber, PhoneNumberStatus as NumberStatus, PhoneNumberSuspensionSource
+    from app.staff.models import PlatformStaffRole
+
+    token = _signup_and_login(client, "suspendsource1@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    account_id = client.get("/auth/me", headers=headers).json()["account_id"]
+
+    voluntary = PhoneNumber(e164="+15550070093", country="US", status=NumberStatus.ACTIVE, account_id=account_id)
+    other = PhoneNumber(e164="+15550070094", country="US", status=NumberStatus.ACTIVE, account_id=account_id)
+    db_session.add_all([voluntary, other])
+    db_session.commit()
+
+    suspend_response = client.post(f"/numbers/+15550070093/suspend", json={"reason": "not using it right now"}, headers=headers)
+    assert suspend_response.status_code == 200, suspend_response.text
+
+    db_session.refresh(voluntary)
+    assert voluntary.status == NumberStatus.SUSPENDED
+    assert voluntary.suspended_by == PhoneNumberSuspensionSource.CUSTOMER
+
+    # Crosses AUTO_SUSPEND_THRESHOLD - suspends every currently-ACTIVE
+    # number on the account by the SYSTEM path. `voluntary` is already
+    # SUSPENDED (not ACTIVE), so only `other` is touched here.
+    for i in range(3):
+        record_risk_signal(db_session, account_id=account_id, signal_type=RiskSignalType.BLOCKED_DESTINATION_ATTEMPT, detail=f"t{i}")
+
+    db_session.refresh(other)
+    assert other.status == NumberStatus.SUSPENDED
+    assert other.suspended_by == PhoneNumberSuspensionSource.SYSTEM
+
+    admin_token = _create_staff_and_login(
+        client, db_session, "suspendsourceadmin1@zoikolocal.com", PlatformStaffRole.SUPER_ADMIN
+    )
+    reinstate_response = client.post(
+        f"/risk/accounts/{account_id}/reinstate",
+        json={"reason": "confirmed false positive"},
+        headers={"Authorization": f"Bearer {admin_token}"},
+    )
+    assert reinstate_response.status_code == 200, reinstate_response.text
+
+    db_session.refresh(voluntary)
+    db_session.refresh(other)
+    # The system-suspended number is reactivated by staff reinstatement...
+    assert other.status == NumberStatus.ACTIVE
+    assert other.suspended_by is None
+    # ...but the customer's own voluntary suspension is left exactly as
+    # they chose it - staff reinstating the account did not touch it.
+    assert voluntary.status == NumberStatus.SUSPENDED
+    assert voluntary.suspended_by == PhoneNumberSuspensionSource.CUSTOMER
+
+
 def test_account_risk_summary_includes_risk_state(client, db_session):
     from app.staff.models import PlatformStaffRole
 

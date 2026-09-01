@@ -3,6 +3,7 @@ import sys
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import sessionmaker
 
 from app.core.database import Base, engine, get_db
@@ -17,9 +18,38 @@ if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 
+_CREATE_SCHEMA_MAX_ATTEMPTS = 3
+
+
 @pytest.fixture(scope="session", autouse=True)
 def create_schema():
-    Base.metadata.create_all(bind=engine)
+    # Real gap fix: create_all's checkfirst walk holds ONE connection for
+    # its entire duration - against this app's real Neon database, with
+    # ~190 tables/enum types to check, that walk can run for several
+    # minutes. pool_recycle/pool_pre_ping (see app.core.database's engine)
+    # only protect a connection at CHECKOUT time; they do nothing for a
+    # connection that's continuously in use mid-walk, which is exactly
+    # what this fixture does. Neon closes long-lived connections server-
+    # side independent of query activity, which surfaced here as a
+    # "psycopg2.OperationalError: SSL SYSCALL error: EOF detected" partway
+    # through the walk - confirmed live, reproducibly, against the real
+    # dev DB. Since this fixture is session-scoped and autouse, that one
+    # failure previously cascaded as "ERROR at setup" into literally every
+    # test in the suite (pytest re-raises a failed fixture's exception for
+    # every dependent test) - not 1006 independent failures, one. engine.
+    # dispose() drops every pooled connection (including the half-dead one
+    # that failed) so the retry opens a genuinely fresh connection rather
+    # than immediately hitting the same dead one again.
+    last_error: OperationalError | None = None
+    for attempt in range(1, _CREATE_SCHEMA_MAX_ATTEMPTS + 1):
+        try:
+            Base.metadata.create_all(bind=engine)
+            break
+        except OperationalError as e:
+            last_error = e
+            engine.dispose()
+    else:
+        raise last_error
     yield
 
 

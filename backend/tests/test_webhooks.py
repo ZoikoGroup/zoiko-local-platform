@@ -65,6 +65,37 @@ def test_creating_an_endpoint_rejects_non_https_urls(client, db_session):
     assert response.status_code == 422
 
 
+def test_creating_an_endpoint_rejects_private_and_loopback_targets(client, db_session):
+    """Real gap fix: _assert_valid_url only checked for an https:// prefix,
+    with no check against private/loopback/link-local/reserved IP ranges -
+    any account admin could register a webhook endpoint and this backend
+    would then make real outbound HTTP calls to it on every event
+    (dispatch_webhook_event), a blind SSRF vector against internal
+    infrastructure (e.g. cloud metadata services, other services on this
+    host's own network). These are all real, syntactically-valid https://
+    URLs (unlike test_creating_an_endpoint_rejects_non_https_urls above) -
+    only the resolved-address check should be what rejects them."""
+    token = _signup_login_and_upgrade(client, db_session, "wh-owner-ssrf1@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    disallowed_urls = [
+        "https://169.254.169.254/latest/meta-data/",  # cloud metadata service
+        "https://127.0.0.1/hook",  # loopback
+        "https://localhost/hook",  # loopback via hostname
+        "https://10.0.0.5/hook",  # RFC1918 private range
+        "https://192.168.1.1/hook",  # RFC1918 private range
+        "https://0.0.0.0/hook",  # unspecified
+    ]
+    for url in disallowed_urls:
+        response = client.post("/webhooks/endpoints", json={"url": url}, headers=headers)
+        assert response.status_code == 422, f"{url} should have been rejected, got {response.status_code}"
+
+    # A genuine public HTTPS URL must still be accepted - the fix must not
+    # be so broad it breaks the legitimate case every other test relies on.
+    allowed = client.post("/webhooks/endpoints", json={"url": "https://example.com/hook"}, headers=headers)
+    assert allowed.status_code == 201, allowed.text
+
+
 def test_member_cannot_create_a_webhook_endpoint(client, db_session):
     from app.billing import service as billing_service
 

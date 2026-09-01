@@ -378,6 +378,65 @@ def test_resolve_fraud_case(client, db_session):
     assert second_attempt.status_code == 409
 
 
+def test_resolving_a_fraud_case_as_confirmed_suspends_the_accounts_numbers(client, db_session, monkeypatch):
+    """Real gap fix: resolve_fraud_case's CONFIRMED branch used to only flip
+    Account.risk_state to SUSPENDED_FRAUD, without ever calling
+    suspend_numbers_for_account_by_system the way the automatic
+    AUTO_SUSPEND_THRESHOLD path (test_auto_suspend_threshold_does_not_also_
+    open_a_case above) already does - a human reviewer confirming real
+    fraud on an account that never itself crossed the auto-suspend score
+    left every PhoneNumber row ACTIVE (inbound calling and billing kept
+    running), with no suspension email/event either. This account only
+    reaches REVIEW_THRESHOLD (a case opens, nothing suspended yet, mirroring
+    test_review_threshold_opens_a_case_without_suspending above) - resolving
+    that case as "confirmed" must be what actually suspends the number."""
+    monkeypatch.setattr("app.core.config.settings.resend_api_key", "")
+    from app.risk.models import BlockedDestination, RiskSignalType
+    from app.risk.service import record_risk_signal
+    from app.staff.models import PlatformStaffRole
+
+    db_session.add(BlockedDestination(prefix="+1905", reason="test prefix"))
+    db_session.commit()
+
+    token = _signup_and_login(client, "fraudconfirm1@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    account_id = client.get("/auth/me", headers=headers).json()["account_id"]
+    number = _active_number(db_session, account_id, "+15550070023")
+
+    # 2 * 40 = 80: above REVIEW_THRESHOLD (60), below AUTO_SUSPEND_THRESHOLD
+    # (100) - opens a case without auto-suspending, same as the sibling test.
+    record_risk_signal(db_session, account_id=account_id, signal_type=RiskSignalType.BLOCKED_DESTINATION_ATTEMPT, detail="t1")
+    record_risk_signal(db_session, account_id=account_id, signal_type=RiskSignalType.BLOCKED_DESTINATION_ATTEMPT, detail="t2")
+
+    db_session.refresh(number)
+    assert number.status == PhoneNumberStatus.ACTIVE
+
+    staff_token = _create_staff_and_login(
+        client, db_session, "fraudconfirmstaff1@zoikolocal.com", PlatformStaffRole.COMPLIANCE_OFFICER
+    )
+    cases = client.get("/risk/fraud-cases", headers={"Authorization": f"Bearer {staff_token}"}).json()
+    case_id = next(c["id"] for c in cases if c["account_id"] == account_id)
+
+    resolve_response = client.post(
+        f"/risk/fraud-cases/{case_id}/resolve",
+        json={"status": "confirmed", "notes": "verified real fraud on manual review"},
+        headers={"Authorization": f"Bearer {staff_token}"},
+    )
+    assert resolve_response.status_code == 200
+    assert resolve_response.json()["status"] == "confirmed"
+
+    db_session.refresh(number)
+    assert number.status == PhoneNumberStatus.SUSPENDED
+
+    account = client.get("/auth/me", headers=headers).json()
+    assert account["risk_state"] == "suspended_fraud"
+
+    notifications = client.get("/notifications/me", headers=headers).json()
+    matches = [n for n in notifications if n["event_name"] == "trust.account_suspended_or_disabled"]
+    assert len(matches) == 1
+    assert matches[0]["status"] == "sent"
+
+
 def test_resolving_as_open_is_rejected(client, db_session):
     from app.risk.models import BlockedDestination, RiskSignalType
     from app.risk.service import record_risk_signal

@@ -141,6 +141,57 @@ def test_retry_provisioning_requires_support_or_super_admin_role(client, db_sess
     assert response.status_code == 403
 
 
+def test_retry_provisioning_is_blocked_while_the_number_provisioning_kill_switch_is_active(client, db_session, monkeypatch):
+    """Real gap fix: purchase_number checks the NUMBER_PROVISIONING kill
+    switch (and its account-level equivalent) before ever calling
+    telecom.buy_number - retry_provisioning, which places that exact same
+    real purchase call for a number stranded mid-flight, had no such check
+    at all. A switch tripped specifically to stop new purchases during an
+    incident was a standing bypass for staff-triggered retries."""
+    _, account_id = _signup_and_login(client, "recoveryowner8@example.com")
+    number = _seed_stuck_number(db_session, account_id, e164="+15550028888")
+
+    buy_calls = []
+    monkeypatch.setattr(
+        "app.numbering.numbers.service.telecom.buy_number",
+        lambda e164, bundle_sid=None: buy_calls.append(e164) or {"sid": "PN_should_not_happen", "phone_number": e164, "capabilities": {}},
+    )
+
+    admin_token = _create_and_login_staff(
+        db_session, client, "recoveryswitchadmin8@zoikolocal.com", role=PlatformStaffRole.SUPER_ADMIN
+    )
+    activate = client.post(
+        "/ops/kill-switches/number_provisioning/activate",
+        json={"reason": "investigating bad purchases"}, headers={"Authorization": f"Bearer {admin_token}"},
+    )
+    assert activate.status_code == 200, activate.text
+
+    staff_token = _create_and_login_staff(db_session, client, "recoverystaff8@zoikolocal.com")
+    blocked = client.post(
+        f"/staff/numbers/{number.id}/retry-provisioning", headers={"Authorization": f"Bearer {staff_token}"}
+    )
+    assert blocked.status_code == 503
+    assert buy_calls == []
+
+    # The number must still be genuinely stuck/retryable, not silently
+    # transitioned or stranded by the blocked attempt.
+    still_stuck = client.get(
+        "/staff/numbers/stuck-provisioning", headers={"Authorization": f"Bearer {staff_token}"}
+    ).json()
+    assert any(e["e164"] == "+15550028888" for e in still_stuck)
+
+    deactivate = client.post(
+        "/ops/kill-switches/number_provisioning/deactivate", headers={"Authorization": f"Bearer {admin_token}"},
+    )
+    assert deactivate.status_code == 200, deactivate.text
+
+    allowed = client.post(
+        f"/staff/numbers/{number.id}/retry-provisioning", headers={"Authorization": f"Bearer {staff_token}"}
+    )
+    assert allowed.status_code == 200, allowed.text
+    assert buy_calls == ["+15550028888"]
+
+
 def test_release_stuck_provisioning_reverts_to_reserved_without_calling_the_provider(client, db_session, monkeypatch):
     _, account_id = _signup_and_login(client, "recoveryowner7@example.com")
     number = _seed_stuck_number(db_session, account_id, e164="+15550027777")

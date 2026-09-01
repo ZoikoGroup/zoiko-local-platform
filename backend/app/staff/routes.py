@@ -7,6 +7,8 @@ from app.core.deps import get_current_staff, require_capability
 from app.core.rate_limit import limiter
 from app.core.security import create_access_token
 from app.integrations.telecom.twilio import TelecomError
+from app.ops.service import KillSwitchTrippedError
+from app.risk.service import AccountKillSwitchTrippedError
 from app.numbering.numbers.schemas import (
     NumberEligibilityCaseResponse,
     NumberEligibilityRuleResponse,
@@ -302,6 +304,10 @@ def retry_number_provisioning(
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e
     except TelecomError as e:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(e)) from e
+    except KillSwitchTrippedError as e:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e)) from e
+    except AccountKillSwitchTrippedError as e:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e)) from e
     return {"id": number.id, "e164": number.e164, "status": number.status}
 
 
