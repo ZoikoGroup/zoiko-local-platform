@@ -48,9 +48,11 @@ from app.staff.models import PlatformStaff, PlatformStaffRole
 from app.staff.schemas import (
     AccessMatrixEntryResponse,
     AccountOverviewResponse,
+    CreateStaffRequest,
     SetAccountLegalHoldRequest,
     SetAccountTestFlagRequest,
     StaffLoginRequest,
+    StaffResponse,
     StaffTokenResponse,
     UpdateAccountBillingClassificationRequest,
 )
@@ -86,6 +88,66 @@ def login(request: Request, payload: StaffLoginRequest, db: Session = Depends(ge
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid email or password")
     token = create_access_token(subject=staff.id, scope="staff")
     return StaffTokenResponse(access_token=token)
+
+
+@router.get("/members", response_model=list[StaffResponse])
+def list_staff_route(
+    db: Session = Depends(get_db),
+    _staff: PlatformStaff = Depends(get_current_staff),
+):
+    """Diagnostic - who currently has staff console access, and at what
+    role (same posture as /staff/access-matrix: any staff role can view
+    it). Adding or deactivating someone is the sensitive action, gated by
+    staff.manage_staff below."""
+    return service.list_staff(db)
+
+
+@router.post("/members", response_model=StaffResponse, status_code=status.HTTP_201_CREATED)
+def create_staff_route(
+    payload: CreateStaffRequest,
+    db: Session = Depends(get_db),
+    staff: PlatformStaff = Depends(require_capability("staff.manage_staff")),
+):
+    """There was previously no way to add a staff member short of direct
+    database/code access - the bootstrap function only ever creates the
+    very first SUPER_ADMIN. SUPER_ADMIN-only capability, same bar as
+    staff.manage_capabilities - granting someone staff console access at
+    all is at least as sensitive as editing the capability matrix itself."""
+    try:
+        role = PlatformStaffRole(payload.role)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e)) from e
+
+    try:
+        return service.create_staff(db, email=payload.email, password=payload.password, role=role, actor=staff.id)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e
+
+
+@router.put("/members/{staff_id}/deactivate", response_model=StaffResponse)
+def deactivate_staff_route(
+    staff_id: str,
+    db: Session = Depends(get_db),
+    staff: PlatformStaff = Depends(require_capability("staff.manage_staff")),
+):
+    try:
+        return service.set_staff_active(db, staff_id, is_active=False, actor_staff_id=staff.id)
+    except service.StaffNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
+    except service.CannotDeactivateSelfError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e
+
+
+@router.put("/members/{staff_id}/reactivate", response_model=StaffResponse)
+def reactivate_staff_route(
+    staff_id: str,
+    db: Session = Depends(get_db),
+    staff: PlatformStaff = Depends(require_capability("staff.manage_staff")),
+):
+    try:
+        return service.set_staff_active(db, staff_id, is_active=True, actor_staff_id=staff.id)
+    except service.StaffNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
 
 
 @router.get("/accounts", response_model=list[AccountOverviewResponse])

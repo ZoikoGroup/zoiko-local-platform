@@ -33,10 +33,18 @@ class LastGrantRemovalError(Exception):
     lockout short of direct database access."""
 
 
-def create_staff(db: Session, email: str, password: str, role: PlatformStaffRole) -> PlatformStaff:
+def create_staff(
+    db: Session, email: str, password: str, role: PlatformStaffRole, *, actor: str | None = None
+) -> PlatformStaff:
     """role has no default - there's no public staff signup endpoint (staff
     are provisioned internally, see app/seed.py), so every call site must
-    consciously pick a role rather than silently inheriting a default."""
+    consciously pick a role rather than silently inheriting a default.
+
+    `actor` is optional so bootstrap_initial_super_admin (a system action
+    with no acting staff member) and create_staff_route (POST
+    /staff/members, a real SUPER_ADMIN inviting a teammate) can share this
+    one function without either faking an actor or skipping the audit
+    trail - bootstrap logs its own system_bootstrap event separately."""
     existing = db.query(PlatformStaff).filter(PlatformStaff.email == email).first()
     if existing:
         raise ValueError("A staff account with this email already exists")
@@ -45,6 +53,11 @@ def create_staff(db: Session, email: str, password: str, role: PlatformStaffRole
     db.add(staff)
     db.commit()
     db.refresh(staff)
+    if actor is not None:
+        log_event(
+            db, actor=actor, action="staff.created", target=f"platform_staff:{staff.id}",
+            after={"email": email, "role": role.value},
+        )
     return staff
 
 
@@ -74,6 +87,43 @@ def bootstrap_initial_super_admin(db: Session) -> PlatformStaff | None:
     log_event(
         db, actor="system_bootstrap", action="staff.bootstrapped", target=f"platform_staff:{staff.id}",
         after={"email": email, "role": PlatformStaffRole.SUPER_ADMIN.value},
+    )
+    return staff
+
+
+class StaffNotFoundError(Exception):
+    """Raised when set_staff_active targets a nonexistent staff id."""
+
+
+class CannotDeactivateSelfError(Exception):
+    """Raised when a staff member tries to deactivate their own account -
+    there's no staff self-service password reset or re-invite flow, so
+    this would be an immediate, unrecoverable-without-direct-database-
+    access lockout rather than a normal permission boundary."""
+
+
+def list_staff(db: Session) -> list[PlatformStaff]:
+    """Diagnostic - who currently has staff console access, and at what
+    role. Any staff role can view this (same posture as the access matrix
+    itself); adding/deactivating someone is the sensitive action, gated by
+    staff.manage_staff at the route level."""
+    return db.query(PlatformStaff).order_by(PlatformStaff.created_at.desc()).all()
+
+
+def set_staff_active(db: Session, staff_id: str, *, is_active: bool, actor_staff_id: str) -> PlatformStaff:
+    if staff_id == actor_staff_id and not is_active:
+        raise CannotDeactivateSelfError("Cannot deactivate your own staff account")
+
+    staff = db.query(PlatformStaff).filter(PlatformStaff.id == staff_id).first()
+    if staff is None:
+        raise StaffNotFoundError(f"No staff account {staff_id!r}")
+
+    staff.is_active = is_active
+    db.commit()
+    db.refresh(staff)
+    log_event(
+        db, actor=actor_staff_id, action="staff.reactivated" if is_active else "staff.deactivated",
+        target=f"platform_staff:{staff.id}", after={"email": staff.email},
     )
     return staff
 

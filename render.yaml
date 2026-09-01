@@ -60,6 +60,25 @@ services:
         sync: false
       - key: TWILIO_TRIAL_NUMBER
         sync: false
+
+      # Real production bug found 2026-08-31: these three were never
+      # declared here either (same bug class as FRONTEND_BASE_URL below) -
+      # app.core.config defaults all three to "", and unlike
+      # TWILIO_API_KEY_SID/SECRET (which fall back to TWILIO_AUTH_TOKEN
+      # when blank), build_voice_access_token (integrations/telecom/
+      # twilio.py) has no fallback: it signs every browser-calling Voice
+      # token with AccessToken(account_sid, "", "", ...), which Twilio's
+      # Voice SDK rejects client-side as "AccessTokenInvalid (20101)" -
+      # confirmed live, this is the exact error. Browser calling (answering
+      # inbound calls in the dashboard, and the browser-based outbound
+      # calling tool) is fully broken in production until these are set to
+      # their real values in the Render dashboard - not just declared here.
+      - key: TWILIO_TWIML_APP_SID
+        sync: false # the TwiML App whose Voice URL is POST /media/voice/browser-connect
+      - key: TWILIO_VOICE_API_KEY_SID
+        sync: false # dedicated Voice-grant API Key SID (SKxxx) - NOT the same key as TWILIO_API_KEY_SID
+      - key: TWILIO_VOICE_API_KEY_SECRET
+        sync: false
       - key: PUBLIC_BASE_URL
         sync: false # this service's own real Render URL, e.g. https://zoiko-local-api.onrender.com
 

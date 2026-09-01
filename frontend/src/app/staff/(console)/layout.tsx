@@ -33,6 +33,7 @@ const NAV_GROUPS: { group: string; items: NavItem[] }[] = [
       { href: "/staff/providers", label: "Provider Status", icon: "plug" },
       { href: "/staff/incidents", label: "Incidents & Errors", icon: "alert" },
       { href: "/staff/billing", label: "Billing (ZoikoNex)", icon: "receipt" },
+      { href: "/staff/kill-switches", label: "Kill Switches", icon: "power" },
     ],
   },
   {
@@ -40,6 +41,7 @@ const NAV_GROUPS: { group: string; items: NavItem[] }[] = [
     items: [
       { href: "/staff/audit", label: "Audit Log", icon: "history" },
       { href: "/staff/access-matrix", label: "Access Matrix", icon: "grid" },
+      { href: "/staff/team", label: "Staff & Team", icon: "badge" },
     ],
   },
 ];
@@ -56,7 +58,9 @@ type IconName =
   | "alert"
   | "receipt"
   | "history"
-  | "grid";
+  | "grid"
+  | "power"
+  | "badge";
 
 const ICON_PATHS: Record<IconName, React.ReactNode> = {
   clipboard: (
@@ -114,6 +118,19 @@ const ICON_PATHS: Record<IconName, React.ReactNode> = {
       <rect x="13" y="4" width="7" height="7" rx="1.4" />
       <rect x="4" y="13" width="7" height="7" rx="1.4" />
       <rect x="13" y="13" width="7" height="7" rx="1.4" />
+    </>
+  ),
+  power: (
+    <>
+      <path d="M12 3v8" />
+      <path d="M7 5.5a8 8 0 105-2.5" />
+    </>
+  ),
+  badge: (
+    <>
+      <circle cx="12" cy="8" r="3.2" />
+      <path d="M6 20a6 6 0 0112 0" />
+      <path d="M9.5 12.5 12 20l1-2.3L15 20l1.5-3.2" />
     </>
   ),
 };
