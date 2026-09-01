@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from pydantic import BaseModel, EmailStr, ConfigDict
+from pydantic import BaseModel, EmailStr, ConfigDict, Field
 
 
 class StaffLoginRequest(BaseModel):
@@ -23,9 +23,13 @@ class StaffResponse(BaseModel):
     created_at: datetime
 
 
-class CreateStaffRequest(BaseModel):
+class CreateStaffMemberRequest(BaseModel):
     email: EmailStr
-    password: str
+    # Same min_length=8 bar as customer signup (numbering/identity/schemas.py's
+    # _PasswordField) - if anything, staff accounts warrant it more: they
+    # include SUPER_ADMIN (see authenticate_staff's own docstring on why
+    # staff auth is treated as more sensitive than customer auth).
+    password: str = Field(min_length=8, max_length=128)
     role: str
 
 

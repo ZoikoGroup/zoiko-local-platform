@@ -75,3 +75,11 @@ class ComplianceCase(Base):
     # starting a provider-side session (e.g. a market where Stripe Identity
     # isn't configured yet, or a manual/paper-document review path).
     kyc_inquiry_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # Set only once a case reaches APPROVED (see approve_case) - a periodic
+    # re-verification cadence, distinct from expires_at (which only governs
+    # the PENDING decision window, not how long an approved decision stays
+    # valid). Detection/notification only (flag_cases_due_for_reverification)
+    # - deliberately does NOT auto-suspend anything on its own, since neither
+    # doc this implements names a real consequence or grace period for a
+    # missed renewal, and inventing one would be an engineering policy call.
+    reverification_due_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

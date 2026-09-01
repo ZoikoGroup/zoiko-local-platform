@@ -48,7 +48,7 @@ from app.staff.models import PlatformStaff, PlatformStaffRole
 from app.staff.schemas import (
     AccessMatrixEntryResponse,
     AccountOverviewResponse,
-    CreateStaffRequest,
+    CreateStaffMemberRequest,
     SetAccountLegalHoldRequest,
     SetAccountTestFlagRequest,
     StaffLoginRequest,
@@ -56,7 +56,13 @@ from app.staff.schemas import (
     StaffTokenResponse,
     UpdateAccountBillingClassificationRequest,
 )
-from app.staff.service import LastGrantRemovalError, list_access_matrix
+from app.staff.service import (
+    LastActiveSuperAdminError,
+    LastGrantRemovalError,
+    StaffEmailAlreadyExistsError,
+    StaffNotFoundError,
+    list_access_matrix,
+)
 from app.usage.schemas import (
     AIUsageRateResponse,
     CallingRateResponse,
@@ -90,64 +96,97 @@ def login(request: Request, payload: StaffLoginRequest, db: Session = Depends(ge
     return StaffTokenResponse(access_token=token)
 
 
-@router.get("/members", response_model=list[StaffResponse])
-def list_staff_route(
+@router.get("/me", response_model=StaffResponse)
+def get_current_staff_profile(staff: PlatformStaff = Depends(get_current_staff)):
+    """Login (POST /staff/login) returns only a bare access token - no
+    role/email - so the frontend has had no way to know who's logged in or
+    what they can do beyond waiting for a 403. This is the source of truth
+    the console UI reads to show/hide sections (SUPER_ADMIN vs SUPPORT vs
+    COMPLIANCE_OFFICER), cross-checked against GET /staff/access-matrix
+    for which capabilities that role actually has - never hardcoded
+    per-role UI rules that could drift from the real grant table."""
+    return StaffResponse(
+        id=staff.id, email=staff.email, role=staff.role.value, is_active=staff.is_active, created_at=staff.created_at
+    )
+
+
+@router.get("/team", response_model=list[StaffResponse])
+def list_staff_team(
     db: Session = Depends(get_db),
     _staff: PlatformStaff = Depends(get_current_staff),
 ):
-    """Diagnostic - who currently has staff console access, and at what
-    role (same posture as /staff/access-matrix: any staff role can view
-    it). Adding or deactivating someone is the sensitive action, gated by
-    staff.manage_staff below."""
-    return service.list_staff(db)
+    """Any staff role can see who else has console access (diagnostic,
+    same posture as GET /staff/accounts); creating or deactivating a
+    member is the sensitive action, gated below by
+    staff.manage_staff_accounts."""
+    return service.list_staff_team(db)
 
 
-@router.post("/members", response_model=StaffResponse, status_code=status.HTTP_201_CREATED)
-def create_staff_route(
-    payload: CreateStaffRequest,
+@router.post("/team", response_model=StaffResponse, status_code=status.HTTP_201_CREATED)
+def create_staff_team_member(
+    payload: CreateStaffMemberRequest,
     db: Session = Depends(get_db),
-    staff: PlatformStaff = Depends(require_capability("staff.manage_staff")),
+    staff: PlatformStaff = Depends(require_capability("staff.manage_staff_accounts")),
 ):
-    """There was previously no way to add a staff member short of direct
-    database/code access - the bootstrap function only ever creates the
-    very first SUPER_ADMIN. SUPER_ADMIN-only capability, same bar as
-    staff.manage_capabilities - granting someone staff console access at
-    all is at least as sensitive as editing the capability matrix itself."""
+    """The gap that made the billing maker-checker flow (request vs.
+    approve, self-approval blocked - see app.billing.service.
+    SelfApprovalNotAllowedError) impossible to actually exercise:
+    bootstrap_initial_super_admin creates exactly one account at first
+    boot, and nothing since then could create a second one short of
+    direct database access. This is that missing route."""
     try:
         role = PlatformStaffRole(payload.role)
-    except ValueError as e:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e)) from e
-
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Unknown role {payload.role!r} - expected one of {[r.value for r in PlatformStaffRole]}",
+        )
     try:
-        return service.create_staff(db, email=payload.email, password=payload.password, role=role, actor=staff.id)
-    except ValueError as e:
+        return service.create_staff_member(db, email=payload.email, password=payload.password, role=role, actor=staff.id)
+    except StaffEmailAlreadyExistsError as e:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e
 
 
-@router.put("/members/{staff_id}/deactivate", response_model=StaffResponse)
-def deactivate_staff_route(
+@router.put("/team/{staff_id}/deactivate", response_model=StaffResponse)
+def deactivate_staff_team_member(
     staff_id: str,
     db: Session = Depends(get_db),
-    staff: PlatformStaff = Depends(require_capability("staff.manage_staff")),
+    staff: PlatformStaff = Depends(require_capability("staff.manage_staff_accounts")),
 ):
     try:
-        return service.set_staff_active(db, staff_id, is_active=False, actor_staff_id=staff.id)
-    except service.StaffNotFoundError as e:
+        return service.deactivate_staff_member(db, staff_id, actor=staff.id)
+    except StaffNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
-    except service.CannotDeactivateSelfError as e:
+    except LastActiveSuperAdminError as e:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e
 
 
-@router.put("/members/{staff_id}/reactivate", response_model=StaffResponse)
-def reactivate_staff_route(
+@router.put("/team/{staff_id}/reactivate", response_model=StaffResponse)
+def reactivate_staff_team_member(
     staff_id: str,
     db: Session = Depends(get_db),
-    staff: PlatformStaff = Depends(require_capability("staff.manage_staff")),
+    staff: PlatformStaff = Depends(require_capability("staff.manage_staff_accounts")),
 ):
     try:
-        return service.set_staff_active(db, staff_id, is_active=True, actor_staff_id=staff.id)
-    except service.StaffNotFoundError as e:
+        return service.reactivate_staff_member(db, staff_id, actor=staff.id)
+    except StaffNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
+
+
+@router.get("/platform-metrics")
+def get_platform_metrics(
+    db: Session = Depends(get_db),
+    _staff: PlatformStaff = Depends(get_current_staff),
+):
+    """Platform-wide call volume + subscription/revenue snapshot for the
+    Super Admin Overview dashboard. Any staff role can call this (same
+    "GET is diagnostic" posture as every other reporting endpoint in this
+    file) - the console UI is what restricts it to SUPER_ADMIN, same
+    pattern as the extra account/audit/provider detail added there."""
+    return {
+        "calls": service.get_platform_call_metrics(db),
+        "billing": service.get_platform_billing_metrics(db),
+    }
 
 
 @router.get("/accounts", response_model=list[AccountOverviewResponse])

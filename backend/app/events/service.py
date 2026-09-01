@@ -192,6 +192,29 @@ def publish_voicemail_created(account_id: str, *, voicemail_id: str, phone_numbe
     )
 
 
+# Real gap fix: the AI Receptionist (media/receptionist.py, media/service.py's
+# capture_receptionist_call/mark_receptionist_call_escalated) published zero
+# Kafka events despite every other domain's event coverage being extended
+# repeatedly (see CLAUDE.md's event-coverage entries) - reuses zoiko.calls
+# since a receptionist-answered call is still fundamentally a call, rather
+# than adding a whole new topic (and consumer.py TOPICS registration) for
+# two events.
+def publish_receptionist_call_captured(
+    account_id: str, *, receptionist_call_id: str, urgency: str | None, is_likely_spam: bool
+) -> None:
+    publish_event(
+        "zoiko.calls", "receptionist.call_captured", account_id,
+        {"receptionist_call_id": receptionist_call_id, "urgency": urgency, "is_likely_spam": is_likely_spam},
+    )
+
+
+def publish_receptionist_call_escalated(account_id: str, *, receptionist_call_id: str, escalated_to_user_id: str) -> None:
+    publish_event(
+        "zoiko.calls", "receptionist.call_escalated", account_id,
+        {"receptionist_call_id": receptionist_call_id, "escalated_to_user_id": escalated_to_user_id},
+    )
+
+
 def publish_transcript_completed(
     account_id: str, *, summary_id: str, source_type: str, source_id: str, model_version: str
 ) -> None:

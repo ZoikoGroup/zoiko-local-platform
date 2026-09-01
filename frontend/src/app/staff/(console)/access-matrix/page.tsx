@@ -23,7 +23,7 @@ export default function StaffAccessMatrixPage() {
   const router = useRouter();
   const { token, ready } = useStaffToken();
   const [entries, setEntries] = useState<AccessMatrixEntry[]>([]);
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(true );
   const [error, setError] = useState<string | null>(null);
 
   const [newCapability, setNewCapability] = useState("");

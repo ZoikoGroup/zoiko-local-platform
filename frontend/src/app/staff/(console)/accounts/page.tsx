@@ -11,10 +11,13 @@ import {
   type StaffNumberSearchResult,
 } from "@/lib/api";
 import { clearStaffToken, useStaffToken } from "@/lib/staffAuth";
+import { useStaffRole } from "@/lib/staffRole";
 
 export default function StaffAccountsPage() {
   const router = useRouter();
   const { token, ready } = useStaffToken();
+  const { role } = useStaffRole();
+  const isSuperAdmin = role === "super_admin";
   const [accounts, setAccounts] = useState<AccountOverview[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -160,7 +163,7 @@ export default function StaffAccountsPage() {
         <p className="text-sm text-slate-400">No accounts yet.</p>
       )}
 
-      <div className="bg-slate-900 border border-slate-800 rounded-xl overflow-hidden">
+      <div className="bg-slate-900 border border-slate-800 rounded-xl overflow-hidden overflow-x-auto">
         <table className="w-full text-sm">
           <thead>
             <tr className="border-b border-slate-800 text-left text-xs text-slate-400">
@@ -169,7 +172,19 @@ export default function StaffAccountsPage() {
               <th className="px-4 py-2.5 font-medium">Type</th>
               <th className="px-4 py-2.5 font-medium">Members</th>
               <th className="px-4 py-2.5 font-medium">Numbers</th>
-              <th className="px-4 py-2.5 font-medium">Test account</th>
+              {/* Billing classification, legal hold, and the test-flag
+                  toggle all back SUPER_ADMIN-only actions (accounts.manage_
+                  billing_classification / manage_legal_hold / manage_test_
+                  flag) - showing them to a role that can't act on any of
+                  them is just noise a SUPPORT/COMPLIANCE_OFFICER lookup
+                  doesn't need. */}
+              {isSuperAdmin && (
+                <>
+                  <th className="px-4 py-2.5 font-medium">Billing</th>
+                  <th className="px-4 py-2.5 font-medium">Legal hold</th>
+                  <th className="px-4 py-2.5 font-medium">Test account</th>
+                </>
+              )}
               <th className="px-4 py-2.5 font-medium">Created</th>
             </tr>
           </thead>
@@ -181,21 +196,42 @@ export default function StaffAccountsPage() {
                 <td className="px-4 py-2.5 text-slate-400 capitalize">{a.account_type}</td>
                 <td className="px-4 py-2.5 text-slate-200">{a.member_count}</td>
                 <td className="px-4 py-2.5 text-slate-200">{a.number_count}</td>
-                <td className="px-4 py-2.5">
-                  <button
-                    type="button"
-                    onClick={() => handleToggleTestFlag(a)}
-                    disabled={togglingTestFlagId === a.id}
-                    className={`text-xs font-medium rounded-lg px-2.5 py-1 disabled:opacity-50 ${
-                      a.is_test
-                        ? "bg-amber-950/50 border border-amber-800 text-amber-300 hover:bg-amber-950"
-                        : "bg-slate-800 border border-slate-700 text-slate-400 hover:bg-slate-700"
-                    }`}
-                    title="Bypasses market activation for this account; blocks real Stripe/ZoikoNex billing while flagged."
-                  >
-                    {togglingTestFlagId === a.id ? "..." : a.is_test ? "Test" : "Off"}
-                  </button>
-                </td>
+                {isSuperAdmin && (
+                  <>
+                    <td className="px-4 py-2.5 text-slate-400">
+                      <span className="capitalize">{a.billing_classification}</span>
+                      <span className="text-slate-600"> · </span>
+                      <span className="capitalize">{a.billing_source}</span>
+                    </td>
+                    <td className="px-4 py-2.5">
+                      {a.legal_hold ? (
+                        <span
+                          className="text-xs font-medium rounded-lg px-2.5 py-1 bg-red-950/50 border border-red-800 text-red-300"
+                          title={a.legal_hold_reference ?? undefined}
+                        >
+                          On hold
+                        </span>
+                      ) : (
+                        <span className="text-xs text-slate-500">—</span>
+                      )}
+                    </td>
+                    <td className="px-4 py-2.5">
+                      <button
+                        type="button"
+                        onClick={() => handleToggleTestFlag(a)}
+                        disabled={togglingTestFlagId === a.id}
+                        className={`text-xs font-medium rounded-lg px-2.5 py-1 disabled:opacity-50 ${
+                          a.is_test
+                            ? "bg-amber-950/50 border border-amber-800 text-amber-300 hover:bg-amber-950"
+                            : "bg-slate-800 border border-slate-700 text-slate-400 hover:bg-slate-700"
+                        }`}
+                        title="Bypasses market activation for this account; blocks real Stripe/ZoikoNex billing while flagged."
+                      >
+                        {togglingTestFlagId === a.id ? "..." : a.is_test ? "Test" : "Off"}
+                      </button>
+                    </td>
+                  </>
+                )}
                 <td className="px-4 py-2.5 text-slate-400">
                   {new Date(a.created_at).toLocaleDateString()}
                 </td>

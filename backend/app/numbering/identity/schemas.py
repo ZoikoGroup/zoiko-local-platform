@@ -67,6 +67,7 @@ class UserResponse(BaseModel):
     role: str
     account_id: str
     mfa_enabled: bool
+    email_verified: bool
     phone_number: str | None
 
 
@@ -77,6 +78,14 @@ class ForgotPasswordRequest(BaseModel):
 class ResetPasswordRequest(BaseModel):
     token: str
     new_password: str = _PasswordField
+
+
+class ResendVerificationRequest(BaseModel):
+    email: EmailStr
+
+
+class VerifyEmailRequest(BaseModel):
+    token: str
 
 
 class TeamMemberAdd(BaseModel):

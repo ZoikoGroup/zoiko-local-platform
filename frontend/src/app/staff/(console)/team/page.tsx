@@ -3,42 +3,38 @@
 import { useEffect, useState, useCallback, type FormEvent } from "react";
 import { useRouter } from "next/navigation";
 import {
-  listStaffMembers,
-  createStaffMember,
-  deactivateStaffMember,
-  reactivateStaffMember,
+  listStaffTeam,
+  createStaffTeamMember,
+  deactivateStaffTeamMember,
+  reactivateStaffTeamMember,
+  getCurrentStaff,
   ApiError,
-  type StaffMember,
+  type StaffTeamMember,
+  type StaffRole,
 } from "@/lib/api";
-import { clearStaffToken, useStaffToken, getOwnStaffIdFromToken } from "@/lib/staffAuth";
+import { clearStaffToken, useStaffToken } from "@/lib/staffAuth";
 
-const ROLE_LABELS: Record<string, string> = {
-  support: "Support (read-only)",
+const ROLE_LABELS: Record<StaffRole, string> = {
+  support: "Support",
   compliance_officer: "Compliance Officer",
   super_admin: "Super Admin",
 };
 
-const ROLES = ["support", "compliance_officer", "super_admin"];
-
-function formatDate(value: string): string {
-  return new Date(value).toLocaleDateString();
-}
+const ROLES: StaffRole[] = ["support", "compliance_officer", "super_admin"];
 
 export default function StaffTeamPage() {
   const router = useRouter();
   const { token, ready } = useStaffToken();
-  const ownStaffId = token ? getOwnStaffIdFromToken(token) : null;
-
-  const [members, setMembers] = useState<StaffMember[]>([]);
+  const [members, setMembers] = useState<StaffTeamMember[]>([]);
+  const [selfId, setSelfId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
-  const [showAddForm, setShowAddForm] = useState(false);
-  const [newEmail, setNewEmail] = useState("");
-  const [newPassword, setNewPassword] = useState("");
-  const [newRole, setNewRole] = useState(ROLES[0]);
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [role, setRole] = useState<StaffRole>("support");
   const [creating, setCreating] = useState(false);
-  const [busyId, setBusyId] = useState<string | null>(null);
+  const [togglingId, setTogglingId] = useState<string | null>(null);
 
   useEffect(() => {
     if (ready && !token) router.replace("/staff/login");
@@ -46,9 +42,10 @@ export default function StaffTeamPage() {
 
   const load = useCallback(() => {
     if (!token) return;
-    return listStaffMembers(token)
-      .then((data) => {
-        setMembers(data);
+    return Promise.all([listStaffTeam(token), getCurrentStaff(token)])
+      .then(([team, me]) => {
+        setMembers(team);
+        setSelfId(me.id);
         setError(null);
       })
       .catch((err) => {
@@ -57,7 +54,7 @@ export default function StaffTeamPage() {
           router.replace("/staff/login");
           return;
         }
-        setError("Couldn't load the staff list.");
+        setError("Couldn't load the staff team.");
       })
       .finally(() => setLoading(false));
   }, [token, router]);
@@ -68,50 +65,51 @@ export default function StaffTeamPage() {
 
   async function handleCreate(e: FormEvent) {
     e.preventDefault();
-    if (!token || !newEmail.trim() || !newPassword) return;
+    if (!token || !email.trim() || password.length < 8) return;
     setCreating(true);
     setError(null);
     try {
-      await createStaffMember(token, newEmail.trim(), newPassword, newRole);
-      setNewEmail("");
-      setNewPassword("");
-      setNewRole(ROLES[0]);
-      setShowAddForm(false);
+      await createStaffTeamMember(token, { email: email.trim(), password, role });
+      setEmail("");
+      setPassword("");
+      setRole("support");
       await load();
     } catch (err) {
-      setError(
-        err instanceof ApiError && err.status === 403
-          ? "Only staff with the staff.manage_staff capability can add staff."
-          : err instanceof ApiError && err.status === 409
-          ? "A staff account with that email already exists."
-          : "Couldn't add that staff member."
-      );
+      if (err instanceof ApiError && err.status === 409) {
+        setError("A staff account with that email already exists.");
+      } else if (err instanceof ApiError && err.status === 403) {
+        setError("Only staff with the staff.manage_staff_accounts capability can add a teammate.");
+      } else if (err instanceof ApiError && err.status === 422) {
+        setError("Password must be at least 8 characters.");
+      } else {
+        setError("Couldn't create that staff account.");
+      }
     } finally {
       setCreating(false);
     }
   }
 
-  async function handleToggleActive(member: StaffMember) {
+  async function handleToggleActive(member: StaffTeamMember) {
     if (!token) return;
-    setBusyId(member.id);
+    setTogglingId(member.id);
     setError(null);
     try {
       if (member.is_active) {
-        await deactivateStaffMember(token, member.id);
+        await deactivateStaffTeamMember(token, member.id);
       } else {
-        await reactivateStaffMember(token, member.id);
+        await reactivateStaffTeamMember(token, member.id);
       }
       await load();
     } catch (err) {
-      setError(
-        err instanceof ApiError && err.status === 409
-          ? "You can't deactivate your own account."
-          : err instanceof ApiError && err.status === 403
-          ? "Only staff with the staff.manage_staff capability can do this."
-          : "Couldn't update that staff member."
-      );
+      if (err instanceof ApiError && err.status === 409) {
+        setError("Can't deactivate the only active Super Admin - promote another account first.");
+      } else if (err instanceof ApiError && err.status === 403) {
+        setError("Only staff with the staff.manage_staff_accounts capability can change this.");
+      } else {
+        setError("Couldn't update that account.");
+      }
     } finally {
-      setBusyId(null);
+      setTogglingId(null);
     }
   }
 
@@ -120,123 +118,103 @@ export default function StaffTeamPage() {
   return (
     <>
       <p className="text-xs text-slate-400">
-        Everyone with access to this staff console, and at what role. Adding or deactivating someone requires the
-        staff.manage_staff capability (Super Admin, by default) - see the Access Matrix for exactly what each role
-        can do.
+        Every staff account with console access, and their role in the capability matrix (see Access Matrix for
+        what each role can actually do). Creating or deactivating an account requires the
+        staff.manage_staff_accounts capability (Super Admin only, by default). Deactivating someone takes effect on
+        their very next request — an existing session doesn&apos;t linger.
       </p>
 
       {error && (
         <p className="text-sm text-red-400 bg-red-950/50 border border-red-900 rounded-lg px-3 py-2">{error}</p>
       )}
 
-      {!showAddForm ? (
+      <form
+        onSubmit={handleCreate}
+        className="flex flex-wrap items-center gap-2 bg-slate-900 border border-slate-800 rounded-lg p-3"
+      >
+        <input
+          type="email"
+          value={email}
+          onChange={(e) => setEmail(e.target.value)}
+          placeholder="name@zoikogroup.com"
+          className="flex-1 min-w-[14rem] text-sm rounded-lg bg-slate-800 border border-slate-700 text-white px-2.5 py-1.5 placeholder:text-slate-500"
+        />
+        <input
+          type="password"
+          value={password}
+          onChange={(e) => setPassword(e.target.value)}
+          placeholder="password (min 8 characters)"
+          className="flex-1 min-w-[14rem] text-sm rounded-lg bg-slate-800 border border-slate-700 text-white px-2.5 py-1.5 placeholder:text-slate-500"
+        />
+        <select
+          value={role}
+          onChange={(e) => setRole(e.target.value as StaffRole)}
+          className="text-sm rounded-lg bg-slate-800 border border-slate-700 text-white px-2.5 py-1.5"
+        >
+          {ROLES.map((r) => (
+            <option key={r} value={r}>
+              {ROLE_LABELS[r]}
+            </option>
+          ))}
+        </select>
         <button
-          type="button"
-          onClick={() => setShowAddForm(true)}
-          className="text-xs font-medium rounded-lg px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white"
+          type="submit"
+          disabled={creating || !email.trim() || password.length < 8}
+          className="text-xs font-medium rounded-lg px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 text-white"
         >
-          + Add staff member
+          {creating ? "Adding..." : "Add teammate"}
         </button>
-      ) : (
-        <form
-          onSubmit={handleCreate}
-          className="flex flex-wrap items-center gap-2 bg-slate-900 border border-slate-800 rounded-lg p-3"
-        >
-          <input
-            type="email"
-            value={newEmail}
-            onChange={(e) => setNewEmail(e.target.value)}
-            placeholder="email@zoikolocal.com"
-            className="flex-1 min-w-[14rem] text-sm rounded-lg bg-slate-800 border border-slate-700 text-white px-2.5 py-1.5 placeholder:text-slate-500"
-          />
-          <input
-            type="text"
-            value={newPassword}
-            onChange={(e) => setNewPassword(e.target.value)}
-            placeholder="Temporary password"
-            className="flex-1 min-w-[12rem] text-sm rounded-lg bg-slate-800 border border-slate-700 text-white px-2.5 py-1.5 placeholder:text-slate-500"
-          />
-          <select
-            value={newRole}
-            onChange={(e) => setNewRole(e.target.value)}
-            className="text-sm rounded-lg bg-slate-800 border border-slate-700 text-white px-2.5 py-1.5"
-          >
-            {ROLES.map((role) => (
-              <option key={role} value={role}>
-                {ROLE_LABELS[role]}
-              </option>
-            ))}
-          </select>
-          <button
-            type="submit"
-            disabled={creating || !newEmail.trim() || !newPassword}
-            className="text-xs font-medium rounded-lg px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 text-white"
-          >
-            {creating ? "Adding..." : "Add"}
-          </button>
-          <button
-            type="button"
-            onClick={() => setShowAddForm(false)}
-            className="text-xs font-medium rounded-lg px-3 py-1.5 border border-slate-700 text-slate-300 hover:bg-slate-800"
-          >
-            Cancel
-          </button>
-        </form>
-      )}
+      </form>
 
       {loading && <p className="text-sm text-slate-400">Loading...</p>}
 
       {!loading && members.length > 0 && (
-        <div className="overflow-x-auto">
+        <div className="bg-slate-900 border border-slate-800 rounded-xl overflow-hidden">
           <table className="w-full text-sm">
             <thead>
-              <tr className="text-left text-xs text-slate-400 border-b border-slate-800">
-                <th className="pb-2 pr-4 font-medium">Email</th>
-                <th className="pb-2 pr-4 font-medium">Role</th>
-                <th className="pb-2 pr-4 font-medium">Status</th>
-                <th className="pb-2 pr-4 font-medium">Added</th>
-                <th className="pb-2 font-medium"></th>
+              <tr className="border-b border-slate-800 text-left text-xs text-slate-400">
+                <th className="px-4 py-2.5 font-medium">Email</th>
+                <th className="px-4 py-2.5 font-medium">Role</th>
+                <th className="px-4 py-2.5 font-medium">Status</th>
+                <th className="px-4 py-2.5 font-medium">Added</th>
+                <th className="px-4 py-2.5 font-medium"></th>
               </tr>
             </thead>
             <tbody>
-              {members.map((m) => {
-                const isSelf = m.id === ownStaffId;
-                return (
-                  <tr key={m.id} className="border-b border-slate-900">
-                    <td className="py-2 pr-4 text-slate-200">
-                      {m.email}
-                      {isSelf && <span className="text-slate-500 ml-1.5 text-xs">(you)</span>}
-                    </td>
-                    <td className="py-2 pr-4 text-slate-300">{ROLE_LABELS[m.role] ?? m.role}</td>
-                    <td className="py-2 pr-4">
-                      <span
-                        className={`text-[10px] font-semibold uppercase tracking-wide rounded-full px-2 py-0.5 ${
-                          m.is_active ? "bg-emerald-950 text-emerald-300" : "bg-slate-800 text-slate-400"
-                        }`}
-                      >
-                        {m.is_active ? "Active" : "Deactivated"}
-                      </span>
-                    </td>
-                    <td className="py-2 pr-4 text-slate-400">{formatDate(m.created_at)}</td>
-                    <td className="py-2 text-right">
-                      {!isSelf && (
-                        <button
-                          type="button"
-                          onClick={() => handleToggleActive(m)}
-                          disabled={busyId === m.id}
-                          className={`text-xs font-medium rounded-lg px-3 py-1.5 disabled:opacity-50 ${
-                            m.is_active
-                              ? "border border-red-900 text-red-400 hover:bg-red-950/50"
-                              : "bg-indigo-600 hover:bg-indigo-700 text-white"
-                          }`}
-                        >
-                          {busyId === m.id ? "Working..." : m.is_active ? "Deactivate" : "Reactivate"}
-                        </button>
-                      )}
-                    </td>
-                  </tr>
-                );
-              })}
+              {members.map((m) => (
+                <tr key={m.id} className="border-b border-slate-800/60 last:border-0">
+                  <td className="px-4 py-2.5 text-white">
+                    {m.email}
+                    {m.id === selfId && <span className="ml-2 text-xs text-slate-500">(you)</span>}
+                  </td>
+                  <td className="px-4 py-2.5 text-slate-300">{ROLE_LABELS[m.role] ?? m.role}</td>
+                  <td className="px-4 py-2.5">
+                    <span
+                      className={`text-xs font-medium rounded-full px-2.5 py-1 ${
+                        m.is_active ? "bg-emerald-950 text-emerald-400" : "bg-slate-800 text-slate-400"
+                      }`}
+                    >
+                      {m.is_active ? "Active" : "Deactivated"}
+                    </span>
+                  </td>
+                  <td className="px-4 py-2.5 text-slate-400">{new Date(m.created_at).toLocaleDateString()}</td>
+                  <td className="px-4 py-2.5 text-right">
+                    <button
+                      type="button"
+                      onClick={() => handleToggleActive(m)}
+                      disabled={togglingId === m.id || m.id === selfId}
+                      title={m.id === selfId ? "You can't deactivate your own account" : undefined}
+                      className={`text-xs font-medium rounded-lg px-2.5 py-1 disabled:opacity-40 ${
+                        m.is_active
+                          ? "bg-slate-800 hover:bg-red-950 hover:text-red-400 text-slate-300"
+                          : "bg-slate-800 hover:bg-emerald-950 hover:text-emerald-400 text-slate-300"
+                      }`}
+                    >
+                      {togglingId === m.id ? "..." : m.is_active ? "Deactivate" : "Reactivate"}
+                    </button>
+                  </td>
+                </tr>
+              ))}
             </tbody>
           </table>
         </div>

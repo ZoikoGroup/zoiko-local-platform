@@ -1,13 +1,24 @@
+from datetime import datetime, timedelta, timezone
+
 from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 from app.audit.service import log_event
+from app.billing.models import (
+    BillingPeriod,
+    CatalogEntryStatus,
+    Plan,
+    PriceCatalogEntry,
+    Subscription,
+    SubscriptionStatus,
+)
 from app.core.security import hash_password, verify_password
 from app.events.service import (
     publish_account_billing_classification_updated,
     publish_capability_granted,
     publish_capability_revoked,
 )
+from app.media.models import CallRecord
 from app.numbering.identity.models import Account, User, UserRole
 from app.numbering.numbers.models import PhoneNumber
 from app.numbering.numbers.service import list_due_renewals as _list_due_renewals
@@ -33,18 +44,14 @@ class LastGrantRemovalError(Exception):
     lockout short of direct database access."""
 
 
-def create_staff(
-    db: Session, email: str, password: str, role: PlatformStaffRole, *, actor: str | None = None
-) -> PlatformStaff:
+def create_staff(db: Session, email: str, password: str, role: PlatformStaffRole) -> PlatformStaff:
     """role has no default - there's no public staff signup endpoint (staff
     are provisioned internally, see app/seed.py), so every call site must
     consciously pick a role rather than silently inheriting a default.
-
-    `actor` is optional so bootstrap_initial_super_admin (a system action
-    with no acting staff member) and create_staff_route (POST
-    /staff/members, a real SUPER_ADMIN inviting a teammate) can share this
-    one function without either faking an actor or skipping the audit
-    trail - bootstrap logs its own system_bootstrap event separately."""
+    Deliberately stays bare (no actor/audit logging) - bootstrap_initial_
+    super_admin and create_staff_member (its console-driven wrapper) each
+    log their own event under a different actor shape, so hardcoding one
+    audit shape here would fit neither caller cleanly."""
     existing = db.query(PlatformStaff).filter(PlatformStaff.email == email).first()
     if existing:
         raise ValueError("A staff account with this email already exists")
@@ -53,11 +60,113 @@ def create_staff(
     db.add(staff)
     db.commit()
     db.refresh(staff)
-    if actor is not None:
-        log_event(
-            db, actor=actor, action="staff.created", target=f"platform_staff:{staff.id}",
-            after={"email": email, "role": role.value},
+    return staff
+
+
+class StaffEmailAlreadyExistsError(Exception):
+    """Raised creating a staff account whose email is already taken."""
+
+
+class StaffNotFoundError(Exception):
+    """Raised when a staff_id doesn't match any platform_staff row."""
+
+
+class LastActiveSuperAdminError(Exception):
+    """Raised deactivating the only remaining active SUPER_ADMIN - an
+    unrecoverable lockout short of direct database access, same class of
+    guard as LastGrantRemovalError above for staff.manage_capabilities."""
+
+
+def list_staff_team(db: Session) -> list[PlatformStaff]:
+    """Every internal staff account - any staff role can view who else has
+    console access (diagnostic, same "GET is open" posture as list_
+    accounts_overview); creating or deactivating one is the sensitive
+    action, gated separately by staff.manage_staff_accounts."""
+    return db.query(PlatformStaff).order_by(PlatformStaff.created_at.asc()).all()
+
+
+def create_staff_member(
+    db: Session, *, email: str, password: str, role: PlatformStaffRole, actor: str
+) -> PlatformStaff:
+    """SUPER_ADMIN-gated (staff.manage_staff_accounts) console entry point
+    for provisioning a teammate - the only real gap this whole capability
+    system had: bootstrap_initial_super_admin creates exactly one account
+    at first boot and nothing since then could create a second one short
+    of direct database access, which also meant the billing maker-checker
+    flow (request vs. approve, self-approval blocked) could never actually
+    run with only one SUPER_ADMIN to ever hold both roles.
+
+    Thin wrapper around create_staff (the same function app.seed and
+    bootstrap_initial_super_admin already use) that adds the audit trail
+    a console-driven creation needs - those two callers log their own
+    event under a different actor shape (system_bootstrap / the seed
+    script), so create_staff itself deliberately stays bare rather than
+    hardcoding one audit shape for every caller."""
+    if db.query(PlatformStaff).filter(PlatformStaff.email == email).first() is not None:
+        raise StaffEmailAlreadyExistsError(f"A staff account with email {email!r} already exists")
+    staff = create_staff(db, email=email, password=password, role=role)
+    log_event(
+        db, actor=actor, action="staff.created", target=f"platform_staff:{staff.id}",
+        after={"email": email, "role": role.value},
+    )
+    return staff
+
+
+def _get_staff_or_raise(db: Session, staff_id: str) -> PlatformStaff:
+    staff = db.query(PlatformStaff).filter(PlatformStaff.id == staff_id).first()
+    if staff is None:
+        raise StaffNotFoundError(f"No such staff account: {staff_id!r}")
+    return staff
+
+
+def deactivate_staff_member(db: Session, staff_id: str, *, actor: str) -> PlatformStaff:
+    """Revokes console access without deleting the row - every past action
+    they took must stay attributable to a real account for the audit
+    trail. Takes effect on their very next request: get_current_staff
+    (core/deps.py) re-checks is_active on every call and deliberately
+    never caches an inactive row, so there's no stale-cache window to
+    wait out the way there would be for a role change.
+
+    Blocked from ever dropping the platform to zero active SUPER_ADMINs -
+    same unrecoverable-lockout class LastGrantRemovalError already guards
+    against for staff.manage_capabilities, just for "nobody left who can
+    manage staff/billing/kill-switches at all" rather than "nobody left
+    who can edit the access matrix"."""
+    staff = _get_staff_or_raise(db, staff_id)
+    if staff.role == PlatformStaffRole.SUPER_ADMIN and staff.is_active:
+        other_active_admins = (
+            db.query(PlatformStaff)
+            .filter(
+                PlatformStaff.role == PlatformStaffRole.SUPER_ADMIN,
+                PlatformStaff.is_active.is_(True),
+                PlatformStaff.id != staff_id,
+            )
+            .count()
         )
+        if other_active_admins == 0:
+            raise LastActiveSuperAdminError(
+                "Cannot deactivate the only active Super Admin - promote another account first."
+            )
+
+    staff.is_active = False
+    db.commit()
+    db.refresh(staff)
+    log_event(
+        db, actor=actor, action="staff.deactivated", target=f"platform_staff:{staff.id}",
+        before={"is_active": True}, after={"is_active": False},
+    )
+    return staff
+
+
+def reactivate_staff_member(db: Session, staff_id: str, *, actor: str) -> PlatformStaff:
+    staff = _get_staff_or_raise(db, staff_id)
+    staff.is_active = True
+    db.commit()
+    db.refresh(staff)
+    log_event(
+        db, actor=actor, action="staff.reactivated", target=f"platform_staff:{staff.id}",
+        before={"is_active": False}, after={"is_active": True},
+    )
     return staff
 
 
@@ -87,43 +196,6 @@ def bootstrap_initial_super_admin(db: Session) -> PlatformStaff | None:
     log_event(
         db, actor="system_bootstrap", action="staff.bootstrapped", target=f"platform_staff:{staff.id}",
         after={"email": email, "role": PlatformStaffRole.SUPER_ADMIN.value},
-    )
-    return staff
-
-
-class StaffNotFoundError(Exception):
-    """Raised when set_staff_active targets a nonexistent staff id."""
-
-
-class CannotDeactivateSelfError(Exception):
-    """Raised when a staff member tries to deactivate their own account -
-    there's no staff self-service password reset or re-invite flow, so
-    this would be an immediate, unrecoverable-without-direct-database-
-    access lockout rather than a normal permission boundary."""
-
-
-def list_staff(db: Session) -> list[PlatformStaff]:
-    """Diagnostic - who currently has staff console access, and at what
-    role. Any staff role can view this (same posture as the access matrix
-    itself); adding/deactivating someone is the sensitive action, gated by
-    staff.manage_staff at the route level."""
-    return db.query(PlatformStaff).order_by(PlatformStaff.created_at.desc()).all()
-
-
-def set_staff_active(db: Session, staff_id: str, *, is_active: bool, actor_staff_id: str) -> PlatformStaff:
-    if staff_id == actor_staff_id and not is_active:
-        raise CannotDeactivateSelfError("Cannot deactivate your own staff account")
-
-    staff = db.query(PlatformStaff).filter(PlatformStaff.id == staff_id).first()
-    if staff is None:
-        raise StaffNotFoundError(f"No staff account {staff_id!r}")
-
-    staff.is_active = is_active
-    db.commit()
-    db.refresh(staff)
-    log_event(
-        db, actor=actor_staff_id, action="staff.reactivated" if is_active else "staff.deactivated",
-        target=f"platform_staff:{staff.id}", after={"email": staff.email},
     )
     return staff
 
@@ -183,12 +255,102 @@ def list_accounts_overview(db: Session) -> list[dict]:
     ]
 
 
+def get_platform_call_metrics(db: Session, *, window_days: int = 30) -> dict:
+    """Platform-wide call volume (every account, not one) - built for the
+    Super Admin Overview dashboard, since nothing in this codebase
+    aggregated CallRecord across accounts before now (the closest
+    precedent, run_zoikonex_reconciliation, counts rows for drift
+    detection, not for a volume report). Same "GET is diagnostic, open to
+    any staff role" posture as list_accounts_overview above - the route
+    exposing this is open to any staff, only the frontend UI restricts it
+    to SUPER_ADMIN. Scoped to a rolling window rather than all-time so the
+    number stays meaningful as volume grows and the query doesn't turn
+    into a full-table scan a year from now."""
+    cutoff = datetime.now(timezone.utc) - timedelta(days=window_days)
+    rows = (
+        db.query(CallRecord.status, func.count(CallRecord.id), func.coalesce(func.sum(CallRecord.duration), 0))
+        .filter(CallRecord.created_at >= cutoff)
+        .group_by(CallRecord.status)
+        .all()
+    )
+    total_calls = sum(count for _, count, _ in rows)
+    total_seconds = sum(seconds for _, _, seconds in rows)
+    return {
+        "window_days": window_days,
+        "total_calls": total_calls,
+        "total_minutes": round(total_seconds / 60, 1),
+        "by_status": sorted(
+            [{"status": status, "count": count} for status, count, _ in rows],
+            key=lambda r: -r["count"],
+        ),
+    }
+
+
+def get_platform_billing_metrics(db: Session) -> dict:
+    """Platform-wide subscription/revenue snapshot - Super Admin dashboard
+    only (same open-GET-restricted-UI posture as get_platform_call_metrics
+    above). estimated_mrr_minor_units is a PLANNING ESTIMATE, not a real
+    revenue-recognition figure: it prices each active subscription off the
+    approved, non-placeholder price catalog (PriceCatalogEntry - see its
+    docstring on why placeholder rows are excluded) and normalizes annual
+    subscriptions to a monthly-equivalent (amount / 12) so mixed billing
+    periods sum to one comparable number - it does not account for
+    proration, discounts, failed payments, or mid-cycle plan changes.
+    A subscription whose plan+period has no matching ACTIVE catalog entry
+    contributes to total_active_subscriptions/by_plan but not to the MRR
+    sum (same "don't invent a price" discipline PriceCatalogEntry's
+    docstring already establishes elsewhere in this codebase)."""
+    active_subs = (
+        db.query(Subscription.plan_code, Subscription.billing_period, func.count(Subscription.id))
+        .filter(Subscription.status == SubscriptionStatus.ACTIVE)
+        .group_by(Subscription.plan_code, Subscription.billing_period)
+        .all()
+    )
+
+    # market="GLOBAL": the only market that exists today (see
+    # PriceCatalogEntry's docstring) - filtered explicitly so a future
+    # market-specific row can never silently collide with this one in the
+    # dict below rather than by accident of query ordering.
+    prices = {
+        (entry.plan_code, entry.billing_period): entry.amount_minor_units
+        for entry in db.query(PriceCatalogEntry).filter(
+            PriceCatalogEntry.status == CatalogEntryStatus.ACTIVE,
+            PriceCatalogEntry.is_placeholder.is_(False),
+            PriceCatalogEntry.market == "GLOBAL",
+        )
+    }
+    plan_names = {code: name for code, name in db.query(Plan.plan_code, Plan.name).all()}
+
+    by_plan: dict[str, int] = {}
+    mrr_minor_units = 0.0
+    for plan_code, period, count in active_subs:
+        by_plan[plan_code] = by_plan.get(plan_code, 0) + count
+        amount = prices.get((plan_code, period))
+        if amount is None:
+            continue
+        monthly_equivalent = amount if period == BillingPeriod.MONTHLY else amount / 12
+        mrr_minor_units += monthly_equivalent * count
+
+    return {
+        "total_active_subscriptions": sum(by_plan.values()),
+        "estimated_mrr_minor_units": round(mrr_minor_units),
+        "currency_code": "USD",
+        "by_plan": sorted(
+            [
+                {"plan_code": code, "plan_name": plan_names.get(code, code), "count": count}
+                for code, count in by_plan.items()
+            ],
+            key=lambda r: -r["count"],
+        ),
+    }
+
+
 class AccountNotFoundError(Exception):
     """Raised when an account id doesn't exist."""
 
 
 def get_account_overview(db: Session, account_id: str) -> dict:
-    """Single-account counterpart to list_accounts_overview - avoids
+    """Single-account counterpart tois  list_accounts_overview - avoids
     pulling every account just to return one, e.g. right after a billing-
     classification update."""
     account = db.query(Account).filter(Account.id == account_id).first()
@@ -230,6 +392,7 @@ def update_account_billing_classification(
     db.refresh(account)
     log_event(
         db, actor=actor, action="account.billing_classification_updated", target=f"account:{account.id}",
+        account_id=account.id,
         before=before,
         after={"billing_classification": billing_classification.value, "billing_source": billing_source.value},
     )
@@ -259,6 +422,7 @@ def set_account_test_flag(db: Session, account_id: str, *, is_test: bool, actor:
     db.refresh(account)
     log_event(
         db, actor=actor, action="account.test_flag_updated", target=f"account:{account.id}",
+        account_id=account.id,
         reason=reason, before={"is_test": previous}, after={"is_test": is_test},
     )
     return account
@@ -294,6 +458,7 @@ def set_account_legal_hold(
     db.refresh(account)
     log_event(
         db, actor=actor, action="account.legal_hold_changed", target=f"account:{account.id}",
+        account_id=account.id,
         before=previous, after={"legal_hold": account.legal_hold, "legal_hold_reference": account.legal_hold_reference},
     )
     return account

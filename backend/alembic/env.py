@@ -72,6 +72,7 @@ def run_migrations_offline() -> None:
         target_metadata=target_metadata,
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
+        transaction_per_migration=True,
     )
 
     with context.begin_transaction():
@@ -92,8 +93,29 @@ def run_migrations_online() -> None:
     )
 
     with connectable.connect() as connection:
+        # Real gap fix: without this, `alembic upgrade head` wraps the
+        # ENTIRE chain (current revision -> head) in one transaction, not
+        # one per migration - confirmed live, replaying this repo's full
+        # migration chain from an empty database in one continuous run
+        # fails with Postgres's "unsafe use of new value ... New enum
+        # values must be committed before they can be used" the moment a
+        # later migration uses an enum value an earlier migration in the
+        # SAME run just added (e.g. c4a891fe6d27 using catalog_entry_
+        # status_enum's ACTIVE value). This never surfaced against the
+        # real Neon database because its schema was built incrementally
+        # across many separate `alembic upgrade head` invocations over
+        # many working sessions - each invocation's transaction committed
+        # independently, so an enum value added in an earlier SESSION was
+        # already durable by the time a later session used it. Any
+        # genuinely fresh environment (new deploy, CI, disaster-recovery
+        # restore) running the full chain in one shot would hit this
+        # every time. transaction_per_migration=True commits after each
+        # individual migration instead - standard Alembic practice for
+        # exactly this class of Postgres limitation, and also closer to
+        # what actually happened historically than one giant transaction.
         context.configure(
-            connection=connection, target_metadata=target_metadata
+            connection=connection, target_metadata=target_metadata,
+            transaction_per_migration=True,
         )
 
         with context.begin_transaction():

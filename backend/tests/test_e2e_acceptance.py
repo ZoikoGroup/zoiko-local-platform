@@ -83,6 +83,16 @@ def _signup_and_login(client, email: str) -> tuple[str, str]:
     )
     account_id = signup.json()["account_id"]
     login = client.post("/auth/login", json={"email": email, "password": "supersecret123"})
+    # Real gap fix: number purchase now requires email_verified (Production
+    # Readiness Standard doc §5's "Identity" trial-abuse control, and the
+    # doc's own golden-path trace explicitly lists "identity verification"
+    # right after signup).
+    from app.core.security import create_access_token
+
+    client.post(
+        "/auth/verify-email",
+        json={"token": create_access_token(subject=signup.json()["id"], scope="email_verification")},
+    )
     return login.json()["access_token"], account_id
 
 

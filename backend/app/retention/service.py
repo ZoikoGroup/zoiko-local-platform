@@ -128,7 +128,8 @@ def list_retention_policies(db: Session, account_id: str) -> dict[str, int]:
 
 
 def _purge_voicemails(
-    db: Session, now: datetime, *, account_id: str | None = None, force: bool = False
+    db: Session, now: datetime, *, account_id: str | None = None, force: bool = False,
+    actor: str = "system:retention_sweep",
 ) -> tuple[int, int]:
     purged = failed = 0
     # Real gap fix: recording_url.isnot(None) alone kept re-selecting
@@ -152,7 +153,7 @@ def _purge_voicemails(
             telecom.delete_recording(telecom.recording_sid_from_url(vm.recording_url))
         except TelecomError as e:
             log_event(
-                db, actor_id=vm.account_id, action="retention.purge_failed",
+                db, actor_id=actor, action="retention.purge_failed",
                 target_type="voicemail", target_id=vm.id, reason=str(e),
             )
             failed += 1
@@ -164,7 +165,7 @@ def _purge_voicemails(
 
             _invalidate_voicemails_cache(vm.account_id)
         log_event(
-            db, actor_id=vm.account_id, action="retention.voicemail_purged",
+            db, actor_id=actor, action="retention.voicemail_purged",
             target_type="voicemail", target_id=vm.id, metadata={"retention_days": retention_days},
         )
         publish_retention_recording_purged(vm.account_id, artifact_type="voicemail", target_id=vm.id)
@@ -173,7 +174,8 @@ def _purge_voicemails(
 
 
 def _purge_call_recordings(
-    db: Session, now: datetime, *, account_id: str | None = None, force: bool = False
+    db: Session, now: datetime, *, account_id: str | None = None, force: bool = False,
+    actor: str = "system:retention_sweep",
 ) -> tuple[int, int]:
     purged = failed = 0
     # Real gap fix - see _purge_voicemails' comment on the same bug.
@@ -193,7 +195,7 @@ def _purge_call_recordings(
             telecom.delete_recording(telecom.recording_sid_from_url(call.recording_url))
         except TelecomError as e:
             log_event(
-                db, actor_id=call.account_id, action="retention.purge_failed",
+                db, actor_id=actor, action="retention.purge_failed",
                 target_type="call_record", target_id=call.id, reason=str(e),
             )
             failed += 1
@@ -208,7 +210,7 @@ def _purge_call_recordings(
 
             _invalidate_calls_cache(call.account_id)
         log_event(
-            db, actor_id=call.account_id, action="retention.call_recording_purged",
+            db, actor_id=actor, action="retention.call_recording_purged",
             target_type="call_record", target_id=call.id, metadata={"retention_days": retention_days},
         )
         publish_retention_recording_purged(call.account_id, artifact_type="call_recording", target_id=call.id)
@@ -217,7 +219,8 @@ def _purge_call_recordings(
 
 
 def _purge_video_recordings(
-    db: Session, now: datetime, *, account_id: str | None = None, force: bool = False
+    db: Session, now: datetime, *, account_id: str | None = None, force: bool = False,
+    actor: str = "system:retention_sweep",
 ) -> tuple[int, int]:
     purged = failed = 0
     # PURGED_MARKER exclusion is the real gap fix here - see
@@ -245,7 +248,7 @@ def _purge_video_recordings(
             delete_object(object_key)
         except StorageError as e:
             log_event(
-                db, actor_id=session.account_id, action="retention.purge_failed",
+                db, actor_id=actor, action="retention.purge_failed",
                 target_type="video_session", target_id=session.id, reason=str(e),
             )
             failed += 1
@@ -253,7 +256,7 @@ def _purge_video_recordings(
         session.recording_url = PURGED_MARKER
         db.commit()
         log_event(
-            db, actor_id=session.account_id, action="retention.video_recording_purged",
+            db, actor_id=actor, action="retention.video_recording_purged",
             target_type="video_session", target_id=session.id, metadata={"retention_days": retention_days},
         )
         publish_retention_recording_purged(session.account_id, artifact_type="video_recording", target_id=session.id)
@@ -343,9 +346,9 @@ def erase_account_data(db: Session, account_id: str, *, actor: str) -> dict[str,
         )
 
     now = datetime.now(timezone.utc)
-    voicemail_purged, voicemail_failed = _purge_voicemails(db, now, account_id=account_id, force=True)
-    call_purged, call_failed = _purge_call_recordings(db, now, account_id=account_id, force=True)
-    video_purged, video_failed = _purge_video_recordings(db, now, account_id=account_id, force=True)
+    voicemail_purged, voicemail_failed = _purge_voicemails(db, now, account_id=account_id, force=True, actor=actor)
+    call_purged, call_failed = _purge_call_recordings(db, now, account_id=account_id, force=True, actor=actor)
+    video_purged, video_failed = _purge_video_recordings(db, now, account_id=account_id, force=True, actor=actor)
 
     contacts_deleted = (
         db.query(Contact).filter(Contact.account_id == account_id).delete(synchronize_session=False)
@@ -373,8 +376,8 @@ def erase_account_data(db: Session, account_id: str, *, actor: str) -> dict[str,
         "receptionist_calls_redacted": receptionist_calls_redacted,
     }
     log_event(
-        db, actor_id=account_id, action="retention.account_data_erased",
-        target_type="account", target_id=account_id, metadata={**result, "erased_by": actor},
+        db, actor_id=actor, action="retention.account_data_erased",
+        target_type="account", target_id=account_id, metadata=result,
     )
     return result
 
@@ -414,7 +417,7 @@ def erase_single_call_content(db: Session, account_id: str, call_id: str, *, act
             telecom.delete_recording(telecom.recording_sid_from_url(call.recording_url))
         except TelecomError as e:
             log_event(
-                db, actor_id=account_id, action="retention.purge_failed",
+                db, actor_id=actor, action="retention.purge_failed",
                 target_type="call_record", target_id=call.id, reason=str(e),
             )
             raise
@@ -439,8 +442,8 @@ def erase_single_call_content(db: Session, account_id: str, call_id: str, *, act
 
     result = {"recording_erased": recording_erased, "summaries_deleted": summaries_deleted}
     log_event(
-        db, actor_id=account_id, action="retention.call_content_erased",
-        target_type="call_record", target_id=call.id, metadata={**result, "erased_by": actor},
+        db, actor_id=actor, action="retention.call_content_erased",
+        target_type="call_record", target_id=call.id, metadata=result,
     )
     publish_retention_recording_purged(account_id, artifact_type="call_recording", target_id=call.id)
     return result

@@ -32,6 +32,7 @@ from app.numbering.numbers.schemas import (
 )
 from app.numbering.numbers.service import (
     ComplianceRequiredError,
+    EmailVerificationRequiredError,
     EmergencyDisclosureRequiredError,
     InvalidAreaCodeError,
     MarketNotActivatedError,
@@ -129,7 +130,10 @@ def purchase_number(
     # both subclass EntitlementError and are handled by the global
     # entitlement_error_handler in app.main, which already returns 402 plus
     # a machine-readable code.
-    except (ComplianceRequiredError, EmergencyDisclosureRequiredError, NumberEligibilityRequiredError) as e:
+    except (
+        ComplianceRequiredError, EmailVerificationRequiredError, EmergencyDisclosureRequiredError,
+        NumberEligibilityRequiredError,
+    ) as e:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e)) from e
     except TelecomError as e:
         raise _telecom_error_response(e) from e
@@ -287,7 +291,10 @@ def create_checkout_session(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e)) from e
     # NumberQuotaExceededError/BillingSuspendedError - see the comment at
     # the /purchase route above; handled by the global entitlement handler.
-    except (ComplianceRequiredError, EmergencyDisclosureRequiredError, NumberEligibilityRequiredError) as e:
+    except (
+        ComplianceRequiredError, EmailVerificationRequiredError, EmergencyDisclosureRequiredError,
+        NumberEligibilityRequiredError,
+    ) as e:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e)) from e
     except TelecomError as e:
         # Included-first-number path calls purchase_number() (and therefore

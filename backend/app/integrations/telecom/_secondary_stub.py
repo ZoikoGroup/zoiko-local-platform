@@ -23,6 +23,7 @@ import time
 import uuid
 
 import httpx
+import phonenumbers
 from jose import jwt as jose_jwt
 
 from app.core.config import settings
@@ -153,12 +154,21 @@ def release_number(phone_number_sid: str) -> None:
 
 def buy_number(phone_number: str) -> dict:
     _require_credentials()
-    # Vonage's /number/buy needs a country code separate from the msisdn -
-    # derived from the E.164 prefix would need a full calling-code table;
-    # good enough for the launch-market set this codebase targets (US/CA
-    # share +1, so this intentionally can't disambiguate them - Vonage
-    # requires the country explicitly for a real purchase).
-    country = "US" if phone_number.startswith("+1") else phone_number[:3]
+    # Vonage's /number/buy needs a proper 2-letter ISO country code, not the
+    # raw E.164 dialing prefix - phone_number[:3] on a non-NANP number (e.g.
+    # "+44...") produced the bogus literal string "+44" instead of "GB",
+    # which Vonage's API would have rejected outright. phonenumbers is
+    # already used elsewhere in this codebase for the exact same E.164 ->
+    # ISO country derivation (see app.risk.service._country_for_e164) - reuse
+    # the same library instead of hand-rolling prefix slicing. Currently
+    # unreachable: buy_number's caller in twilio.py passes secondary_fn=None
+    # (see that module's comment), so this only matters once that override
+    # is lifted - fixed now regardless so it's correct when it is.
+    try:
+        parsed = phonenumbers.parse(phone_number)
+        country = phonenumbers.region_code_for_number(parsed) or "US"
+    except phonenumbers.NumberParseException:
+        country = "US"
     try:
         response = httpx.post(
             _NUMBER_BUY_URL,

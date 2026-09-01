@@ -1,5 +1,13 @@
 @import "tailwindcss";
 
+/* Enables the `dark:` variant, but ONLY under a `.dark` class - never
+   activated automatically by OS/browser preference. Scoped in practice to
+   the staff console (see staff-theme.css), which toggles `.dark` on its
+   own root wrapper; the customer dashboard below never applies that
+   class, so defining the variant here has zero effect on its own theme
+   (deliberately light-only - see the color-scheme comment further down). */
+@custom-variant dark (&:where(.dark, .dark *));
+
 /* ==========================================================================
    ZOIKO LOCAL — GREEN + BEIGE DASHBOARD THEME
    --------------------------------------------------------------------------

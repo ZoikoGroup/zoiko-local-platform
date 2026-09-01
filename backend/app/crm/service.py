@@ -100,7 +100,6 @@ def connect_crm(db: Session, *, account_id: str, provider: str, actor: str) -> C
     publish_crm_connected(account_id, provider=provider_enum.value)
 
     from app.numbering.identity.models import Account, User, UserRole
-
     actor_user = db.query(User).filter(User.id == actor).first()
     owner = db.query(User).filter(User.account_id == account_id, User.role == UserRole.OWNER).first()
     if owner is not None:
@@ -173,7 +172,8 @@ def complete_hubspot_oauth(db: Session, *, code: str, state: str) -> CrmConnecti
 
     log_event(
         db, actor="hubspot_oauth_callback", action="crm_connection.connected",
-        target=f"crm_connection:{connection.id}", after={"provider": "hubspot", "real": True},
+        target=f"crm_connection:{connection.id}", account_id=connection.account_id,
+        after={"provider": "hubspot", "real": True},
     )
     publish_crm_connected(account_id, provider="hubspot")
 
@@ -244,7 +244,8 @@ def complete_salesforce_oauth(db: Session, *, code: str, state: str) -> CrmConne
 
     log_event(
         db, actor="salesforce_oauth_callback", action="crm_connection.connected",
-        target=f"crm_connection:{connection.id}", after={"provider": "salesforce", "real": True},
+        target=f"crm_connection:{connection.id}", account_id=connection.account_id,
+        after={"provider": "salesforce", "real": True},
     )
     publish_crm_connected(account_id, provider="salesforce")
 
@@ -313,7 +314,8 @@ def complete_pipedrive_oauth(db: Session, *, code: str, state: str) -> CrmConnec
 
     log_event(
         db, actor="pipedrive_oauth_callback", action="crm_connection.connected",
-        target=f"crm_connection:{connection.id}", after={"provider": "pipedrive", "real": True},
+        target=f"crm_connection:{connection.id}", account_id=connection.account_id,
+        after={"provider": "pipedrive", "real": True},
     )
     publish_crm_connected(account_id, provider="pipedrive")
 

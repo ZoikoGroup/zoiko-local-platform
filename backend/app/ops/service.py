@@ -230,11 +230,18 @@ def _list_active_subscribers(db: Session) -> list:
     return db.query(User).filter(User.account_id.in_(account_ids), User.email.isnot(None)).all()
 
 
-def create_incident(db: Session, *, title: str, affected_service: str, impact_summary: str) -> Incident:
+def create_incident(
+    db: Session, *, title: str, affected_service: str, impact_summary: str, actor: str = "staff_console"
+) -> Incident:
     incident = Incident(title=title, affected_service=affected_service, impact_summary=impact_summary)
     db.add(incident)
     db.commit()
     db.refresh(incident)
+    log_event(
+        db, actor=actor, action="ops.incident_created", target=f"incident:{incident.id}",
+        after={"title": title, "affected_service": affected_service, "impact_summary": impact_summary,
+               "status": incident.status.value},
+    )
     publish_incident_declared(incident_id=incident.id, title=title, affected_service=affected_service)
     for user in _list_active_subscribers(db):
         notify_incident_declared(
@@ -254,7 +261,7 @@ class IncidentAlreadyResolvedError(Exception):
 
 def update_incident(
     db: Session, incident_id: str, *, status: IncidentStatus, impact_summary: str | None = None,
-    mitigation_summary: str | None = None,
+    mitigation_summary: str | None = None, actor: str = "staff_console",
 ) -> Incident:
     incident = db.query(Incident).filter(Incident.id == incident_id).first()
     if incident is None:
@@ -262,6 +269,10 @@ def update_incident(
     if incident.status == IncidentStatus.RESOLVED:
         raise IncidentAlreadyResolvedError(f"Incident {incident_id} is already resolved")
 
+    before = {
+        "status": incident.status.value, "impact_summary": incident.impact_summary,
+        "mitigation_summary": incident.mitigation_summary,
+    }
     incident.status = status
     if impact_summary is not None:
         incident.impact_summary = impact_summary
@@ -269,6 +280,14 @@ def update_incident(
         incident.mitigation_summary = mitigation_summary
     db.commit()
     db.refresh(incident)
+    log_event(
+        db, actor=actor, action="ops.incident_updated", target=f"incident:{incident.id}",
+        before=before,
+        after={
+            "status": incident.status.value, "impact_summary": incident.impact_summary,
+            "mitigation_summary": incident.mitigation_summary,
+        },
+    )
     for user in _list_active_subscribers(db):
         notify_incident_update(
             db, account_id=user.account_id, account_email=user.email, incident_reference=incident.id,
@@ -278,17 +297,23 @@ def update_incident(
     return incident
 
 
-def resolve_incident(db: Session, incident_id: str) -> Incident:
+def resolve_incident(db: Session, incident_id: str, *, actor: str = "staff_console") -> Incident:
     incident = db.query(Incident).filter(Incident.id == incident_id).first()
     if incident is None:
         raise IncidentNotFoundError(f"No such incident {incident_id!r}")
     if incident.status == IncidentStatus.RESOLVED:
         raise IncidentAlreadyResolvedError(f"Incident {incident_id} is already resolved")
 
+    before_status = incident.status.value
     incident.status = IncidentStatus.RESOLVED
     incident.resolved_at = sa.func.now()
     db.commit()
     db.refresh(incident)
+    log_event(
+        db, actor=actor, action="ops.incident_resolved", target=f"incident:{incident.id}",
+        before={"status": before_status},
+        after={"status": incident.status.value, "resolved_at": incident.resolved_at.isoformat()},
+    )
     publish_incident_resolved(incident_id=incident.id)
     duration = incident.resolved_at - incident.started_at
     for user in _list_active_subscribers(db):
@@ -333,6 +358,40 @@ class KillSwitchTrippedError(Exception):
     """Raised by assert_kill_switch_not_active - a staff member has
     manually halted new activity in this scope (Commercial Billing
     Operating Standard doc §32.1)."""
+
+
+def get_event_outbox_summary(db: Session) -> dict:
+    """Backlog visibility for the producer-side durability outbox (see
+    app.events.models.EventOutbox's docstring) - separate from the actual
+    POST /ops/event-outbox/flush action (ops.manage_event_outbox,
+    SUPER_ADMIN only), same "GET is diagnostic, open to any staff role"
+    split as every other ops status endpoint in this file. Before this,
+    the only way to know whether anything even NEEDED flushing was to
+    query the table directly - the flush button existed with zero
+    visibility into what it would do.
+
+    oldest_pending_age_seconds surfaces how long the oldest unpublished
+    row has been waiting - a growing number here means publishing is
+    stuck (Kafka down, or the flush sweep isn't running), not just "a
+    normal trickle of recent events." failing_count (attempt_count >= 3)
+    flags rows that have been retried repeatedly without success -
+    exactly the events a flush by itself won't fix if the underlying
+    cause is still broken.
+    """
+    from app.events.models import EventOutbox
+
+    pending = db.query(EventOutbox).filter(EventOutbox.published_at.is_(None))
+    pending_count = pending.count()
+    oldest = pending.order_by(EventOutbox.created_at.asc()).first()
+    oldest_pending_age_seconds = (
+        (datetime.now(timezone.utc) - oldest.created_at).total_seconds() if oldest else None
+    )
+    failing_count = pending.filter(EventOutbox.attempt_count >= 3).count()
+    return {
+        "pending_count": pending_count,
+        "failing_count": failing_count,
+        "oldest_pending_age_seconds": oldest_pending_age_seconds,
+    }
 
 
 def list_kill_switches(db: Session) -> list[PlatformKillSwitch]:
@@ -416,7 +475,7 @@ def expire_overdue_kill_switches(db: Session) -> dict[str, int]:
         switch.deactivated_at = now
         log_event(
             db, actor="system:kill_switch_expiry", action="risk.account_kill_switch_deactivated",
-            target=f"account_kill_switch:{switch.id}",
+            target=f"account_kill_switch:{switch.id}", account_id=switch.account_id,
             after={"reason": "expired", "account_id": switch.account_id, "expires_at": switch.expires_at.isoformat()},
         )
         # The manual deactivation path (risk/service.py:592) publishes this

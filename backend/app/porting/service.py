@@ -1,6 +1,8 @@
 import uuid
 from datetime import date
 
+import sqlalchemy as sa
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.audit.service import log_event
@@ -54,6 +56,16 @@ def submit_porting_request(
     authorization_evidence_url: str | None = None,
     target_completion_date: date | None = None,
 ) -> PortingRequest:
+    # Two brand-new PortingRequest rows for the SAME phone number have no
+    # existing row either request could lock (with_for_update needs a row
+    # to lock, and neither exists yet) - unlike numbering's reserve_number,
+    # which locks the PhoneNumber row that already exists. A Postgres
+    # transaction-scoped advisory lock keyed on the phone number serializes
+    # concurrent submissions for the SAME number while leaving different
+    # numbers uncontended; it auto-releases at transaction end (commit or
+    # rollback), so no explicit unlock is needed.
+    db.execute(sa.select(sa.func.pg_advisory_xact_lock(sa.func.hashtext(phone_number))))
+
     if db.query(PhoneNumber).filter(PhoneNumber.e164 == phone_number).first() is not None:
         raise PortingRequestConflictError(f"{phone_number} is already a number on this platform")
 
@@ -265,7 +277,21 @@ def complete_porting_request(
 
     request.status = PortingRequestStatus.COMPLETED
     request.twilio_incoming_number_sid = twilio_incoming_number_sid
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError as e:
+        # The existence check above is TOCTOU-racy against a concurrent
+        # completion for the same e164 (no row to with_for_update()-lock
+        # beforehand - unlike reserve_number, both completions are racing
+        # to INSERT a brand-new PhoneNumber row, not contending on an
+        # existing one). PhoneNumber.e164's DB unique constraint is the
+        # real backstop; without this except, that IntegrityError surfaced
+        # as an unhandled 500 instead of the same clean 409 every other
+        # porting conflict already gets.
+        db.rollback()
+        raise PortingRequestConflictError(
+            f"{request.phone_number} is already a number on this platform"
+        ) from e
     db.refresh(request)
     db.refresh(number)
 

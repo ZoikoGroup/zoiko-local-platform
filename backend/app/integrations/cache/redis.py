@@ -77,6 +77,19 @@ def _run(op_name: str, key, fn) -> bool:
         _breaker.record_failure()
         logger.warning("%s(%s) failed: %s", op_name, key, e)
         return False
+    except (TypeError, ValueError) as e:
+        # Real gap fix: cache_set's fn does json.dumps(value) INSIDE this
+        # try block, so a non-JSON-serializable value (e.g. a caller
+        # passing a raw datetime/Decimal instead of an already-serialized
+        # primitive) would otherwise escape uncaught here - contradicting
+        # this whole module's own documented guarantee ("must never fails
+        # or blocks the underlying operation... rather than raising").
+        # Deliberately NOT recorded as a breaker failure - this is a
+        # caller-side bug, not a Redis outage, and treating it as one
+        # would incorrectly degrade cache availability for every OTHER
+        # caller too.
+        logger.warning("%s(%s) failed to serialize: %s", op_name, key, e)
+        return False
 
 
 def cache_get(key: str) -> dict | list | None:

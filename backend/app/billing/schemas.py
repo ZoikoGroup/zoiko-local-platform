@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class PlanResponse(BaseModel):
@@ -65,7 +65,7 @@ class CreatePriceCatalogEntryRequest(BaseModel):
     plan_code: str
     catalog_version: str
     billing_period: str = "monthly"
-    amount_minor_units: int
+    amount_minor_units: int = Field(gt=0)
     currency_code: str = "USD"
     is_placeholder: bool = True
     price_book_version: str | None = None
@@ -212,21 +212,21 @@ class RunBillingCycleResponse(BaseModel):
 class IssueCreditNoteRequest(BaseModel):
     account_id: str
     invoice_id: str
-    amount_minor_units: int
+    amount_minor_units: int = Field(gt=0)
     reason: str
 
 
 class IssueDebitNoteRequest(BaseModel):
     account_id: str
     invoice_id: str
-    amount_minor_units: int
+    amount_minor_units: int = Field(gt=0)
     reason: str
 
 
 class RefundPaymentRequest(BaseModel):
     account_id: str
     payment_intent_id: str
-    amount_minor_units: int
+    amount_minor_units: int = Field(gt=0)
     reason: str
 
 

@@ -13,6 +13,7 @@ from app.consent.service import has_active_consent
 from app.core.config import settings
 from app.events.service import (
     publish_number_activated,
+    publish_number_purchase_confirmed,
     publish_number_reserved,
     publish_number_suspended,
 )
@@ -45,6 +46,7 @@ from app.numbering.numbers.models import (
     NumberEligibilityRule,
     PhoneNumber,
     PhoneNumberStatus,
+    PhoneNumberSuspensionSource,
     RingGroupDestination,
     SupportedCountry,
 )
@@ -376,6 +378,12 @@ class ComplianceRequiredError(Exception):
     "Compliance Pending" lifecycle state, enforced at the point of purchase."""
 
 
+class EmailVerificationRequiredError(Exception):
+    """Raised when the account owner hasn't verified their email yet -
+    required before ANY number purchase (Production Readiness Standard
+    doc §5's "Identity" trial-abuse control)."""
+
+
 class EmergencyDisclosureRequiredError(Exception):
     """Raised when the account hasn't acknowledged the emergency-calling
     limitation disclosure yet - required before ANY number purchase, every
@@ -681,8 +689,23 @@ def submit_number_eligibility_bundle(
     API for GB local/individual, 2026-08-22). Requires at least one
     document already uploaded via submit_number_eligibility_document.
     Real, no-mock - every Twilio call here is a genuine API call, same
-    discipline as every other Provider Gateway integration this session."""
-    case = _get_eligibility_case(db, case_id)
+    discipline as every other Provider Gateway integration this session.
+
+    Locked with with_for_update() (same convention as reserve_number's
+    "Atomicity law") before the double-submission checks below - without
+    it, two genuinely concurrent submissions for the same case can both
+    read twilio_bundle_sid as unset and each go on to create a real,
+    separate Twilio EndUser/SupportingDocument/Bundle, silently orphaning
+    one of them (exactly what NumberEligibilityBundleAlreadySubmittedError's
+    docstring says this guard exists to prevent)."""
+    case = (
+        db.query(NumberEligibilityCase)
+        .filter(NumberEligibilityCase.id == case_id)
+        .with_for_update()
+        .first()
+    )
+    if case is None:
+        raise NumberEligibilityCaseNotFoundError(f"No eligibility case with id {case_id}")
     if case.account_id != account_id:
         raise NumberEligibilityCaseNotFoundError(f"No eligibility case with id {case_id}")
     if not case.documents:
@@ -887,6 +910,17 @@ def approve_number_eligibility_case(db: Session, case_id: str, *, actor: str, no
         db, actor=actor, action="number.eligibility_case_approved",
         target=f"number_eligibility_case:{case.id}", before={"status": before_status}, after={"status": case.status},
     )
+    # This manual staff override path never notified the customer, unlike
+    # the Twilio-bundle-driven path (_apply_bundle_status_result) - a staff
+    # approval left the customer with no signal to go back and complete the
+    # purchase, same gap notify_number_eligibility_approved's own docstring
+    # describes fixing for the automated path.
+    owner = db.query(User).filter(User.account_id == case.account_id, User.role == UserRole.OWNER).first()
+    if owner is not None:
+        notify_number_eligibility_approved(
+            db, account_id=case.account_id, account_email=owner.email,
+            country=case.country, number_type=case.number_type,
+        )
     return case
 
 
@@ -902,6 +936,12 @@ def reject_number_eligibility_case(db: Session, case_id: str, *, actor: str, not
         db, actor=actor, action="number.eligibility_case_rejected",
         target=f"number_eligibility_case:{case.id}", before={"status": before_status}, after={"status": case.status},
     )
+    owner = db.query(User).filter(User.account_id == case.account_id, User.role == UserRole.OWNER).first()
+    if owner is not None:
+        notify_number_eligibility_rejected(
+            db, account_id=case.account_id, account_email=owner.email,
+            country=case.country, number_type=case.number_type, rejection_reason=notes or "",
+        )
     return case
 
 
@@ -1030,6 +1070,21 @@ def _assert_purchase_eligible(db: Session, account_id: str, number: PhoneNumber,
     purchase_number itself as defense-in-depth against the case's status
     changing in the gap between checkout-session creation and the
     payment webhook actually firing."""
+    # Production Readiness Standard doc §5 "Identity" trial-abuse control -
+    # the cheapest possible check, ahead of market/quota/billing, since an
+    # unverified email means we don't even know this signup is real yet. A
+    # scripted signup with a disposable address (rate-limited to 5/min but
+    # otherwise unthrottled) previously got a real Twilio number with no
+    # identity check at all. Checks the ACCOUNT OWNER specifically (not
+    # whichever user is placing the order) - a business account's owner is
+    # who's accountable for it, same pattern the KYC/eligibility gates
+    # below already use for their own owner lookups.
+    owner_for_verification = db.query(User).filter(User.account_id == account_id, User.role == UserRole.OWNER).first()
+    if owner_for_verification is not None and not owner_for_verification.email_verified:
+        raise EmailVerificationRequiredError(
+            "Verify your email address before purchasing a number — check your inbox for the "
+            "verification link, or request a new one via POST /auth/resend-verification"
+        )
     # Production Readiness Standard doc §6.2 - re-checked here too (already
     # checked once at reserve_number time) as the same defense-in-depth
     # against the market being suspended in the gap between reservation
@@ -1109,6 +1164,20 @@ def _assert_purchase_eligible(db: Session, account_id: str, number: PhoneNumber,
                 target_type="phone_number", target_id=number.id,
                 metadata={"e164": e164, "country": number.country, "number_type": number.number_type},
             )
+            # Unlike the KYC gate above, this one never told the customer -
+            # they'd see the number stuck in COMPLIANCE_PENDING with no
+            # explanation of what to do about it. Reuses the same "please
+            # submit evidence" notification, since both gates mean the same
+            # thing to the customer (purchase blocked pending a case).
+            owner = db.query(User).filter(User.account_id == account_id, User.role == UserRole.OWNER).first()
+            if owner is not None:
+                notify_number_verification_required(
+                    db, account_id=account_id, account_email=owner.email, e164=e164,
+                    action_summary=(
+                        f"An approved market-eligibility case for {number.number_type} numbers "
+                        f"in {number.country}"
+                    ),
+                )
             raise NumberEligibilityRequiredError(
                 f"An approved market-eligibility case for {number.number_type} numbers in {number.country} "
                 "is required before purchasing this number"
@@ -1217,6 +1286,13 @@ def purchase_number(db: Session, account_id: str, e164: str) -> PhoneNumber:
         target_type="phone_number", target_id=number.id, metadata={"e164": e164, "provider_sid": bought["sid"]},
     )
     publish_number_activated(account_id, number_id=number.id, e164=e164)
+    # Real gap fix: this event existed (added specifically for numbering
+    # purchase completion per CLAUDE.md's event-coverage history) but had
+    # zero call sites anywhere - it never actually fired. payment_intent_id
+    # is None here since this direct-purchase path has no Stripe intent
+    # threaded through it (see publish_number_purchase_confirmed's own
+    # docstring on when a real one would be available).
+    publish_number_purchase_confirmed(account_id, number_id=number.id, e164=e164)
 
     # Commercial Billing Operating Standard doc §R6 - a real Twilio
     # purchase IS itself a legitimate verification/authorization source,
@@ -1510,11 +1586,31 @@ def _assert_is_stuck(number: PhoneNumber | None, number_id: str) -> PhoneNumber:
 def retry_provisioning(db: Session, staff_id: str, number_id: str) -> PhoneNumber:
     """Staff recovery action - re-attempts the provider purchase for a
     number stranded mid-flight. Reuses the exact same success/failure
-    transitions as purchase_number's tail, just actor-attributed to staff."""
+    transitions as purchase_number's tail, just actor-attributed to staff.
+
+    Gated on the same kill switches as purchase_number: this still places a
+    real telecom.buy_number() call, so a switch tripped specifically to stop
+    new purchases during an incident must also stop staff-triggered retries -
+    otherwise "retry provisioning" is a standing bypass of the switch."""
     number = db.query(PhoneNumber).filter(PhoneNumber.id == number_id).with_for_update().first()
     number = _assert_is_stuck(number, number_id)
+    assert_kill_switch_not_active(db, KillSwitchScope.NUMBER_PROVISIONING)
+    from app.risk.service import assert_account_kill_switch_not_active
+    assert_account_kill_switch_not_active(db, number.account_id, KillSwitchScope.NUMBER_PROVISIONING)
 
     number.status = PhoneNumberStatus.PROVISIONING
+    # Load-bearing, not cosmetic: with_for_update()'s row lock only holds
+    # until this commit below, and _assert_is_stuck treats a stale/None
+    # provisioning_started_at as still recoverable. Without refreshing it
+    # here (purchase_number does this for the same reason - see its own
+    # PURCHASE_PENDING transition above), a second concurrent retry_
+    # provisioning call for the same number (staff double-click, or two
+    # staff members) would pass _assert_is_stuck again the instant this
+    # transaction commits and race telecom.buy_number() against this one -
+    # whichever finishes second and fails would reset the number back to
+    # RESERVED, silently clobbering the other call's successful ACTIVE
+    # provisioning and orphaning a real provider-owned number.
+    number.provisioning_started_at = datetime.now(timezone.utc)
     db.commit()
     log_event(
         db, actor_id=staff_id, action="number.provisioning_retried",
@@ -1557,6 +1653,7 @@ def retry_provisioning(db: Session, staff_id: str, number_id: str) -> PhoneNumbe
     # silent drift between two independently-maintained copies of the same
     # transition.
     publish_number_activated(number.account_id, number_id=number.id, e164=number.e164)
+    publish_number_purchase_confirmed(number.account_id, number_id=number.id, e164=number.e164)
     _auto_verify_caller_identity(db, number, verification_source="platform_provisioned_purchase")
 
     from app.risk.service import step_up_risk_state_after_purchase
@@ -1692,6 +1789,7 @@ def suspend_number(db: Session, user: User, e164: str, reason: str | None = None
     assert_number_access(number, user)
 
     number.status = PhoneNumberStatus.SUSPENDED
+    number.suspended_by = PhoneNumberSuspensionSource.CUSTOMER
     db.commit()
     db.refresh(number)
     _invalidate_numbers_cache(user.account_id)
@@ -1726,6 +1824,7 @@ def suspend_numbers_for_account_by_system(db: Session, account_id: str, *, reaso
     )
     for number in numbers:
         number.status = PhoneNumberStatus.SUSPENDED
+        number.suspended_by = PhoneNumberSuspensionSource.SYSTEM
     db.commit()
     if numbers:
         _invalidate_numbers_cache(account_id)
@@ -1769,16 +1868,25 @@ def reactivate_numbers_for_account_by_staff(
     """Staff-initiated reversal of a suspension - the review/reversal half
     of the risk engine's auto-suspend workflow (a false positive or a
     resolved dispute shouldn't need engineering intervention to undo).
-    Reactivates every SUSPENDED number on the account; numbers already
-    cancelled or never suspended are left alone."""
+    Reactivates every SYSTEM-suspended number on the account; numbers
+    already cancelled, never suspended, or suspended by the CUSTOMER
+    themselves (via suspend_number, not this risk workflow) are left
+    alone - see PhoneNumberSuspensionSource's docstring for why a plain
+    status == SUSPENDED filter used to also reactivate numbers the
+    customer had voluntarily suspended."""
     numbers = (
         db.query(PhoneNumber)
-        .filter(PhoneNumber.account_id == account_id, PhoneNumber.status == PhoneNumberStatus.SUSPENDED)
+        .filter(
+            PhoneNumber.account_id == account_id,
+            PhoneNumber.status == PhoneNumberStatus.SUSPENDED,
+            PhoneNumber.suspended_by == PhoneNumberSuspensionSource.SYSTEM,
+        )
         .with_for_update()
         .all()
     )
     for number in numbers:
         number.status = PhoneNumberStatus.ACTIVE
+        number.suspended_by = None
     db.commit()
     if numbers:
         _invalidate_numbers_cache(account_id)
@@ -2039,7 +2147,7 @@ def set_ring_group(db: Session, user: User, e164: str, destinations: list[str]) 
     db.commit()
 
     log_event(
-        db, actor_id=user.account_id, action="number.ring_group_updated",
+        db, actor_id=user.id, action="number.ring_group_updated",
         target_type="phone_number", target_id=number.id, metadata={"e164": e164, "destinations": destinations},
     )
     return list_ring_group(db, e164)
@@ -2095,7 +2203,7 @@ def set_ivr_menu(
     _invalidate_numbers_cache(user.account_id)
 
     log_event(
-        db, actor_id=user.account_id, action="number.ivr_menu_updated",
+        db, actor_id=user.id, action="number.ivr_menu_updated",
         target_type="phone_number", target_id=number.id, metadata={"e164": e164, "options": options},
     )
     return get_ivr_menu(db, e164)
@@ -2126,7 +2234,7 @@ def clear_ivr_menu(db: Session, user: User, e164: str) -> None:
     _invalidate_numbers_cache(user.account_id)
 
     log_event(
-        db, actor_id=user.account_id, action="number.ivr_menu_cleared",
+        db, actor_id=user.id, action="number.ivr_menu_cleared",
         target_type="phone_number", target_id=number.id, metadata={"e164": e164},
     )
 

@@ -84,3 +84,56 @@
   scrollbar-color: #24352f transparent;
   scrollbar-width: thin;
 }
+
+/* ==========================================================================
+   LIGHT/DARK TOGGLE
+   --------------------------------------------------------------------------
+   Semantic surface/text roles, NOT a blanket flip of the --color-slate-*
+   ramp above. Reason: every existing console page pairs literal `text-white`
+   with BOTH card headings (which should go dark-ink in light mode) AND
+   colored accent buttons like `bg-indigo-600 text-white` (whose text should
+   STAY white in both modes, since the button itself stays the same brand
+   teal regardless of theme) - `text-white` alone can't tell those two cases
+   apart, so redefining Tailwind's global --color-white would fix the first
+   case and break the second. These roles sidestep that: they're only
+   referenced by classes deliberately written to use them (the console
+   shell in layout.tsx and the Overview page), applied via Tailwind v4's
+   `bg-(--role)` / `text-(--role)` arbitrary-var syntax. The other console
+   pages (accounts, billing, cases, etc.) still use the fixed dark palette
+   above and are unaffected by this toggle - extending it to them means
+   auditing each file's `text-white` usages the same way, not yet done.
+   ========================================================================== */
+.staff-scope {
+  --surface-page: var(--color-slate-950);
+  --surface-card: var(--color-slate-900);
+  --surface-border: var(--color-slate-800);
+  --surface-hover: var(--color-slate-800);
+  --text-heading: #ffffff;
+  --text-body: var(--color-slate-200);
+  --text-muted: var(--color-slate-400);
+  /* Active nav item / selected-pill fill - a dark teal pill reads fine on
+     the dark sidebar but goes muddy floating on a white one, so this gets
+     its own light-mode value rather than reusing --color-slate-700
+     directly. */
+  --nav-active-bg: var(--color-slate-700);
+  --nav-active-text: #ffffff;
+}
+
+.staff-scope.light {
+  --surface-page: #f6f8f7;
+  --surface-card: #ffffff;
+  --surface-border: #e1e6e3;
+  --surface-hover: #eef2f0;
+  --text-heading: #0b1614;
+  --text-body: #24352f;
+  /* 4.6:1 on both surface-page and surface-card - same bar staff-scope's
+     own dark slate-400 comment holds itself to above. */
+  --text-muted: #5c6d68;
+  --nav-active-bg: #e7f6f3;
+  --nav-active-text: #0f766e;
+  color-scheme: light;
+}
+
+.staff-scope.light * {
+  scrollbar-color: #c7d1cd transparent;
+}

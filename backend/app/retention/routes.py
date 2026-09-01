@@ -72,9 +72,13 @@ def set_policy(
 @router.post("/purge")
 def purge(
     db: Session = Depends(get_db),
-    _staff: PlatformStaff = Depends(get_current_staff),
+    _staff: PlatformStaff = Depends(require_capability("retention.purge_recordings")),
 ):
-    """Staff-only, manually triggered - there's no cron/scheduler in this
+    """SUPER_ADMIN only (retention.purge_recordings) - this deletes real
+    recordings via Twilio/S3 across every account, the single most
+    destructive action in this module, so it must not be reachable by a
+    read-only SUPPORT staff member the way a bare get_current_staff gate
+    would allow. Manually triggered - there's no cron/scheduler in this
     app yet, so this is meant to be called by an external scheduled task
     (e.g. a daily OS-level cron hitting this endpoint) until real job
     infrastructure exists."""

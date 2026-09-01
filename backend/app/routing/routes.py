@@ -65,6 +65,7 @@ def save_draft(
         return service.save_draft(
             db, current_user.account_id, call_flow_id, payload.entry_node_id,
             [node.model_dump(mode="json") for node in payload.nodes],
+            actor_id=current_user.id,
         )
     except CallFlowNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
@@ -120,7 +121,9 @@ def assign_call_flow(
     current_user: User = Depends(require_writer),
 ):
     try:
-        number = service.assign_to_number(db, current_user.account_id, call_flow_id, payload.phone_number_id)
+        number = service.assign_to_number(
+            db, current_user.account_id, call_flow_id, payload.phone_number_id, current_user.id,
+        )
     except CallFlowNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
     except NumberNotOwnedError as e:
@@ -135,7 +138,7 @@ def unassign_call_flow(
     current_user: User = Depends(require_writer),
 ):
     try:
-        number = service.assign_to_number(db, current_user.account_id, None, phone_number_id)
+        number = service.assign_to_number(db, current_user.account_id, None, phone_number_id, current_user.id)
     except NumberNotOwnedError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"number {e} not found") from e
     return {"phone_number_id": number.id, "call_flow_id": number.call_flow_id}

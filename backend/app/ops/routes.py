@@ -160,10 +160,11 @@ def list_incidents(limit: int = 50, db: Session = Depends(get_db)):
 def create_incident(
     payload: CreateIncidentRequest,
     db: Session = Depends(get_db),
-    _staff: PlatformStaff = Depends(require_capability("ops.manage_incidents")),
+    staff: PlatformStaff = Depends(require_capability("ops.manage_incidents")),
 ):
     return service.create_incident(
         db, title=payload.title, affected_service=payload.affected_service, impact_summary=payload.impact_summary,
+        actor=staff.id,
     )
 
 
@@ -172,12 +173,13 @@ def update_incident(
     incident_id: str,
     payload: UpdateIncidentRequest,
     db: Session = Depends(get_db),
-    _staff: PlatformStaff = Depends(require_capability("ops.manage_incidents")),
+    staff: PlatformStaff = Depends(require_capability("ops.manage_incidents")),
 ):
     try:
         return service.update_incident(
             db, incident_id, status=IncidentStatus(payload.status),
             impact_summary=payload.impact_summary, mitigation_summary=payload.mitigation_summary,
+            actor=staff.id,
         )
     except service.IncidentNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
@@ -191,10 +193,10 @@ def update_incident(
 def resolve_incident(
     incident_id: str,
     db: Session = Depends(get_db),
-    _staff: PlatformStaff = Depends(require_capability("ops.manage_incidents")),
+    staff: PlatformStaff = Depends(require_capability("ops.manage_incidents")),
 ):
     try:
-        return service.resolve_incident(db, incident_id)
+        return service.resolve_incident(db, incident_id, actor=staff.id)
     except service.IncidentNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
     except service.IncidentAlreadyResolvedError as e:
@@ -258,6 +260,17 @@ def deactivate_kill_switch(
 ):
     """SUPER_ADMIN only."""
     return service.set_kill_switch(db, scope, False, actor=staff.id)
+
+
+@router.get("/event-outbox")
+def get_event_outbox_summary(
+    db: Session = Depends(get_db),
+    _staff: PlatformStaff = Depends(get_current_staff),
+):
+    """Any staff role can view the backlog (diagnostic, same posture as
+    kill-switches above); the flush action itself stays SUPER_ADMIN only,
+    below."""
+    return service.get_event_outbox_summary(db)
 
 
 @router.post("/event-outbox/flush", response_model=EventOutboxFlushResponse)

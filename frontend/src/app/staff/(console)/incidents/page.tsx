@@ -13,6 +13,8 @@ import {
   runSyntheticChecks,
   listSyntheticChecks,
   getSyntheticCheckSummary,
+  getEventOutboxSummary,
+  flushEventOutbox,
   ApiError,
   type ErrorEvent,
   type ErrorEventDetail,
@@ -21,15 +23,24 @@ import {
   type IncidentStatus,
   type SyntheticCheckRun,
   type SyntheticCheckSummary,
+  type EventOutboxSummary,
 } from "@/lib/api";
 import { clearStaffToken, useStaffToken } from "@/lib/staffAuth";
+import { useStaffRole } from "@/lib/staffRole";
 
-const SECTIONS = ["errors", "incidents", "synthetic"] as const;
-type Section = (typeof SECTIONS)[number];
+const ALL_SECTIONS = ["errors", "incidents", "synthetic", "outbox"] as const;
+type Section = (typeof ALL_SECTIONS)[number];
+const SECTION_LABELS: Record<Section, string> = {
+  errors: "Errors",
+  incidents: "Incidents",
+  synthetic: "Synthetic Checks",
+  outbox: "Event Outbox",
+};
 
 export default function StaffIncidentsPage() {
   const router = useRouter();
   const { token, ready } = useStaffToken();
+  const { role } = useStaffRole();
   const [section, setSection] = useState<Section>("errors");
   const [error, setError] = useState<string | null>(null);
 
@@ -37,20 +48,26 @@ export default function StaffIncidentsPage() {
     if (ready && !token) router.replace("/staff/login");
   }, [ready, token, router]);
 
+  // Event Outbox is its own tab because ops.manage_event_outbox is
+  // SUPER_ADMIN-only, unlike the other three sections here (any staff, or
+  // ops.manage_incidents which SUPPORT also has) - same "shared page,
+  // admin-only tab" split already used on the Risk & Fraud page.
+  const visibleSections: readonly Section[] = role === "super_admin" ? ALL_SECTIONS : ["errors", "incidents", "synthetic"];
+
   if (!token) return null;
 
   return (
     <>
       <div className="flex gap-1 bg-slate-900 border border-slate-800 rounded-lg p-1 w-fit">
-        {SECTIONS.map((s) => (
+        {visibleSections.map((s) => (
           <button
             key={s}
             onClick={() => setSection(s)}
-            className={`px-3 py-1.5 rounded-md text-xs font-medium capitalize transition ${
+            className={`px-3 py-1.5 rounded-md text-xs font-medium transition ${
               section === s ? "bg-slate-700 text-white" : "text-slate-400 hover:text-slate-200"
             }`}
           >
-            {s === "errors" ? "Errors" : s === "incidents" ? "Incidents" : "Synthetic Checks"}
+            {SECTION_LABELS[s]}
           </button>
         ))}
       </div>
@@ -62,6 +79,7 @@ export default function StaffIncidentsPage() {
       {section === "errors" && <ErrorsSection token={token} onError={setError} />}
       {section === "incidents" && <IncidentsSection token={token} onError={setError} />}
       {section === "synthetic" && <SyntheticChecksSection token={token} onError={setError} />}
+      {role === "super_admin" && section === "outbox" && <EventOutboxSection token={token} onError={setError} />}
     </>
   );
 }
@@ -569,6 +587,114 @@ function SyntheticChecksSection({
           </div>
         ))}
       </div>
+    </>
+  );
+}
+
+function formatAge(seconds: number): string {
+  if (seconds < 60) return `${Math.round(seconds)}s`;
+  if (seconds < 3600) return `${Math.round(seconds / 60)}m`;
+  if (seconds < 86400) return `${Math.round(seconds / 3600)}h`;
+  return `${Math.round(seconds / 86400)}d`;
+}
+
+function EventOutboxSection({
+  token,
+  onError,
+}: {
+  token: string;
+  onError: (message: string | null) => void;
+}) {
+  const handleAuthError = useAuthErrorHandler(onError);
+  const [summary, setSummary] = useState<EventOutboxSummary | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [flushing, setFlushing] = useState(false);
+  const [lastFlush, setLastFlush] = useState<{ checked: number; published: number; failed: number } | null>(null);
+
+  const load = useCallback(() => {
+    return Promise.resolve()
+      .then(() => {
+        setLoading(true);
+        return getEventOutboxSummary(token);
+      })
+      .then((data) => {
+        setSummary(data);
+        onError(null);
+      })
+      .catch((err) => handleAuthError(err, "Couldn't load the event outbox backlog."))
+      .finally(() => setLoading(false));
+  }, [token, handleAuthError, onError]);
+
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  async function handleFlush() {
+    setFlushing(true);
+    onError(null);
+    try {
+      const result = await flushEventOutbox(token);
+      setLastFlush(result);
+      await load();
+    } catch (err) {
+      onError(
+        err instanceof ApiError && err.status === 403
+          ? "Only staff with the ops.manage_event_outbox capability can flush the backlog."
+          : "Couldn't flush the event outbox."
+      );
+    } finally {
+      setFlushing(false);
+    }
+  }
+
+  return (
+    <>
+      <p className="text-xs text-slate-400">
+        Producer-side durability for events that must reach Kafka even if it was unreachable at publish time (money/
+        entitlement-critical call sites only, not every event in the system). Flushing retries every not-yet-published
+        row.
+      </p>
+
+      {loading && <p className="text-sm text-slate-400">Loading...</p>}
+
+      {summary && (
+        <div className="grid gap-3 sm:grid-cols-3">
+          <div className="bg-slate-900 border border-slate-800 rounded-xl p-4">
+            <div className="text-2xl font-semibold text-white">{summary.pending_count}</div>
+            <div className="text-sm text-slate-400 mt-0.5">Pending</div>
+          </div>
+          <div
+            className={`rounded-xl p-4 border ${
+              summary.failing_count > 0 ? "bg-red-950/40 border-red-900" : "bg-slate-900 border-slate-800"
+            }`}
+          >
+            <div className={`text-2xl font-semibold ${summary.failing_count > 0 ? "text-red-400" : "text-white"}`}>
+              {summary.failing_count}
+            </div>
+            <div className="text-sm text-slate-400 mt-0.5">Retried 3+ times</div>
+          </div>
+          <div className="bg-slate-900 border border-slate-800 rounded-xl p-4">
+            <div className="text-2xl font-semibold text-white">
+              {summary.oldest_pending_age_seconds === null ? "—" : formatAge(summary.oldest_pending_age_seconds)}
+            </div>
+            <div className="text-sm text-slate-400 mt-0.5">Oldest pending</div>
+          </div>
+        </div>
+      )}
+
+      <button
+        onClick={handleFlush}
+        disabled={flushing || summary?.pending_count === 0}
+        className="text-sm font-medium rounded-lg px-4 py-1.5 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 text-white transition"
+      >
+        {flushing ? "Flushing..." : "Flush now"}
+      </button>
+
+      {lastFlush && (
+        <p className="text-xs text-slate-400">
+          Last flush: checked {lastFlush.checked}, published {lastFlush.published}, failed {lastFlush.failed}.
+        </p>
+      )}
     </>
   );
 }

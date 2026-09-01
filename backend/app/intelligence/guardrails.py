@@ -11,44 +11,65 @@ for language that reads as a firm commitment in a disallowed category.
 Deterministic and regex-based on purpose, not a second LLM call - an LLM
 judging an LLM's output would just need its own guardrail, and a fixed set
 of patterns is auditable in a way a second model call isn't.
+
+Patterns are data, not hardcoded Python constants (per the architecture
+rule: "Compliance rules are stored as data (a table), never hardcoded
+if-statements") - see intelligence.models.GuardrailRule and
+load_active_guardrail_patterns below. The categories these patterns
+populate are pricing_commitment/legal_advice/medical_advice - the same
+three this module has always checked; only their storage moved.
 """
 
 import re
 
-_PRICING_PATTERNS = [
-    re.compile(r"\$\s?\d"),
-    re.compile(r"\b\d+(\.\d+)?\s?(dollars|usd|percent|% ?(off|discount))\b", re.IGNORECASE),
-    re.compile(r"\b(guarantee|guaranteed|promise[ds]?)\b[^.]{0,40}\b(price|cost|rate|discount|refund|quote)\b", re.IGNORECASE),
-    re.compile(r"\b(price|cost|rate|quote) (is|will be|of) \b", re.IGNORECASE),
-    re.compile(r"\b(free|no charge|complimentary)\b[^.]{0,40}\b(service|repair|installation|replacement)\b", re.IGNORECASE),
-]
+from sqlalchemy.orm import Session
 
-_LEGAL_PATTERNS = [
-    re.compile(r"\blegal advice\b", re.IGNORECASE),
-    re.compile(r"\b(legally (binding|obligated|required|entitled))\b", re.IGNORECASE),
-    re.compile(r"\byou (will|can|should) (sue|win (your|the) case|be liable)\b", re.IGNORECASE),
-    re.compile(r"\bwe (accept|admit) (liability|fault)\b", re.IGNORECASE),
-]
+from app.intelligence.models import GuardrailRule
 
-_MEDICAL_PATTERNS = [
-    re.compile(r"\bmedical advice\b", re.IGNORECASE),
-    re.compile(r"\byou (have|are experiencing) (a|an) [\w\s]{0,30}(condition|disease|infection|disorder)\b", re.IGNORECASE),
-    re.compile(r"\b(diagnos(e|is|ed|ing)|prescri(be|bed|ption))\b", re.IGNORECASE),
-]
-
-_CATEGORY_PATTERNS: dict[str, list[re.Pattern]] = {
-    "pricing_commitment": _PRICING_PATTERNS,
-    "legal_advice": _LEGAL_PATTERNS,
-    "medical_advice": _MEDICAL_PATTERNS,
-}
+# Stable output order for the three categories this guardrail has always
+# checked (pricing, legal, medical) - callers/tests rely on this order. Any
+# additional category seeded into GuardrailRule later (e.g. "financial")
+# still gets flagged, just appended after these three in first-seen order.
+_CATEGORY_ORDER = ["pricing_commitment", "legal_advice", "medical_advice"]
 
 
-def check_for_disallowed_commitments(*texts: str | None) -> list[str]:
+def load_active_guardrail_patterns(db: Session) -> dict[str, list[re.Pattern]]:
+    """Loads every active GuardrailRule row and compiles it, grouped by
+    category - the data-driven replacement for this module's old hardcoded
+    _PRICING_PATTERNS/_LEGAL_PATTERNS/_MEDICAL_PATTERNS constants. Compiled
+    fresh on every call (this only runs on the receptionist's
+    qualify-caller path, not a request hot loop) so a staff edit to a rule
+    takes effect immediately, with no cache to invalidate. A row with an
+    invalid regex is skipped rather than raising - one bad pattern
+    shouldn't take down the whole guardrail check on a live call.
+    """
+    rules = db.query(GuardrailRule).filter(GuardrailRule.is_active.is_(True)).all()
+    patterns: dict[str, list[re.Pattern]] = {}
+    for rule in rules:
+        try:
+            compiled = re.compile(rule.pattern, re.IGNORECASE)
+        except re.error:
+            continue
+        patterns.setdefault(rule.category, []).append(compiled)
+    return patterns
+
+
+def check_for_disallowed_commitments(db: Session, *texts: str | None) -> list[str]:
     """Returns the disallowed-commitment categories found in the given
-    AI-generated texts (e.g. the receptionist's structured summary/reason),
-    empty if none. Order is stable (pricing, legal, medical) so callers and
-    tests can rely on it."""
+    AI-generated texts (the receptionist's structured summary/reason plus
+    every other LLM-extracted field surfaced to staff - spam_reason,
+    callback_preference, caller name, caller company - since all of them
+    come from the same untrusted LLM call), empty if none. Order is stable
+    (pricing, legal, medical, then any other seeded category) so callers
+    and tests can rely on it.
+    """
     combined = " ".join(t for t in texts if t)
     if not combined:
         return []
-    return [category for category, patterns in _CATEGORY_PATTERNS.items() if any(p.search(combined) for p in patterns)]
+    category_patterns = load_active_guardrail_patterns(db)
+    ordered_categories = _CATEGORY_ORDER + [c for c in category_patterns if c not in _CATEGORY_ORDER]
+    return [
+        category
+        for category in ordered_categories
+        if category in category_patterns and any(p.search(combined) for p in category_patterns[category])
+    ]

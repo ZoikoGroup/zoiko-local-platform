@@ -479,6 +479,118 @@ export function staffRejectCase(
   });
 }
 
+// Who's actually logged in - login itself returns only a bare token, so
+// this is the only way the console UI knows which role to show/hide
+// sections for (see access-matrix cross-check below, in the console layout).
+export type StaffRole = "support" | "compliance_officer" | "super_admin";
+
+export type StaffProfile = {
+  id: string;
+  email: string;
+  role: StaffRole;
+  is_active: boolean;
+};
+
+export function getCurrentStaff(token: string): Promise<StaffProfile> {
+  return request<StaffProfile>("/staff/me", {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+// Staff team management (staff.manage_staff_accounts, SUPER_ADMIN only for
+// create/deactivate/reactivate - the list itself is open to any staff role,
+// same "GET is diagnostic" posture as everywhere else in this console).
+export type StaffTeamMember = {
+  id: string;
+  email: string;
+  role: StaffRole;
+  is_active: boolean;
+  created_at: string;
+};
+
+export function listStaffTeam(token: string): Promise<StaffTeamMember[]> {
+  return request<StaffTeamMember[]>("/staff/team", {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export function createStaffTeamMember(
+  token: string,
+  input: { email: string; password: string; role: StaffRole }
+): Promise<StaffTeamMember> {
+  return request<StaffTeamMember>("/staff/team", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify(input),
+  });
+}
+
+export function deactivateStaffTeamMember(token: string, staffId: string): Promise<StaffTeamMember> {
+  return request<StaffTeamMember>(`/staff/team/${staffId}/deactivate`, {
+    method: "PUT",
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export function reactivateStaffTeamMember(token: string, staffId: string): Promise<StaffTeamMember> {
+  return request<StaffTeamMember>(`/staff/team/${staffId}/reactivate`, {
+    method: "PUT",
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+// Event outbox backlog (ops.manage_event_outbox governs the flush action
+// itself; this GET is open to any staff role, same diagnostic posture as
+// kill-switches).
+export type EventOutboxSummary = {
+  pending_count: number;
+  failing_count: number;
+  oldest_pending_age_seconds: number | null;
+};
+
+export function getEventOutboxSummary(token: string): Promise<EventOutboxSummary> {
+  return request<EventOutboxSummary>("/ops/event-outbox", {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export function flushEventOutbox(token: string): Promise<{ checked: number; published: number; failed: number }> {
+  return request("/ops/event-outbox/flush", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+// Platform-wide call volume + subscription/revenue snapshot (Super Admin
+// dashboard). estimated_mrr_minor_units is a planning estimate, not a
+// real revenue figure - see the backend's own docstring
+// (app.staff.service.get_platform_billing_metrics) for exactly what it
+// does and doesn't account for.
+export type PlatformCallMetrics = {
+  window_days: number;
+  total_calls: number;
+  total_minutes: number;
+  by_status: { status: string; count: number }[];
+};
+
+export type PlatformBillingMetrics = {
+  total_active_subscriptions: number;
+  estimated_mrr_minor_units: number;
+  currency_code: string;
+  by_plan: { plan_code: string; plan_name: string; count: number }[];
+};
+
+export type PlatformMetrics = {
+  calls: PlatformCallMetrics;
+  billing: PlatformBillingMetrics;
+};
+
+export function getPlatformMetrics(token: string): Promise<PlatformMetrics> {
+  return request<PlatformMetrics>("/staff/platform-metrics", {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
 export type AccountOverview = {
   id: string;
   name: string;
@@ -486,7 +598,15 @@ export type AccountOverview = {
   owner_email: string | null;
   member_count: number;
   number_count: number;
+  // Already returned by the backend (AccountOverviewResponse) but never
+  // surfaced in the UI until now - real depth worth showing a Super Admin
+  // (billing risk/legal exposure per account), not meaningful to a role
+  // with no capability to act on either.
+  billing_classification: string;
+  billing_source: string;
   is_test: boolean;
+  legal_hold: boolean;
+  legal_hold_reference: string | null;
   created_at: string;
 };
 
@@ -664,6 +784,33 @@ export function listStuckProvisioning(staffToken: string): Promise<StuckProvisio
   });
 }
 
+export type DueRenewalEntry = {
+  id: string;
+  e164: string;
+  country: string;
+  status: string;
+  account_id: string;
+  account_name: string | null;
+  account_owner_email: string | null;
+  next_renewal_at: string | null;
+};
+
+export function listDueForRenewal(staffToken: string): Promise<DueRenewalEntry[]> {
+  return request<DueRenewalEntry[]>("/staff/numbers/due-for-renewal", {
+    headers: { Authorization: `Bearer ${staffToken}` },
+  });
+}
+
+export function markNumberRenewed(
+  staffToken: string,
+  numberId: string
+): Promise<{ id: string; e164: string; next_renewal_at: string | null }> {
+  return request(`/staff/numbers/${numberId}/mark-renewed`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${staffToken}` },
+  });
+}
+
 export function retryProvisioning(
   staffToken: string,
   numberId: string
@@ -709,6 +856,11 @@ export type ProviderStatus = {
   configured: boolean;
   ok: boolean;
   detail: string | null;
+  // Only present for providers with a secondary-vendor failover path
+  // configured (see integrations/_shared/circuit_breaker.py) - already
+  // returned by the backend but never surfaced in the UI until now.
+  circuit_state?: "closed" | "open" | "half_open";
+  failover_enabled?: boolean;
 };
 
 export function listProviderStatuses(staffToken: string): Promise<{ providers: ProviderStatus[] }> {
@@ -822,6 +974,25 @@ export function listIncidents(limit: number = 50): Promise<Incident[]> {
   return request<Incident[]>(`/ops/incidents?limit=${limit}`);
 }
 
+// --- Kill switches (staff-only, platform-wide or per-account) ---
+
+export type KillSwitch = {
+  id: string;
+  scope: string;
+  is_active: boolean;
+  reason: string | null;
+  activated_by: string | null;
+  activated_at: string | null;
+  deactivated_at: string | null;
+  expires_at: string | null;
+};
+
+export function listKillSwitches(staffToken: string): Promise<KillSwitch[]> {
+  return request<KillSwitch[]>("/ops/kill-switches", {
+    headers: { Authorization: `Bearer ${staffToken}` },
+  });
+}
+
 export function createIncident(
   staffToken: string,
   input: { title: string; affected_service: string; impact_summary: string }
@@ -927,6 +1098,32 @@ export function simulateZoikoNexPaymentEvent(
     method: "POST",
     headers: { Authorization: `Bearer ${staffToken}` },
     body: JSON.stringify({ account_id: accountId, event_type: eventType }),
+  });
+}
+
+// --- Billing action requests (maker-checker: request now, approve/reject
+// later, self-approval blocked server-side) ---
+
+export type BillingActionRequest = {
+  id: string;
+  action_type: string;
+  payload: Record<string, unknown>;
+  requested_by: string;
+  status: string;
+  approved_by: string | null;
+  rejection_reason: string | null;
+  result: Record<string, unknown> | null;
+  resolved_at: string | null;
+  created_at: string;
+};
+
+export function listBillingActions(
+  staffToken: string,
+  requestStatus?: string
+): Promise<BillingActionRequest[]> {
+  const query = requestStatus ? `?request_status=${requestStatus}` : "";
+  return request<BillingActionRequest[]>(`/billing/actions${query}`, {
+    headers: { Authorization: `Bearer ${staffToken}` },
   });
 }
 

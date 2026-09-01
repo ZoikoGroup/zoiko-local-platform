@@ -363,7 +363,7 @@ async def bridge_call(
     status_callback_url = str(request.base_url) + "media/voice/status-callback"
     bridge_connect_url = (
         str(request.base_url) + "media/voice/bridge-connect"
-        f"?to={quote(body.to)}&from={quote(body.from_number)}"
+        f"?to={quote(body.to)}&from={quote(body.from_number)}&account_id={quote(current_user.account_id)}"
     )
     try:
         return media_service.place_bridge_call(
@@ -392,15 +392,31 @@ async def bridge_call(
 
 
 @router.post("/bridge-connect")
-async def bridge_connect(request: Request, to: str, from_: str = Query(alias="from")):
+async def bridge_connect(
+    request: Request, to: str, account_id: str, from_: str = Query(alias="from"), db: Session = Depends(get_db)
+):
     """Twilio requests this once the agent leg (place_bridge_call's call to
     owner.forwarding_number) is actually answered - never called at all if
     the agent doesn't pick up, so the customer is never dialed for a call
-    the agent never joined. No signature verification/DB lookup needed:
-    `to`/`from` are values WE put on this URL when creating the call (see
-    bridge_call above), not caller-supplied input Twilio is relaying."""
+    the agent never joined. No signature verification needed: `to`/`from`/
+    `account_id` are values WE put on this URL when creating the call (see
+    bridge_call above), not caller-supplied input Twilio is relaying - db
+    is only needed here to check recording consent, same as every other
+    real two-way call path.
+
+    Real gap fix: this genuinely live, two-way bridged call was never
+    recorded at all (build_bridge_response had no recording_callback_url
+    parameter until now) - same class of gap should_record_forwarded_call
+    already closes for the forward/ring-group/IVR paths."""
     status_callback_url = str(request.base_url) + "media/voice/status-callback"
-    twiml = telecom.build_bridge_response(to, caller_id=from_, status_callback_url=status_callback_url)
+    recording_callback_url = (
+        str(request.base_url) + "media/voice/recording-callback"
+        if media_service.should_record_forwarded_call(db, account_id)
+        else None
+    )
+    twiml = telecom.build_bridge_response(
+        to, caller_id=from_, status_callback_url=status_callback_url, recording_callback_url=recording_callback_url
+    )
     return Response(content=twiml, media_type="application/xml")
 
 
@@ -430,7 +446,10 @@ async def browser_token(current_user: User = Depends(require_writer), db: Sessio
             "Upgrade your plan to use this feature - you can view it during your trial, but changes need a paid plan."
         )
 
-    token = telecom.build_voice_access_token(identity=current_user.account_id)
+    try:
+        token = telecom.build_voice_access_token(identity=current_user.account_id)
+    except TelecomError as e:
+        raise HTTPException(status_code=502, detail=str(e)) from e
     return {"token": token}
 
 
@@ -451,6 +470,11 @@ async def browser_connect(request: Request, db: Session = Depends(get_db)):
     from_number = params.get("ZoikoFrom", "")
     call_sid = params.get("CallSid", "")
     status_callback_url = str(request.base_url) + "media/voice/status-callback"
+    recording_callback_url = (
+        str(request.base_url) + "media/voice/recording-callback"
+        if media_service.should_record_forwarded_call(db, account_id)
+        else None
+    )
     try:
         result = media_service.handle_browser_connect(
             db, account_id=account_id, from_number=from_number, to=to, call_sid=call_sid,
@@ -464,6 +488,7 @@ async def browser_connect(request: Request, db: Session = Depends(get_db)):
         else:
             twiml = telecom.build_bridge_response(
                 result["destination"], caller_id=result["caller_id"], status_callback_url=status_callback_url,
+                recording_callback_url=recording_callback_url,
             )
     except (
         media_service.CallAuthorizationError,

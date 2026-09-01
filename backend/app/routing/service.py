@@ -99,6 +99,21 @@ def _get_draft(db: Session, call_flow_id: str) -> CallFlowVersion:
     return draft
 
 
+def _lock_flow_versions(db: Session, call_flow_id: str) -> None:
+    """Row-locks every CallFlowVersion for this call_flow_id, held until
+    commit - same "Atomicity law" pattern as reserve_number's
+    with_for_update() in numbering/numbers/service.py. CallFlowVersion's
+    own docstring requires "exactly one PUBLISHED version per call_flow_id"
+    to be enforced atomically; without this, two concurrent
+    publish_flow/rollback_flow calls for the same flow can both read the
+    same stale draft/live state and each create a colliding new version,
+    silently losing one admin's edits. Must be called before _get_draft,
+    the live-version lookup, and _next_version_number - every read that
+    determines the next version number or flips PUBLISHED/ARCHIVED status
+    has to happen after the lock is acquired, inside the same transaction."""
+    db.query(CallFlowVersion).filter(CallFlowVersion.call_flow_id == call_flow_id).with_for_update().all()
+
+
 def _next_version_number(db: Session, call_flow_id: str) -> int:
     latest = (
         db.query(CallFlowVersion)
@@ -124,7 +139,7 @@ def create_flow(db: Session, account_id: str, name: str, actor_id: str) -> CallF
     db.add(draft)
     db.commit()
     _invalidate_flows_cache(account_id)
-    log_event(db, actor_id=account_id, action="call_flow.created", target_type="call_flow", target_id=flow.id,
+    log_event(db, actor_id=actor_id, action="call_flow.created", target_type="call_flow", target_id=flow.id,
                metadata={"name": name})
     return flow
 
@@ -196,12 +211,29 @@ def get_flow_detail(db: Session, account_id: str, call_flow_id: str) -> dict:
     }
 
 
-def save_draft(db: Session, account_id: str, call_flow_id: str, entry_node_id: str, nodes: list[dict]) -> CallFlowVersion:
+def save_draft(
+    db: Session, account_id: str, call_flow_id: str, entry_node_id: str, nodes: list[dict],
+    actor_id: str | None = None,
+) -> CallFlowVersion:
     flow = _get_flow(db, account_id, call_flow_id)
     draft = _get_draft(db, flow.id)
     draft.entry_node_id = entry_node_id
     draft.nodes = nodes
     db.commit()
+    # Real gap fix - every sibling write in this file (create_flow/
+    # publish_flow/rollback_flow/assign_to_number) logs via log_event;
+    # editing a draft's node graph is exactly as state-changing as those
+    # and previously left zero audit trail. `actor_id` is optional and
+    # keyword-only-in-practice here since routing/routes.py's existing
+    # /draft route doesn't pass current_user.id through yet (out of scope
+    # for this fix) - falls back to account_id as the actor, same
+    # "no specific user in the loop" convention numbering.numbers.service's
+    # reserve_number already uses (actor_id=account_id) rather than
+    # skipping the audit entry entirely.
+    log_event(
+        db, actor_id=actor_id or account_id, action="call_flow.draft_saved", target_type="call_flow",
+        target_id=flow.id, metadata={"version": draft.version},
+    )
     return draft
 
 
@@ -317,6 +349,7 @@ def validate_flow(nodes: list[dict], entry_node_id: str, valid_queue_ids: set[st
 
 def publish_flow(db: Session, account_id: str, call_flow_id: str, actor_id: str) -> tuple[bool, list[str], CallFlowVersion | None]:
     flow = _get_flow(db, account_id, call_flow_id)
+    _lock_flow_versions(db, flow.id)
     draft = _get_draft(db, flow.id)
 
     errors = validate_flow(draft.nodes, draft.entry_node_id, account_queue_ids(db, account_id))
@@ -348,7 +381,7 @@ def publish_flow(db: Session, account_id: str, call_flow_id: str, actor_id: str)
     db.commit()
 
     _invalidate_flows_cache(account_id)
-    log_event(db, actor_id=account_id, action="call_flow.published", target_type="call_flow", target_id=flow.id,
+    log_event(db, actor_id=actor_id, action="call_flow.published", target_type="call_flow", target_id=flow.id,
                metadata={"version": published_version.version})
     publish_call_flow_published(account_id, call_flow_id=flow.id, version=published_version.version)
 
@@ -367,6 +400,7 @@ def publish_flow(db: Session, account_id: str, call_flow_id: str, actor_id: str)
 
 def rollback_flow(db: Session, account_id: str, call_flow_id: str, target_version: int, actor_id: str) -> CallFlowVersion:
     flow = _get_flow(db, account_id, call_flow_id)
+    _lock_flow_versions(db, flow.id)
     target = (
         db.query(CallFlowVersion)
         .filter(CallFlowVersion.call_flow_id == flow.id, CallFlowVersion.version == target_version)
@@ -398,7 +432,7 @@ def rollback_flow(db: Session, account_id: str, call_flow_id: str, target_versio
     db.commit()
 
     _invalidate_flows_cache(account_id)
-    log_event(db, actor_id=account_id, action="call_flow.rolled_back", target_type="call_flow", target_id=flow.id,
+    log_event(db, actor_id=actor_id, action="call_flow.rolled_back", target_type="call_flow", target_id=flow.id,
                metadata={"restored_version": target_version, "new_version": rolled_back.version})
     publish_call_flow_rolled_back(
         account_id, call_flow_id=flow.id, restored_version=target_version, new_version=rolled_back.version,
@@ -413,7 +447,9 @@ def rollback_flow(db: Session, account_id: str, call_flow_id: str, target_versio
     return rolled_back
 
 
-def assign_to_number(db: Session, account_id: str, call_flow_id: str | None, phone_number_id: str) -> PhoneNumber:
+def assign_to_number(
+    db: Session, account_id: str, call_flow_id: str | None, phone_number_id: str, actor_id: str,
+) -> PhoneNumber:
     number = db.query(PhoneNumber).filter(PhoneNumber.id == phone_number_id, PhoneNumber.account_id == account_id).first()
     if number is None:
         raise NumberNotOwnedError(phone_number_id)
@@ -422,7 +458,7 @@ def assign_to_number(db: Session, account_id: str, call_flow_id: str | None, pho
     number.call_flow_id = call_flow_id
     db.commit()
     _invalidate_flows_cache(account_id)
-    log_event(db, actor_id=account_id, action="call_flow.assigned", target_type="phone_number", target_id=number.id,
+    log_event(db, actor_id=actor_id, action="call_flow.assigned", target_type="phone_number", target_id=number.id,
                metadata={"call_flow_id": call_flow_id})
     return number
 

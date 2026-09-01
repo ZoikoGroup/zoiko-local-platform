@@ -35,6 +35,13 @@ def _signup_and_login(client, email: str) -> str:
         json={"account_name": "ZoikoNex Test Co", "account_type": "individual", "email": email, "password": "supersecret123"},
     )
     token = client.post("/auth/login", json={"email": email, "password": "supersecret123"}).json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+    # Real gap fix: number purchase now requires email_verified (Production
+    # Readiness Standard doc §5's "Identity" trial-abuse control).
+    from app.core.security import create_access_token
+
+    user_id = client.get("/auth/me", headers=headers).json()["id"]
+    client.post("/auth/verify-email", json={"token": create_access_token(subject=user_id, scope="email_verification")})
     # A fresh signup defaults to the free trial - app.core.deps.
     # require_paid_or_read_only now blocks write actions (buying a number,
     # placing a call) for a TRIALING account. The billing-suspension tests

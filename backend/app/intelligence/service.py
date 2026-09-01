@@ -147,7 +147,7 @@ def _download_and_transcribe_video(room_name: str, object_key: str) -> str:
 
 
 def _analyze_and_store(
-    db: Session, *, account_id: str, source_type: SummarySourceType, source_id: str, transcript: str
+    db: Session, *, account_id: str, actor_id: str, source_type: SummarySourceType, source_id: str, transcript: str
 ) -> ConversationSummary:
     # Graceful degradation (Architecture doc §9) - AI features pause once a
     # payment grace period expires. Checked before spending a real Groq
@@ -205,7 +205,7 @@ def _analyze_and_store(
     db.refresh(record)
     _invalidate_summaries_cache(account_id)
     log_event(
-        db, actor_id=account_id, action="intelligence.summary_created",
+        db, actor_id=actor_id, action="intelligence.summary_created",
         target_type="conversation_summary", target_id=record.id,
         metadata={
             "source_type": source_type.value,
@@ -296,8 +296,8 @@ def summarize_voicemail(db: Session, user: User, voicemail_id: str) -> Conversat
     summary = _run_ai_job(
         db, account_id=user.account_id, source_type=SummarySourceType.VOICEMAIL, source_id=voicemail.id,
         work_fn=lambda: _analyze_and_store(
-            db, account_id=user.account_id, source_type=SummarySourceType.VOICEMAIL, source_id=voicemail.id,
-            transcript=_download_and_transcribe(voicemail.recording_url),
+            db, account_id=user.account_id, actor_id=user.id, source_type=SummarySourceType.VOICEMAIL,
+            source_id=voicemail.id, transcript=_download_and_transcribe(voicemail.recording_url),
         ),
     )
     notify_voicemail_transcription_ready(db, account_id=user.account_id, account_email=user.email)
@@ -320,8 +320,8 @@ def summarize_call(db: Session, user: User, call_id: str) -> ConversationSummary
     summary = _run_ai_job(
         db, account_id=user.account_id, source_type=SummarySourceType.CALL, source_id=call.id,
         work_fn=lambda: _analyze_and_store(
-            db, account_id=user.account_id, source_type=SummarySourceType.CALL, source_id=call.id,
-            transcript=_download_and_transcribe(call.recording_url),
+            db, account_id=user.account_id, actor_id=user.id, source_type=SummarySourceType.CALL,
+            source_id=call.id, transcript=_download_and_transcribe(call.recording_url),
         ),
     )
     counterparty = call.to_number if call.direction == CallDirection.OUTBOUND else call.from_number
@@ -349,8 +349,8 @@ def summarize_video_session(db: Session, user: User, room_name: str) -> Conversa
     return _run_ai_job(
         db, account_id=user.account_id, source_type=SummarySourceType.VIDEO, source_id=session.id,
         work_fn=lambda: _analyze_and_store(
-            db, account_id=user.account_id, source_type=SummarySourceType.VIDEO, source_id=session.id,
-            transcript=_download_and_transcribe_video(session.room_name, object_key),
+            db, account_id=user.account_id, actor_id=user.id, source_type=SummarySourceType.VIDEO,
+            source_id=session.id, transcript=_download_and_transcribe_video(session.room_name, object_key),
         ),
     )
 

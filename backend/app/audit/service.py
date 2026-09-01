@@ -1,5 +1,6 @@
 import hashlib
 import json
+import logging
 import uuid
 from typing import Any
 
@@ -7,6 +8,8 @@ from sqlalchemy.orm import Session
 
 from app.audit.models import AuditEvent
 from app.events.service import publish_audit_event_recorded
+
+logger = logging.getLogger(__name__)
 
 
 def _hash_state(state: dict[str, Any] | None) -> str | None:
@@ -88,9 +91,16 @@ def log_event(
     target_type: str | None = None,
     target_id: str | None = None,
     metadata: dict[str, Any] | None = None,
-) -> AuditEvent:
+) -> AuditEvent | None:
     """Record an immutable audit entry. Call this for every state-changing
     action — signup, login, number purchase, admin override, etc.
+
+    Never raises: callers commonly perform their real state change first and
+    then call this, sometimes with more logic (auto-suspend, notifications)
+    after it - a transient audit-write failure (DB blip, etc.) must not take
+    down business logic that already happened or that still needs to run.
+    A failure here is logged and swallowed; it returns None instead of the
+    persisted AuditEvent. Nothing in the codebase reads the return value.
     """
     resolved_actor = actor if actor is not None else actor_id
     resolved_target = target
@@ -115,9 +125,15 @@ def log_event(
         before_hash=_hash_state(before),
         after_hash=_hash_state(resolved_after),
     )
-    db.add(event)
-    db.commit()
-    db.refresh(event)
+    try:
+        db.add(event)
+        db.commit()
+        db.refresh(event)
+    except Exception:
+        db.rollback()
+        logger.exception("log_event failed to persist audit entry action=%s target=%s", action, resolved_target)
+        return None
+
     publish_audit_event_recorded(resolved_account_id, audit_id=event.id, action=action, target=resolved_target)
     return event
 

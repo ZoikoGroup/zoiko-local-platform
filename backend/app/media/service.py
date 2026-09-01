@@ -15,6 +15,8 @@ from app.consent.service import has_active_consent
 from app.events.service import (
     publish_call_ended,
     publish_call_started,
+    publish_receptionist_call_captured,
+    publish_receptionist_call_escalated,
     publish_video_room_created,
     publish_video_room_ended,
     publish_video_session_ended,
@@ -410,7 +412,6 @@ def handle_browser_connect(
         provider_call_sid=call_sid,
         status="in-progress",
     )
-
     target_owner = find_number_owner(db, to)
     if (
         target_owner is not None
@@ -884,7 +885,7 @@ async def create_video_session(
     db.refresh(session)
     _invalidate_video_sessions_cache(account_id)
     log_event(
-        db, actor_id=account_id, action="video.session.started",
+        db, actor_id=host_user_id, action="video.session.started",
         target_type="video_session", target_id=session.id,
         metadata={"room_name": room_name, "confidential": confidential},
     )
@@ -916,7 +917,7 @@ async def end_video_session(db: Session, user: User, room_name: str) -> VideoSes
     db.refresh(session)
     _invalidate_video_sessions_cache(user.account_id)
     log_event(
-        db, actor_id=user.account_id, action="video.session.ended",
+        db, actor_id=user.id, action="video.session.ended",
         target_type="video_session", target_id=session.id, metadata={"room_name": room_name},
     )
     publish_video_room_ended(user.account_id, room_name=room_name)
@@ -986,7 +987,7 @@ async def start_video_recording(db: Session, user: User, room_name: str) -> Vide
     db.refresh(session)
     _invalidate_video_sessions_cache(user.account_id)
     log_event(
-        db, actor_id=user.account_id, action="video.recording_started",
+        db, actor_id=user.id, action="video.recording_started",
         target_type="video_session", target_id=session.id, metadata={"room_name": room_name},
     )
     return session
@@ -1008,7 +1009,7 @@ async def stop_video_recording(db: Session, user: User, room_name: str) -> Video
 
     await video.stop_room_recording(session.recording_egress_id)
     log_event(
-        db, actor_id=user.account_id, action="video.recording_stopped",
+        db, actor_id=user.id, action="video.recording_stopped",
         target_type="video_session", target_id=session.id, metadata={"room_name": room_name},
     )
     return session
@@ -1631,7 +1632,18 @@ def capture_receptionist_call(
     Groq failure degrades to a plain captured message (raw_transcript is
     always saved) rather than breaking the live call — the caller must
     still get a TwiML response either way.
+
+    Idempotent against a redelivered /respond webhook for the same call_sid
+    (Twilio can retry a Gather action URL on a slow response/network blip,
+    same risk every other Twilio webhook in this codebase already guards
+    against) - call_sid is unique on ReceptionistCall, so a second insert
+    would otherwise raise an unhandled IntegrityError instead of just
+    returning the row already captured on the first delivery.
     """
+    existing = db.query(ReceptionistCall).filter(ReceptionistCall.call_sid == call_sid).first()
+    if existing is not None:
+        return existing
+
     owner = find_number_owner(db, to_number)
     if owner is None:
         return None
@@ -1646,8 +1658,19 @@ def capture_receptionist_call(
     urgency_raw = qualification.get("urgency")
     urgency = ReceptionistUrgency(urgency_raw) if urgency_raw in ("low", "medium", "high") else None
     # Guardrail check on the AI's OWN generated text, not the caller's raw
-    # transcript - see app/intelligence/guardrails.py.
-    guardrail_flags = check_for_disallowed_commitments(qualification.get("summary"), qualification.get("reason"))
+    # transcript - see app/intelligence/guardrails.py. Scans every
+    # LLM-extracted field surfaced to staff, not just summary/reason - a
+    # disallowed commitment can just as easily land in spam_reason,
+    # callback_preference, or the extracted name/company.
+    guardrail_flags = check_for_disallowed_commitments(
+        db,
+        qualification.get("summary"),
+        qualification.get("reason"),
+        qualification.get("spam_reason"),
+        qualification.get("callback_preference"),
+        qualification.get("name"),
+        qualification.get("company"),
+    )
     is_likely_spam = bool(qualification.get("is_likely_spam"))
     spam_reason = qualification.get("spam_reason") if is_likely_spam else None
 
@@ -1676,6 +1699,10 @@ def capture_receptionist_call(
         db, actor_id=owner.account_id, action="receptionist.call_captured",
         target_type="receptionist_call", target_id=call.id,
         metadata={"urgency": urgency.value if urgency else None, "guardrail_flags": guardrail_flags, "is_likely_spam": is_likely_spam},
+    )
+    publish_receptionist_call_captured(
+        owner.account_id, receptionist_call_id=call.id,
+        urgency=urgency.value if urgency else None, is_likely_spam=is_likely_spam,
     )
     return call
 
@@ -1733,7 +1760,15 @@ def record_receptionist_followup(db: Session, call: ReceptionistCall, followup_t
     if qualification:
         urgency_raw = qualification.get("urgency")
         urgency = ReceptionistUrgency(urgency_raw) if urgency_raw in ("low", "medium", "high") else call.urgency
-        guardrail_flags = check_for_disallowed_commitments(qualification.get("summary"), qualification.get("reason"))
+        guardrail_flags = check_for_disallowed_commitments(
+            db,
+            qualification.get("summary"),
+            qualification.get("reason"),
+            qualification.get("spam_reason"),
+            qualification.get("callback_preference"),
+            qualification.get("name"),
+            qualification.get("company"),
+        )
         is_likely_spam = bool(qualification.get("is_likely_spam"))
 
         call.caller_name = qualification.get("name") or call.caller_name
@@ -1798,6 +1833,9 @@ def mark_receptionist_call_escalated(db: Session, receptionist_call_id: str, esc
         db, actor_id=call.account_id, action="receptionist.call_escalated",
         target_type="receptionist_call", target_id=call.id,
         metadata={"escalated_to_user_id": escalated_to_user_id},
+    )
+    publish_receptionist_call_escalated(
+        call.account_id, receptionist_call_id=call.id, escalated_to_user_id=escalated_to_user_id,
     )
 
 
