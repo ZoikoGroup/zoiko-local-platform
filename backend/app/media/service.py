@@ -514,8 +514,15 @@ def update_call_status(db: Session, provider_call_sid: str, status: str, duratio
     db.commit()
     db.refresh(call)
     _invalidate_calls_cache(call.account_id)
+    # Real gap fix, same pattern as record_call's own fix: an inbound call
+    # to a number we don't recognize (or don't own) is persisted with
+    # account_id=None by design - log_event requires a real actor, so this
+    # crashed the whole status-callback webhook (a 500 to Twilio) for any
+    # such call that later received a real terminal status. Found live via
+    # sweep_stale_calls's own test.
     log_event(
-        db, actor_id=call.account_id, action="call.status_updated",
+        db, actor_id=call.account_id if call.account_id else "system:unrecognized_number",
+        action="call.status_updated",
         target_type="call_record", target_id=call.id, metadata={"status": status, "duration": duration},
     )
     if call.account_id and status in TERMINAL_CALL_STATUSES:
@@ -1621,6 +1628,60 @@ def sweep_stale_video_recordings(db: Session) -> dict[str, int]:
             target_type="video_session", target_id=session.id,
             metadata={"room_name": session.room_name, "reason": reason},
         )
+    return {"swept": swept}
+
+
+CALL_STALE_AFTER_MINUTES = 240
+
+
+def sweep_stale_calls(db: Session) -> dict[str, int]:
+    """Real gap found live: a CallRecord only ever leaves a non-terminal
+    status via /media/voice/status-callback actually firing (update_call_
+    status) - if that webhook is lost (browser tab closed mid-call before
+    Twilio's own call ends, a dropped delivery, our backend restarting at
+    the wrong moment), the row sits "ringing"/"in-progress" forever. That
+    silently and permanently eats one of the account's
+    MAX_CONCURRENT_CALLS_BY_RISK_STATE slots (risk.service.
+    assert_concurrent_call_limit_ok counts exactly these rows) - a
+    customer can end up unable to place ANY new call, with no error that
+    points at the real cause and no existing way to recover short of
+    direct database access.
+
+    Same verify-against-the-real-provider-first philosophy as
+    sweep_stale_video_recordings: never guesses a stale row's outcome from
+    elapsed time alone. Asks Twilio for the real current status via
+    telecom.get_call and only ever applies what Twilio actually reports
+    (through update_call_status, so metering/cache/events all fire
+    exactly like a normal webhook would have) - a row Twilio still
+    considers genuinely in progress, or one Twilio's API call itself
+    failed to check, is left untouched and retried on the next sweep
+    rather than force-closed on a guess."""
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=CALL_STALE_AFTER_MINUTES)
+    stale = (
+        db.query(CallRecord)
+        .filter(
+            CallRecord.status.notin_(TERMINAL_CALL_STATUSES),
+            CallRecord.provider_call_sid.isnot(None),
+            CallRecord.created_at < cutoff,
+        )
+        .all()
+    )
+    swept = 0
+    for call in stale:
+        try:
+            real = telecom.get_call(call.provider_call_sid)
+        except telecom.TelecomError:
+            continue  # Twilio unreachable, or genuinely can't tell right now - retry next sweep
+
+        if real["status"] not in TERMINAL_CALL_STATUSES:
+            continue  # Twilio itself still considers this call active - leave it alone
+
+        # telecom.get_call's duration is Twilio's raw string field (same
+        # shape as the CallDuration form param the real status-callback
+        # webhook gets) - update_call_status expects an int.
+        real_duration = int(real["duration"]) if real["duration"] else None
+        update_call_status(db, call.provider_call_sid, real["status"], real_duration)
+        swept += 1
     return {"swept": swept}
 
 

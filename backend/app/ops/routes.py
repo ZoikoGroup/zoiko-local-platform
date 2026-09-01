@@ -21,6 +21,7 @@ from app.ops.schemas import (
     KillSwitchResponse,
     SetKillSwitchRequest,
     StatusSubscriptionResponse,
+    SweepStaleCallsResponse,
     SyntheticCheckRunResponse,
     SyntheticCheckSummaryResponse,
     UpdateIncidentRequest,
@@ -285,3 +286,21 @@ def flush_event_outbox(
     from app.events.service import flush_pending_outbox_events
 
     return flush_pending_outbox_events(db)
+
+
+@router.post("/calls/sweep-stale", response_model=SweepStaleCallsResponse)
+def sweep_stale_calls_route(
+    db: Session = Depends(get_db),
+    _staff: PlatformStaff = Depends(require_capability("ops.manage_event_outbox")),
+):
+    """Real gap fix, same manual-trigger-plus-external-cron pattern as the
+    routes above - recovers a CallRecord stuck non-terminal because its
+    status-callback webhook was lost (see media.service.sweep_stale_calls's
+    docstring for the real customer impact: it silently eats a concurrent-
+    call slot forever with no error pointing at the real cause). Reuses
+    the event-outbox capability rather than a new one - both are "staff
+    manually kicks a maintenance sweep the daily cron would otherwise run"
+    actions with the same real-world sensitivity."""
+    from app.media.service import sweep_stale_calls
+
+    return sweep_stale_calls(db)

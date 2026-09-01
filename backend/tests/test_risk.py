@@ -876,6 +876,64 @@ def test_completed_call_frees_up_the_concurrent_call_slot(client, db_session, mo
     assert second.status_code == 200, second.text
 
 
+def test_sweep_stale_calls_recovers_a_lost_webhook_and_frees_the_slot(client, db_session, monkeypatch):
+    """Real gap fix: a CallRecord whose status-callback webhook was lost
+    (browser tab closed mid-call, dropped delivery) used to sit non-
+    terminal forever, permanently eating a concurrent-call slot with no
+    recovery path. Proves the sweep recovers it by checking Twilio's real
+    status - only after that does a new call succeed again."""
+    from datetime import datetime, timedelta, timezone
+
+    from app.media.models import CallRecord
+    from app.staff.models import PlatformStaffRole
+
+    monkeypatch.setattr(
+        "app.media.service.telecom.place_call",
+        lambda **kwargs: {"sid": "CAstale1", "status": "queued", "to": kwargs["to"], "from": kwargs["from_"]},
+    )
+    token = _signup_and_login(client, "sweepstale1@example.com")
+    account_id = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"}).json()["account_id"]
+    _clear_billing_trial_gate(db_session, account_id)
+    _active_number(db_session, account_id, "+15550009093")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    first = client.post(
+        "/media/voice/outbound", json={"to": "+15551110005", "from": "+15550009093"}, headers=headers,
+    )
+    assert first.status_code == 200, first.text
+
+    # Simulate the lost webhook: the call never receives a real status
+    # update, and enough time has passed to make it eligible for the sweep.
+    call = db_session.query(CallRecord).filter(CallRecord.provider_call_sid == "CAstale1").first()
+    call.created_at = datetime.now(timezone.utc) - timedelta(hours=5)
+    db_session.commit()
+
+    blocked = client.post(
+        "/media/voice/outbound", json={"to": "+15551110006", "from": "+15550009093"}, headers=headers,
+    )
+    assert blocked.status_code == 429
+
+    admin_token = _create_staff_and_login(
+        client, db_session, "sweepstaleadmin1@zoikolocal.com", PlatformStaffRole.SUPER_ADMIN
+    )
+    monkeypatch.setattr(
+        "app.media.service.telecom.get_call",
+        lambda call_sid: {"sid": call_sid, "status": "completed", "duration": "42"},
+    )
+    swept = client.post("/ops/calls/sweep-stale", headers={"Authorization": f"Bearer {admin_token}"})
+    assert swept.status_code == 200, swept.text
+    assert swept.json()["swept"] == 1
+
+    db_session.refresh(call)
+    assert call.status == "completed"
+    assert call.duration == 42
+
+    recovered = client.post(
+        "/media/voice/outbound", json={"to": "+15551110007", "from": "+15550009093"}, headers=headers,
+    )
+    assert recovered.status_code == 200, recovered.text
+
+
 def test_kyc_approval_steps_up_trial_low_to_trial_verified(client, db_session):
     from app.compliance.models import ComplianceRule
     from app.numbering.identity.models import Account

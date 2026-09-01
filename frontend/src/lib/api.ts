@@ -712,6 +712,18 @@ export function deactivateKillSwitch(staffToken: string, scope: string): Promise
   });
 }
 
+// Recovers a call stuck non-terminal because its status-callback webhook
+// was lost (e.g. a browser tab closed mid-call) - such a call silently
+// and permanently eats one of the account's concurrent-call slots until
+// this runs. Normally handled by the daily reconciliation job; this is
+// the manual trigger for when a customer needs it fixed right now.
+export function sweepStaleCalls(staffToken: string): Promise<{ swept: number }> {
+  return request<{ swept: number }>("/ops/calls/sweep-stale", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${staffToken}` },
+  });
+}
+
 export type StaffNumberSearchResult = {
   id: string;
   e164: string;

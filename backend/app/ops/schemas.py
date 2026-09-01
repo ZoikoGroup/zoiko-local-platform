@@ -78,3 +78,7 @@ class EventOutboxFlushResponse(BaseModel):
     checked: int
     published: int
     failed: int
+
+
+class SweepStaleCallsResponse(BaseModel):
+    swept: int

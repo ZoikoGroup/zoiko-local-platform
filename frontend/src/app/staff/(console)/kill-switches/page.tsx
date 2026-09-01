@@ -6,6 +6,7 @@ import {
   listKillSwitches,
   activateKillSwitch,
   deactivateKillSwitch,
+  sweepStaleCalls,
   ApiError,
   KILL_SWITCH_SCOPES,
   type KillSwitch,
@@ -44,6 +45,8 @@ export default function StaffKillSwitchesPage() {
   const [reason, setReason] = useState("");
   const [expiresAt, setExpiresAt] = useState("");
   const [busyScope, setBusyScope] = useState<string | null>(null);
+  const [sweeping, setSweeping] = useState(false);
+  const [sweepResult, setSweepResult] = useState<string | null>(null);
 
   useEffect(() => {
     if (ready && !token) router.replace("/staff/login");
@@ -112,6 +115,29 @@ export default function StaffKillSwitchesPage() {
       );
     } finally {
       setBusyScope(null);
+    }
+  }
+
+  async function handleSweepStaleCalls() {
+    if (!token) return;
+    setSweeping(true);
+    setSweepResult(null);
+    setError(null);
+    try {
+      const result = await sweepStaleCalls(token);
+      setSweepResult(
+        result.swept === 0
+          ? "No stuck calls found - nothing to fix."
+          : `Fixed ${result.swept} stuck call${result.swept === 1 ? "" : "s"}. Affected accounts can place new calls again.`
+      );
+    } catch (err) {
+      setError(
+        err instanceof ApiError && err.status === 403
+          ? "Only staff with the ops.manage_event_outbox capability can do this."
+          : "Couldn't run the sweep."
+      );
+    } finally {
+      setSweeping(false);
     }
   }
 
@@ -229,6 +255,28 @@ export default function StaffKillSwitchesPage() {
           })}
         </div>
       )}
+
+      <div className="rounded-lg border border-slate-800 bg-slate-900 p-4">
+        <div className="flex items-start justify-between gap-4">
+          <div>
+            <div className="font-medium text-sm text-slate-100">Fix stuck calls</div>
+            <p className="text-xs text-slate-500 mt-1 max-w-xl">
+              A call can occasionally get stuck "in progress" forever if the browser tab closes or the connection
+              drops mid-call - this silently blocks that account from placing new calls. Checks every stuck call
+              against Twilio's real status and fixes any that have actually ended.
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={handleSweepStaleCalls}
+            disabled={sweeping}
+            className="shrink-0 text-xs font-medium rounded-lg px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 text-white"
+          >
+            {sweeping ? "Checking..." : "Fix stuck calls"}
+          </button>
+        </div>
+        {sweepResult && <p className="text-xs text-emerald-400 mt-3">{sweepResult}</p>}
+      </div>
     </>
   );
 }

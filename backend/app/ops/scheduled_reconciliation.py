@@ -9,10 +9,17 @@ Not wired into the FastAPI app itself - owns its own DB session, same
 pattern as app.events.consumer. Deliberately a thin script: it only calls
 existing, already-tested service functions (run_zoikonex_reconciliation,
 list_due_renewals, expire_overdue_cases, purge_expired_recordings,
-sweep_stale_video_recordings) and logs a summary; it contains no
-reconciliation logic of its own. Exits 1 if this run found new exceptions,
-numbers overdue for renewal, or any purge failures, so cron/host alerting
-can key off the exit code without parsing log output.
+sweep_stale_video_recordings, sweep_stale_calls) and logs a summary; it
+contains no reconciliation logic of its own. Exits 1 if this run found new
+exceptions, numbers overdue for renewal, or any purge failures, so
+cron/host alerting can key off the exit code without parsing log output.
+
+sweep_stale_calls (real gap fix) closes the same class of bug
+sweep_stale_video_recordings already covers, for voice instead of video: a
+CallRecord stuck non-terminal because its status-callback webhook was lost
+previously had no recovery path at all, and silently ate one of the
+account's MAX_CONCURRENT_CALLS_BY_RISK_STATE slots forever - see that
+function's own docstring for the real customer impact this was found from.
 
 expire_overdue_cases and purge_expired_recordings both existed with no
 scheduler calling them (see their own docstrings) - this is that scheduler.
@@ -54,7 +61,7 @@ from app.billing.service import run_zoikonex_reconciliation
 from app.compliance.service import expire_overdue_cases, flag_cases_due_for_reverification
 from app.core.database import SessionLocal
 from app.events.service import flush_pending_outbox_events
-from app.media.service import sweep_stale_video_recordings
+from app.media.service import sweep_stale_calls, sweep_stale_video_recordings
 from app.notifications.service import send_internal_alert
 from app.numbering.numbers.service import (
     list_due_renewals,
@@ -153,6 +160,14 @@ def main() -> int:
         swept = sweep_stale_video_recordings(db)
         logger.info("stale_video_recordings_swept count=%d", swept["swept"])
 
+    def _sweep_stale_calls() -> None:
+        # Real gap fix: a CallRecord stuck non-terminal (lost status-
+        # callback webhook) silently and permanently ate one of the
+        # account's concurrent-call slots with no automatic recovery -
+        # see sweep_stale_calls's own docstring.
+        swept = sweep_stale_calls(db)
+        logger.info("stale_calls_swept count=%d", swept["swept"])
+
     def _sync_eligibility() -> None:
         nonlocal exit_code
         # sync_number_eligibility_bundle_status only fires when a customer
@@ -209,6 +224,7 @@ def main() -> int:
         _run_step("expire_kill_switches", _expire_kill_switches)
         _run_step("purge_recordings", _purge_recordings)
         _run_step("sweep_stale_video", _sweep_stale_video)
+        _run_step("sweep_stale_calls", _sweep_stale_calls)
         _run_step("sync_eligibility", _sync_eligibility)
         _run_step("stuck_provisioning", _stuck_provisioning)
         _run_step("flush_outbox", _flush_outbox)
