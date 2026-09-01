@@ -47,7 +47,11 @@ def test_concurrent_checkouts_for_two_numbers_on_the_same_account_only_one_is_fr
         setup_db.refresh(account)
         account_id = account.id
 
-        setup_db.add(User(account_id=account_id, email=f"concurrency-{suffix}@example.com"))
+        # email_verified=True - this test is about the checkout-locking
+        # race, not the (separately tested) email-verification gate, and
+        # this User is built directly rather than via /auth/signup, so it
+        # would otherwise never pick up a verified email at all.
+        setup_db.add(User(account_id=account_id, email=f"concurrency-{suffix}@example.com", email_verified=True))
         setup_db.commit()
 
         grant_consent(setup_db, account_id, ConsentType.EMERGENCY_CALLING_ACKNOWLEDGED)

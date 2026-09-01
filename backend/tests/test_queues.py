@@ -158,9 +158,13 @@ def test_full_queue_lifecycle_enqueue_pull_answer_wrapup(client, db_session, mon
 
     # 4. Agent's phone answers - Twilio hits agent-connect, which bridges into the real queue
     #    and marks our own log row as answered.
-    connect = client.post(
-        f"/media/voice/queue/agent-connect?queue_id={queue['id']}&agent_user_id={me['id']}"
+    connect_url = (
+        f"http://testserver/media/voice/queue/agent-connect?queue_id={queue['id']}&agent_user_id={me['id']}"
         f"&queue_call_log_id={pulled.json()['queue_call_log_id']}"
+    )
+    connect = client.post(
+        connect_url.replace("http://testserver", ""),
+        headers={"X-Twilio-Signature": _twilio_signature(connect_url, {})},
     )
     assert connect.status_code == 200
     assert f"<Dial><Queue>zoiko-queue-{queue['id']}</Queue></Dial>" in connect.text

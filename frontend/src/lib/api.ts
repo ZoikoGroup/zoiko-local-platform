@@ -659,47 +659,10 @@ export function revokeCapability(staffToken: string, capability: string, role: s
   );
 }
 
-// Who has staff console access, and at what role - adding/deactivating
-// someone requires the staff.manage_staff capability (Super Admin only,
-// by default).
-
-export type StaffMember = {
-  id: string;
-  email: string;
-  role: string;
-  is_active: boolean;
-  created_at: string;
-};
-
-export function listStaffMembers(staffToken: string): Promise<StaffMember[]> {
-  return request<StaffMember[]>("/staff/members", {
-    headers: { Authorization: `Bearer ${staffToken}` },
-  });
-}
-
-export function createStaffMember(
-  staffToken: string, email: string, password: string, role: string
-): Promise<StaffMember> {
-  return request<StaffMember>("/staff/members", {
-    method: "POST",
-    headers: { Authorization: `Bearer ${staffToken}` },
-    body: JSON.stringify({ email, password, role }),
-  });
-}
-
-export function deactivateStaffMember(staffToken: string, staffId: string): Promise<StaffMember> {
-  return request<StaffMember>(`/staff/members/${staffId}/deactivate`, {
-    method: "PUT",
-    headers: { Authorization: `Bearer ${staffToken}` },
-  });
-}
-
-export function reactivateStaffMember(staffToken: string, staffId: string): Promise<StaffMember> {
-  return request<StaffMember>(`/staff/members/${staffId}/reactivate`, {
-    method: "PUT",
-    headers: { Authorization: `Bearer ${staffToken}` },
-  });
-}
+// Who has staff console access, and at what role: listStaffTeam/
+// createStaffTeamMember/deactivateStaffTeamMember/reactivateStaffTeamMember
+// (defined further up, near getCurrentStaff) already cover this - staff.
+// manage_staff_accounts, not a second /staff/members surface.
 
 // Platform-wide emergency kill switches (Commercial Billing Operating
 // Standard doc §32.1) - "stop new harm without destroying customer
@@ -974,24 +937,8 @@ export function listIncidents(limit: number = 50): Promise<Incident[]> {
   return request<Incident[]>(`/ops/incidents?limit=${limit}`);
 }
 
-// --- Kill switches (staff-only, platform-wide or per-account) ---
-
-export type KillSwitch = {
-  id: string;
-  scope: string;
-  is_active: boolean;
-  reason: string | null;
-  activated_by: string | null;
-  activated_at: string | null;
-  deactivated_at: string | null;
-  expires_at: string | null;
-};
-
-export function listKillSwitches(staffToken: string): Promise<KillSwitch[]> {
-  return request<KillSwitch[]>("/ops/kill-switches", {
-    headers: { Authorization: `Bearer ${staffToken}` },
-  });
-}
+// Kill switches: type/listKillSwitches/activateKillSwitch/deactivateKillSwitch
+// are defined once, near the other staff-only endpoints above.
 
 export function createIncident(
   staffToken: string,

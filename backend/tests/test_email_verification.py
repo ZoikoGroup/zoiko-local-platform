@@ -26,8 +26,11 @@ def test_signup_sends_a_verification_email_and_starts_unverified(client, monkeyp
     )
     assert signup.status_code == 201
     assert signup.json()["email_verified"] is False
-    assert len(sent) == 1
-    assert sent[0]["subject"] == "Verify your email for Zoiko Local"
+    # Signup also sends the unrelated "welcome" email (notify_account_
+    # activated) - this only asserts the verification one is among them,
+    # not that it's the only one sent.
+    assert len(sent) == 2
+    assert sent[-1]["subject"] == "Verify your email for Zoiko Local"
     token = _capture_verification_token(sent)
     assert token
 
@@ -157,8 +160,16 @@ def test_number_purchase_requires_email_verification(client, monkeypatch):
     sent = []
     monkeypatch.setattr("app.notifications.service.send_email", lambda **kw: sent.append(kw))
     monkeypatch.setattr("app.core.config.settings.resend_api_key", "re_fake_configured")
+    monkeypatch.setattr(
+        "app.numbering.numbers.service.telecom.buy_number",
+        lambda e164, bundle_sid=None: {"sid": "PN_fake_sid", "phone_number": e164, "capabilities": {}},
+    )
 
     token = _signup_and_login(client, "buyunverified1@example.com")
+    # Captured right after signup - compliance/billing calls below send
+    # their own notifications, so sent[-1] would otherwise no longer be
+    # the verification email by the time this test reaches for it.
+    verify_token = _capture_verification_token(sent)
     headers = {"Authorization": f"Bearer {token}"}
     client.post("/compliance/consent", json={"consent_type": "emergency_calling_acknowledged"}, headers=headers)
     client.put("/billing/subscription/plan", json={"plan_code": "starter", "billing_period": "monthly"}, headers=headers)
@@ -168,7 +179,6 @@ def test_number_purchase_requires_email_verification(client, monkeypatch):
     assert blocked.status_code == 403
     assert "verify" in blocked.json()["detail"].lower()
 
-    verify_token = _capture_verification_token(sent)
     client.post("/auth/verify-email", json={"token": verify_token})
 
     allowed = client.post("/numbers/purchase", json={"e164": "+15550001111"}, headers=headers)

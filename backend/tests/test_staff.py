@@ -346,15 +346,15 @@ def test_access_matrix_route_requires_staff_auth(client):
 def test_super_admin_can_add_and_deactivate_a_staff_member(client, db_session):
     """Real gap fix: there was previously no way to add a staff member
     short of direct database/code access - bootstrap only ever creates
-    the very first SUPER_ADMIN. Proves POST /staff/members works
-    end-to-end for a real SUPER_ADMIN, and that the new account can log in."""
+    the very first SUPER_ADMIN. Proves POST /staff/team works end-to-end
+    for a real SUPER_ADMIN, and that the new account can log in."""
     _create_staff(db_session, "teamadmin1@zoikolocal.com", role=PlatformStaffRole.SUPER_ADMIN)
     admin_token = client.post(
         "/staff/login", json={"email": "teamadmin1@zoikolocal.com", "password": "staffpass123"}
     ).json()["access_token"]
 
     create = client.post(
-        "/staff/members",
+        "/staff/team",
         json={"email": "newteammate1@zoikolocal.com", "password": "supersecret123", "role": "support"},
         headers={"Authorization": f"Bearer {admin_token}"},
     )
@@ -369,11 +369,11 @@ def test_super_admin_can_add_and_deactivate_a_staff_member(client, db_session):
     )
     assert new_login.status_code == 200
 
-    members = client.get("/staff/members", headers={"Authorization": f"Bearer {admin_token}"}).json()
+    members = client.get("/staff/team", headers={"Authorization": f"Bearer {admin_token}"}).json()
     assert any(m["id"] == new_staff_id for m in members)
 
     deactivate = client.put(
-        f"/staff/members/{new_staff_id}/deactivate", headers={"Authorization": f"Bearer {admin_token}"}
+        f"/staff/team/{new_staff_id}/deactivate", headers={"Authorization": f"Bearer {admin_token}"}
     )
     assert deactivate.status_code == 200
     assert deactivate.json()["is_active"] is False
@@ -384,7 +384,7 @@ def test_super_admin_can_add_and_deactivate_a_staff_member(client, db_session):
     assert blocked_login.status_code == 401
 
     reactivate = client.put(
-        f"/staff/members/{new_staff_id}/reactivate", headers={"Authorization": f"Bearer {admin_token}"}
+        f"/staff/team/{new_staff_id}/reactivate", headers={"Authorization": f"Bearer {admin_token}"}
     )
     assert reactivate.status_code == 200
     assert reactivate.json()["is_active"] is True
@@ -397,21 +397,32 @@ def test_support_cannot_add_a_staff_member(client, db_session):
     ).json()["access_token"]
 
     response = client.post(
-        "/staff/members",
+        "/staff/team",
         json={"email": "shouldnotexist1@zoikolocal.com", "password": "supersecret123", "role": "support"},
         headers={"Authorization": f"Bearer {support_token}"},
     )
     assert response.status_code == 403
 
 
-def test_super_admin_cannot_deactivate_their_own_account(client, db_session):
+def test_super_admin_cannot_deactivate_the_only_active_super_admin(client, db_session):
+    from app.staff.models import PlatformStaff
+
     staff = _create_staff(db_session, "teamselfdeactivate1@zoikolocal.com", role=PlatformStaffRole.SUPER_ADMIN)
     admin_token = client.post(
         "/staff/login", json={"email": "teamselfdeactivate1@zoikolocal.com", "password": "staffpass123"}
     ).json()["access_token"]
 
+    # This file's other tests each create their own SUPER_ADMIN in the same
+    # shared test DB - deactivate every other one first so this genuinely
+    # exercises "the only active SUPER_ADMIN left", not an artifact of test
+    # ordering.
+    db_session.query(PlatformStaff).filter(
+        PlatformStaff.role == PlatformStaffRole.SUPER_ADMIN, PlatformStaff.id != staff.id
+    ).update({"is_active": False})
+    db_session.commit()
+
     response = client.put(
-        f"/staff/members/{staff.id}/deactivate", headers={"Authorization": f"Bearer {admin_token}"}
+        f"/staff/team/{staff.id}/deactivate", headers={"Authorization": f"Bearer {admin_token}"}
     )
     assert response.status_code == 409
 
@@ -423,7 +434,7 @@ def test_creating_a_staff_member_with_a_duplicate_email_conflicts(client, db_ses
     ).json()["access_token"]
 
     response = client.post(
-        "/staff/members",
+        "/staff/team",
         json={"email": "teamduplicate1@zoikolocal.com", "password": "supersecret123", "role": "support"},
         headers={"Authorization": f"Bearer {admin_token}"},
     )

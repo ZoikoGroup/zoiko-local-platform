@@ -113,6 +113,15 @@ def verify_email(db: Session, token: str) -> User:
         db.commit()
         db.refresh(user)
         log_event(db, actor=user.id, action="user.email_verified", target=f"user:{user.id}")
+        # Real bug found live in the anilupdated merge: get_current_user's
+        # 30s auth cache holds a serialized snapshot from before
+        # verification - without invalidating it here, a purchase attempt
+        # in that window reads the stale unverified user and 403s even
+        # though /auth/verify-email just returned 200. Same pattern as
+        # enable_mfa/disable_mfa below.
+        from app.core.deps import invalidate_cached_user
+
+        invalidate_cached_user(user.id)
     return user
 
 
