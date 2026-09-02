@@ -1,0 +1,32 @@
+name: Deploy Zoiko Local Platform
+on:
+  push:
+    branches: [main]
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.GCP_SSH_HOST }}
+          username: ${{ secrets.GCP_SSH_USER }}
+          key: ${{ secrets.GCP_SSH_KEY }}
+          script: |
+            set -e
+
+            cd /var/www/zoiko-local-backend/app
+            git pull origin main
+            cd backend
+            source venv/bin/activate
+            pip install -r requirements.txt
+            alembic upgrade head
+            deactivate
+            sudo systemctl restart zoiko-local-backend
+
+            cd /var/www/zoiko-local-platform/app
+            git pull origin main
+            cd frontend
+            npm install
+            npm run build
+            pm2 restart zoiko-local-platform
+            pm2 save
