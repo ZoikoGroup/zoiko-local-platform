@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import {
   listFraudCases,
   resolveFraudCase,
+  reinstateAccountNumbers,
   listFraudRules,
   upsertFraudRule,
   listBlockedDestinations,
@@ -111,6 +112,8 @@ function FraudCasesSection({
   const [resolvingId, setResolvingId] = useState<string | null>(null);
   const [notes, setNotes] = useState("");
   const [busyId, setBusyId] = useState<string | null>(null);
+  const [reinstatingId, setReinstatingId] = useState<string | null>(null);
+  const [reinstateResult, setReinstateResult] = useState<{ caseId: string; message: string } | null>(null);
 
   const loadCases = useCallback(() => {
     return Promise.resolve()
@@ -149,6 +152,36 @@ function FraudCasesSection({
       onError("Couldn't resolve this case.");
     } finally {
       setBusyId(null);
+    }
+  }
+
+  // Separate from resolving the case: "Clear"/"Confirm" only change the
+  // account's risk tier, not the actual suspended numbers - a case can be
+  // auto-resolved as "confirmed" by the risk engine itself (before a human
+  // ever reviews it) the moment the account crosses the auto-suspend
+  // threshold, which is common, so this needs to work regardless of the
+  // case's status, not just while it's still "open".
+  async function handleReinstate(c: FraudCase) {
+    setReinstatingId(c.id);
+    setReinstateResult(null);
+    onError(null);
+    try {
+      const result = await reinstateAccountNumbers(token, c.account_id, notes || undefined);
+      setReinstateResult({
+        caseId: c.id,
+        message:
+          result.reactivated.length === 0
+            ? "No suspended numbers found for this account - nothing to reactivate."
+            : `Reactivated: ${result.reactivated.join(", ")}`,
+      });
+    } catch (err) {
+      onError(
+        err instanceof ApiError && err.status === 403
+          ? "Only staff with the risk.reinstate_account capability can do this."
+          : "Couldn't reinstate this account's numbers."
+      );
+    } finally {
+      setReinstatingId(null);
     }
   }
 
@@ -212,6 +245,26 @@ function FraudCasesSection({
                 <div className="text-sm text-slate-200">{c.resolution_notes}</div>
               </div>
             )}
+
+            <div className="mt-4 pt-4 border-t border-slate-800 flex items-center justify-between gap-3">
+              <div>
+                <button
+                  onClick={() => handleReinstate(c)}
+                  disabled={reinstatingId === c.id}
+                  className="text-sm bg-slate-800 hover:bg-slate-700 disabled:opacity-60 text-white rounded-lg px-4 py-1.5 transition"
+                >
+                  {reinstatingId === c.id ? "Reinstating..." : "Reinstate numbers"}
+                </button>
+                <p className="text-xs text-slate-500 mt-1.5 max-w-md">
+                  Reactivates every number the risk engine auto-suspended on this account - separate from
+                  resolving the case above, since "Clear" only lifts the account's risk tier, not the numbers
+                  themselves.
+                </p>
+              </div>
+              {reinstateResult && reinstateResult.caseId === c.id && (
+                <p className="text-xs text-emerald-400 max-w-xs text-right">{reinstateResult.message}</p>
+              )}
+            </div>
 
             {c.status === "open" && (
               <div className="mt-4 pt-4 border-t border-slate-800">

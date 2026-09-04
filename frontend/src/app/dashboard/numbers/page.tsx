@@ -211,10 +211,14 @@ export default function NumbersPage() {
         setCountriesError(null);
         // Only override the "US" initial default if US genuinely isn't
         // supported - avoids resetting a user's in-progress selection on
-        // every re-render.
-        setCountryCode((current) =>
-          data.some((c) => c.code === current) ? current : (data[0]?.code ?? current)
-        );
+        // every re-render. Falls back to the first NON-closed country (not
+        // just data[0]) - the search dropdown below hides closed countries
+        // entirely, so defaulting to one would select a value with no
+        // matching visible option.
+        setCountryCode((current) => {
+          if (data.some((c) => c.code === current && c.activation_state !== "CLOSED")) return current;
+          return data.find((c) => c.activation_state !== "CLOSED")?.code ?? current;
+        });
       })
       .catch(() => setCountriesError("Couldn't load the list of supported countries."));
   }, [token]);
@@ -1079,11 +1083,20 @@ export default function NumbersPage() {
               onChange={(e) => setCountryCode(e.target.value)}
               className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900"
             >
-              {countries.map((c) => (
-                <option key={c.code} value={c.code}>
-                  {c.name} ({c.code})
-                </option>
-              ))}
+              {/* Real gap fix: this list previously showed every seeded
+                  country regardless of activation_state, including ones
+                  marked CLOSED that fail every real search - a customer had
+                  no way to tell "not open yet" from "broken." Closed
+                  countries are hidden here rather than disabled, since
+                  there's nothing useful for a customer to do with one right
+                  now. */}
+              {countries
+                .filter((c) => c.activation_state !== "CLOSED")
+                .map((c) => (
+                  <option key={c.code} value={c.code}>
+                    {c.name} ({c.code})
+                  </option>
+                ))}
             </select>
             <label htmlFor="search-type" className="sr-only">
               Number type

@@ -2972,3 +2972,17 @@ export function resolveFraudCase(
     body: JSON.stringify({ status, notes }),
   });
 }
+
+// Reactivates every number the risk engine auto-suspended on this account -
+// separate from resolveFraudCase("cleared"), which only lifts the
+// account's risk tier/concurrent-call limit back down, not the numbers
+// themselves. Both are usually needed together after a false positive.
+export function reinstateAccountNumbers(
+  token: string, accountId: string, reason?: string
+): Promise<{ reactivated: string[] }> {
+  return request<{ reactivated: string[] }>(`/risk/accounts/${accountId}/reinstate`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ reason }),
+  });
+}
