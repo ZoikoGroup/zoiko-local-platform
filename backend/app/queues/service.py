@@ -15,7 +15,8 @@ from app.audit.service import log_event
 from app.events.service import publish_agent_presence_changed, publish_queue_created
 from app.integrations.cache.redis import cache_delete, cache_get, cache_set
 from app.integrations.telecom import twilio as telecom
-from app.numbering.identity.models import User
+from app.notifications.service import notify_queue_membership_changed
+from app.numbering.identity.models import Account, User
 from app.queues.models import (
     AgentPresence,
     AgentPresenceStatus,
@@ -148,14 +149,26 @@ def add_member(db: Session, account_id: str, queue_id: str, user_id: str) -> dic
         db.add(QueueMember(queue_id=queue_id, user_id=user_id))
         db.commit()
         _invalidate_queues_cache(account_id)
+        account = db.query(Account).filter(Account.id == account_id).first()
+        notify_queue_membership_changed(
+            db, account_id=account_id, member_email=member_user.email,
+            organization_name=account.name if account else "your organization", added=queue.name, removed=None,
+        )
     return _to_response(db, queue)
 
 
 def remove_member(db: Session, account_id: str, queue_id: str, user_id: str) -> dict:
     queue = _get_queue(db, account_id, queue_id)
+    member_user = db.query(User).filter(User.id == user_id, User.account_id == account_id).first()
     db.query(QueueMember).filter(QueueMember.queue_id == queue_id, QueueMember.user_id == user_id).delete()
     db.commit()
     _invalidate_queues_cache(account_id)
+    if member_user is not None:
+        account = db.query(Account).filter(Account.id == account_id).first()
+        notify_queue_membership_changed(
+            db, account_id=account_id, member_email=member_user.email,
+            organization_name=account.name if account else "your organization", added=None, removed=queue.name,
+        )
     return _to_response(db, queue)
 
 

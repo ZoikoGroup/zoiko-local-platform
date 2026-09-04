@@ -20,6 +20,7 @@ from app.notifications.service import (
     notify_email_verification_requested,
     notify_mfa_disabled,
     notify_mfa_enabled,
+    notify_organization_created,
     notify_password_changed,
     notify_password_reset_requested,
     notify_team_member_added,
@@ -69,6 +70,7 @@ def create_account_with_owner(
     )
     publish_account_created(account.id, user_id=user.id, email=user.email, account_type=account_type)
     notify_account_activated(db, account_id=account.id, user_email=user.email)
+    notify_organization_created(db, account_id=account.id, account_email=user.email, organization_name=account.name)
     # Architecture doc §5 "Fraud and Risk: device fingerprinting" - detection
     # only, never blocks signup itself (see check_fingerprint_on_signup's
     # docstring). Optional: a client that sends no fingerprint header is a

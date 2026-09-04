@@ -26,10 +26,11 @@ def test_signup_sends_a_verification_email_and_starts_unverified(client, monkeyp
     )
     assert signup.status_code == 201
     assert signup.json()["email_verified"] is False
-    # Signup also sends the unrelated "welcome" email (notify_account_
-    # activated) - this only asserts the verification one is among them,
-    # not that it's the only one sent.
-    assert len(sent) == 2
+    # Signup also sends two unrelated emails (notify_account_activated's
+    # welcome, notify_organization_created's onboarding nudge) - this only
+    # asserts the verification one is among them, not that it's the only
+    # one sent.
+    assert len(sent) == 3
     assert sent[-1]["subject"] == "Verify your email for Zoiko Local"
     token = _capture_verification_token(sent)
     assert token

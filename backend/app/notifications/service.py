@@ -1181,6 +1181,45 @@ def notify_compliance_reverification_due(
     )
 
 
+def notify_caller_id_restricted(
+    db: Session, *, account_id: str, account_email: str, e164: str, reason: str | None = None,
+) -> None:
+    """numbering.numbers.service.revoke_caller_identity previously only
+    logged the change - the account had no way to learn a number could no
+    longer be presented as an outbound caller ID short of a call failing
+    unexpectedly. compliance.caller_id_restricted_or_removed already
+    existed as a seeded template with zero call sites."""
+    send_notification(
+        db,
+        event_name="compliance.caller_id_restricted_or_removed",
+        account_id=account_id,
+        recipient_email=account_email,
+        context={
+            "user_display_name": account_email,
+            "number_masked_or_formatted": _mask_number(e164),
+            "decision_reason_category": reason or "policy review",
+        },
+    )
+
+
+def notify_caller_id_approved(
+    db: Session, *, account_id: str, account_email: str, e164: str, organization_name: str,
+) -> None:
+    """Reversal counterpart to notify_caller_id_restricted above - fires
+    from numbering.numbers.service.reinstate_caller_identity."""
+    send_notification(
+        db,
+        event_name="compliance.caller_id_approved",
+        account_id=account_id,
+        recipient_email=account_email,
+        context={
+            "user_display_name": account_email,
+            "number_formatted": e164,
+            "organization_name": organization_name,
+        },
+    )
+
+
 def notify_compliance_information_required(
     db: Session, *, account_id: str, account_email: str, jurisdiction: str, requirement_type: str, case_reference: str
 ) -> None:
@@ -1281,6 +1320,35 @@ def notify_porting_request_canceled(
             "port_reference": port_reference,
             "port_canceled_at": _now_str(),
             "port_canceled_by": canceled_by,
+        },
+    )
+
+
+def notify_organization_created(db: Session, *, account_id: str, account_email: str, organization_name: str) -> None:
+    """org.organization_created was seeded with zero call sites - distinct
+    from auth.account_activated (a plain "your account is active" welcome,
+    fired right before this one in create_account_with_owner): this is the
+    onboarding-checklist nudge (company details/admins/billing/emergency-
+    calling/numbers/routing) the ORG domain template actually describes."""
+    send_notification(
+        db, event_name="org.organization_created", account_id=account_id, recipient_email=account_email,
+        context={"user_display_name": account_email, "organization_name": organization_name},
+    )
+
+
+def notify_queue_membership_changed(
+    db: Session, *, account_id: str, member_email: str, organization_name: str, added: str | None, removed: str | None,
+) -> None:
+    """route.queue_membership_changed was seeded with zero call sites -
+    fires from queues.service.add_member/remove_member, addressed to the
+    specific member whose assignment changed (not the account owner)."""
+    send_notification(
+        db, event_name="route.queue_membership_changed", account_id=account_id, recipient_email=member_email,
+        context={
+            "user_display_name": member_email,
+            "organization_name": organization_name,
+            "queue_added_summary": added or "none",
+            "queue_removed_summary": removed or "none",
         },
     )
 
@@ -1792,6 +1860,42 @@ def notify_call_flow_rolled_back(
             "route_version": str(restored_version),
             "event_occurred_at": _now_str(),
             "route_rollback_reason": "requested by an account admin",
+        },
+    )
+
+
+def notify_inbound_message_received(
+    db: Session, *, account_id: str, account_email: str, e164: str, from_number: str,
+) -> None:
+    """msg.inbound_message_received was seeded with zero call sites -
+    fires from messaging.service._record_inbound (SMS and WhatsApp both).
+    Content is deliberately not included in the email (per the template's
+    own body), matching the same "don't put message content in an
+    email" posture the seeded copy already commits to."""
+    send_notification(
+        db, event_name="msg.inbound_message_received", account_id=account_id, recipient_email=account_email,
+        context={
+            "user_display_name": account_email,
+            "number_masked_or_formatted": _mask_number(e164),
+            "message_sender_safe": _mask_number(from_number),
+            "message_received_local": _now_str(),
+        },
+    )
+
+
+def notify_message_delivery_failed(
+    db: Session, *, account_id: str, account_email: str, message_reference: str, destination: str, failure_category: str,
+) -> None:
+    """Counterpart to notify_inbound_message_received - fires from
+    messaging.service.update_message_status when a provider status
+    callback reports a failed/undelivered outbound message."""
+    send_notification(
+        db, event_name="msg.message_delivery_failed", account_id=account_id, recipient_email=account_email,
+        context={
+            "user_display_name": account_email,
+            "message_reference": message_reference,
+            "message_destination_masked": _mask_number(destination),
+            "message_failure_category": failure_category,
         },
     )
 

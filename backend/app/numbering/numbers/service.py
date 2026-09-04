@@ -24,6 +24,8 @@ from app.ops.models import KillSwitchScope
 from app.ops.service import assert_kill_switch_not_active
 from app.usage import service as usage_service
 from app.notifications.service import (
+    notify_caller_id_approved,
+    notify_caller_id_restricted,
     notify_number_activated,
     notify_number_assigned,
     notify_number_eligibility_approved,
@@ -1389,6 +1391,12 @@ def revoke_caller_identity(
 
     check_caller_id_change_velocity(db, identity.account_id)
 
+    owner = db.query(User).filter(User.account_id == identity.account_id, User.role == UserRole.OWNER).first()
+    if owner is not None:
+        number = db.query(PhoneNumber).filter(PhoneNumber.id == phone_number_id).first()
+        if number is not None:
+            notify_caller_id_restricted(db, account_id=identity.account_id, account_email=owner.email, e164=number.e164, reason=reason)
+
     return identity
 
 
@@ -1414,6 +1422,16 @@ def reinstate_caller_identity(
     from app.risk.service import check_caller_id_change_velocity
 
     check_caller_id_change_velocity(db, identity.account_id)
+
+    owner = db.query(User).filter(User.account_id == identity.account_id, User.role == UserRole.OWNER).first()
+    if owner is not None:
+        number = db.query(PhoneNumber).filter(PhoneNumber.id == phone_number_id).first()
+        account = db.query(Account).filter(Account.id == identity.account_id).first()
+        if number is not None:
+            notify_caller_id_approved(
+                db, account_id=identity.account_id, account_email=owner.email, e164=number.e164,
+                organization_name=account.name if account else "your organization",
+            )
 
     return identity
 

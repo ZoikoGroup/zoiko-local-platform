@@ -19,7 +19,11 @@ from app.events.service import publish_message_received, publish_message_sent
 from app.integrations.cache.redis import cache_delete, cache_get, cache_set
 from app.integrations.telecom import twilio as telecom
 from app.messaging.models import Conversation, Message, MessageDirection, MessageStatus, MessagingChannel
-from app.notifications.service import notify_recipient_opted_out
+from app.notifications.service import (
+    notify_inbound_message_received,
+    notify_message_delivery_failed,
+    notify_recipient_opted_out,
+)
 from app.numbering.identity.models import User, UserRole
 from app.numbering.numbers.models import PhoneNumber
 
@@ -165,6 +169,13 @@ def _record_inbound(
     log_event(db, actor_id=number.account_id, action=f"messaging.{channel.value}.received", target_type="messaging_conversation",
                target_id=conversation.id, metadata={"from": from_number})
     publish_message_received(number.account_id, message_id=message.id, conversation_id=conversation.id, channel=channel.value)
+
+    owner = db.query(User).filter(User.account_id == number.account_id, User.role == UserRole.OWNER).first()
+    if owner is not None:
+        notify_inbound_message_received(
+            db, account_id=number.account_id, account_email=owner.email, e164=number.e164, from_number=from_number,
+        )
+
     return message
 
 
@@ -198,6 +209,16 @@ def update_message_status(db: Session, provider_message_sid: str, status: str) -
             return
     db.commit()
     _invalidate_messages_cache(message.conversation_id)
+
+    if message.status == MessageStatus.FAILED:
+        conversation = db.query(Conversation).filter(Conversation.id == message.conversation_id).first()
+        if conversation is not None:
+            owner = db.query(User).filter(User.account_id == conversation.account_id, User.role == UserRole.OWNER).first()
+            if owner is not None:
+                notify_message_delivery_failed(
+                    db, account_id=conversation.account_id, account_email=owner.email,
+                    message_reference=message.id, destination=conversation.customer_number, failure_category=status,
+                )
 
 
 def _conversations_cache_key(account_id: str) -> str:
