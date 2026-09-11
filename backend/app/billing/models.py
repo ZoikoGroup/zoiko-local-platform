@@ -409,6 +409,14 @@ class Subscription(Base):
     # see run_billing_cycle's ai_receptionist block) - a stale prior note
     # here claiming otherwise predates both.
     ai_receptionist_addon_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # Bug ZL-8 fix - separate from stripe_subscription_id above (that one
+    # is the PLAN's own Stripe subscription; overwriting it with the
+    # add-on's would silently lose track of whichever was set second).
+    # Set once handle_ai_receptionist_addon_checkout_completed confirms
+    # real payment; cleared when set_ai_receptionist_addon cancels it on
+    # disable, so Stripe never keeps charging an add-on the customer
+    # turned off here.
+    ai_receptionist_addon_stripe_subscription_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     # ZL-COM-ENT-001 v3.0 §8 - a downgrade normally takes effect at the end
     # of the current paid period, not immediately (unlike an upgrade). No
     # scheduler/cron exists in this codebase - these 3 columns are applied
@@ -665,6 +673,31 @@ class PlanChangeCheckoutSession(Base):
     plan_code: Mapped[str] = mapped_column(String(50), nullable=False)
     billing_period: Mapped[BillingPeriod] = mapped_column(
         Enum(BillingPeriod, name="billing_period_enum"), nullable=False,
+    )
+    stripe_session_id: Mapped[str] = mapped_column(String(255), nullable=False, unique=True, index=True)
+    status: Mapped[PlanChangeCheckoutSessionStatus] = mapped_column(
+        Enum(PlanChangeCheckoutSessionStatus, name="plan_change_checkout_session_status_enum"),
+        nullable=False, default=PlanChangeCheckoutSessionStatus.PENDING,
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class AIReceptionistAddonCheckoutSession(Base):
+    """Bug ZL-8 (tester-reported, confirmed live): PUT /billing/subscription/
+    ai-receptionist-addon enabled a real $29/workspace/month paid add-on
+    immediately, with zero payment collection - the exact same "payment-
+    success UI is not the same as an authoritative paid invoice" gap
+    PlanChangeCheckoutSession (above) was built to close for plan upgrades,
+    just never applied to this second paid toggle. Reuses
+    PlanChangeCheckoutSessionStatus (PENDING/COMPLETED) rather than a
+    second near-identical enum."""
+
+    __tablename__ = "ai_receptionist_addon_checkout_sessions"
+
+    id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=new_uuid)
+    account_id: Mapped[str] = mapped_column(
+        UUID(as_uuid=False), ForeignKey("accounts.id"), nullable=False, index=True
     )
     stripe_session_id: Mapped[str] = mapped_column(String(255), nullable=False, unique=True, index=True)
     status: Mapped[PlanChangeCheckoutSessionStatus] = mapped_column(

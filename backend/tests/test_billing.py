@@ -794,3 +794,119 @@ def test_team_member_add_blocked_once_seat_quota_is_reached(client, db_session):
     )
     assert over_limit.status_code == 402, over_limit.text
     assert "plan allows up to" in over_limit.json()["detail"]
+
+
+# --- Bug ZL-8: AI Receptionist add-on required real Stripe payment ---
+
+
+def test_ai_receptionist_addon_checkout_session_requires_real_payment_before_enabling(client, db_session, monkeypatch):
+    """Tester-reported (ClickUp Bug ZL-8), confirmed live: PUT /billing/
+    subscription/ai-receptionist-addon used to enable this $29/mo paid
+    add-on with zero payment collection. The real fix: creating a checkout
+    session must NOT itself enable the add-on - only a completed webhook
+    does."""
+    created_sessions = []
+
+    def _fake_create_subscription_checkout_session(**kwargs):
+        created_sessions.append(kwargs)
+        return {"id": "cs_test_addon_1", "url": "https://checkout.stripe.com/test_addon_1"}
+
+    monkeypatch.setattr(
+        "app.integrations.billing.stripe_checkout.create_subscription_checkout_session",
+        _fake_create_subscription_checkout_session,
+    )
+
+    account = _make_account_on_plan(db_session, "ZL8 Addon Checkout Co", "starter")
+    session = service.create_ai_receptionist_addon_checkout_session(db_session, account.id, actor="test-actor")
+
+    assert session["id"] == "cs_test_addon_1"
+    assert session["url"] == "https://checkout.stripe.com/test_addon_1"
+    assert len(created_sessions) == 1
+    assert created_sessions[0]["metadata"]["checkout_type"] == "ai_receptionist_addon"
+
+    # Creating the session alone must not have enabled the add-on.
+    db_session.refresh(account)
+    sub = service.get_or_create_subscription(db_session, account.id)
+    assert sub.ai_receptionist_addon_enabled is False
+
+
+def test_ai_receptionist_addon_enables_only_after_webhook_confirms_payment(client, db_session, monkeypatch):
+    monkeypatch.setattr(
+        "app.integrations.billing.stripe_checkout.create_subscription_checkout_session",
+        lambda **kwargs: {"id": "cs_test_addon_2", "url": "https://checkout.stripe.com/test_addon_2"},
+    )
+
+    account = _make_account_on_plan(db_session, "ZL8 Addon Webhook Co", "starter")
+    service.create_ai_receptionist_addon_checkout_session(db_session, account.id, actor="test-actor")
+
+    from app.billing.models import AIReceptionistAddonCheckoutSession
+
+    record = (
+        db_session.query(AIReceptionistAddonCheckoutSession)
+        .filter(AIReceptionistAddonCheckoutSession.account_id == account.id)
+        .first()
+    )
+    assert record is not None
+    assert record.stripe_session_id == "cs_test_addon_2"
+
+    sub = service.handle_ai_receptionist_addon_checkout_completed(
+        db_session, checkout_record_id=record.id, stripe_subscription_id="sub_test_addon_2",
+    )
+    assert sub.ai_receptionist_addon_enabled is True
+    assert sub.ai_receptionist_addon_stripe_subscription_id == "sub_test_addon_2"
+
+    # Idempotent on Stripe's webhook-retry behavior - a second delivery of
+    # the same completed event must not error or double-apply.
+    sub_again = service.handle_ai_receptionist_addon_checkout_completed(
+        db_session, checkout_record_id=record.id, stripe_subscription_id="sub_test_addon_2",
+    )
+    assert sub_again.ai_receptionist_addon_enabled is True
+
+
+def test_disabling_ai_receptionist_addon_cancels_the_real_stripe_subscription(client, db_session, monkeypatch):
+    canceled = []
+    monkeypatch.setattr(
+        "app.integrations.billing.stripe_checkout.cancel_subscription",
+        lambda stripe_subscription_id: canceled.append(stripe_subscription_id) or {"status": "canceled"},
+    )
+
+    account = _make_account_on_plan(db_session, "ZL8 Addon Disable Co", "starter")
+    sub = service.get_or_create_subscription(db_session, account.id)
+    sub.ai_receptionist_addon_enabled = True
+    sub.ai_receptionist_addon_stripe_subscription_id = "sub_test_addon_3"
+    db_session.commit()
+
+    updated = service.set_ai_receptionist_addon(db_session, account.id, enabled=False, actor="test-actor")
+    assert updated.ai_receptionist_addon_enabled is False
+    assert updated.ai_receptionist_addon_stripe_subscription_id is None
+    assert canceled == ["sub_test_addon_3"]
+
+
+def test_ai_receptionist_addon_checkout_route_requires_admin(client, db_session):
+    # A genuinely fresh MEMBER login (not an Owner token downgraded in the
+    # DB after issuance) - the JWT encodes role at login time, so a role
+    # change made after a token was already issued wouldn't be reflected
+    # in that token and this test would silently call the real route logic
+    # (including a real Stripe API call) instead of testing the 403 gate.
+    owner_token = _signup_and_login(client, "zl8addonowner1@example.com", account_type="business")
+    owner_headers = {"Authorization": f"Bearer {owner_token}"}
+    owner_account_id = client.get("/auth/me", headers=owner_headers).json()["account_id"]
+    # team.enabled (needed to add a second team member below) isn't
+    # granted on free_trial - "business" is the plan test_seat_quota_
+    # allows_up_to_the_limit_then_blocks already establishes this for.
+    service.change_plan(db_session, owner_account_id, "business", actor="test-setup")
+    created = client.post(
+        "/team/members",
+        json={"email": "zl8addonmember1@example.com", "password": "supersecret123", "role": "member"},
+        headers=owner_headers,
+    )
+    assert created.status_code == 201, created.text
+    member_token = client.post(
+        "/auth/login", json={"email": "zl8addonmember1@example.com", "password": "supersecret123"}
+    ).json()["access_token"]
+
+    response = client.post(
+        "/billing/subscription/ai-receptionist-addon/checkout-session",
+        headers={"Authorization": f"Bearer {member_token}"},
+    )
+    assert response.status_code == 403

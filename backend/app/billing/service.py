@@ -20,6 +20,7 @@ from app.billing.models import (
     PendingAccountCharge,
     PendingAccountChargeStatus,
     Plan,
+    AIReceptionistAddonCheckoutSession,
     PlanChangeCheckoutSession,
     PlanChangeCheckoutSessionStatus,
     PlanEntitlement,
@@ -239,6 +240,11 @@ class PlanChangeCheckoutSessionNotFoundError(Exception):
     """Raised when a Stripe webhook references a checkout session id this
     system never created - either a forged/unrelated event or a record
     that predates this feature."""
+
+
+class AIReceptionistAddonCheckoutSessionNotFoundError(Exception):
+    """Same role as PlanChangeCheckoutSessionNotFoundError, for the addon's
+    own checkout-session table."""
 
 
 class PriceCatalogEntryExistsError(Exception):
@@ -2856,20 +2862,125 @@ def _compute_ai_receptionist_overage(
 def set_ai_receptionist_addon(db: Session, account_id: str, *, enabled: bool, actor: str) -> Subscription:
     """Pricing doc §5.3 "$29.00 per workspace/month" - a subscription-level
     toggle, not a plan change (see change_plan for that), so this doesn't
-    touch plan_code or re-run entitlement checks. Audited the same way
-    every other billing state change in this module is (see
-    change_plan/cancel_subscription) - this is real money-adjacent state,
-    not a UI preference."""
+    touch plan_code or re-run entitlement checks.
+
+    Bug ZL-8 (tester-reported, confirmed live): this used to be the
+    customer-facing "Add to my plan" action, granting the paid add-on with
+    zero payment collection - the exact "payment-success UI is not the
+    same as an authoritative paid invoice" gap change_plan had before
+    create_plan_change_checkout_session closed it. Same fix, same shape:
+    this function is now staff/internal-only for ENABLING (kept for
+    comped add-ons/support corrections, deliberately not exposed as a
+    customer button) - the customer-facing path is
+    create_ai_receptionist_addon_checkout_session below, which requires
+    real Stripe payment before this ever runs with enabled=True. DISABLING
+    needs no payment, so it's still exposed directly to customers (see
+    billing/routes.py) - and cancels the real Stripe subscription created
+    when it was enabled, so Stripe doesn't keep charging for a feature
+    that's now off."""
     sub = get_or_create_subscription(db, account_id)
     previous = sub.ai_receptionist_addon_enabled
     sub.ai_receptionist_addon_enabled = enabled
+
+    canceled_stripe_subscription_id = None
+    if not enabled and sub.ai_receptionist_addon_stripe_subscription_id:
+        from app.integrations.billing import stripe_checkout
+
+        canceled_stripe_subscription_id = sub.ai_receptionist_addon_stripe_subscription_id
+        try:
+            stripe_checkout.cancel_subscription(canceled_stripe_subscription_id)
+        except stripe_checkout.PaymentError:
+            logger.exception(
+                "Failed to cancel AI Receptionist add-on Stripe subscription %s for account %s - "
+                "it may still be actively charging this customer and needs manual cancellation in Stripe.",
+                canceled_stripe_subscription_id, account_id,
+            )
+            send_internal_alert(
+                db, event_name="bill_int.stripe_subscription_cancel_failed",
+                summary=(
+                    f"Account {account_id} disabled the AI Receptionist add-on, but canceling its Stripe "
+                    f"subscription {canceled_stripe_subscription_id} failed. It may still be actively charging "
+                    f"this customer - cancel it manually in the Stripe dashboard."
+                ),
+                console_link=f"{settings.public_base_url}/staff/accounts",
+                tenant_reference=account_id,
+            )
+        sub.ai_receptionist_addon_stripe_subscription_id = None
+
     db.commit()
     db.refresh(sub)
     log_event(
         db, actor_id=actor, action="billing.ai_receptionist_addon_changed",
         target_type="subscription", target_id=sub.id, account_id=account_id,
-        metadata={"account_id": account_id, "previous": previous, "enabled": enabled},
+        metadata={
+            "account_id": account_id, "previous": previous, "enabled": enabled,
+            "canceled_stripe_subscription_id": canceled_stripe_subscription_id,
+        },
     )
+    return sub
+
+
+def create_ai_receptionist_addon_checkout_session(db: Session, account_id: str, *, actor: str) -> dict:
+    """Bug ZL-8 fix - the real customer-facing entry point for enabling the
+    AI Receptionist add-on, mirroring create_plan_change_checkout_session
+    exactly (see that function's docstring for the underlying doc
+    citation). Returns the Stripe-hosted Checkout Session {id, url} the
+    frontend must redirect the browser to; the add-on itself only turns on
+    once handle_ai_receptionist_addon_checkout_completed processes the
+    resulting webhook."""
+    rate = get_active_ai_receptionist_addon_rate(db)
+    if rate is None or rate.status != CatalogEntryStatus.ACTIVE:
+        raise PriceUnavailableForCheckoutError(
+            "No real, non-placeholder ACTIVE rate is configured for the AI Receptionist add-on"
+        )
+
+    record = AIReceptionistAddonCheckoutSession(account_id=account_id, stripe_session_id="")
+    db.add(record)
+    db.flush()  # assigns record.id without committing yet - needed for the metadata below
+
+    from app.integrations.billing import stripe_checkout
+
+    session = stripe_checkout.create_subscription_checkout_session(
+        plan_name="AI Receptionist add-on", amount_cents=rate.monthly_price_minor_units,
+        currency=rate.currency_code.lower(), interval="month",
+        success_url=f"{settings.frontend_base_url}/dashboard/billing?addon_checkout=success",
+        cancel_url=f"{settings.frontend_base_url}/dashboard/billing?addon_checkout=cancel",
+        metadata={"checkout_type": "ai_receptionist_addon", "checkout_record_id": record.id, "account_id": account_id},
+    )
+    record.stripe_session_id = session["id"]
+    db.commit()
+
+    log_event(
+        db, actor=actor, action="subscription.ai_receptionist_addon_checkout_created",
+        target=f"ai_receptionist_addon_checkout:{record.id}", account_id=account_id,
+        after={"stripe_session_id": session["id"]},
+    )
+    return session
+
+
+def handle_ai_receptionist_addon_checkout_completed(
+    db: Session, *, checkout_record_id: str, stripe_subscription_id: str | None = None,
+) -> Subscription:
+    """Called from the Stripe webhook once the add-on's own Checkout
+    Session payment actually succeeds - mirrors handle_stripe_checkout_
+    completed exactly (see that function's docstring for the idempotency/
+    stripe_subscription_id rationale, identical here)."""
+    record = db.query(AIReceptionistAddonCheckoutSession).filter(
+        AIReceptionistAddonCheckoutSession.id == checkout_record_id
+    ).first()
+    if record is None:
+        raise AIReceptionistAddonCheckoutSessionNotFoundError(f"No addon checkout session record {checkout_record_id!r}")
+
+    if record.status == PlanChangeCheckoutSessionStatus.COMPLETED:
+        return get_or_create_subscription(db, record.account_id)
+
+    sub = set_ai_receptionist_addon(db, record.account_id, enabled=True, actor="stripe_checkout_webhook")
+    sub.ai_receptionist_addon_stripe_subscription_id = stripe_subscription_id
+
+    record.status = PlanChangeCheckoutSessionStatus.COMPLETED
+    record.completed_at = datetime.now(timezone.utc)
+    db.commit()
+    db.refresh(sub)
     return sub
 
 

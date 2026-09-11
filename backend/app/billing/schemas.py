@@ -148,6 +148,14 @@ class PlanChangeCheckoutSessionResponse(BaseModel):
     url: str
 
 
+class AIReceptionistAddonCheckoutSessionResponse(BaseModel):
+    """Bug ZL-8 fix - same shape as PlanChangeCheckoutSessionResponse, for
+    the AI Receptionist add-on's own real Stripe Checkout Session."""
+
+    id: str
+    url: str
+
+
 class CancelSubscriptionRequest(BaseModel):
     reason: str | None = None
 

@@ -11,6 +11,7 @@ import {
   cancelScheduledPlanChange,
   createPlanChangeCheckoutSession,
   setAIReceptionistAddon,
+  createAIReceptionistAddonCheckoutSession,
   cancelSubscription,
   getPriceCatalogEntry,
   getUsageSummary,
@@ -236,7 +237,17 @@ export default function BillingPage() {
     setAddonBusy(true);
     setAddonError(null);
     try {
-      const sub = await setAIReceptionistAddon(token, active);
+      if (active) {
+        // Bug ZL-8 fix - enabling is a real paid action now, so it must go
+        // through Stripe Checkout first, same as a plan upgrade above. The
+        // add-on itself only turns on once Stripe confirms payment via the
+        // backend webhook, not on this click - navigate away and never
+        // reach setSubscription below for this branch.
+        const session = await createAIReceptionistAddonCheckoutSession(token);
+        window.location.href = session.url;
+        return;
+      }
+      const sub = await setAIReceptionistAddon(token, false);
       setSubscription(sub);
     } catch (err) {
       setAddonError(err instanceof ApiError ? err.message : "Couldn't update the AI Receptionist add-on.");

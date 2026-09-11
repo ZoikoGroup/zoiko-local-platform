@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 from app.billing import service
 from app.billing.models import BillingActionRequestStatus, BillingActionType, BillingPeriod
 from app.billing.schemas import (
+    AIReceptionistAddonCheckoutSessionResponse,
     AIReceptionistAddonRateResponse,
     ApprovePriceCatalogEntryRequest,
     BillingActionRequestResponse,
@@ -329,15 +330,28 @@ async def stripe_checkout_webhook(request: Request, db: Session = Depends(get_db
 
     if event["type"] == "checkout.session.completed":
         session_object = event["data"]["object"].to_dict()
-        checkout_record_id = session_object.get("metadata", {}).get("checkout_record_id")
+        metadata = session_object.get("metadata", {})
+        checkout_record_id = metadata.get("checkout_record_id")
         if not checkout_record_id:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Missing checkout_record_id metadata")
+        # Bug ZL-8 fix - checkout_type distinguishes which checkout-session
+        # table this id belongs to (plan change vs AI Receptionist add-on);
+        # absent on every pre-existing plan-change session, so defaults to
+        # that for backward compatibility with any already-in-flight
+        # Checkout Session created before this field existed.
+        checkout_type = metadata.get("checkout_type", "plan_change")
         try:
-            service.handle_stripe_checkout_completed(
-                db, checkout_record_id=checkout_record_id,
-                stripe_subscription_id=session_object.get("subscription"),
-            )
-        except service.PlanChangeCheckoutSessionNotFoundError as e:
+            if checkout_type == "ai_receptionist_addon":
+                service.handle_ai_receptionist_addon_checkout_completed(
+                    db, checkout_record_id=checkout_record_id,
+                    stripe_subscription_id=session_object.get("subscription"),
+                )
+            else:
+                service.handle_stripe_checkout_completed(
+                    db, checkout_record_id=checkout_record_id,
+                    stripe_subscription_id=session_object.get("subscription"),
+                )
+        except (service.PlanChangeCheckoutSessionNotFoundError, service.AIReceptionistAddonCheckoutSessionNotFoundError) as e:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
     elif event["type"] == "invoice.payment_failed":
         invoice = event["data"]["object"].to_dict()
@@ -395,11 +409,31 @@ def set_ai_receptionist_addon(
     current_user: User = Depends(require_admin),
 ):
     """Owner/Admin only, same commercial-decision gating as change_plan
-    above. Pricing doc §5.3 $29/workspace/month AI Receptionist add-on -
-    purely local entitlement flip; no real payment is collected here any
-    more than change_plan collects one (see run_billing_cycle for why -
-    this doesn't add an invoice line yet)."""
+    above. Bug ZL-8 fix: kept for staff/internal use and for DISABLING
+    (no payment needed to turn a paid feature off) - same "kept for
+    internal use, not a customer button" posture as change_plan above.
+    The customer-facing way to enable it now goes through POST
+    /subscription/ai-receptionist-addon/checkout-session below, which
+    requires real Stripe payment first."""
     return service.set_ai_receptionist_addon(db, current_user.account_id, enabled=payload.enabled, actor=current_user.id)
+
+
+@router.post("/subscription/ai-receptionist-addon/checkout-session", response_model=AIReceptionistAddonCheckoutSessionResponse)
+def create_ai_receptionist_addon_checkout_session(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin),
+):
+    """Bug ZL-8 fix (tester-reported, confirmed live: the add-on could be
+    activated with zero payment collection). The frontend must redirect
+    the browser to the returned `url`; the add-on itself only turns on
+    once Stripe confirms payment via POST /stripe/checkout-webhook below -
+    same pattern as POST /subscription/plan/checkout-session."""
+    try:
+        return service.create_ai_receptionist_addon_checkout_session(db, current_user.account_id, actor=current_user.id)
+    except service.PriceUnavailableForCheckoutError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e
+    except stripe_checkout.PaymentError as e:
+        raise HTTPException(status_code=502, detail=str(e)) from e
 
 
 @router.get("/usage-summary", response_model=UsageSummaryResponse)
