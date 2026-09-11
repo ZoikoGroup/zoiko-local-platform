@@ -7,9 +7,9 @@ import AuthLayout from "@/components/AuthLayout";
 
 export default function ForgotPasswordPage() {
   const [email, setEmail] = useState("");
-  const [submitted, setSubmitted] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  const [sent, setSent] = useState(false);
 
   async function handleSubmit(e: FormEvent) {
     e.preventDefault();
@@ -17,26 +17,24 @@ export default function ForgotPasswordPage() {
     setLoading(true);
     try {
       await forgotPassword(email);
-      // Always show the same success state regardless of whether the email
-      // matched an account - the API itself never reveals which (see
-      // backend app/numbering/identity/service.py's
-      // request_password_reset), so the UI must not either.
-      setSubmitted(true);
+      setSent(true);
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Something went wrong");
+      // Never reveal whether the email matched an account (same posture
+      // as the backend's always-204 response) - a generic message here
+      // even on a real request failure avoids leaking anything useful.
+      setError(err instanceof ApiError ? err.message : "Something went wrong. Please try again.");
     } finally {
       setLoading(false);
     }
   }
 
-  if (submitted) {
+  if (sent) {
     return (
-      <AuthLayout title="Check your email" subtitle="If that email matches an account, we've sent a reset link.">
-        <p className="text-sm text-slate-500">
-          The link expires in 30 minutes and can only be used once. If you don&apos;t see it, check your spam
-          folder.
-        </p>
-        <p className="text-sm text-slate-500 mt-6 text-center">
+      <AuthLayout
+        title="Check your email"
+        subtitle={`If an account exists for ${email}, we've sent a link to reset your password. It expires in 30 minutes.`}
+      >
+        <p className="text-sm text-slate-500 text-center">
           <Link href="/login" className="text-indigo-600 font-medium hover:text-indigo-700">
             Back to login
           </Link>
@@ -46,7 +44,7 @@ export default function ForgotPasswordPage() {
   }
 
   return (
-    <AuthLayout title="Reset your password" subtitle="Enter your email and we'll send you a reset link.">
+    <AuthLayout title="Forgot your password?" subtitle="Enter your email and we'll send you a reset link.">
       <form onSubmit={handleSubmit} className="space-y-4">
         <div>
           <label className="block text-sm font-medium text-slate-700 mb-1.5">Email</label>
@@ -70,13 +68,14 @@ export default function ForgotPasswordPage() {
         >
           {loading ? "Sending..." : "Send reset link"}
         </button>
-      </form>
 
-      <p className="text-sm text-slate-500 mt-6 text-center">
-        <Link href="/login" className="text-indigo-600 font-medium hover:text-indigo-700">
-          Back to login
-        </Link>
-      </p>
+        <p className="text-sm text-slate-500 text-center">
+          Remembered it?{" "}
+          <Link href="/login" className="text-indigo-600 font-medium hover:text-indigo-700">
+            Back to login
+          </Link>
+        </p>
+      </form>
     </AuthLayout>
   );
 }
