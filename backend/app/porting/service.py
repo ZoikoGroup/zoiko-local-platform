@@ -21,7 +21,7 @@ from app.notifications.service import (
     notify_porting_request_submitted,
 )
 from app.numbering.numbers.models import PhoneNumber, PhoneNumberStatus
-from app.numbering.numbers.service import _auto_verify_caller_identity
+from app.numbering.numbers.service import MarketNotActivatedError, _auto_verify_caller_identity, assert_country_capability
 from app.porting.models import PortingRequest, PortingRequestStatus
 
 
@@ -56,6 +56,15 @@ def submit_porting_request(
     authorization_evidence_url: str | None = None,
     target_completion_date: date | None = None,
 ) -> PortingRequest:
+    # ZL-COM-LAUNCH-001 §4 - porting_supported (an existing field, reused
+    # as this capability's flag - see _COUNTRY_CAPABILITY_COLUMNS). Wrapped
+    # into PortingRequestConflictError (already handled by every route
+    # below) rather than leaving MarketNotActivatedError unhandled.
+    try:
+        assert_country_capability(db, country, account_id, "porting")
+    except MarketNotActivatedError as e:
+        raise PortingRequestConflictError(str(e)) from e
+
     # Two brand-new PortingRequest rows for the SAME phone number have no
     # existing row either request could lock (with_for_update needs a row
     # to lock, and neither exists yet) - unlike numbering's reserve_number,

@@ -253,19 +253,37 @@ def _test_markets_stay_paid_open(db_session):
     specifically blocks is_test accounts from checkout, breaking every
     real-commercial-account checkout test instead of fixing the market gate.
 
-    This is the correct fix: reset market_status back to PAID_OPEN for the
-    8 seeded countries inside THIS TEST'S OWN db_session transaction only -
-    same rollback-at-teardown boundary as every other test-time DB change,
-    so the real dev DB / real browser session stays on the pulled-back
-    CONTROLLED_BETA state the product decision requires. Tests that
-    specifically exercise CLOSED/SUSPENDED/CONTROLLED_BETA gating for a
-    non-is_test account already create their own dedicated test countries
-    (M1, M2, M3...) and are unaffected."""
+    This is the correct fix: reset market_status back to a fully-open
+    state for the 8 seeded countries inside THIS TEST'S OWN db_session
+    transaction only - same rollback-at-teardown boundary as every other
+    test-time DB change, so the real dev DB / real browser session stays
+    on the pulled-back CONTROLLED_BETA state the product decision
+    requires. Tests that specifically exercise CLOSED/SUSPENDED/
+    CONTROLLED_BETA/LAUNCHING gating for a non-is_test account already
+    create their own dedicated test countries (M1, M2, M3...) and are
+    unaffected.
+
+    ZL-COM-LAUNCH-001 (2026-09-11): PAID_OPEN was replaced by OPEN plus
+    independent per-capability flags (see assert_country_capability) -
+    every flag is set True here so this fixture keeps behaving like the
+    old "fully open, nothing restricted" PAID_OPEN did for every other
+    test in this suite that isn't specifically testing the new capability-
+    flag granularity itself (see test_country_approvals.py for those)."""
     from app.numbering.numbers.models import MarketActivationStatus, SupportedCountry
 
     db_session.query(SupportedCountry).filter(
         SupportedCountry.code.in_(["US", "CA", "GB", "AU", "DE", "FR", "IN", "SG"])
-    ).update({"market_status": MarketActivationStatus.PAID_OPEN}, synchronize_session=False)
+    ).update({
+        "market_status": MarketActivationStatus.OPEN,
+        "customer_signup_enabled": True,
+        "number_search_enabled": True,
+        "number_purchase_enabled": True,
+        "inbound_voice_enabled": True,
+        "outbound_voice_enabled": True,
+        "sms_enabled": True,
+        "porting_supported": True,
+        "recording_enabled": True,
+    }, synchronize_session=False)
     db_session.commit()
     yield
 

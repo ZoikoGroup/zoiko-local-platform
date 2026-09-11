@@ -8,16 +8,25 @@ from app.core.rate_limit import limiter
 from app.core.security import create_access_token
 from app.integrations.telecom.twilio import TelecomError
 from app.numbering.numbers.schemas import (
+    CountryApprovalRecordResponse,
     NumberEligibilityCaseResponse,
     NumberEligibilityRuleResponse,
+    RecordCountryApprovalRequest,
     ResolveNumberEligibilityCaseRequest,
+    SetCountryCapabilitiesRequest,
     SetMarketActivationStatusRequest,
     SupportedCountryResponse,
     UpdateCountryRegistryFieldsRequest,
     UpsertNumberEligibilityRuleRequest,
     UpsertSupportedCountryRequest,
 )
-from app.numbering.numbers.models import MarketActivationStatus, NumberEligibilityCaseStatus
+from app.numbering.numbers.models import (
+    CountryApprovalRecord,
+    CountryApprovalStatus,
+    CountryApprovalType,
+    MarketActivationStatus,
+    NumberEligibilityCaseStatus,
+)
 from app.numbering.numbers.service import (
     MissingLegalSignoffError,
     NoStuckProvisioningError,
@@ -27,9 +36,11 @@ from app.numbering.numbers.service import (
     UnsupportedCountryError,
     approve_number_eligibility_case,
     list_all_eligibility_cases,
+    list_country_approvals,
     list_number_eligibility_rules,
     list_supported_countries,
     mark_number_renewed,
+    record_country_approval,
     reinstate_caller_identity,
     reject_number_eligibility_case,
     release_stuck_provisioning,
@@ -38,6 +49,7 @@ from app.numbering.numbers.service import (
     retry_provisioning,
     revoke_caller_identity,
     seed_market_release_registry,
+    set_country_capability_flags,
     set_market_activation_status,
     update_country_registry_fields,
     upsert_number_eligibility_rule,
@@ -526,6 +538,89 @@ def update_country_registry_fields_route(
         )
     except UnsupportedCountryError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
+
+
+@router.put("/countries/{code}/capabilities", response_model=SupportedCountryResponse)
+def set_country_capabilities_route(
+    code: str,
+    payload: SetCountryCapabilitiesRequest,
+    db: Session = Depends(get_db),
+    staff: PlatformStaff = Depends(require_capability("numbers.manage_country_list")),
+):
+    """ZL-COM-LAUNCH-001 §4 - independent per-capability toggles. Same
+    numbers.manage_country_list bar as the rest of this table's row
+    management (not one of the 3 approval capabilities below) - flipping a
+    flag doesn't itself open anything until the country also reaches
+    OPEN/RESTRICTED (see set_market_activation_status_route's 3-approval
+    gate), so it doesn't carry that gate's weight."""
+    flags = payload.model_dump(exclude={"reason"}, exclude_none=True)
+    try:
+        return set_country_capability_flags(db, code, actor=staff.id, reason=payload.reason, **flags)
+    except UnsupportedCountryError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
+
+
+@router.get("/countries/{code}/approvals", response_model=list[CountryApprovalRecordResponse])
+def list_country_approvals_route(
+    code: str,
+    db: Session = Depends(get_db),
+    _staff: PlatformStaff = Depends(get_current_staff),
+):
+    return list_country_approvals(db, code)
+
+
+def _record_country_approval_route(
+    code: str, approval_type: CountryApprovalType, payload: RecordCountryApprovalRequest, db: Session, staff: PlatformStaff,
+) -> CountryApprovalRecord:
+    try:
+        approval_status = CountryApprovalStatus(payload.status)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e)) from e
+    try:
+        return record_country_approval(
+            db, code, approval_type, status=approval_status, actor=staff.id,
+            owner_name=payload.owner_name, owner_title=payload.owner_title,
+            evidence_reference=payload.evidence_reference, reason=payload.reason,
+        )
+    except UnsupportedCountryError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
+
+
+@router.post("/countries/{code}/approvals/regulatory", response_model=CountryApprovalRecordResponse)
+def record_country_regulatory_approval_route(
+    code: str,
+    payload: RecordCountryApprovalRequest,
+    db: Session = Depends(get_db),
+    staff: PlatformStaff = Depends(require_capability("numbers.approve_country_regulatory")),
+):
+    """ZL-COM-LAUNCH-001 §5 - COMPLIANCE_OFFICER/SUPER_ADMIN only. A
+    separate capability from numbers.manage_country_list on purpose - the
+    directive's "executive approval must not impersonate specialist
+    clearance" applies here too."""
+    return _record_country_approval_route(code, CountryApprovalType.REGULATORY, payload, db, staff)
+
+
+@router.post("/countries/{code}/approvals/finance", response_model=CountryApprovalRecordResponse)
+def record_country_finance_approval_route(
+    code: str,
+    payload: RecordCountryApprovalRequest,
+    db: Session = Depends(get_db),
+    staff: PlatformStaff = Depends(require_capability("numbers.approve_country_finance")),
+):
+    """FINANCE_OFFICER/SUPER_ADMIN only."""
+    return _record_country_approval_route(code, CountryApprovalType.FINANCE, payload, db, staff)
+
+
+@router.post("/countries/{code}/approvals/commercial", response_model=CountryApprovalRecordResponse)
+def record_country_commercial_approval_route(
+    code: str,
+    payload: RecordCountryApprovalRequest,
+    db: Session = Depends(get_db),
+    staff: PlatformStaff = Depends(require_capability("numbers.approve_country_commercial")),
+):
+    """SUPER_ADMIN only - "Commercial Launch... Founder & Executive
+    Chairman, Zoiko Group, or formally delegated launch executive" (§5)."""
+    return _record_country_approval_route(code, CountryApprovalType.COMMERCIAL, payload, db, staff)
 
 
 @router.get("/number-eligibility-rules", response_model=list[NumberEligibilityRuleResponse])

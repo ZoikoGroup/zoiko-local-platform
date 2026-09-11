@@ -405,9 +405,10 @@ def update_account_billing_classification(
 def set_account_test_flag(db: Session, account_id: str, *, is_test: bool, actor: str, reason: str) -> Account:
     """Backs the accounts.manage_test_flag capability (granted in migration
     db8d0f0b2e05, which shipped no route/service function for it - this is
-    that missing piece). is_test bypasses the CONTROLLED_BETA/INTERNAL_TEST
-    market-activation gate (see app.numbering.numbers.service.
-    _assert_market_activated) and blocks real ZoikoNex/Stripe billing (see
+    that missing piece). is_test bypasses the LAUNCHING-state (formerly
+    CONTROLLED_BETA/INTERNAL_TEST) market-activation gate (see
+    app.numbering.numbers.service.assert_country_capability) and blocks
+    real ZoikoNex/Stripe billing (see
     app.billing.service.assert_not_test_account) - a platform-wide decision
     a SUPER_ADMIN makes deliberately, not a routine support toggle, so
     `reason` is mandatory for the audit trail (same bar as

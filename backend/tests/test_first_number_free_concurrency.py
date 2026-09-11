@@ -24,7 +24,7 @@ from app.consent.models import ConsentType
 from app.consent.service import grant_consent
 from app.core.database import SessionLocal
 from app.numbering.identity.models import Account, AccountType, User
-from app.numbering.numbers.models import PhoneNumber
+from app.numbering.numbers.models import MarketActivationStatus, PhoneNumber, SupportedCountry
 from app.numbering.numbers.service import create_number_purchase_checkout_session, reserve_number
 
 
@@ -38,9 +38,22 @@ def test_concurrent_checkouts_for_two_numbers_on_the_same_account_only_one_is_fr
     e164_a = f"+1999{suffix:07d}"
     e164_b = f"+1998{suffix:07d}"
 
+    # ZL-COM-LAUNCH-001 (2026-09-11): a dedicated, disposable test country
+    # instead of mutating the real shared "US" row - see
+    # test_number_reservation_concurrency.py's identical comment. Mutating
+    # the real US row caused genuine lock contention with anything else
+    # (this suite's own other tests, or another session) touching that
+    # same shared row against this shared dev DB at the same moment.
+    country_code = uuid.uuid4().hex[:2].upper()
     setup_db = SessionLocal()
     account_id = None
     try:
+        setup_db.add(SupportedCountry(
+            code=country_code, name="Concurrency Test Country",
+            market_status=MarketActivationStatus.OPEN, number_search_enabled=True, number_purchase_enabled=True,
+        ))
+        setup_db.commit()
+
         account = Account(name="First Number Free Concurrency Co", account_type=AccountType.BUSINESS)
         setup_db.add(account)
         setup_db.commit()
@@ -57,8 +70,8 @@ def test_concurrent_checkouts_for_two_numbers_on_the_same_account_only_one_is_fr
         grant_consent(setup_db, account_id, ConsentType.EMERGENCY_CALLING_ACKNOWLEDGED)
         billing_service.change_plan(setup_db, account_id, "starter", actor="test-actor")
 
-        reserve_number(setup_db, account_id, e164_a, country="US")
-        reserve_number(setup_db, account_id, e164_b, country="US")
+        reserve_number(setup_db, account_id, e164_a, country=country_code)
+        reserve_number(setup_db, account_id, e164_b, country=country_code)
     finally:
         setup_db.close()
 
@@ -85,6 +98,7 @@ def test_concurrent_checkouts_for_two_numbers_on_the_same_account_only_one_is_fr
             cleanup_db.query(PhoneNumber).filter(PhoneNumber.e164.in_([e164_a, e164_b])).delete(synchronize_session=False)
             cleanup_db.query(User).filter(User.account_id == account_id).delete(synchronize_session=False)
             cleanup_db.query(Account).filter(Account.id == account_id).delete(synchronize_session=False)
+            cleanup_db.query(SupportedCountry).filter(SupportedCountry.code == country_code).delete()
             cleanup_db.commit()
         finally:
             cleanup_db.close()

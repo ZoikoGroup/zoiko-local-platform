@@ -81,7 +81,8 @@ def _flow_response(
         call_flow = db.query(CallFlow).filter(CallFlow.id == version.call_flow_id).first()
         recording_callback_url = (
             base + "media/voice/recording-callback"
-            if call_flow is not None and media_service.should_record_forwarded_call(db, call_flow.account_id)
+            if call_flow is not None and owner is not None
+            and media_service.should_record_forwarded_call(db, call_flow.account_id, owner.country)
             else None
         )
         # Also ring the browser dashboard alongside this node's configured
@@ -154,7 +155,7 @@ def _default_call_twiml(request: Request, db: Session, owner, to_number: str) ->
         fallback_action_url = str(request.base_url) + "media/voice/forward-fallback"
         recording_callback_url = (
             str(request.base_url) + "media/voice/recording-callback"
-            if media_service.should_record_forwarded_call(db, owner.account_id)
+            if media_service.should_record_forwarded_call(db, owner.account_id, owner.country)
             else None
         )
         # Ring every configured destination simultaneously if a ring group
@@ -201,6 +202,18 @@ def _resolve_call_twiml(request: Request, db: Session, owner, to_number: str) ->
     real configured handling, not a bare client-to-client bridge that
     would bypass it entirely - see media.service.handle_browser_connect's
     docstring)."""
+    # ZL-COM-LAUNCH-001 §4 - inbound_voice_enabled, checked against the
+    # RECEIVING number's own country. Non-raising (has_country_capability,
+    # not assert_) since this runs inside a live Twilio webhook - a raise
+    # here would 500 Twilio's request instead of returning valid TwiML,
+    # the same trap voicemail_enabled's own check below is already written
+    # to avoid.
+    if owner is not None and not numbers_service.has_country_capability(
+        db, owner.country, owner.account_id, "inbound_voice"
+    ):
+        return telecom.build_say_response(
+            "Sorry, this number can't take calls right now. Goodbye."
+        )
     live_flow_version = routing_service.get_live_version(db, owner) if owner is not None else None
 
     if live_flow_version is not None:
@@ -275,7 +288,7 @@ async def ivr_select(request: Request, db: Session = Depends(get_db)):
         fallback_action_url = str(request.base_url) + "media/voice/forward-fallback"
         recording_callback_url = (
             str(request.base_url) + "media/voice/recording-callback"
-            if owner is not None and media_service.should_record_forwarded_call(db, owner.account_id)
+            if owner is not None and media_service.should_record_forwarded_call(db, owner.account_id, owner.country)
             else None
         )
         destinations = [f"client:{owner.account_id}", option.destination_number] if owner is not None else [option.destination_number]
@@ -409,9 +422,10 @@ async def bridge_connect(
     parameter until now) - same class of gap should_record_forwarded_call
     already closes for the forward/ring-group/IVR paths."""
     status_callback_url = str(request.base_url) + "media/voice/status-callback"
+    bridge_owner = media_service.find_number_owner(db, from_)
     recording_callback_url = (
         str(request.base_url) + "media/voice/recording-callback"
-        if media_service.should_record_forwarded_call(db, account_id)
+        if bridge_owner is not None and media_service.should_record_forwarded_call(db, account_id, bridge_owner.country)
         else None
     )
     twiml = telecom.build_bridge_response(
@@ -470,9 +484,10 @@ async def browser_connect(request: Request, db: Session = Depends(get_db)):
     from_number = params.get("ZoikoFrom", "")
     call_sid = params.get("CallSid", "")
     status_callback_url = str(request.base_url) + "media/voice/status-callback"
+    connect_owner = media_service.find_number_owner(db, from_number)
     recording_callback_url = (
         str(request.base_url) + "media/voice/recording-callback"
-        if media_service.should_record_forwarded_call(db, account_id)
+        if connect_owner is not None and media_service.should_record_forwarded_call(db, account_id, connect_owner.country)
         else None
     )
     try:

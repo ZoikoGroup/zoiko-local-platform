@@ -91,7 +91,7 @@ def _finish_capture_and_respond(request: Request, db: Session, call: Receptionis
         # callback since this is still the same outer CallSid throughout.
         recording_callback_url = (
             str(request.base_url) + "media/voice/recording-callback"
-            if media_service.should_record_forwarded_call(db, call.account_id)
+            if media_service.should_record_forwarded_call(db, call.account_id, owner.country)
             else None
         )
         twiml = telecom.build_receptionist_reply_response(

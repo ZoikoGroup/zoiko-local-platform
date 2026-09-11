@@ -18,6 +18,12 @@ class PlatformStaffRole(str, enum.Enum):
     SUPPORT = "support"
     COMPLIANCE_OFFICER = "compliance_officer"
     SUPER_ADMIN = "super_admin"
+    # ZL-COM-LAUNCH-001 §5 - a named Finance/Tax owner, distinct from
+    # COMPLIANCE_OFFICER, so the Finance/Tax country approval isn't
+    # recorded by someone holding regulatory clearance instead ("executive
+    # approval must not impersonate specialist clearance" applies equally
+    # between specialist roles, not just executive-vs-specialist).
+    FINANCE_OFFICER = "finance_officer"
 
 
 class PlatformStaff(Base):

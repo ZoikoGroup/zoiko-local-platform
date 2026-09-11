@@ -56,10 +56,13 @@ from app.numbering.identity.models import User, UserRole
 from app.numbering.numbers.models import PhoneNumber, PhoneNumberStatus
 from app.numbering.numbers.service import (
     CallerIdNotAuthorizedError,
+    MarketNotActivatedError,
     NumberConflictError,
     assert_caller_id_authorized,
+    assert_country_capability,
     assert_number_access,
     assigned_number_ids,
+    has_country_capability,
 )
 from app.ops.models import KillSwitchScope
 from app.ops.service import assert_kill_switch_not_active
@@ -148,17 +151,22 @@ def should_forward_call(owner: PhoneNumber, *, has_ring_group: bool = False) -> 
     return is_within_business_hours(owner.business_hours_start, owner.business_hours_end, owner.business_hours_timezone)
 
 
-def should_record_forwarded_call(db: Session, account_id: str) -> bool:
+def should_record_forwarded_call(db: Session, account_id: str, country: str) -> bool:
     """Architecture doc §2.2: "Recording: off by default. Where enabled, it
     must be consented..." - reuses the same AI_PROCESSING consent record the
     video-recording feature gates on, rather than recording every forwarded
     call unconditionally the moment forwarding_number is configured. Also
     checks the ZL-COM-ENT-001 v3.0 recording.policy_enabled plan gate -
-    additive to consent, not a replacement. This feeds TwiML for a live
-    Twilio webhook, so it fails closed/silent (has_entitlement) rather than
-    raising (assert_entitlement would 500 the call)."""
-    return has_active_consent(db, account_id, ConsentType.AI_PROCESSING) and billing_service.has_entitlement(
-        db, account_id, "recording.policy_enabled"
+    additive to consent, not a replacement. Also checks the newer
+    ZL-COM-LAUNCH-001 §4 country-level recording_enabled flag - additive
+    again, not a replacement (country flag -> plan entitlement -> consent,
+    all three must allow it). This feeds TwiML for a live Twilio webhook,
+    so it fails closed/silent (has_entitlement/has_country_capability)
+    rather than raising (assert_* would 500 the call)."""
+    return (
+        has_active_consent(db, account_id, ConsentType.AI_PROCESSING)
+        and billing_service.has_entitlement(db, account_id, "recording.policy_enabled")
+        and has_country_capability(db, country, account_id, "recording")
     )
 
 
@@ -263,6 +271,18 @@ def _dispatch_outbound_call(
     """Shared core of place_outbound_call and place_outbound_call_for_account
     - everything after "is this number really available to the caller" is
     identical for both a logged-in user and a public API key."""
+    # ZL-COM-LAUNCH-001 §4 - outbound_voice_enabled, checked against the
+    # CALLING number's own country (not the dialed destination) - the
+    # directive's capability flags describe what a Zoiko-owned number in a
+    # given country may do, not a per-destination dialing restriction.
+    # Re-raised as CallAuthorizationError (not the raw MarketNotActivatedError)
+    # since every route calling into here only has a handler for the
+    # former - same wrapping pattern place_outbound_call already uses for
+    # NumberConflictError/CallerIdNotAuthorizedError just above.
+    try:
+        assert_country_capability(db, owner.country, account_id, "outbound_voice")
+    except MarketNotActivatedError as e:
+        raise CallAuthorizationError(str(e)) from e
     assert_outbound_call_allowed(db, account_id=account_id, account_email=account_email, to=to, from_number=from_number)
 
     twiml = telecom.build_say_response(message)

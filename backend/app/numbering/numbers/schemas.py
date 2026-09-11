@@ -143,6 +143,14 @@ class SupportedCountryResponse(BaseModel):
     recording_consent_basis: str | None = None
     payments_enabled: bool = False
     marketing_claims_approved: bool = False
+    # ZL-COM-LAUNCH-001 §4 - independent per-capability flags.
+    customer_signup_enabled: bool = False
+    number_search_enabled: bool = False
+    number_purchase_enabled: bool = False
+    inbound_voice_enabled: bool = False
+    outbound_voice_enabled: bool = False
+    sms_enabled: bool = False
+    recording_enabled: bool = False
 
 
 class UpdateCountryRegistryFieldsRequest(BaseModel):
@@ -151,6 +159,42 @@ class UpdateCountryRegistryFieldsRequest(BaseModel):
     recording_consent_basis: str | None = None
     payments_enabled: bool = False
     marketing_claims_approved: bool = False
+
+
+class SetCountryCapabilitiesRequest(BaseModel):
+    """ZL-COM-LAUNCH-001 §4 - every field optional so a caller can flip
+    just the one capability they mean to change, matching
+    UpdateCountryRegistryFieldsRequest's sibling fields' own posture of
+    "one call, whichever fields are supplied.\""""
+    reason: str
+    customer_signup_enabled: bool | None = None
+    number_search_enabled: bool | None = None
+    number_purchase_enabled: bool | None = None
+    inbound_voice_enabled: bool | None = None
+    outbound_voice_enabled: bool | None = None
+    sms_enabled: bool | None = None
+    porting_supported: bool | None = None
+    recording_enabled: bool | None = None
+
+
+class CountryApprovalRecordResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    approval_type: str
+    status: str
+    owner_name: str | None = None
+    owner_title: str | None = None
+    evidence_reference: str | None = None
+    reason: str | None = None
+    decided_at: datetime | None = None
+
+
+class RecordCountryApprovalRequest(BaseModel):
+    status: str
+    owner_name: str
+    owner_title: str
+    evidence_reference: str
+    reason: str
 
 
 class UpsertSupportedCountryRequest(BaseModel):

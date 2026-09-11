@@ -724,6 +724,109 @@ export function sweepStaleCalls(staffToken: string): Promise<{ swept: number }> 
   });
 }
 
+// ZL-COM-LAUNCH-001 (executive directive, 2026-09-11) - country launch
+// control: 5-stage status, independent per-capability flags, and 3
+// separately-owned approvals (Regulatory/Finance/Commercial) per country.
+// Distinct from the customer-facing SupportedCountry type above (which
+// only exposes activation_state for the number-search dropdown) - this
+// mirrors the full staff-only SupportedCountryResponse.
+
+export const COUNTRY_MARKET_STATUSES = ["closed", "launching", "open", "restricted", "suspended"] as const;
+
+export type StaffCountry = {
+  code: string;
+  name: string;
+  emergency_calling_supported: boolean;
+  market_status: string;
+  legal_signoff_reference: string | null;
+  legal_signoff_by: string | null;
+  porting_supported: boolean;
+  payments_enabled: boolean;
+  marketing_claims_approved: boolean;
+  customer_signup_enabled: boolean;
+  number_search_enabled: boolean;
+  number_purchase_enabled: boolean;
+  inbound_voice_enabled: boolean;
+  outbound_voice_enabled: boolean;
+  sms_enabled: boolean;
+  recording_enabled: boolean;
+};
+
+export function listStaffCountries(staffToken: string): Promise<StaffCountry[]> {
+  return request<StaffCountry[]>("/staff/countries", {
+    headers: { Authorization: `Bearer ${staffToken}` },
+  });
+}
+
+export function upsertStaffCountry(staffToken: string, code: string, name: string): Promise<StaffCountry> {
+  return request<StaffCountry>("/staff/countries", {
+    method: "PUT",
+    headers: { Authorization: `Bearer ${staffToken}` },
+    body: JSON.stringify({ code, name }),
+  });
+}
+
+export function setCountryMarketStatus(
+  staffToken: string, code: string, status: string, reason: string
+): Promise<StaffCountry> {
+  return request<StaffCountry>(`/staff/countries/${code}/market-status`, {
+    method: "PUT",
+    headers: { Authorization: `Bearer ${staffToken}` },
+    body: JSON.stringify({ status, reason }),
+  });
+}
+
+export type CountryCapabilityFlags = {
+  customer_signup_enabled?: boolean;
+  number_search_enabled?: boolean;
+  number_purchase_enabled?: boolean;
+  inbound_voice_enabled?: boolean;
+  outbound_voice_enabled?: boolean;
+  sms_enabled?: boolean;
+  porting_supported?: boolean;
+  recording_enabled?: boolean;
+};
+
+export function setCountryCapabilities(
+  staffToken: string, code: string, reason: string, flags: CountryCapabilityFlags
+): Promise<StaffCountry> {
+  return request<StaffCountry>(`/staff/countries/${code}/capabilities`, {
+    method: "PUT",
+    headers: { Authorization: `Bearer ${staffToken}` },
+    body: JSON.stringify({ reason, ...flags }),
+  });
+}
+
+export const COUNTRY_APPROVAL_TYPES = ["regulatory", "finance", "commercial"] as const;
+export type CountryApprovalTypeName = (typeof COUNTRY_APPROVAL_TYPES)[number];
+
+export type CountryApprovalRecord = {
+  approval_type: string;
+  status: string;
+  owner_name: string | null;
+  owner_title: string | null;
+  evidence_reference: string | null;
+  reason: string | null;
+  decided_at: string | null;
+};
+
+export function listCountryApprovals(staffToken: string, code: string): Promise<CountryApprovalRecord[]> {
+  return request<CountryApprovalRecord[]>(`/staff/countries/${code}/approvals`, {
+    headers: { Authorization: `Bearer ${staffToken}` },
+  });
+}
+
+export function recordCountryApproval(
+  staffToken: string, code: string, approvalType: CountryApprovalTypeName,
+  payload: { status: string; owner_name: string; owner_title: string; evidence_reference: string; reason: string }
+): Promise<CountryApprovalRecord> {
+  return request<CountryApprovalRecord>(`/staff/countries/${code}/approvals/${approvalType}`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${staffToken}` },
+    body: JSON.stringify(payload),
+  });
+}
+
 export type StaffNumberSearchResult = {
   id: string;
   e164: string;
@@ -2148,6 +2251,19 @@ export function setAIReceptionistAddon(token: string, enabled: boolean): Promise
     method: "PUT",
     headers: { Authorization: `Bearer ${token}` },
     body: JSON.stringify({ enabled }),
+  });
+}
+
+// Bug ZL-8 fix - enabling the add-on now requires real Stripe payment
+// first (same pattern as createPlanChangeCheckoutSession above); disabling
+// still goes through setAIReceptionistAddon directly since no payment is
+// needed to turn a paid feature off.
+export type AIReceptionistAddonCheckoutSession = { id: string; url: string };
+
+export function createAIReceptionistAddonCheckoutSession(token: string): Promise<AIReceptionistAddonCheckoutSession> {
+  return request<AIReceptionistAddonCheckoutSession>("/billing/subscription/ai-receptionist-addon/checkout-session", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
   });
 }
 

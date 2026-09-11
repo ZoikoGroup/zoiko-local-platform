@@ -29,6 +29,19 @@ class MarketActivationStatus(str, enum.Enum):
     CONTROLLED_BETA = "controlled_beta"
     PAID_OPEN = "paid_open"
     SUSPENDED = "suspended"
+    # ZL-COM-LAUNCH-001 (2026-09-11 executive directive) - a 5-stage model
+    # replacing the 4 states above going forward: LAUNCHING = "in the
+    # launch programme, not yet public" (INTERNAL_TEST/CONTROLLED_BETA's
+    # replacement), OPEN = "public, capability flags decide what's usable"
+    # (PAID_OPEN's replacement), RESTRICTED = "public but under active
+    # restriction" (a reporting/visibility label - the actual restriction
+    # mechanism is the capability flags below, not a separate enforcement
+    # path). Postgres can't rename/remove enum labels, so the 4 original
+    # members stay defined forever but unused - see the migration that
+    # adds these for the one-time data move off them.
+    LAUNCHING = "launching"
+    OPEN = "open"
+    RESTRICTED = "restricted"
 
 
 class SupportedCountry(Base):
@@ -98,6 +111,64 @@ class SupportedCountry(Base):
     recording_consent_basis: Mapped[str | None] = mapped_column(String(50), nullable=True)
     payments_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     marketing_claims_approved: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # ZL-COM-LAUNCH-001 §4 - "do not implement one Boolean such as
+    # COUNTRY_OPEN as the sole control... commercial approval must be
+    # service-scoped." Independent per-capability switches, all defaulting
+    # False (nothing is enabled just because a country entered LAUNCHING -
+    # each capability gets turned on individually once its own review
+    # clears). porting_supported/payments_enabled/emergency_calling_
+    # supported above already are this exact pattern for their capabilities
+    # - not duplicated here.
+    customer_signup_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    number_search_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    number_purchase_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    inbound_voice_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    outbound_voice_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    sms_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    recording_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class CountryApprovalType(str, enum.Enum):
+    REGULATORY = "regulatory"
+    FINANCE = "finance"
+    COMMERCIAL = "commercial"
+
+
+class CountryApprovalStatus(str, enum.Enum):
+    PENDING = "pending"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+
+
+class CountryApprovalRecord(Base):
+    """ZL-COM-LAUNCH-001 §5 - "The system should record three distinct
+    approvals; executive approval must not impersonate specialist
+    clearance." One row per (country, approval_type), upserted in place -
+    same "one row per scope" shape as app.ops.models.PlatformKillSwitch -
+    with full history living in the audit log (log_event), not a separate
+    history table, matching how every other decision in this codebase is
+    tracked. A country's transition to OPEN requires all three rows
+    APPROVED (see set_market_activation_status)."""
+
+    __tablename__ = "country_approval_records"
+    __table_args__ = (UniqueConstraint("country_id", "approval_type", name="uq_country_approval_type"),)
+
+    id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=new_uuid)
+    country_id: Mapped[str] = mapped_column(UUID(as_uuid=False), ForeignKey("supported_countries.id"), nullable=False)
+    approval_type: Mapped[CountryApprovalType] = mapped_column(
+        Enum(CountryApprovalType, name="country_approval_type_enum"), nullable=False,
+    )
+    status: Mapped[CountryApprovalStatus] = mapped_column(
+        Enum(CountryApprovalStatus, name="country_approval_status_enum"),
+        nullable=False, default=CountryApprovalStatus.PENDING,
+    )
+    owner_name: Mapped[str | None] = mapped_column(String(150), nullable=True)
+    owner_title: Mapped[str | None] = mapped_column(String(150), nullable=True)
+    evidence_reference: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    reason: Mapped[str | None] = mapped_column(String(2000), nullable=True)
+    decided_by: Mapped[str | None] = mapped_column(UUID(as_uuid=False), nullable=True)
+    decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 

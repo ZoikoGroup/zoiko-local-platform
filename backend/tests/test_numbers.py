@@ -740,11 +740,11 @@ def test_purchase_sets_a_next_renewal_date_about_30_days_out(client, monkeypatch
     assert abs((next_renewal_at - expected).total_seconds()) < 60
 
 
-def _create_staff_and_login(client, db_session, email: str) -> str:
+def _create_staff_and_login(client, db_session, email: str, role=None) -> str:
     from app.staff import service as staff_service
     from app.staff.models import PlatformStaffRole
 
-    staff_service.create_staff(db_session, email=email, password="staffpass123", role=PlatformStaffRole.SUPER_ADMIN)
+    staff_service.create_staff(db_session, email=email, password="staffpass123", role=role or PlatformStaffRole.SUPER_ADMIN)
     return client.post("/staff/login", json={"email": email, "password": "staffpass123"}).json()["access_token"]
 
 
@@ -993,9 +993,6 @@ def _upsert_market_country(client, staff_headers, code: str, name: str = "Market
 
 def _set_market_status(client, staff_headers, code: str, market_status: str, reason: str = "test setup"):
     payload = {"status": market_status, "reason": reason}
-    if market_status == "paid_open":
-        payload["legal_signoff_reference"] = "TEST-SIGNOFF-001"
-        payload["legal_signoff_by"] = "test-legal-reviewer"
     response = client.put(
         f"/staff/countries/{code}/market-status",
         json=payload,
@@ -1003,6 +1000,47 @@ def _set_market_status(client, staff_headers, code: str, market_status: str, rea
     )
     assert response.status_code == 200, response.text
     return response.json()
+
+
+def _grant_all_country_approvals(client, staff_headers, code: str):
+    """ZL-COM-LAUNCH-001 §5 - all 3 approvals, granted with a real staff
+    session for each (in tests, the same SUPER_ADMIN session covers all 3
+    capabilities, matching a real SUPER_ADMIN's actual grants)."""
+    for approval_type in ("regulatory", "finance", "commercial"):
+        response = client.post(
+            f"/staff/countries/{code}/approvals/{approval_type}",
+            json={
+                "status": "approved", "owner_name": "Test Reviewer", "owner_title": "Test Owner",
+                "evidence_reference": "TEST-EVIDENCE-001", "reason": "test setup",
+            },
+            headers=staff_headers,
+        )
+        assert response.status_code == 200, response.text
+
+
+def _enable_all_country_capabilities(client, staff_headers, code: str):
+    response = client.put(
+        f"/staff/countries/{code}/capabilities",
+        json={
+            "reason": "test setup", "customer_signup_enabled": True, "number_search_enabled": True,
+            "number_purchase_enabled": True, "inbound_voice_enabled": True, "outbound_voice_enabled": True,
+            "sms_enabled": True, "porting_supported": True, "recording_enabled": True,
+        },
+        headers=staff_headers,
+    )
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+def _open_market_fully(client, staff_headers, code: str):
+    """Drop-in replacement for the old _set_market_status(..., "paid_open")
+    - ZL-COM-LAUNCH-001 replaced that one-step transition with 3 required
+    approvals plus independent capability flags (see
+    assert_country_capability); this grants all of it so a test can get
+    the old "fully open, nothing restricted" behavior in one call."""
+    _grant_all_country_approvals(client, staff_headers, code)
+    _set_market_status(client, staff_headers, code, "open", reason="Legal sign-off received")
+    return _enable_all_country_capabilities(client, staff_headers, code)
 
 
 def test_search_is_blocked_for_a_closed_market(client, db_session):
@@ -1047,16 +1085,18 @@ def test_purchase_is_blocked_for_a_non_test_account_in_controlled_beta(client, d
     # reservable - open it first so the reserve below exercises the real
     # target of this test (the purchase-time re-check), not just the
     # default-closed gate a different test already covers on its own.
-    _set_market_status(client, staff_headers, "M3", "paid_open")
+    _open_market_fully(client, staff_headers, "M3")
 
     token = _signup_and_login(client, "marketbeta1@example.com")
     headers = {"Authorization": f"Bearer {token}"}
     _reserve(client, headers, "+9990003333", country="M3")
 
-    # Flip the market to CONTROLLED_BETA only after reserving - reserve_number
-    # itself also checks this, so demonstrating the purchase-time re-check
-    # needs the country to still be PAID_OPEN at reservation time.
-    _set_market_status(client, staff_headers, "M3", "controlled_beta")
+    # Flip the market to LAUNCHING (ZL-COM-LAUNCH-001's replacement for the
+    # old CONTROLLED_BETA/INTERNAL_TEST is_test-only holding state) only
+    # after reserving - reserve_number itself also checks this, so
+    # demonstrating the purchase-time re-check needs the country to still
+    # be OPEN at reservation time.
+    _set_market_status(client, staff_headers, "M3", "launching")
 
     response = client.post("/numbers/purchase", json={"e164": "+9990003333"}, headers=headers)
     assert response.status_code == 403
@@ -1071,7 +1111,7 @@ def test_purchase_succeeds_for_a_test_account_in_controlled_beta(client, db_sess
     staff_headers = {"Authorization": f"Bearer {staff_token}"}
     _upsert_market_country(client, staff_headers, "M4")
     # Same fail-closed default as M3 above - open it before reserving.
-    _set_market_status(client, staff_headers, "M4", "paid_open")
+    _open_market_fully(client, staff_headers, "M4")
 
     token = _signup_and_login(client, "marketbeta2@example.com")
     headers = {"Authorization": f"Bearer {token}"}
@@ -1081,7 +1121,7 @@ def test_purchase_succeeds_for_a_test_account_in_controlled_beta(client, db_sess
     db_session.commit()
 
     _reserve(client, headers, "+9990004444", country="M4")
-    _set_market_status(client, staff_headers, "M4", "controlled_beta")
+    _set_market_status(client, staff_headers, "M4", "launching")
 
     response = client.post("/numbers/purchase", json={"e164": "+9990004444"}, headers=headers)
     assert response.status_code == 200, response.text
@@ -1107,9 +1147,9 @@ def test_a_newly_added_country_defaults_to_closed(client, db_session):
 def test_staff_can_open_a_market_for_paid_sale(client, db_session, monkeypatch):
     """M6 isn't a real Twilio-recognized country code - stubbed here (same
     pattern as _stub_buy_number) purely so the real object under test
-    (market_status gating) reaches telecom.search_available_numbers at all,
-    rather than getting a genuine 502 from Twilio rejecting an unknown
-    country code."""
+    (market_status/capability-flag gating) reaches
+    telecom.search_available_numbers at all, rather than getting a genuine
+    502 from Twilio rejecting an unknown country code."""
     monkeypatch.setattr(
         "app.numbering.numbers.service.telecom.search_available_numbers",
         lambda country, number_type, area_code: [],
@@ -1117,9 +1157,11 @@ def test_staff_can_open_a_market_for_paid_sale(client, db_session, monkeypatch):
     staff_token = _create_staff_and_login(client, db_session, "staffmarket6@zoikolocal.com")
     staff_headers = {"Authorization": f"Bearer {staff_token}"}
     _upsert_market_country(client, staff_headers, "M6")
+    _grant_all_country_approvals(client, staff_headers, "M6")
 
-    updated = _set_market_status(client, staff_headers, "M6", "paid_open", reason="Legal sign-off received")
-    assert updated["market_status"] == "paid_open"
+    updated = _set_market_status(client, staff_headers, "M6", "open", reason="Legal sign-off received")
+    assert updated["market_status"] == "open"
+    _enable_all_country_capabilities(client, staff_headers, "M6")
 
     token = _signup_and_login(client, "marketopen1@example.com")
     response = client.get(
@@ -1128,12 +1170,13 @@ def test_staff_can_open_a_market_for_paid_sale(client, db_session, monkeypatch):
     assert response.status_code == 200
 
 
-def test_opening_a_market_for_paid_sale_requires_a_named_legal_signoff(client, db_session, monkeypatch):
-    """Readiness Standard doc §6.2: "PAID_OPEN only after ... named
-    sign-off" - a free-text `reason` alone (e.g. "testing") used to be
-    enough to open a market for real commercial sale. legal_signoff_
-    reference/legal_signoff_by are now required specifically for this
-    transition."""
+def test_opening_a_market_for_paid_sale_requires_all_three_approvals(client, db_session, monkeypatch):
+    """ZL-COM-LAUNCH-001 §5: "The system should record three distinct
+    approvals; executive approval must not impersonate specialist
+    clearance." A country can't reach OPEN with only some (or none) of
+    Regulatory/Finance/Commercial approved - this replaces the old
+    two-free-text-field legal_signoff_reference/legal_signoff_by gate,
+    which one SUPER_ADMIN could satisfy unilaterally."""
     monkeypatch.setattr(
         "app.numbering.numbers.service.telecom.search_available_numbers",
         lambda country, number_type, area_code: [],
@@ -1142,27 +1185,76 @@ def test_opening_a_market_for_paid_sale_requires_a_named_legal_signoff(client, d
     staff_headers = {"Authorization": f"Bearer {staff_token}"}
     _upsert_market_country(client, staff_headers, "M7")
 
-    missing_signoff = client.put(
+    missing_approvals = client.put(
         "/staff/countries/M7/market-status",
-        json={"status": "paid_open", "reason": "Let's open this one"},
+        json={"status": "open", "reason": "Let's open this one"},
         headers=staff_headers,
     )
-    assert missing_signoff.status_code == 422, missing_signoff.text
-    assert "legal_signoff" in missing_signoff.json()["detail"]
+    assert missing_approvals.status_code == 422, missing_approvals.text
+    assert "3 country approvals" in missing_approvals.json()["detail"]
 
-    with_signoff = client.put(
-        "/staff/countries/M7/market-status",
+    # Grant only 2 of the 3 - still not enough.
+    for approval_type in ("regulatory", "finance"):
+        client.post(
+            f"/staff/countries/M7/approvals/{approval_type}",
+            json={
+                "status": "approved", "owner_name": "Test Reviewer", "owner_title": "Test Owner",
+                "evidence_reference": "TEST-EVIDENCE-M7", "reason": "test",
+            },
+            headers=staff_headers,
+        )
+    still_missing = client.put(
+        "/staff/countries/M7/market-status", json={"status": "open", "reason": "Two down"}, headers=staff_headers,
+    )
+    assert still_missing.status_code == 422, still_missing.text
+    assert "commercial" in still_missing.json()["detail"]
+
+    # Grant the 3rd (Commercial) - now it succeeds.
+    client.post(
+        "/staff/countries/M7/approvals/commercial",
         json={
-            "status": "paid_open", "reason": "Legal review complete",
-            "legal_signoff_reference": "LEGAL-2026-M7-001", "legal_signoff_by": "jane.counsel@zoikolocal.com",
+            "status": "approved", "owner_name": "Lennox G. McLeod",
+            "owner_title": "Founder & Executive Chairman, Zoiko Group",
+            "evidence_reference": "ZL-COM-LAUNCH-001", "reason": "Executive commercial approval",
         },
         headers=staff_headers,
     )
-    assert with_signoff.status_code == 200, with_signoff.text
-    body = with_signoff.json()
-    assert body["market_status"] == "paid_open"
-    assert body["legal_signoff_reference"] == "LEGAL-2026-M7-001"
-    assert body["legal_signoff_by"] == "jane.counsel@zoikolocal.com"
+    opened = client.put(
+        "/staff/countries/M7/market-status", json={"status": "open", "reason": "All 3 approved"}, headers=staff_headers,
+    )
+    assert opened.status_code == 200, opened.text
+    assert opened.json()["market_status"] == "open"
+
+    approvals = client.get("/staff/countries/M7/approvals", headers=staff_headers)
+    assert approvals.status_code == 200
+    statuses = {a["approval_type"]: a["status"] for a in approvals.json()}
+    assert statuses == {"regulatory": "approved", "finance": "approved", "commercial": "approved"}
+
+
+def test_only_the_matching_specialist_capability_can_record_each_approval(client, db_session):
+    """ZL-COM-LAUNCH-001 §5's "executive approval must not impersonate
+    specialist clearance" - a plain SUPPORT staffer (no capability grants
+    at all) must be refused on all 3 approval endpoints."""
+    from app.staff.models import PlatformStaffRole
+
+    staff_token = _create_staff_and_login(
+        client, db_session, "staffmarket9@zoikolocal.com", role=PlatformStaffRole.SUPPORT,
+    )
+    staff_headers = {"Authorization": f"Bearer {staff_token}"}
+    admin_token = _create_staff_and_login(client, db_session, "staffmarket9admin@zoikolocal.com")
+    admin_headers = {"Authorization": f"Bearer {admin_token}"}
+    _upsert_market_country(client, admin_headers, "M9")
+
+    for approval_type in ("regulatory", "finance", "commercial"):
+        response = client.post(
+            f"/staff/countries/M9/approvals/{approval_type}",
+            json={
+                "status": "approved", "owner_name": "x", "owner_title": "x",
+                "evidence_reference": "x", "reason": "x",
+            },
+            headers=staff_headers,
+        )
+        assert response.status_code == 403, (approval_type, response.text)
 
 
 def test_set_market_activation_status_rejects_an_unsupported_country(client, db_session):
@@ -1289,7 +1381,7 @@ def _open_eligibility_case_via_blocked_checkout(client, db_session, staff_header
     that country/number_type - there's no direct "open a case" endpoint,
     matching create_number_purchase_checkout_session's own docstring."""
     _upsert_market_country(client, staff_headers, code)
-    _set_market_status(client, staff_headers, code, "paid_open")
+    _open_market_fully(client, staff_headers, code)
     client.put(
         "/staff/number-eligibility-rules",
         json={

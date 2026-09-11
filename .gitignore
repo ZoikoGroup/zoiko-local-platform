@@ -18,3 +18,10 @@ Thumbs.db
 
 # Local dev tools (e.g. ngrok binary, downloaded manually - not project source)
 .tools/
+
+# Dev server logs (local nohup/background runs, not project artifacts)
+*.log
+
+# Ad-hoc plain-text extractions of the real .docx docs (scratch, for grepping -
+# the .docx files in docs/ are the source of truth, these are disposable mirrors)
+docs/*_full.txt

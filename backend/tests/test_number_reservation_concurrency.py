@@ -24,7 +24,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from app.core.database import SessionLocal
 from app.numbering.identity.models import Account, AccountType
-from app.numbering.numbers.models import PhoneNumber
+from app.numbering.numbers.models import MarketActivationStatus, PhoneNumber, SupportedCountry
 from app.numbering.numbers.service import NumberConflictError, reserve_number
 
 
@@ -38,17 +38,31 @@ def _make_account(db, name: str) -> str:
 
 def test_concurrent_reservations_of_the_same_number_only_one_succeeds():
     e164 = f"+1999{uuid.uuid4().int % 10_000_000:07d}"
+    # ZL-COM-LAUNCH-001 (2026-09-11): a dedicated, disposable test country
+    # instead of mutating the real shared "US" row - this test's own
+    # "independent real connections against the real database" design
+    # means a concurrent run of the rest of this suite (or anyone else's
+    # session against this same shared dev DB) touching the real US row
+    # at the same moment caused genuine lock contention/deadlock here.
+    # code is 2 chars max (SupportedCountry.code), so a slice of a fresh
+    # uuid keeps this collision-safe without touching shared data at all.
+    country_code = uuid.uuid4().hex[:2].upper()
     setup_db = SessionLocal()
     account_ids: list[str] = []
     try:
         account_ids = [_make_account(setup_db, f"Concurrency Test {i}") for i in range(8)]
+        setup_db.add(SupportedCountry(
+            code=country_code, name="Concurrency Test Country",
+            market_status=MarketActivationStatus.OPEN, number_search_enabled=True,
+        ))
+        setup_db.commit()
     finally:
         setup_db.close()
 
     def _attempt(account_id: str):
         db = SessionLocal()
         try:
-            reserve_number(db, account_id, e164, country="US")
+            reserve_number(db, account_id, e164, country=country_code)
             return "ok"
         except NumberConflictError:
             return "conflict"
@@ -69,6 +83,7 @@ def test_concurrent_reservations_of_the_same_number_only_one_succeeds():
         try:
             cleanup_db.query(PhoneNumber).filter(PhoneNumber.e164 == e164).delete()
             cleanup_db.query(Account).filter(Account.id.in_(account_ids)).delete(synchronize_session=False)
+            cleanup_db.query(SupportedCountry).filter(SupportedCountry.code == country_code).delete()
             cleanup_db.commit()
         finally:
             cleanup_db.close()

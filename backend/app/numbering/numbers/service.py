@@ -41,6 +41,9 @@ from app.numbering.identity.models import Account, AccountBillingClassification,
 from app.numbering.numbers.models import (
     CallerIdentity,
     CallerIdentityStatus,
+    CountryApprovalRecord,
+    CountryApprovalStatus,
+    CountryApprovalType,
     IVROption,
     MarketActivationStatus,
     NumberEligibilityCase,
@@ -305,26 +308,78 @@ def _assert_supported_country(db: Session, country: str) -> None:
         raise UnsupportedCountryError(f"{country!r} is not on Zoiko Local's supported country list yet")
 
 
-def _assert_market_activated(db: Session, country: str, account_id: str) -> None:
-    """Production Readiness Standard doc §6.2/Annex B - "Market availability
-    is policy-controlled and default-deny." Separate from
-    _assert_supported_country (which only asks "do we have a row for this
-    country at all") - a country can be on the launch list yet still be
-    CLOSED/SUSPENDED for everyone, or INTERNAL_TEST/CONTROLLED_BETA for
-    testers only. Callers run _assert_supported_country first so a
-    genuinely unknown country still gets that clearer error instead of
-    this one."""
+_LIVE_STATES = (MarketActivationStatus.OPEN, MarketActivationStatus.RESTRICTED)
+
+# ZL-COM-LAUNCH-001 §4 - the capability name -> SupportedCountry column map.
+# "Do not implement one Boolean such as COUNTRY_OPEN as the sole control" -
+# each of these is checked independently once a country reaches OPEN/
+# RESTRICTED; CLOSED/LAUNCHING deny every capability regardless of these
+# flags (a country doesn't get partial public access before it's even in
+# the public stage), and SUSPENDED denies every capability regardless of
+# these flags too (the directive's "instant kill switch", reusing this
+# status rather than a separate KillSwitchScope - see plan notes).
+_COUNTRY_CAPABILITY_COLUMNS = {
+    "customer_signup": "customer_signup_enabled",
+    "number_search": "number_search_enabled",
+    "number_purchase": "number_purchase_enabled",
+    "inbound_voice": "inbound_voice_enabled",
+    "outbound_voice": "outbound_voice_enabled",
+    "sms": "sms_enabled",
+    "porting": "porting_supported",
+    "recording": "recording_enabled",
+}
+
+
+def assert_country_capability(db: Session, country: str, account_id: str, capability: str) -> None:
+    """ZL-COM-LAUNCH-001 §4 "Engineering control model" - replaces the old
+    single _assert_market_activated gate (which only ever meant "can this
+    account buy a number here"). Same is_test carve-out CONTROLLED_BETA/
+    INTERNAL_TEST used to have, preserved for the new LAUNCHING state - a
+    country "in the launch programme, not yet public" still lets staff/QA
+    test accounts through so hard-blocker checks can actually be exercised
+    before public capability flags are turned on. CLOSED is stricter than
+    LAUNCHING (no is_test carve-out) - CLOSED means "not even in the
+    launch programme yet", distinct from "in the programme, not public
+    yet."
+
+    `capability` is one of _COUNTRY_CAPABILITY_COLUMNS's keys - callers
+    pass a name, not a column, so this stays the one place that knows the
+    column mapping."""
+    column_name = _COUNTRY_CAPABILITY_COLUMNS[capability]
     supported = db.query(SupportedCountry).filter(SupportedCountry.code == country).first()
-    if supported is None or supported.market_status == MarketActivationStatus.PAID_OPEN:
+    if supported is None:
         return
-    if supported.market_status in (MarketActivationStatus.INTERNAL_TEST, MarketActivationStatus.CONTROLLED_BETA):
+    if supported.market_status == MarketActivationStatus.SUSPENDED:
+        raise MarketNotActivatedError(f"{country!r} is currently suspended")
+    if supported.market_status == MarketActivationStatus.CLOSED:
+        raise MarketNotActivatedError(f"{country!r} is not currently available")
+    if supported.market_status == MarketActivationStatus.LAUNCHING:
         account = db.query(Account).filter(Account.id == account_id).first()
         if account is not None and account.is_test:
             return
-        raise MarketNotActivatedError(
-            f"{country!r} is not yet open for general commercial sale"
-        )
+        raise MarketNotActivatedError(f"{country!r} is not yet open for general commercial sale")
+    if supported.market_status in _LIVE_STATES:
+        if getattr(supported, column_name):
+            return
+        raise MarketNotActivatedError(f"{capability!r} is not yet enabled for {country!r}")
+    # Deprecated pre-directive states (INTERNAL_TEST/CONTROLLED_BETA/
+    # PAID_OPEN) - no row is assigned these going forward (see the
+    # d4a7f2c6b8e1 backfill migration), but a stray row left on one of
+    # them fails closed rather than silently matching neither branch above.
     raise MarketNotActivatedError(f"{country!r} is not currently available")
+
+
+def has_country_capability(db: Session, country: str, account_id: str, capability: str) -> bool:
+    """Non-raising counterpart to assert_country_capability, for webhook-
+    adjacent code paths that must return valid TwiML rather than crash
+    (a raise here would 500 Twilio's request, the same trap this
+    codebase's voicemail_enabled/should_record_forwarded_call checks are
+    already written to avoid)."""
+    try:
+        assert_country_capability(db, country, account_id, capability)
+        return True
+    except MarketNotActivatedError:
+        return False
 
 
 def set_market_activation_status(
@@ -332,31 +387,39 @@ def set_market_activation_status(
     legal_signoff_reference: str | None = None, legal_signoff_by: str | None = None,
 ) -> SupportedCountry:
     """Staff-only, SUPER_ADMIN-gated at the route - moving a market between
-    CLOSED/INTERNAL_TEST/CONTROLLED_BETA/PAID_OPEN/SUSPENDED is exactly the
-    kind of commercial/legal decision this doc's Rule of Authority reserves
-    from Engineering self-ratification; this function is the enforcement
-    mechanism a human decision is recorded through, not the decision
-    itself. `reason` is mandatory - see Annex B's "every override... has
-    actor, reason, timestamp and evidence".
+    CLOSED/LAUNCHING/OPEN/RESTRICTED/SUSPENDED is exactly the kind of
+    commercial/legal decision ZL-COM-LAUNCH-001's Rule of Authority
+    reserves from Engineering self-ratification; this function is the
+    enforcement mechanism a human decision is recorded through, not the
+    decision itself. `reason` is mandatory - see Annex B's "every
+    override... has actor, reason, timestamp and evidence".
 
-    Readiness doc §6.2: a transition INTO PAID_OPEN additionally requires
-    legal_signoff_reference (a ticket/decision ID) and legal_signoff_by (the
-    named reviewer) - `reason` alone used to be enough to open a market for
-    real commercial sale, which is exactly the "provider has numbers there"
-    shortcut this doc prohibits. Not required for any other transition
-    (INTERNAL_TEST/CONTROLLED_BETA/SUSPENDED/CLOSED), which don't carry the
-    same "customers can now actually pay for this" weight."""
+    ZL-COM-LAUNCH-001 §5: a transition INTO OPEN requires all three
+    country approvals (Regulatory, Finance, Commercial - see
+    CountryApprovalRecord/record_country_approval) to be APPROVED. This
+    replaces the old two-free-text-field legal_signoff_reference/
+    legal_signoff_by gate, which let one SUPER_ADMIN fill in both fields
+    themselves with no independent specialist check - exactly the
+    "executive approval must not impersonate specialist clearance" gap the
+    directive calls out. The legal_signoff_* params/columns stay (nothing
+    dropped), but no longer gate anything; they're superseded by the
+    3-approval table."""
     country = db.query(SupportedCountry).filter(SupportedCountry.code == code).first()
     if country is None:
         raise UnsupportedCountryError(f"{code!r} is not on Zoiko Local's supported country list yet")
-    if status == MarketActivationStatus.PAID_OPEN and not (legal_signoff_reference and legal_signoff_by):
-        raise MissingLegalSignoffError(
-            f"Opening {code!r} for paid sale requires legal_signoff_reference and legal_signoff_by "
-            f"(Readiness Standard doc §6.2 - a named legal/tax/telecom/privacy review, not just a reason string)"
-        )
+    if status == MarketActivationStatus.OPEN:
+        approvals = db.query(CountryApprovalRecord).filter(CountryApprovalRecord.country_id == country.id).all()
+        approved_types = {a.approval_type for a in approvals if a.status == CountryApprovalStatus.APPROVED}
+        missing = set(CountryApprovalType) - approved_types
+        if missing:
+            raise MissingLegalSignoffError(
+                f"Opening {code!r} for public sale requires all 3 country approvals (Regulatory, Finance, "
+                f"Commercial) to be APPROVED first (ZL-COM-LAUNCH-001 §5) - still missing: "
+                f"{', '.join(sorted(m.value for m in missing))}"
+            )
     previous_status = country.market_status
     country.market_status = status
-    if status == MarketActivationStatus.PAID_OPEN:
+    if legal_signoff_reference and legal_signoff_by:
         country.legal_signoff_reference = legal_signoff_reference
         country.legal_signoff_by = legal_signoff_by
     db.commit()
@@ -370,6 +433,98 @@ def set_market_activation_status(
             "market_status": status.value,
             "legal_signoff_reference": legal_signoff_reference, "legal_signoff_by": legal_signoff_by,
         },
+    )
+    return country
+
+
+def list_country_approvals(db: Session, code: str) -> list[CountryApprovalRecord]:
+    country = db.query(SupportedCountry).filter(SupportedCountry.code == code).first()
+    if country is None:
+        raise UnsupportedCountryError(f"{code!r} is not on Zoiko Local's supported country list yet")
+    return (
+        db.query(CountryApprovalRecord)
+        .filter(CountryApprovalRecord.country_id == country.id)
+        .order_by(CountryApprovalRecord.approval_type)
+        .all()
+    )
+
+
+def record_country_approval(
+    db: Session, code: str, approval_type: CountryApprovalType, *, status: CountryApprovalStatus,
+    actor: str, owner_name: str, owner_title: str, evidence_reference: str, reason: str,
+) -> CountryApprovalRecord:
+    """ZL-COM-LAUNCH-001 §5 - records one of the three independent country
+    approvals (Regulatory, Finance, Commercial). One row per (country,
+    approval_type), upserted in place (same "one row per scope" shape as
+    app.ops.models.PlatformKillSwitch) - history lives in the audit log,
+    not a separate history table. The route calling this gates each
+    approval_type behind its OWN capability
+    (numbers.approve_country_regulatory/_finance/_commercial), so a
+    Finance-only staffer can't record a Regulatory approval and vice
+    versa - the actual "specialist clearance" enforcement; this function
+    just persists whatever the already-authorized caller decided."""
+    country = db.query(SupportedCountry).filter(SupportedCountry.code == code).first()
+    if country is None:
+        raise UnsupportedCountryError(f"{code!r} is not on Zoiko Local's supported country list yet")
+    record = (
+        db.query(CountryApprovalRecord)
+        .filter(CountryApprovalRecord.country_id == country.id, CountryApprovalRecord.approval_type == approval_type)
+        .first()
+    )
+    if record is None:
+        record = CountryApprovalRecord(
+            country_id=country.id, approval_type=approval_type, status=CountryApprovalStatus.PENDING,
+        )
+        db.add(record)
+    previous_status = record.status
+    record.status = status
+    record.owner_name = owner_name
+    record.owner_title = owner_title
+    record.evidence_reference = evidence_reference
+    record.reason = reason
+    record.decided_by = actor
+    record.decided_at = datetime.now(timezone.utc)
+    db.commit()
+    db.refresh(record)
+    log_event(
+        db, actor=actor, action="market.country_approval_recorded",
+        target=f"supported_country:{code}:{approval_type.value}",
+        before={"status": previous_status.value},
+        after={
+            "status": status.value, "owner_name": owner_name, "owner_title": owner_title,
+            "evidence_reference": evidence_reference, "reason": reason,
+        },
+    )
+    return record
+
+
+def set_country_capability_flags(db: Session, code: str, *, actor: str, reason: str, **flags: bool) -> SupportedCountry:
+    """ZL-COM-LAUNCH-001 §4 - toggles one or more of the per-country
+    capability flags (see _COUNTRY_CAPABILITY_COLUMNS' column names). Does
+    NOT itself check approvals - toggling flags on a LAUNCHING/CLOSED
+    country is harmless (assert_country_capability denies everyone but
+    is_test accounts regardless of flags until the country reaches OPEN/
+    RESTRICTED), and requiring re-approval per flag-flip would make the
+    3-approval gate on set_market_activation_status meaningless (staff
+    could just toggle flags instead of transitioning status). The OPEN
+    transition itself is the one moment that's actually gated."""
+    country = db.query(SupportedCountry).filter(SupportedCountry.code == code).first()
+    if country is None:
+        raise UnsupportedCountryError(f"{code!r} is not on Zoiko Local's supported country list yet")
+    valid_columns = set(_COUNTRY_CAPABILITY_COLUMNS.values())
+    before, after = {}, {}
+    for key, value in flags.items():
+        if key not in valid_columns:
+            raise ValueError(f"{key!r} is not a recognized country capability flag")
+        before[key] = getattr(country, key)
+        setattr(country, key, value)
+        after[key] = value
+    db.commit()
+    db.refresh(country)
+    _invalidate_supported_countries_cache()
+    log_event(
+        db, actor=actor, action="market.country_capabilities_changed",
+        target=f"supported_country:{code}", reason=reason, before=before, after=after,
     )
     return country
 
@@ -967,7 +1122,7 @@ def search_numbers(
     db: Session, country: str, *, account_id: str, number_type: str = "local", area_code: str | None = None,
 ) -> list[dict]:
     _assert_supported_country(db, country)
-    _assert_market_activated(db, country, account_id)
+    assert_country_capability(db, country, account_id, "number_search")
     if area_code is not None and area_code.strip() and not area_code.strip().isdigit():
         raise InvalidAreaCodeError(
             f"{area_code!r} isn't a valid area code - enter digits only, e.g. 312 for Chicago."
@@ -982,7 +1137,7 @@ def reserve_number(db: Session, account_id: str, e164: str, country: str, number
     requests both try to INSERT a brand-new row for the same number.
     """
     _assert_supported_country(db, country)
-    _assert_market_activated(db, country, account_id)
+    assert_country_capability(db, country, account_id, "number_search")
     now = datetime.now(timezone.utc)
     number = db.query(PhoneNumber).filter(PhoneNumber.e164 == e164).with_for_update().first()
     # Captured before any mutation below - a re-reservation of an expired/
@@ -1092,7 +1247,7 @@ def _assert_purchase_eligible(db: Session, account_id: str, number: PhoneNumber,
     # against the market being suspended in the gap between reservation
     # and purchase - "New sales/provisioning blocked immediately" on
     # SUSPENDED means an in-flight reservation shouldn't complete either.
-    _assert_market_activated(db, number.country, account_id)
+    assert_country_capability(db, number.country, account_id, "number_purchase")
     # Architecture doc §5 "Subscription and Entitlement" - number allowance
     # gate. Checked before the (unwindable) emergency-disclosure/KYC checks
     # below since it's the cheapest possible reason to reject, and unlike

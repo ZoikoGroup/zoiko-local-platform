@@ -26,6 +26,7 @@ from app.notifications.service import (
 )
 from app.numbering.identity.models import User, UserRole
 from app.numbering.numbers.models import PhoneNumber
+from app.numbering.numbers.service import MarketNotActivatedError, assert_country_capability, has_country_capability
 
 _OPT_OUT_KEYWORDS = {"stop", "unsubscribe", "cancel", "end", "quit"}
 _OPT_IN_KEYWORDS = {"start", "unstop", "subscribe"}
@@ -70,6 +71,18 @@ def _get_owned_number_for_channel(db: Session, account_id: str, phone_number_id:
         raise NumberNotOwnedError(phone_number_id)
     if not _channel_enabled(number, channel):
         raise ChannelNotEnabledError(phone_number_id)
+    if channel == MessagingChannel.SMS:
+        # ZL-COM-LAUNCH-001 §4 - sms_enabled, country-level, checked BEFORE
+        # (cheaper than) the per-number flag above's already-passed check -
+        # stacked, not a replacement (country flag -> number flag ->
+        # billing entitlement in send_message, cheapest-first). WhatsApp
+        # has no country-level flag - its approval is Meta's own
+        # out-of-band process (see this module's docstring), a country
+        # launch-control flag has nothing to gate there.
+        try:
+            assert_country_capability(db, number.country, account_id, "sms")
+        except MarketNotActivatedError as e:
+            raise ChannelNotEnabledError(str(e)) from e
     return number
 
 
@@ -137,6 +150,12 @@ def _record_inbound(
         column_filter = PhoneNumber.sms_enabled.is_(True)
     number = db.query(PhoneNumber).filter(PhoneNumber.e164 == to_number, column_filter).first()
     if number is None:
+        return None
+    if channel == MessagingChannel.SMS and not has_country_capability(db, number.country, number.account_id, "sms"):
+        # Webhook-adjacent (provider inbound-message callback) - non-raising
+        # has_country_capability, same reasoning as media/voice.py's
+        # inbound_voice_enabled check: silently drop rather than 500 the
+        # provider's callback.
         return None
 
     conversation = _get_or_create_conversation(db, number.account_id, number.id, from_number, channel)

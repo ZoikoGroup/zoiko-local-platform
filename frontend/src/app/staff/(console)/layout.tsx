@@ -85,6 +85,17 @@ const NAV_GROUPS: { group: string; items: NavItem[] }[] = [
         ],
       },
       { href: "/staff/kill-switches", label: "Kill Switches", icon: "power", capabilities: ["ops.manage_kill_switches"] },
+      {
+        href: "/staff/countries",
+        label: "Countries",
+        icon: "globe",
+        capabilities: [
+          "numbers.manage_country_list",
+          "numbers.approve_country_regulatory",
+          "numbers.approve_country_finance",
+          "numbers.approve_country_commercial",
+        ],
+      },
     ],
   },
   {
@@ -124,7 +135,8 @@ type IconName =
   | "power"
   | "sun"
   | "moon"
-  | "userPlus";
+  | "userPlus"
+  | "globe";
 
 const ICON_PATHS: Record<IconName, React.ReactNode> = {
   home: (
@@ -208,6 +220,12 @@ const ICON_PATHS: Record<IconName, React.ReactNode> = {
       <circle cx="9" cy="8" r="3.2" />
       <path d="M3 20a6 6 0 0112 0" />
       <path d="M18 8v6M15 11h6" />
+    </>
+  ),
+  globe: (
+    <>
+      <circle cx="12" cy="12" r="9" />
+      <path d="M3 12h18M12 3c2.7 2.6 4 5.7 4 9s-1.3 6.4-4 9c-2.7-2.6-4-5.7-4-9s1.3-6.4 4-9Z" />
     </>
   ),
 };
