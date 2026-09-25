@@ -10,7 +10,7 @@ export const NAV_ITEMS = [
   { label: "My Numbers", href: "/dashboard/numbers" },
   { label: "Call Flows", href: "/dashboard/call-flows", requiredEntitlement: "routing.advanced" },
   { label: "Queues", href: "/dashboard/queues", requiredEntitlement: "routing.shared" },
-  { label: "Messaging", href: "/dashboard/messaging" },
+  { label: "Messaging", href: "/dashboard/messaging", requiredEntitlement: "messaging.enabled" },
   { label: "Calls", href: "/dashboard/calls" },
   { label: "Video", href: "/dashboard/video" },
   { label: "AI Center", href: "/dashboard/ai-insights" },

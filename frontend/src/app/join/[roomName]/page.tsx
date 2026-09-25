@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import { useParams } from "next/navigation";
+import Link from "next/link";
 import {
   Room,
   RoomEvent,
@@ -401,18 +402,24 @@ export default function GuestJoinPage() {
         </div>
 
         {callState === "not-found" && (
-          <div className="bg-slate-900 border border-slate-800 rounded-2xl p-8 text-center space-y-2">
+          <div className="bg-slate-900 border border-slate-800 rounded-2xl p-8 text-center space-y-3">
             <h2 className="text-lg font-semibold text-white">This call isn&apos;t available</h2>
             <p className="text-sm text-slate-400">
               The link may have expired, or the call has already ended.
             </p>
+            <Link href="/" className="inline-block text-sm font-medium text-indigo-400 hover:text-indigo-300">
+              Return to homepage
+            </Link>
           </div>
         )}
 
         {callState === "denied" && (
-          <div className="bg-slate-900 border border-slate-800 rounded-2xl p-8 text-center space-y-2">
+          <div className="bg-slate-900 border border-slate-800 rounded-2xl p-8 text-center space-y-3">
             <h2 className="text-lg font-semibold text-white">You weren&apos;t let in</h2>
             <p className="text-sm text-slate-400">The host didn&apos;t admit you to this call.</p>
+            <Link href="/" className="inline-block text-sm font-medium text-indigo-400 hover:text-indigo-300">
+              Return to homepage
+            </Link>
           </div>
         )}
 
@@ -422,12 +429,17 @@ export default function GuestJoinPage() {
             <p className="text-sm text-slate-400">
               The host didn&apos;t respond to your request to join. They may not be on the call right now.
             </p>
-            <button
-              onClick={() => setCallState("lobby")}
-              className="text-sm font-medium text-indigo-400 hover:text-indigo-300"
-            >
-              Try again
-            </button>
+            <div className="flex items-center justify-center gap-4">
+              <button
+                onClick={() => setCallState("lobby")}
+                className="text-sm font-medium text-indigo-400 hover:text-indigo-300"
+              >
+                Try again
+              </button>
+              <Link href="/" className="text-sm font-medium text-slate-400 hover:text-slate-300">
+                Return to homepage
+              </Link>
+            </div>
           </div>
         )}
 
@@ -440,9 +452,15 @@ export default function GuestJoinPage() {
         )}
 
         {callState === "ended" && (
-          <div className="bg-slate-900 border border-slate-800 rounded-2xl p-8 text-center space-y-2">
+          <div className="bg-slate-900 border border-slate-800 rounded-2xl p-8 text-center space-y-3">
             <h2 className="text-lg font-semibold text-white">You&apos;ve left the call</h2>
-            <p className="text-sm text-slate-400">You can close this tab now.</p>
+            <p className="text-sm text-slate-400">You can close this tab, or head back to Zoiko Local.</p>
+            <Link
+              href="/"
+              className="inline-block text-sm font-medium rounded-lg px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white"
+            >
+              Return to homepage
+            </Link>
           </div>
         )}
 
