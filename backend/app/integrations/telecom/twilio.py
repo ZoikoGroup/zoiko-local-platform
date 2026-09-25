@@ -23,7 +23,15 @@ from app.core.config import settings
 from app.integrations._shared.circuit_breaker import CircuitBreaker, with_failover
 from app.observability.service import trace_provider_call
 
-_NUMBER_TYPE_PATH = {"local": "Local", "mobile": "Mobile", "tollfree": "TollFree"}
+# Bug ZL-16 fix: these must be the Twilio SDK's real attribute names on
+# available_phone_numbers(country) (verified directly against the
+# installed twilio package: local, mobile, toll_free, ...), not a display
+# string lowered at the call site - "TollFree".lower() produces "tollfree",
+# which doesn't exist (the real attribute has an underscore: toll_free).
+# getattr() raising AttributeError for that mismatch was never caught by
+# the except TwilioException block below it, so a Toll-Free search crashed
+# outright instead of returning results or a clean "not available" error.
+_NUMBER_TYPE_PATH = {"local": "local", "mobile": "mobile", "tollfree": "toll_free"}
 
 _breaker = CircuitBreaker("telecom")
 
@@ -206,7 +214,7 @@ def search_available_numbers(country: str, number_type: str = "local", area_code
     def _primary() -> list[dict]:
         try:
             with trace_provider_call("twilio", "search_available_numbers"):
-                resource = getattr(_client().available_phone_numbers(country), _NUMBER_TYPE_PATH[number_type].lower())
+                resource = getattr(_client().available_phone_numbers(country), _NUMBER_TYPE_PATH[number_type])
                 numbers = resource.list(**kwargs)
         except TwilioException as e:
             # Twilio's SDK raises the bare base class (no .status) for some
