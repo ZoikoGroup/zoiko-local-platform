@@ -55,12 +55,19 @@ class NumberSearchResult(BaseModel):
     region: str | None = None
     capabilities: dict | None = None
     address_requirements: str | None = None
+    # Which telecom provider actually found this number ("twilio" or
+    # "vonage" - see telecom.twilio.search_available_numbers' NoCoverageError
+    # fallback). The frontend must echo this back on ReserveNumberRequest
+    # below for this specific number, so purchase dispatches to the same
+    # provider it was actually found on.
+    provider: str = "twilio"
 
 
 class ReserveNumberRequest(BaseModel):
     e164: str
     country: str
     number_type: str = "local"
+    provider: str = "twilio"
 
 
 class PurchaseNumberRequest(BaseModel):

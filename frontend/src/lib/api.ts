@@ -1346,6 +1346,12 @@ export type NumberSearchResult = {
   region: string | null;
   capabilities: Record<string, boolean> | null;
   address_requirements: string | null;
+  // Which telecom provider actually found this number ("twilio" or
+  // "vonage") - some countries (e.g. India) have zero coverage through
+  // the primary provider and are only found via the secondary. Must be
+  // echoed back on reserveNumber for this specific number so purchase
+  // dispatches to the same provider it was actually found on.
+  provider: string;
 };
 
 export type NumberRate = {
@@ -1406,7 +1412,7 @@ export function searchNumbers(
 
 export function reserveNumber(
   token: string,
-  input: { e164: string; country: string; number_type?: string }
+  input: { e164: string; country: string; number_type?: string; provider?: string }
 ): Promise<MyPhoneNumber> {
   return request<MyPhoneNumber>("/numbers/reserve", {
     method: "POST",

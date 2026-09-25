@@ -46,6 +46,23 @@ class TelecomError(Exception):
     vendor-specific exception type (Provider Gateway rule)."""
 
 
+class NoCoverageError(TelecomError):
+    """Raised when Twilio returns 404 for AvailablePhoneNumbers/{country}/
+    {type} - the primary provider simply doesn't sell this country/type
+    combination at all (confirmed live: India has zero Local/Mobile/
+    TollFree coverage via Twilio's API, a permanent fact about Twilio's
+    own inventory, not an outage). Deliberately NOT routed through
+    _is_provider_failure/with_failover's breaker-based failover below -
+    that mechanism exists for "the provider is unhealthy right now" (see
+    _is_provider_failure's own docstring on why a 4xx correctly bypasses
+    it - a real incident where repeated 400s from one bad destination
+    tripped the shared breaker for every account on the platform).
+    "Twilio never sells numbers here" is a different, permanent-per-
+    country fact - search_available_numbers below catches this
+    specifically to retry via Vonage explicitly, every call, regardless
+    of breaker state."""
+
+
 def _clean_twilio_error_message(e: TwilioException) -> str:
     """Confirmed live: a Twilio trial-account restriction on
     AvailablePhoneNumbers reached the customer as the literal raw Python
@@ -82,6 +99,26 @@ def _clean_twilio_error_message(e: TwilioException) -> str:
     if "trial account" in message.lower():
         return "Number search/purchase is temporarily unavailable while we finish setting up this feature. Please try again shortly."
     return message
+
+
+def _is_404_response(e: TwilioException) -> bool:
+    """Bug fix, found live while testing the NoCoverageError fallback
+    below: `isinstance(e, TwilioRestException) and e.status == 404` alone
+    misses a real case - Twilio's SDK raises the BARE TwilioException base
+    class (no .status attribute at all) specifically from the paginated
+    .list()/.stream()/.page() call chain used here, not just for the
+    "missing/invalid credentials" case the comment above used to describe.
+    Confirmed live against country='IN': the exact same "HTTP 404 ...
+    AvailablePhoneNumbers/IN/Local.json was not found" failure came through
+    as the bare class, so the isinstance check alone let it fall through
+    to the generic branch and never triggered the Vonage fallback - the
+    NoCoverageError path this function exists for was silently unreachable
+    for exactly the case it was built for. Falls back to checking the
+    exception's own string representation for Twilio's embedded HTTP
+    status, same source _clean_twilio_error_message already parses."""
+    if isinstance(e, TwilioRestException) and e.status == 404:
+        return True
+    return bool(re.search(r'"status"\s*:\s*404\b', str(e))) or "HTTP 404" in str(e)
 
 
 def _is_provider_failure(e: Exception) -> bool:
@@ -217,11 +254,8 @@ def search_available_numbers(country: str, number_type: str = "local", area_code
                 resource = getattr(_client().available_phone_numbers(country), _NUMBER_TYPE_PATH[number_type])
                 numbers = resource.list(**kwargs)
         except TwilioException as e:
-            # Twilio's SDK raises the bare base class (no .status) for some
-            # lower-level failures (e.g. missing/invalid credentials) rather
-            # than the TwilioRestException subclass this 404 check expects.
-            if isinstance(e, TwilioRestException) and e.status == 404:
-                raise TelecomError(f"Twilio has no {number_type} numbering coverage for country '{country}'") from e
+            if _is_404_response(e):
+                raise NoCoverageError(f"Twilio has no {number_type} numbering coverage for country '{country}'") from e
             raise TelecomError(_clean_twilio_error_message(e)) from e
 
         return [
@@ -231,19 +265,40 @@ def search_available_numbers(country: str, number_type: str = "local", area_code
                 "region": n.region,
                 "capabilities": n.capabilities,
                 "address_requirements": n.address_requirements,
+                "provider": "twilio",
             }
             for n in numbers
         ]
 
-    # Vonage failover deliberately disabled here (matches buy_number's own
-    # disable below) - search and buy must stay in sync on which secondary
-    # providers are actually wired end-to-end, or a customer can search
-    # (falls over to Vonage while the Twilio breaker is OPEN), reserve, and
-    # try to purchase a Vonage-only number that buy_number's secondary_fn=None
-    # can never fulfill, failing immediately at the worst possible moment
-    # (after they've already picked a number). Remove this override in
-    # lockstep with buy_number's, not independently.
-    return with_failover(_breaker, _primary, None, TelecomError, _is_provider_failure)
+    # Real gap fix: a country/type Twilio simply never sells at all (e.g.
+    # India has zero Local/Mobile/TollFree coverage via Twilio's API -
+    # confirmed live) used to surface as a hard error with no fallback,
+    # even though Vonage (the already-configured, already-tested secondary
+    # telecom provider) genuinely can search that same country. The
+    # breaker-based with_failover below is deliberately left disabled for
+    # THIS - it's gated on _is_provider_failure, which correctly treats a
+    # 4xx as "not a health signal" and never fails over for one (see that
+    # function's own docstring on the real incident that taught this
+    # codebase to make that distinction) - "Twilio never sells this
+    # country" isn't Twilio being unhealthy, it's a permanent fact,
+    # checked explicitly below every single call regardless of breaker
+    # state, not something a circuit breaker should ever gate.
+    #
+    # Consistency with buy_number_via_provider below: each returned
+    # number is tagged "provider": "twilio" or "vonage" at the point it
+    # was actually found, carried through reserve_number onto PhoneNumber.
+    # provider, and buy_number_via_provider dispatches on THAT stored
+    # value at purchase time - never re-decided independently, which is
+    # exactly the search/buy inconsistency this mechanism used to risk.
+    try:
+        return with_failover(_breaker, _primary, None, TelecomError, _is_provider_failure)
+    except NoCoverageError:
+        if not settings.telecom_failover_enabled:
+            raise
+        results = secondary.search_available_numbers(
+            country, number_type=number_type, area_code=area_code, contains=contains, limit=limit,
+        )
+        return [{**r, "provider": "vonage"} for r in results]
 
 
 def list_owned_numbers() -> list[dict]:
@@ -348,6 +403,37 @@ def buy_number(phone_number: str, *, bundle_sid: str | None = None) -> dict:
     # operation (search, calls, SMS) still fails over normally - remove this
     # override once Vonage's account is confirmed able to purchase numbers.
     return with_failover(_breaker, _primary, None, TelecomError, _is_provider_failure)
+
+
+def buy_number_via_provider(provider: str, phone_number: str, *, bundle_sid: str | None = None) -> dict:
+    """Real gap fix (search now finds numbers from either provider - see
+    search_available_numbers' NoCoverageError fallback above): purchase
+    must go through the SAME provider a specific number was actually
+    found on, never re-decided independently at buy time - that mismatch
+    is exactly what the old "Vonage failover deliberately disabled" search
+    comment used to warn about (a customer picking a Vonage-only number
+    then having buy_number's own internal failover logic try Twilio for
+    it, or vice versa). Callers store `provider` on PhoneNumber at
+    reserve_number time and pass that same value back in here at purchase
+    time - the provider decision is made once, at search, and carried
+    through, never guessed again.
+
+    bundle_sid is a Twilio-only concept (silently ignored for Vonage,
+    which has no equivalent regulatory-bundle system).
+
+    Known live limitation, honestly surfaced rather than hidden: Vonage's
+    /number/buy endpoint currently 401s for this account even though
+    every other Vonage operation (search, balance) works fine - see
+    buy_number's own 2026-08-21 comment above. A Vonage-sourced purchase
+    will raise TelecomError with that real reason until that account-level
+    access is fixed on Vonage's side (contact Vonage support / check the
+    dashboard for programmatic number-purchase permission) - this
+    function does not paper over that, it surfaces exactly what Vonage
+    returns."""
+    if provider == "vonage":
+        with trace_provider_call("vonage", "buy_number"):
+            return secondary.buy_number(phone_number)
+    return buy_number(phone_number, bundle_sid=bundle_sid)
 
 
 # --- Regulatory Compliance (real Twilio-reviewed identity bundles required

@@ -102,9 +102,10 @@ def reserve_number(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_admin),
 ):
+    provider = payload.provider if payload.provider in ("twilio", "vonage") else "twilio"
     try:
         return service.reserve_number(
-            db, current_user.account_id, payload.e164, payload.country, payload.number_type,
+            db, current_user.account_id, payload.e164, payload.country, payload.number_type, provider,
         )
     except UnsupportedCountryError as e:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e)) from e

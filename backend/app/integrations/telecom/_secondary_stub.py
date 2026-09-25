@@ -93,7 +93,18 @@ def search_available_numbers(
         "type": _NUMBER_TYPE.get(number_type, "landline"),
         "size": limit,
     }
-    if contains:
+    # Real gap fix: area_code was accepted in this function's signature but
+    # never actually used - Vonage's search API has no distinct "area
+    # code" concept the way Twilio's does, but its generic "pattern"
+    # filter (already used for `contains` below) works just as well when
+    # anchored to the start of the number (search_pattern=0), which is
+    # exactly what an area code means in practice. area_code takes
+    # priority over contains when both are somehow given - the frontend
+    # today never sends both at once.
+    if area_code:
+        params["pattern"] = area_code
+        params["search_pattern"] = 0  # Vonage: 0 = pattern must appear at the start of the number
+    elif contains:
         params["pattern"] = contains
         params["search_pattern"] = 1  # Vonage: 1 = pattern may appear anywhere in the number
     try:
@@ -105,7 +116,14 @@ def search_available_numbers(
     numbers = response.json().get("numbers", [])
     return [
         {
-            "phone_number": n["msisdn"],
+            # Real bug fix, found live: Vonage's msisdn field has no
+            # leading "+" ("917039068350"), unlike Twilio's phone_number
+            # ("+15551234567") - every downstream consumer of this shared
+            # return shape (PhoneNumber.e164, reserve/purchase, calling)
+            # assumes real E.164 formatting with the "+". Silently missing
+            # it here would have stored a malformed number the moment a
+            # Vonage-sourced number was actually reserved.
+            "phone_number": f"+{n['msisdn']}",
             "locality": None,
             "region": n.get("country"),
             "capabilities": {c: True for c in n.get("features", [])},

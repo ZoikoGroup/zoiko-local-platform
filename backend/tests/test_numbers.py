@@ -722,6 +722,69 @@ def test_reserve_rejects_an_uncurated_country(client):
     assert response.status_code == 422
 
 
+def test_reserve_stores_which_provider_the_number_was_actually_found_on(client, db_session):
+    """Real gap fix: search_available_numbers now returns numbers from
+    either Twilio or Vonage (a country Twilio has zero coverage for, e.g.
+    India, falls back to Vonage - see test_telecom_failover.py). The
+    frontend must echo that provider back on reserve so purchase later
+    dispatches to the SAME provider, never re-decided independently."""
+    from app.numbering.numbers.models import PhoneNumber
+
+    token = _signup_and_login(client, "vonagereserve1@example.com")
+    response = client.post(
+        "/numbers/reserve",
+        json={"e164": "+917039068350", "country": "IN", "number_type": "mobile", "provider": "vonage"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert response.status_code == 201
+    number = db_session.query(PhoneNumber).filter(PhoneNumber.e164 == "+917039068350").first()
+    assert number is not None
+    assert number.provider == "vonage"
+
+
+def test_reserve_rejects_an_unrecognized_provider_value_and_defaults_to_twilio(client, db_session):
+    from app.numbering.numbers.models import PhoneNumber
+
+    token = _signup_and_login(client, "badproviderreserve1@example.com")
+    response = client.post(
+        "/numbers/reserve",
+        json={"e164": "+15550099001", "country": "US", "provider": "not-a-real-provider"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert response.status_code == 201
+    number = db_session.query(PhoneNumber).filter(PhoneNumber.e164 == "+15550099001").first()
+    assert number.provider == "twilio"
+
+
+def test_purchase_dispatches_to_the_provider_the_number_was_reserved_under(client, monkeypatch):
+    """End-to-end: a Vonage-sourced number, reserved with provider=vonage,
+    must purchase through Vonage's buy_number - never Twilio's, even
+    though purchase_number's default/fallback provider is "twilio"."""
+    from app.integrations.telecom import twilio as telecom_module
+
+    vonage_calls = []
+    monkeypatch.setattr(
+        telecom_module.secondary, "buy_number",
+        lambda phone_number: vonage_calls.append(phone_number) or {"sid": phone_number, "phone_number": phone_number, "capabilities": {}},
+    )
+
+    def _fail_if_twilio_buy_called(*args, **kwargs):
+        raise AssertionError("Twilio's buy_number must not be called for a Vonage-reserved number")
+
+    monkeypatch.setattr(telecom_module, "buy_number", _fail_if_twilio_buy_called)
+
+    token = _signup_and_login(client, "vonagepurchase1@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    client.post(
+        "/numbers/reserve",
+        json={"e164": "+917039068351", "country": "IN", "number_type": "mobile", "provider": "vonage"},
+        headers=headers,
+    )
+    response = client.post("/numbers/purchase", json={"e164": "+917039068351"}, headers=headers)
+    assert response.status_code == 200
+    assert vonage_calls == ["+917039068351"]
+
+
 # --- Renewal flow ---
 
 

@@ -345,12 +345,14 @@ export default function NumbersPage() {
     }
   }
 
-  async function handleReserve(phoneNumber: string) {
+  async function handleReserve(phoneNumber: string, provider: string) {
     if (!token) return;
     setReserveBusy(true);
     setReserveError(null);
     try {
-      const number = await reserveNumber(token, { e164: phoneNumber, country: countryCode, number_type: numberType });
+      const number = await reserveNumber(token, {
+        e164: phoneNumber, country: countryCode, number_type: numberType, provider,
+      });
       setReservedNumber(number);
       setStep("reserved");
     } catch (err) {
@@ -1171,10 +1173,11 @@ export default function NumbersPage() {
                       <tr key={result.phone_number} className="border-b border-slate-100 last:border-0">
                         <td className="px-2 py-3">
                           <span className="font-mono text-slate-800">{result.phone_number}</span>
-                          {result.locality && (
+                          {(result.locality || result.region) && (
                             <div className="text-xs text-slate-400">
                               {result.locality}
-                              {result.region ? `, ${result.region}` : ""}
+                              {result.locality && result.region ? ", " : ""}
+                              {result.region}
                             </div>
                           )}
                         </td>
@@ -1198,7 +1201,7 @@ export default function NumbersPage() {
                         <td className="px-2 py-3 text-slate-600">{formatMonthlyFee(rate)}</td>
                         <td className="px-2 py-3 text-right">
                           <button
-                            onClick={() => handleReserve(result.phone_number)}
+                            onClick={() => handleReserve(result.phone_number, result.provider)}
                             disabled={reserveBusy}
                             className="text-xs font-medium text-indigo-600 border border-indigo-200 rounded-lg px-3 py-1.5 hover:bg-indigo-50 disabled:opacity-60"
                           >

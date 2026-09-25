@@ -1130,11 +1130,21 @@ def search_numbers(
     return telecom.search_available_numbers(country, number_type=number_type, area_code=area_code.strip() if area_code else area_code)
 
 
-def reserve_number(db: Session, account_id: str, e164: str, country: str, number_type: str = "local") -> PhoneNumber:
+def reserve_number(
+    db: Session, account_id: str, e164: str, country: str, number_type: str = "local", provider: str = "twilio",
+) -> PhoneNumber:
     """Atomicity law: two accounts must never hold a live reservation on the
     same number. `SELECT ... FOR UPDATE` serializes concurrent reservers of an
     existing row; the unique constraint on `e164` catches the race where two
     requests both try to INSERT a brand-new row for the same number.
+
+    provider: which telecom provider search_available_numbers actually
+    found this specific number on ("twilio" or "vonage" - see that
+    function's NoCoverageError fallback). Stored on the PhoneNumber row so
+    purchase_number/the checkout-webhook path can dispatch the real buy
+    call to the SAME provider later, rather than re-deciding independently
+    - see buy_number_via_provider's docstring for why that consistency
+    matters.
     """
     _assert_supported_country(db, country)
     assert_country_capability(db, country, account_id, "number_search")
@@ -1154,6 +1164,7 @@ def reserve_number(db: Session, account_id: str, e164: str, country: str, number
             number_type=number_type,
             status=PhoneNumberStatus.RESERVED,
             account_id=account_id,
+            provider=provider,
             reserved_until=now + timedelta(minutes=RESERVATION_TTL_MINUTES),
         )
         db.add(number)
@@ -1180,6 +1191,7 @@ def reserve_number(db: Session, account_id: str, e164: str, country: str, number
         number.status = PhoneNumberStatus.RESERVED
         number.account_id = account_id
         number.number_type = number_type
+        number.provider = provider
         number.reserved_until = now + timedelta(minutes=RESERVATION_TTL_MINUTES)
 
     try:
@@ -1403,7 +1415,7 @@ def purchase_number(db: Session, account_id: str, e164: str) -> PhoneNumber:
     bundle_sid = eligibility_case.twilio_bundle_sid if eligibility_case is not None else None
 
     try:
-        bought = telecom.buy_number(e164, bundle_sid=bundle_sid)
+        bought = telecom.buy_number_via_provider(number.provider, e164, bundle_sid=bundle_sid)
     except telecom.TelecomError as e:
         # payment/provisioning failure must not strand the number silently —
         # release it back to Reserved so the customer can retry or it can expire
@@ -1791,7 +1803,7 @@ def retry_provisioning(db: Session, staff_id: str, number_id: str) -> PhoneNumbe
     )
 
     try:
-        bought = telecom.buy_number(number.e164)
+        bought = telecom.buy_number_via_provider(number.provider, number.e164)
     except telecom.TelecomError as e:
         number.status = PhoneNumberStatus.RESERVED
         number.provisioning_started_at = None
