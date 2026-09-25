@@ -2198,6 +2198,13 @@ export interface PlanChangePreview {
     team_capability_lost: boolean;
   } | null;
   ai_receptionist_included_minutes: { current: number; target: number };
+  // "proration": an existing paying customer - call applyPlanChangeWithProration,
+  // which applies immediately (no redirect) and fairly prorates the switch.
+  // "checkout": no existing subscription yet - createPlanChangeCheckoutSession
+  // is still required. "none": free/placeholder target, or a downgrade.
+  payment_method: "proration" | "checkout" | "none";
+  prorated_amount_due_cents: number | null;
+  prorated_currency: string | null;
   preview_token: string;
   expires_in_minutes: number;
 }
@@ -2216,6 +2223,22 @@ export function previewPlanChange(
 
 export function confirmPlanChange(token: string, previewToken: string): Promise<Subscription> {
   return request<Subscription>("/billing/subscription/plan/confirm", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ preview_token: previewToken }),
+  });
+}
+
+// Real proration for an existing paying customer's mid-cycle upgrade -
+// applies immediately (Stripe modifies their live subscription in place,
+// crediting unused time on the current price, charging only the real
+// difference to the payment method already on file). No redirect, unlike
+// createPlanChangeCheckoutSession below, which is still required for an
+// account's first-ever paid plan (no existing subscription to prorate
+// against, and no payment method on file yet to charge without a Checkout
+// page). Only call this when the preview's payment_method is "proration".
+export function applyPlanChangeWithProration(token: string, previewToken: string): Promise<Subscription> {
+  return request<Subscription>("/billing/subscription/plan/apply-proration", {
     method: "POST",
     headers: { Authorization: `Bearer ${token}` },
     body: JSON.stringify({ preview_token: previewToken }),

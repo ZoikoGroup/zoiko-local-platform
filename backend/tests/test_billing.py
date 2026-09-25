@@ -149,6 +149,110 @@ def test_preview_plan_change_upgrade_shows_gained_entitlements(db_session):
     assert preview["preview_token"]
 
 
+def _ensure_active_price(db_session, plan_code: str, catalog_version: str):
+    """Reuses a real, already-ACTIVE non-placeholder price for plan_code/
+    MONTHLY if one exists (the real price book seeded via migration
+    usually has one for starter/business/pro/scale) rather than inserting
+    a second, competing ACTIVE row - get_active_price_catalog_entry's own
+    "prefer ACTIVE" query has no tiebreak ordering across multiple ACTIVE
+    rows, so adding a duplicate would make which one wins non-deterministic.
+    Only creates one if the plan genuinely has no real price configured."""
+    from app.billing.models import BillingPeriod, CatalogEntryStatus, PriceCatalogEntry
+
+    existing = service.get_active_price_catalog_entry(db_session, plan_code, billing_period=BillingPeriod.MONTHLY)
+    if existing is not None and not existing.is_placeholder and existing.status == CatalogEntryStatus.ACTIVE:
+        return existing
+    price = PriceCatalogEntry(
+        plan_code=plan_code, catalog_version=catalog_version, billing_period=BillingPeriod.MONTHLY,
+        amount_minor_units=2999, currency_code="USD", status=CatalogEntryStatus.ACTIVE, is_placeholder=False,
+    )
+    db_session.add(price)
+    db_session.commit()
+    db_session.refresh(price)
+    return price
+
+
+def test_preview_plan_change_upgrade_with_existing_subscription_shows_prorated_amount(db_session, monkeypatch):
+    """New proration feature: preview_plan_change must show a real dollar
+    "commercial impact" figure (Commercial Billing Operating Standard doc
+    §B4) for an account that already has a live paid subscription to
+    upgrade - not just the feature diff it showed before this fix."""
+    account = _make_account_on_plan(db_session, "Proration Preview Co", "starter")
+    sub = service.get_or_create_subscription(db_session, account.id)
+    sub.stripe_subscription_id = "sub_existing_123"
+    db_session.commit()
+    _ensure_active_price(db_session, "pro", "test-proration-preview")
+
+    monkeypatch.setattr(
+        "app.integrations.billing.stripe_checkout.preview_subscription_price_change",
+        lambda stripe_subscription_id, **kwargs: {"amount_due_cents": 1050, "currency": "usd"},
+    )
+
+    preview = service.preview_plan_change(db_session, account.id, "pro")
+    assert preview["payment_method"] == "proration"
+    assert preview["prorated_amount_due_cents"] == 1050
+    assert preview["prorated_currency"] == "usd"
+
+
+def test_preview_plan_change_upgrade_without_existing_subscription_requires_checkout(db_session):
+    """No existing Stripe subscription (e.g. a free-trial account's first
+    ever paid plan) - nothing to prorate against and no payment method on
+    file yet, so the frontend must still use the Checkout Session flow,
+    not the in-place proration one."""
+    account = _make_account_on_plan(db_session, "Proration No-Sub Co", "starter")
+    _ensure_active_price(db_session, "pro", "test-proration-no-sub")
+
+    preview = service.preview_plan_change(db_session, account.id, "pro")
+    assert preview["payment_method"] == "checkout"
+    assert preview["prorated_amount_due_cents"] is None
+
+
+def test_apply_plan_change_with_proration_modifies_existing_subscription_and_upgrades_plan(db_session, monkeypatch):
+    """The actual proration mechanism: an existing paying customer's
+    upgrade modifies their live Stripe subscription in place (crediting
+    unused time on the old price) instead of canceling it and starting a
+    fresh one at full price."""
+    account = _make_account_on_plan(db_session, "Proration Apply Co", "starter")
+    sub = service.get_or_create_subscription(db_session, account.id)
+    sub.stripe_subscription_id = "sub_existing_456"
+    db_session.commit()
+    price = _ensure_active_price(db_session, "pro", "test-proration-apply")
+
+    changed_subscriptions = []
+    monkeypatch.setattr(
+        "app.integrations.billing.stripe_checkout.change_subscription_price",
+        lambda stripe_subscription_id, **kwargs: changed_subscriptions.append((stripe_subscription_id, kwargs))
+        or {"id": stripe_subscription_id, "status": "active"},
+    )
+
+    preview = service.preview_plan_change(db_session, account.id, "pro")
+    updated = service.apply_plan_change_with_proration(
+        db_session, account.id, preview["preview_token"], actor="test-actor",
+    )
+
+    assert updated.plan_code == "pro"
+    assert len(changed_subscriptions) == 1
+    assert changed_subscriptions[0][0] == "sub_existing_456"
+    assert changed_subscriptions[0][1]["amount_cents"] == price.amount_minor_units
+
+
+def test_apply_plan_change_with_proration_requires_existing_subscription(db_session):
+    """An account with no live Stripe subscription yet (first-ever paid
+    plan) must be rejected here, not silently do nothing useful - it needs
+    the real Checkout Session flow instead."""
+    account = _make_account_on_plan(db_session, "Proration Missing Sub Co", "starter")
+    _ensure_active_price(db_session, "pro", "test-proration-missing-sub")
+
+    preview = service.preview_plan_change(db_session, account.id, "pro")
+    assert preview["payment_method"] == "checkout"  # confirms no existing subscription
+
+    try:
+        service.apply_plan_change_with_proration(db_session, account.id, preview["preview_token"], actor="test-actor")
+        assert False, "expected ProrationRequiresExistingSubscriptionError"
+    except service.ProrationRequiresExistingSubscriptionError:
+        pass
+
+
 def test_preview_plan_change_downgrade_shows_lost_entitlements_and_resource_impact(db_session):
     from app.numbering.identity.models import User, UserRole
 

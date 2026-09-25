@@ -29,6 +29,10 @@ function friendlyKey(key: string): string {
   return ENTITLEMENT_LABELS[key] ?? key.replace(/[._]/g, " ");
 }
 
+function formatProratedAmount(cents: number, currency: string): string {
+  return new Intl.NumberFormat("en-US", { style: "currency", currency: currency.toUpperCase() }).format(cents / 100);
+}
+
 export default function PlanChangePreviewModal({
   preview,
   targetPlanName,
@@ -90,6 +94,22 @@ export default function PlanChangePreviewModal({
               ))}
             </ul>
           </div>
+        )}
+
+        {preview.payment_method === "proration" && preview.prorated_amount_due_cents !== null && (
+          <p className="text-sm text-slate-700 bg-indigo-50 rounded-lg px-3 py-2">
+            You&apos;ll be charged{" "}
+            <span className="font-semibold">
+              {formatProratedAmount(preview.prorated_amount_due_cents, preview.prorated_currency ?? "usd")}
+            </span>{" "}
+            today - already credited for the unused time left on your current plan. Your renewal date doesn&apos;t
+            change.
+          </p>
+        )}
+        {preview.payment_method === "checkout" && (
+          <p className="text-sm text-slate-500">
+            You&apos;ll be taken to a secure payment page to complete this upgrade.
+          </p>
         )}
 
         {ai.current !== ai.target && (

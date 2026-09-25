@@ -861,6 +861,47 @@ def preview_plan_change(
         target_plan_code=target_plan_code, billing_period=billing_period.value, impact_hash=impact_hash,
     )
 
+    # Commercial Billing Operating Standard doc §B4: an upgrade must show
+    # real "commercial impact" before the customer authorizes it - this
+    # used to only ever show the entitlement_diff above (which features
+    # change), never an actual amount. payment_method tells the frontend
+    # which confirm path applies: "proration" (an existing paying customer
+    # - POST /subscription/plan/apply-proration modifies their live Stripe
+    # subscription in place, crediting unused time on the old price rather
+    # than forfeiting it) vs "checkout" (no existing subscription yet - a
+    # real Checkout Session is still needed to collect a payment method)
+    # vs "none" (free/placeholder target, or a downgrade - never charges).
+    payment_method = "none"
+    prorated_amount_due_cents: int | None = None
+    prorated_currency: str | None = None
+    if direction == "upgrade":
+        price = get_active_price_catalog_entry(db, target_plan_code, billing_period=billing_period)
+        requires_payment = (
+            price is not None and not price.is_placeholder
+            and price.status == CatalogEntryStatus.ACTIVE and price.amount_minor_units > 0
+        )
+        if requires_payment:
+            if sub.stripe_subscription_id:
+                payment_method = "proration"
+                from app.integrations.billing import stripe_checkout
+
+                interval = "year" if billing_period == BillingPeriod.ANNUAL else "month"
+                try:
+                    result = stripe_checkout.preview_subscription_price_change(
+                        sub.stripe_subscription_id, amount_cents=price.amount_minor_units,
+                        currency=price.currency_code.lower(), interval=interval, plan_name=target_plan.name,
+                    )
+                    prorated_amount_due_cents = result["amount_due_cents"]
+                    prorated_currency = result["currency"]
+                except stripe_checkout.PaymentError:
+                    # Best-effort preview only - a transient Stripe API hiccup
+                    # here must not block showing the rest of the preview;
+                    # apply_plan_change_with_proration will surface any real
+                    # problem when it actually tries to apply the change.
+                    pass
+            else:
+                payment_method = "checkout"
+
     return {
         "direction": direction,
         "current_plan_code": sub.plan_code,
@@ -870,6 +911,9 @@ def preview_plan_change(
         "entitlement_diff": entitlement_diff,
         "resource_impact": resource_impact,
         "ai_receptionist_included_minutes": {"current": current_ai_minutes, "target": target_ai_minutes},
+        "payment_method": payment_method,
+        "prorated_amount_due_cents": prorated_amount_due_cents,
+        "prorated_currency": prorated_currency,
         "preview_token": preview_token,
         "expires_in_minutes": _PLAN_CHANGE_PREVIEW_TTL_MINUTES,
     }
@@ -1023,6 +1067,76 @@ def create_plan_change_checkout_session(
         after={"plan_code": plan.plan_code, "billing_period": billing_period.value, "stripe_session_id": session["id"]},
     )
     return session
+
+
+class ProrationRequiresExistingSubscriptionError(Exception):
+    """Raised when apply_plan_change_with_proration is called for an
+    account with no existing live Stripe subscription to modify in place -
+    that's an account's first-ever paid plan, which still has to go
+    through create_plan_change_checkout_session above (a real Checkout
+    Session is the only way to collect a payment method for the first
+    time; there's nothing yet for Stripe to prorate against)."""
+
+
+def apply_plan_change_with_proration(
+    db: Session, account_id: str, preview_token: str, *, actor: str,
+) -> Subscription:
+    """The customer-facing entry point for a mid-cycle upgrade on an
+    account that already has a live paid subscription - real proration,
+    via Stripe directly (not ZoikoNex - see preview_subscription_price_
+    change's docstring for why). Modifies the existing Stripe subscription
+    in place instead of create_plan_change_checkout_session's cancel-and-
+    start-a-new-one approach, so the unused portion of the current period
+    is credited rather than forfeited, and only the real difference is
+    charged - immediately, to the payment method already on file, no
+    Checkout redirect needed.
+
+    Same preview_token contract as confirm_plan_change (short-lived,
+    signed, re-validated against current account state) - this is a
+    sibling entry point for the "payment_method": "proration" case
+    preview_plan_change already told the frontend to expect, not a
+    replacement for confirm_plan_change, which still handles downgrades
+    and the no-payment-needed case."""
+    payload = _decode_plan_change_preview(db, account_id, preview_token)
+    target_plan_code = payload["target_plan_code"]
+    billing_period = BillingPeriod(payload["billing_period"])
+
+    sub = get_or_create_subscription(db, account_id)
+    if not sub.stripe_subscription_id:
+        raise ProrationRequiresExistingSubscriptionError(
+            "No existing paid subscription to prorate against - this account's first paid plan "
+            "must go through the Checkout Session flow instead."
+        )
+    target_plan = get_plan(db, target_plan_code)
+    price = get_active_price_catalog_entry(db, target_plan_code, billing_period=billing_period)
+    if price is None or price.is_placeholder or price.status != CatalogEntryStatus.ACTIVE:
+        raise PriceUnavailableForCheckoutError(
+            f"No real, non-placeholder ACTIVE price is configured for {target_plan_code}/{billing_period.value}"
+        )
+
+    from app.integrations.billing import stripe_checkout
+
+    interval = "year" if billing_period == BillingPeriod.ANNUAL else "month"
+    stripe_result = stripe_checkout.change_subscription_price(
+        sub.stripe_subscription_id, amount_cents=price.amount_minor_units,
+        currency=price.currency_code.lower(), interval=interval, plan_name=target_plan.name,
+    )
+
+    # change_plan is the same function the Checkout-webhook path calls -
+    # updates plan_code/entitlements/risk step-up/notification, all
+    # identically, regardless of which payment path got here. Deliberately
+    # does NOT touch current_period_start/end (billing_period is unchanged
+    # here, so change_plan's own billing_period_changed branch is a no-op)
+    # - Stripe keeps the subscription's original renewal date for an
+    # in-place price change, it doesn't reset the clock, so neither should
+    # our own record of it.
+    updated_sub = change_plan(db, account_id, target_plan.plan_code, actor=actor, billing_period=billing_period)
+    log_event(
+        db, actor=actor, action="subscription.plan_changed_with_proration",
+        target=f"subscription:{updated_sub.id}", account_id=account_id,
+        after={"stripe_subscription_status": stripe_result.get("status")},
+    )
+    return updated_sub
 
 
 def handle_stripe_checkout_completed(

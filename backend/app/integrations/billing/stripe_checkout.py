@@ -177,6 +177,111 @@ def cancel_subscription(stripe_subscription_id: str) -> dict:
     return with_failover(_breaker, _primary, None, PaymentError, _is_provider_failure)
 
 
+def _subscription_item_id(stripe_subscription_id: str) -> str:
+    subscription = stripe.Subscription.retrieve(
+        stripe_subscription_id, api_key=settings.stripe_payments_secret_key,
+    )
+    return subscription["items"]["data"][0]["id"]
+
+
+def preview_subscription_price_change(
+    stripe_subscription_id: str, *, amount_cents: int, currency: str, interval: str, plan_name: str,
+) -> dict:
+    """Computes exactly what Stripe would invoice today for switching an
+    EXISTING live subscription to a new price - crediting whatever time is
+    still unused on the current price, charging only the real difference -
+    without committing anything. This is how a real dollar "commercial
+    impact" figure gets shown to the customer before they authorize an
+    upgrade, per the Commercial Billing Operating Standard doc's §B4 rule
+    ("Immediate or scheduled... after commercial impact is shown"), which
+    this codebase's plan-change preview never actually computed before -
+    only a feature/entitlement diff, never a dollar amount.
+
+    Deliberately talks to Stripe directly rather than routing through
+    ZoikoNex (this repo's other billing system) - ZoikoNex has 2 known,
+    unfixed bugs of its own blocking full billing integration (see
+    docs/zoikonex-defect-packet-2026-08-13.md), so this uses the payment
+    processor that's actually real and working today. change_plan's
+    existing best-effort sync_subscription_to_zoikonex call is untouched -
+    this doesn't replace that, it just doesn't depend on it either."""
+    if not settings.stripe_payments_secret_key:
+        raise PaymentError("Stripe payments secret key is not configured")
+
+    def _primary() -> dict:
+        try:
+            with trace_provider_call("stripe_payments", "preview_subscription_price_change"):
+                item_id = _subscription_item_id(stripe_subscription_id)
+                preview = stripe.Invoice.create_preview(
+                    api_key=settings.stripe_payments_secret_key,
+                    subscription=stripe_subscription_id,
+                    subscription_details={
+                        "items": [
+                            {
+                                "id": item_id,
+                                "price_data": {
+                                    "currency": currency,
+                                    "unit_amount": amount_cents,
+                                    "recurring": {"interval": interval},
+                                    "product_data": {"name": f"Zoiko Local {plan_name}"},
+                                },
+                            }
+                        ],
+                        "proration_behavior": "always_invoice",
+                    },
+                )
+        except stripe.error.StripeError as e:
+            raise PaymentError(f"Stripe preview subscription price change failed: {e}") from e
+        return {"amount_due_cents": preview.amount_due, "currency": preview.currency}
+
+    return with_failover(_breaker, _primary, None, PaymentError, _is_provider_failure)
+
+
+def change_subscription_price(
+    stripe_subscription_id: str, *, amount_cents: int, currency: str, interval: str, plan_name: str,
+) -> dict:
+    """Changes an EXISTING, live Stripe subscription to a new price in
+    place, with proration_behavior="always_invoice" - Stripe automatically
+    credits whatever time is unused on the old price and immediately
+    invoices (charging the already-saved payment method on file) only the
+    real difference for the new one. This is the industry-standard way to
+    handle a mid-cycle plan upgrade.
+
+    Deliberately distinct from create_plan_change_checkout_session's flow
+    above, which cancels the old subscription outright (forfeiting its
+    unused time entirely) and starts a brand new one at full price via a
+    fresh Checkout Session - that flow is now reserved for an account's
+    FIRST-EVER paid subscription (no existing one to modify in place, and
+    no saved payment method yet to charge without a Checkout page)."""
+    if not settings.stripe_payments_secret_key:
+        raise PaymentError("Stripe payments secret key is not configured")
+
+    def _primary() -> dict:
+        try:
+            with trace_provider_call("stripe_payments", "change_subscription_price"):
+                item_id = _subscription_item_id(stripe_subscription_id)
+                updated = stripe.Subscription.modify(
+                    stripe_subscription_id,
+                    api_key=settings.stripe_payments_secret_key,
+                    items=[
+                        {
+                            "id": item_id,
+                            "price_data": {
+                                "currency": currency,
+                                "unit_amount": amount_cents,
+                                "recurring": {"interval": interval},
+                                "product_data": {"name": f"Zoiko Local {plan_name}"},
+                            },
+                        }
+                    ],
+                    proration_behavior="always_invoice",
+                )
+        except stripe.error.StripeError as e:
+            raise PaymentError(f"Stripe change subscription price failed: {e}") from e
+        return {"id": updated.id, "status": updated.status}
+
+    return with_failover(_breaker, _primary, None, PaymentError, _is_provider_failure)
+
+
 def refund_payment(payment_intent_id: str) -> dict:
     """Issues a full refund against a completed Checkout Session's
     PaymentIntent. Confirmed the restricted "One-time payments" key scope

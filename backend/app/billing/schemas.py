@@ -130,6 +130,20 @@ class PlanChangePreviewResponse(BaseModel):
     entitlement_diff: dict
     resource_impact: dict | None
     ai_receptionist_included_minutes: dict
+    # "proration": an existing paying customer - POST /subscription/plan/
+    # apply-proration applies this immediately, crediting unused time on
+    # the current price. "checkout": no existing subscription yet - POST
+    # /subscription/plan/checkout-session is still required to collect a
+    # payment method. "none": free/placeholder target, or a downgrade.
+    payment_method: str
+    # Real dollar commercial impact (Commercial Billing Operating Standard
+    # doc §B4) for the "proration" case - what Stripe would actually
+    # invoice today, crediting unused time on the current price. None for
+    # "checkout" (no existing subscription to compute a credit against) or
+    # "none" (nothing charges), or if Stripe's preview call itself
+    # transiently failed - never blocks showing the rest of the preview.
+    prorated_amount_due_cents: int | None
+    prorated_currency: str | None
     preview_token: str
     expires_in_minutes: int
 

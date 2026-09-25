@@ -8,6 +8,7 @@ import {
   getSubscription,
   previewPlanChange,
   confirmPlanChange,
+  applyPlanChangeWithProration,
   cancelScheduledPlanChange,
   createPlanChangeCheckoutSession,
   setAIReceptionistAddon,
@@ -194,20 +195,31 @@ export default function BillingPage() {
     setChangingPlan(preview.target_plan_code);
     setPlanError(null);
     try {
-      const entry = prices[preview.target_plan_code];
-      const requiresPayment =
-        preview.direction === "upgrade" && !!entry && !entry.is_placeholder && entry.amount_minor_units > 0;
-      if (requiresPayment) {
-        // Real money changes hands here - redirect to Stripe's hosted
-        // Checkout page instead of confirming the preview locally. The
-        // plan itself only changes once Stripe confirms payment via the
-        // /billing/stripe/checkout-webhook backend route, not on this
-        // click - so we navigate away and never reach loadPlanAndUsage.
+      // payment_method is authoritative from the backend (it already knows
+      // whether this account has a live Stripe subscription to prorate
+      // against) - no longer recomputed here from the raw price entry.
+      if (preview.payment_method === "checkout") {
+        // No existing subscription to modify in place (this account's
+        // first-ever paid plan) - real money changes hands here, so
+        // redirect to Stripe's hosted Checkout page instead of confirming
+        // locally. The plan itself only changes once Stripe confirms
+        // payment via the /billing/stripe/checkout-webhook backend route,
+        // not on this click - so we navigate away and never reach
+        // loadPlanAndUsage.
         const session = await createPlanChangeCheckoutSession(token, preview.target_plan_code, billingPeriod);
         window.location.href = session.url;
         return;
       }
-      await confirmPlanChange(token, preview.preview_token);
+      if (preview.payment_method === "proration") {
+        // An existing paying customer upgrading mid-cycle - applies
+        // immediately, no redirect: Stripe modifies their live
+        // subscription in place, crediting whatever time is unused on
+        // their current price and charging only the real difference to
+        // the payment method already on file.
+        await applyPlanChangeWithProration(token, preview.preview_token);
+      } else {
+        await confirmPlanChange(token, preview.preview_token);
+      }
       await loadPlanAndUsage();
       setPlanChangedTo(preview.direction === "upgrade" ? preview.target_plan_code : null);
       setPreview(null);

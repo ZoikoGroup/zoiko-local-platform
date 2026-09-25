@@ -13,6 +13,8 @@ from app.analytics.routes import router as analytics_router
 from app.apikeys.routes import router as apikeys_router
 from app.audit.routes import router as audit_router
 from app.billing.routes import router as billing_router
+from app.careers.routes import public_router as careers_public_router
+from app.careers.routes import staff_router as careers_staff_router
 from app.compliance.routes import router as compliance_router
 from app.compliance.routes import kyc_router as compliance_kyc_router
 from app.compliance.routes import staff_router as compliance_staff_router
@@ -173,6 +175,12 @@ app.include_router(identity_router)
 app.include_router(team_router)
 app.include_router(audit_router)
 app.include_router(billing_router)
+# Genuinely public (no auth, no _TRIAL_GATE) - the separate marketing
+# careers site (github.com/ZoikoGroup/zoiko-local-react) calls this
+# directly with no Zoiko account involved, same posture as video_
+# public_router below.
+app.include_router(careers_public_router)
+app.include_router(careers_staff_router)
 app.include_router(compliance_router, dependencies=_TRIAL_GATE)
 app.include_router(compliance_kyc_router)
 app.include_router(compliance_staff_router)

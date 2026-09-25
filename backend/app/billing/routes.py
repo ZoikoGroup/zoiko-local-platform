@@ -286,6 +286,33 @@ def create_plan_change_checkout_session(
         raise HTTPException(status_code=502, detail=str(e)) from e
 
 
+@router.post("/subscription/plan/apply-proration", response_model=SubscriptionResponse)
+def apply_plan_change_with_proration(
+    payload: ConfirmPlanChangeRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin),
+):
+    """Sibling to POST /subscription/plan/confirm for the case preview_plan_
+    change flags as "payment_method": "proration" - an existing paying
+    customer upgrading mid-cycle. Applies immediately: no redirect, no
+    Checkout page, since Stripe just charges the payment method already on
+    file for the real prorated difference. See service.apply_plan_change_
+    with_proration's docstring for why this talks to Stripe directly
+    instead of ZoikoNex."""
+    try:
+        return service.apply_plan_change_with_proration(
+            db, current_user.account_id, payload.preview_token, actor=current_user.id
+        )
+    except service.PlanNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
+    except service.PriceUnavailableForCheckoutError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e
+    except service.ProrationRequiresExistingSubscriptionError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e
+    except stripe_checkout.PaymentError as e:
+        raise HTTPException(status_code=502, detail=str(e)) from e
+
+
 @router.post("/stripe/checkout-webhook", status_code=status.HTTP_204_NO_CONTENT)
 async def stripe_checkout_webhook(request: Request, db: Session = Depends(get_db)):
     """Real inbound Stripe -> Zoiko Local payment-completion webhook for
