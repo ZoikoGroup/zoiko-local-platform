@@ -33,6 +33,12 @@ export default function MessagingPage() {
   const [messages, setMessages] = useState<MessagingMessage[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  // Bug fix: sending only ever showed a red error banner on failure - there
+  // was no positive confirmation at all on success, so a customer had no
+  // way to tell a send actually went through short of finding their own
+  // outbound message in the conversation thread. Auto-clears itself so it
+  // doesn't linger stale after later actions.
+  const [sentConfirmation, setSentConfirmation] = useState<string | null>(null);
 
   const [newChannel, setNewChannel] = useState<MessagingChannel>("whatsapp");
   const [newNumberId, setNewNumberId] = useState("");
@@ -81,13 +87,20 @@ export default function MessagingPage() {
     if (selectedId) loadMessages(selectedId);
   }, [selectedId, loadMessages]);
 
+  function confirmSent(to: string) {
+    setSentConfirmation(`Message sent to ${to}`);
+    setTimeout(() => setSentConfirmation((prev) => (prev === `Message sent to ${to}` ? null : prev)), 4000);
+  }
+
   async function handleSend(e: React.FormEvent) {
     e.preventDefault();
     if (!token || !newNumberId || !newTo.trim() || !newBody.trim()) return;
     setSending(true);
     setError(null);
+    setSentConfirmation(null);
     try {
       await sendOnChannel(token, newChannel, { phone_number_id: newNumberId, to: newTo.trim(), body: newBody.trim() });
+      confirmSent(newTo.trim());
       setNewBody("");
       await loadConversations();
     } catch (err) {
@@ -103,12 +116,14 @@ export default function MessagingPage() {
     if (!token || !conversation || !newBody.trim()) return;
     setSending(true);
     setError(null);
+    setSentConfirmation(null);
     try {
       await sendOnChannel(token, conversation.channel, {
         phone_number_id: conversation.phone_number_id,
         to: conversation.customer_number,
         body: newBody.trim(),
       });
+      confirmSent(conversation.customer_number);
       setNewBody("");
       await Promise.all([loadConversations(), loadMessages(conversation.id)]);
     } catch (err) {
@@ -130,6 +145,9 @@ export default function MessagingPage() {
       </div>
 
       {error && <p className="text-sm text-red-600 bg-red-50 rounded-lg px-3 py-2">{error}</p>}
+      {sentConfirmation && (
+        <p className="text-sm text-emerald-700 bg-emerald-50 rounded-lg px-3 py-2">{sentConfirmation}</p>
+      )}
       {loading && <p className="text-sm text-slate-500">Loading...</p>}
 
       {!loading && !anyChannelEnabled && (
