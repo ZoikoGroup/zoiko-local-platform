@@ -2,7 +2,14 @@
 
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import { useParams } from "next/navigation";
-import { Room, RoomEvent, Track } from "livekit-client";
+import {
+  Room,
+  RoomEvent,
+  Track,
+  type RemoteTrack,
+  type RemoteTrackPublication,
+  type RemoteParticipant,
+} from "livekit-client";
 import { guestJoinVideoRoom, checkGuestWaitingStatus, ApiError } from "@/lib/api";
 import MeetingRoom, { createParticipantTile, type ReactionEvent } from "@/components/MeetingRoom";
 import Logo from "@/components/Logo";
@@ -54,6 +61,9 @@ export default function GuestJoinPage() {
   const lobbyVideoRef = useRef<HTMLVideoElement>(null);
   const localVideoRef = useRef<HTMLVideoElement>(null);
   const remoteContainerRef = useRef<HTMLDivElement>(null);
+  const remoteScreenContainerRef = useRef<HTMLDivElement>(null);
+  const [remoteScreenShare, setRemoteScreenShare] = useState<{ identity: string; name: string } | null>(null);
+  const [connectionBanner, setConnectionBanner] = useState<string | null>(null);
   const attachedElements = useRef<Map<string, HTMLMediaElement>>(new Map());
   const participantTiles = useRef<Map<string, HTMLDivElement>>(new Map());
   const pendingJoinRef = useRef<{ camera: boolean; mic: boolean } | null>(null);
@@ -152,20 +162,77 @@ export default function GuestJoinPage() {
 
   async function connectToRoom(liveKitToken: string, url: string) {
     const { camera: useCamera, mic: useMic } = pendingJoinRef.current ?? { camera: false, mic: false };
+    setConnectionBanner(null);
 
-    const room = new Room();
+    // Performance fix: see the matching comment in dashboard/video/page.tsx
+    // - without these, every participant downloads every other
+    // participant's video at full resolution regardless of visibility, and
+    // the server forwards every simulcast layer to everyone. That breaks
+    // down at the 30-50 participant scale this app advertises. adaptiveStream
+    // scales each subscribed track's resolution to how it's actually
+    // rendered; dynacast stops the server encoding layers nobody needs.
+    const room = new Room({ adaptiveStream: true, dynacast: true });
     roomRef.current = room;
 
-    room.on(RoomEvent.TrackSubscribed, (track, _publication, participant) => {
+    // Bug ZL-14 fix: see the matching function in dashboard/video/page.tsx
+    // for the full explanation - a remote screen-share track was being
+    // appended into that participant's small per-person camera tile instead
+    // of a dedicated spotlight. A guest needs to see the host's shared
+    // screen too, so this page needs the identical fix.
+    //
+    // Bug ZL-12 resilience fix: also shared with dashboard/video/page.tsx -
+    // this is now the one place a subscribed track gets attached, used both
+    // by TrackSubscribed below and by resyncRemoteTracks (called after a
+    // RoomEvent.Reconnected), so a dropped/flaky connection that silently
+    // drops track subscriptions without dropping the Room connection itself
+    // gets a chance to recover instead of leaving the guest permanently
+    // unable to see/hear the host with no explanation.
+    function attachRemoteTrack(track: RemoteTrack, publication: RemoteTrackPublication, participant: RemoteParticipant) {
+      const key = publication.trackSid;
+      if (attachedElements.current.has(key)) return;
+      if (publication.source === Track.Source.ScreenShare) {
+        const container = remoteScreenContainerRef.current;
+        if (container) {
+          const el = track.attach();
+          attachedElements.current.set(key, el);
+          container.appendChild(el);
+        }
+        setRemoteScreenShare({ identity: participant.identity, name: participant.name || participant.identity });
+        return;
+      }
       if (track.kind === Track.Kind.Video || track.kind === Track.Kind.Audio) {
         const tile = getOrCreateTile(participant.identity, participant.name || participant.identity);
         const el = track.attach();
-        attachedElements.current.set(track.sid ?? el.id, el);
+        attachedElements.current.set(key, el);
         tile.appendChild(el);
       }
-    });
-    room.on(RoomEvent.TrackUnsubscribed, (track) => {
+    }
+
+    function resyncRemoteTracks() {
+      Array.from(room.remoteParticipants.values()).forEach((participant) => {
+        getOrCreateTile(participant.identity, participant.name || participant.identity);
+        participant.trackPublications.forEach((publication) => {
+          if (publication.isSubscribed && publication.track) {
+            attachRemoteTrack(publication.track, publication, participant);
+          }
+        });
+      });
+    }
+
+    room.on(RoomEvent.TrackSubscribed, attachRemoteTrack);
+    room.on(RoomEvent.TrackUnsubscribed, (track, publication, participant) => {
       track.detach().forEach((el) => el.remove());
+      attachedElements.current.delete(publication.trackSid);
+      if (publication.source === Track.Source.ScreenShare) {
+        setRemoteScreenShare((prev) => (prev?.identity === participant.identity ? null : prev));
+      }
+    });
+    room.on(RoomEvent.Reconnecting, () => {
+      setConnectionBanner("Connection interrupted - reconnecting...");
+    });
+    room.on(RoomEvent.Reconnected, () => {
+      resyncRemoteTracks();
+      setConnectionBanner(null);
     });
     room.on(RoomEvent.ParticipantConnected, (participant) => {
       getOrCreateTile(participant.identity, participant.name || participant.identity);
@@ -175,6 +242,7 @@ export default function GuestJoinPage() {
       setParticipants((prev) => prev.filter((p) => p.identity !== participant.identity));
       participantTiles.current.get(participant.identity)?.remove();
       participantTiles.current.delete(participant.identity);
+      setRemoteScreenShare((prev) => (prev?.identity === participant.identity ? null : prev));
     });
     room.on(RoomEvent.DataReceived, (payload, participant) => {
       let parsed: { type?: string; text?: string; emoji?: string };
@@ -196,6 +264,7 @@ export default function GuestJoinPage() {
       }
     });
     room.on(RoomEvent.Disconnected, () => {
+      setConnectionBanner(null);
       setCallState("ended");
       roomRef.current = null;
       clearRemoteTiles();
@@ -471,6 +540,9 @@ export default function GuestJoinPage() {
             leaveLabel="Leave call"
             topLeft={<span className="truncate">{displayName}</span>}
             recordingBadge={recording}
+            remoteScreenShareName={remoteScreenShare?.name}
+            remoteScreenContainerRef={remoteScreenContainerRef}
+            connectionBanner={connectionBanner}
           />
         )}
       </div>

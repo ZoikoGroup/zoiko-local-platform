@@ -34,6 +34,7 @@ import {
   type CrmProvider,
 } from "@/lib/api";
 import { getToken } from "@/lib/auth";
+import PasswordInput from "@/components/PasswordInput";
 
 function Dot({ status }: { status: "operational" | "degraded" }) {
   return (
@@ -376,8 +377,7 @@ function BusinessPageContent() {
               onChange={(e) => setNewEmail(e.target.value)}
               className="text-sm rounded-lg border border-slate-200 px-3 py-1.5 min-w-[200px]"
             />
-            <input
-              type="password"
+            <PasswordInput
               required
               placeholder="Temporary password"
               value={newPassword}

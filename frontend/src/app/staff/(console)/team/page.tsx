@@ -13,6 +13,7 @@ import {
   type StaffRole,
 } from "@/lib/api";
 import { clearStaffToken, useStaffToken } from "@/lib/staffAuth";
+import PasswordInput from "@/components/PasswordInput";
 
 const ROLE_LABELS: Record<StaffRole, string> = {
   support: "Support",
@@ -139,12 +140,12 @@ export default function StaffTeamPage() {
           placeholder="name@zoikogroup.com"
           className="flex-1 min-w-[14rem] text-sm rounded-lg bg-slate-800 border border-slate-700 text-white px-2.5 py-1.5 placeholder:text-slate-500"
         />
-        <input
-          type="password"
+        <PasswordInput
           value={password}
           onChange={(e) => setPassword(e.target.value)}
           placeholder="password (min 8 characters)"
-          className="flex-1 min-w-[14rem] text-sm rounded-lg bg-slate-800 border border-slate-700 text-white px-2.5 py-1.5 placeholder:text-slate-500"
+          containerClassName="flex-1 min-w-[14rem]"
+          className="w-full text-sm rounded-lg bg-slate-800 border border-slate-700 text-white px-2.5 py-1.5 placeholder:text-slate-500"
         />
         <select
           value={role}

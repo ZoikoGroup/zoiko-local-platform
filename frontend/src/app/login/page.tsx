@@ -7,6 +7,7 @@ import { login, googleAuth, completeMfaLogin, ApiError } from "@/lib/api";
 import { saveToken } from "@/lib/auth";
 import AuthLayout from "@/components/AuthLayout";
 import GoogleSignInButton from "@/components/GoogleSignInButton";
+import PasswordInput from "@/components/PasswordInput";
 
 export default function LoginPage() {
   const router = useRouter();
@@ -142,8 +143,7 @@ export default function LoginPage() {
               Forgot password?
             </Link>
           </div>
-          <input
-            type="password"
+          <PasswordInput
             required
             value={password}
             onChange={(e) => setPassword(e.target.value)}

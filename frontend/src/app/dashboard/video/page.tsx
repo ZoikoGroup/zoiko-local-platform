@@ -1,7 +1,15 @@
 "use client";
 
 import { useEffect, useRef, useState, useCallback, type FormEvent } from "react";
-import { Room, RoomEvent, Track, ConnectionQuality } from "livekit-client";
+import {
+  Room,
+  RoomEvent,
+  Track,
+  ConnectionQuality,
+  type RemoteTrack,
+  type RemoteTrackPublication,
+  type RemoteParticipant,
+} from "livekit-client";
 import {
   getCurrentUser,
   listVideoRooms,
@@ -94,6 +102,9 @@ export default function VideoPage() {
   const localScreenVideoRef = useRef<HTMLVideoElement>(null);
   const lobbyVideoRef = useRef<HTMLVideoElement>(null);
   const remoteContainerRef = useRef<HTMLDivElement>(null);
+  const remoteScreenContainerRef = useRef<HTMLDivElement>(null);
+  const [remoteScreenShare, setRemoteScreenShare] = useState<{ identity: string; name: string } | null>(null);
+  const [connectionBanner, setConnectionBanner] = useState<string | null>(null);
   const attachedElements = useRef<Map<string, HTMLMediaElement>>(new Map());
   const participantTiles = useRef<Map<string, HTMLDivElement>>(new Map());
   // Mirrors of state read inside long-lived room.on(...) handlers/cleanups
@@ -348,6 +359,7 @@ export default function VideoPage() {
     setCallState("connecting");
     setRecordingState("idle");
     setRecordingError(null);
+    setConnectionBanner(null);
     const useCamera = lobbyCameraOn;
     const useMic = lobbyMicOn;
     const displayName = lobbyDisplayName.trim();
@@ -368,19 +380,84 @@ export default function VideoPage() {
       }
       const { token: liveKitToken, url } = await joinVideoRoom(token, targetRoomName, displayName || me.email);
 
-      const room = new Room();
+      // Performance fix: with defaults (neither option set), every
+      // participant downloads every other participant's video at full
+      // resolution regardless of whether it's actually visible on screen,
+      // and the server encodes/forwards every simulcast layer to everyone
+      // whether they need it or not. That's fine for a handful of people,
+      // but at the 30-50 participant scale this page already advertises
+      // ("up to 50 participants" below), it saturates bandwidth/CPU on
+      // ordinary connections and is the likely cause of calls breaking
+      // under real load. adaptiveStream makes each client only request the
+      // resolution/frame rate a track's tile is actually rendered at (and
+      // pauses tracks scrolled out of view); dynacast tells the LiveKit
+      // server to stop encoding simulcast layers nobody has subscribed to.
+      // Both are LiveKit's own documented recommendation for group calls
+      // past a handful of people - zero behavior change for 1:1 calls.
+      const room = new Room({ adaptiveStream: true, dynacast: true });
       roomRef.current = room;
 
-      room.on(RoomEvent.TrackSubscribed, (track, _publication, participant) => {
+      // Bug ZL-12 fix: this function is the single place a subscribed
+      // remote track gets attached to the DOM - used both by the normal
+      // TrackSubscribed event below AND by resyncRemoteTracks (called after
+      // a RoomEvent.Reconnected). A dropped/flaky connection can leave a
+      // participant's Room itself reconnected while one or more of their
+      // individual track subscriptions never came back - LiveKit's own
+      // auto-reconnect guarantees the signaling connection recovers, not
+      // that every previously-subscribed track's DOM element does. Without
+      // this, that failure mode is silent and permanent for the rest of the
+      // call: camera/screen-share never reappear and reactions/chat (also
+      // carried over the same subscriber connection) stop arriving, with no
+      // visible error - exactly what was reported (one participant seeing
+      // only themselves, screen share, and reactions all silently broken at
+      // once for them, while the other side was unaffected). Guards against
+      // double-attaching a track that's already showing via attachedElements.
+      function attachRemoteTrack(
+        track: RemoteTrack,
+        publication: RemoteTrackPublication,
+        participant: RemoteParticipant
+      ) {
+        const key = publication.trackSid;
+        if (attachedElements.current.has(key)) return;
+        if (publication.source === Track.Source.ScreenShare) {
+          const container = remoteScreenContainerRef.current;
+          if (container) {
+            const el = track.attach();
+            attachedElements.current.set(key, el);
+            container.appendChild(el);
+          }
+          setRemoteScreenShare({ identity: participant.identity, name: participant.name || participant.identity });
+          return;
+        }
         if (track.kind === Track.Kind.Video || track.kind === Track.Kind.Audio) {
           const tile = getOrCreateTile(participant.identity, participant.name || participant.identity);
           const el = track.attach();
-          attachedElements.current.set(track.sid ?? el.id, el);
+          attachedElements.current.set(key, el);
           tile.appendChild(el);
         }
-      });
-      room.on(RoomEvent.TrackUnsubscribed, (track) => {
+      }
+
+      function resyncRemoteTracks() {
+        Array.from(room.remoteParticipants.values()).forEach((participant) => {
+          getOrCreateTile(participant.identity, participant.name || participant.identity);
+          participant.trackPublications.forEach((publication) => {
+            if (publication.isSubscribed && publication.track) {
+              attachRemoteTrack(publication.track, publication, participant);
+            }
+          });
+        });
+      }
+
+      room.on(RoomEvent.TrackSubscribed, attachRemoteTrack);
+      room.on(RoomEvent.TrackUnsubscribed, (track, publication, participant) => {
         track.detach().forEach((el) => el.remove());
+        attachedElements.current.delete(publication.trackSid);
+        if (publication.source === Track.Source.ScreenShare) {
+          setRemoteScreenShare((prev) => (prev?.identity === participant.identity ? null : prev));
+        }
+      });
+      room.on(RoomEvent.Reconnecting, () => {
+        setConnectionBanner("Connection interrupted - reconnecting...");
       });
       // Regression fix: turning the camera off then back on mid-call (or
       // switching camera device) publishes a brand-new LocalVideoTrack -
@@ -403,6 +480,7 @@ export default function VideoPage() {
         setParticipants((prev) => prev.filter((p) => p.identity !== participant.identity));
         participantTiles.current.get(participant.identity)?.remove();
         participantTiles.current.delete(participant.identity);
+        setRemoteScreenShare((prev) => (prev?.identity === participant.identity ? null : prev));
       });
       room.on(RoomEvent.ActiveSpeakersChanged, (speakers) => {
         const speakingIds = new Set(speakers.map((p) => p.identity));
@@ -442,9 +520,12 @@ export default function VideoPage() {
         });
       });
       room.on(RoomEvent.Reconnected, () => {
+        resyncRemoteTracks();
+        setConnectionBanner(null);
         reportCallQuality(token, targetRoomName as string, connectionQualityRef.current ?? "good", true).catch(() => {});
       });
       room.on(RoomEvent.Disconnected, () => {
+        setConnectionBanner(null);
         setCallState("idle");
         setRoomName(null);
         roomRef.current = null;
@@ -914,6 +995,9 @@ export default function VideoPage() {
           screenSharing={screenSharing}
           onToggleScreenShare={handleToggleScreenShare}
           localScreenVideoRef={localScreenVideoRef}
+          remoteScreenShareName={remoteScreenShare?.name}
+          remoteScreenContainerRef={remoteScreenContainerRef}
+          connectionBanner={connectionBanner}
           recordingState={recordingState}
           onStartRecording={!roomConfidential ? handleStartRecording : undefined}
           onStopRecording={handleStopRecording}

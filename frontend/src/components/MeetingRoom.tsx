@@ -190,6 +190,24 @@ export type MeetingRoomProps = {
   screenSharing?: boolean;
   onToggleScreenShare?: () => void;
   localScreenVideoRef?: RefObject<HTMLVideoElement | null>;
+
+  // Bug ZL-14 fix: a REMOTE participant's shared screen, distinct from
+  // screenSharing/localScreenVideoRef above (which is only ever the local
+  // user's own preview of their own share). Both host and guest pages need
+  // this, since either side may be the one watching. `track.attach()` is
+  // called by the page (it owns the Room instance), which appends the
+  // resulting <video> into this container imperatively - same pattern
+  // already used for remoteContainerRef.
+  remoteScreenShareName?: string | null;
+  remoteScreenContainerRef?: RefObject<HTMLDivElement | null>;
+
+  // Bug ZL-12 resilience fix: shown while LiveKit's client is mid-reconnect
+  // after a dropped connection - previously there was no feedback at all,
+  // so a participant whose connection blipped (network hiccup, wifi
+  // handoff) had no way to tell "something's wrong, hang on" apart from
+  // "the other person's video/reactions have just silently stopped
+  // forever," which is exactly what got reported as a bug.
+  connectionBanner?: string | null;
   recordingState?: "idle" | "busy" | "consent_required" | "active";
   onStartRecording?: () => void;
   onStopRecording?: () => void;
@@ -208,7 +226,8 @@ export default function MeetingRoom(props: MeetingRoomProps) {
     chatMessages, chatInput, onChatInputChange, onSendChat, onLeave, leaveLabel, topLeft, recordingBadge,
     confidentialBadge, screenSharing, onToggleScreenShare, localScreenVideoRef, recordingState,
     onStartRecording, onStopRecording, onGrantConsentAndRecord, recordingError, waitingGuests,
-    onAdmitGuest, onDenyGuest, admittingGuestId,
+    onAdmitGuest, onDenyGuest, admittingGuestId, remoteScreenShareName, remoteScreenContainerRef,
+    connectionBanner,
   } = props;
 
   const [reactionPickerOpen, setReactionPickerOpen] = useState(false);
@@ -253,6 +272,12 @@ export default function MeetingRoom(props: MeetingRoomProps) {
         </div>
       </div>
 
+      {connectionBanner && (
+        <div className="mx-4 sm:mx-6 mb-2 text-xs bg-amber-950 text-amber-400 rounded-lg px-3 py-2 flex items-center gap-2 shrink-0">
+          <span className="w-3 h-3 border-2 border-amber-700 border-t-amber-400 rounded-full animate-spin shrink-0" />
+          {connectionBanner}
+        </div>
+      )}
       {recordingState === "consent_required" && (
         <div className="mx-4 sm:mx-6 mb-2 text-xs bg-amber-950 text-amber-400 rounded-lg px-3 py-2 flex items-center justify-between gap-3 shrink-0">
           <span>Recording this call needs your consent first.</span>
@@ -301,6 +326,26 @@ export default function MeetingRoom(props: MeetingRoomProps) {
             <div className="relative shrink-0 max-h-[45%] aspect-video bg-black rounded-xl overflow-hidden mx-auto w-full">
               <video ref={localScreenVideoRef} autoPlay muted playsInline className="w-full h-full object-contain" />
               <span className="absolute bottom-2 left-2 text-xs text-white/80 bg-black/40 rounded px-2 py-0.5">Your screen</span>
+            </div>
+          )}
+
+          {/* Bug ZL-14 fix: previously a remote participant's screen-share
+              track was just appended as another <video> into that same
+              person's small per-participant grid tile (see
+              createParticipantTile below) - stacked directly on top of
+              their camera video, cropped by object-cover, and liable to end
+              up hidden behind the camera element again the moment that
+              track re-subscribed (e.g. a quality/simulcast switch). A
+              shared screen now gets this dedicated, larger spotlight
+              instead, same treatment the local user's own share already
+              had - the page attaches the subscribed track's <video> into
+              remoteScreenContainerRef imperatively. */}
+          {remoteScreenShareName && (
+            <div className="relative shrink-0 max-h-[45%] aspect-video bg-black rounded-xl overflow-hidden mx-auto w-full">
+              <div ref={remoteScreenContainerRef} className="w-full h-full [&>video]:w-full [&>video]:h-full [&>video]:object-contain" />
+              <span className="absolute bottom-2 left-2 text-xs text-white/80 bg-black/40 rounded px-2 py-0.5">
+                {remoteScreenShareName}&apos;s screen
+              </span>
             </div>
           )}
 

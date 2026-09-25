@@ -6,6 +6,7 @@ import Link from "next/link";
 import { resetPassword, completeMfaLogin, ApiError } from "@/lib/api";
 import { saveToken } from "@/lib/auth";
 import AuthLayout from "@/components/AuthLayout";
+import PasswordInput from "@/components/PasswordInput";
 
 function ResetPasswordForm() {
   const router = useRouter();
@@ -109,8 +110,7 @@ function ResetPasswordForm() {
       <form onSubmit={handleSubmit} className="space-y-4">
         <div>
           <label className="block text-sm font-medium text-slate-700 mb-1.5">New password</label>
-          <input
-            type="password"
+          <PasswordInput
             required
             autoFocus
             minLength={8}
@@ -122,8 +122,7 @@ function ResetPasswordForm() {
         </div>
         <div>
           <label className="block text-sm font-medium text-slate-700 mb-1.5">Confirm new password</label>
-          <input
-            type="password"
+          <PasswordInput
             required
             minLength={8}
             value={confirmPassword}

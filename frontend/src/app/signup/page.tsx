@@ -7,6 +7,7 @@ import { signup, login, googleAuth, ApiError } from "@/lib/api";
 import { saveToken } from "@/lib/auth";
 import AuthLayout from "@/components/AuthLayout";
 import GoogleSignInButton from "@/components/GoogleSignInButton";
+import PasswordInput from "@/components/PasswordInput";
 
 export default function SignupPage() {
   const router = useRouter();
@@ -122,8 +123,7 @@ export default function SignupPage() {
 
         <div>
           <label className="block text-sm font-medium text-slate-700 mb-1.5">Password</label>
-          <input
-            type="password"
+          <PasswordInput
             required
             minLength={8}
             value={password}
