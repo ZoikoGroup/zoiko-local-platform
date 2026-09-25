@@ -90,6 +90,13 @@ def set_retention_policy(
         policy.retention_days = retention_days
     db.commit()
     db.refresh(policy)
+    # Bug fix: this cache-invalidation helper already existed (used by every
+    # other write path in this module) but was never actually called here -
+    # the save genuinely persisted to the database, but list_retention_
+    # policies kept serving its stale 30-second cache regardless, so a page
+    # reload shortly after saving showed the OLD value again, looking
+    # exactly like the save silently failed.
+    _invalidate_retention_policies_cache(account_id)
     log_event(
         db, actor=actor, action="retention.policy_set",
         target=f"retention_policy:{policy.id}",

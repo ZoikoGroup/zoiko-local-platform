@@ -17,6 +17,18 @@ import { getToken } from "@/lib/auth";
 
 const CHANNEL_LABEL: Record<MessagingChannel, string> = { whatsapp: "WhatsApp", sms: "SMS" };
 
+// Bug fix: the "to" field is free text with only a placeholder hint
+// ("+1...") - nothing stopped a customer from typing a number without the
+// leading "+", which Twilio then rejects outright ("Invalid 'To' Phone
+// Number") instead of the app just fixing the one-character mistake
+// itself. Only prepends "+" when missing - never reshapes the digits
+// themselves, so a genuinely malformed number still surfaces Twilio's own
+// error rather than being silently "fixed" into something wrong.
+function normalizePhoneNumber(raw: string): string {
+  const trimmed = raw.trim();
+  return trimmed && !trimmed.startsWith("+") ? `+${trimmed}` : trimmed;
+}
+
 function sendOnChannel(
   token: string,
   channel: MessagingChannel,
@@ -99,8 +111,9 @@ export default function MessagingPage() {
     setError(null);
     setSentConfirmation(null);
     try {
-      await sendOnChannel(token, newChannel, { phone_number_id: newNumberId, to: newTo.trim(), body: newBody.trim() });
-      confirmSent(newTo.trim());
+      const to = normalizePhoneNumber(newTo);
+      await sendOnChannel(token, newChannel, { phone_number_id: newNumberId, to, body: newBody.trim() });
+      confirmSent(to);
       setNewBody("");
       await loadConversations();
     } catch (err) {
