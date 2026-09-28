@@ -7,6 +7,7 @@ import {
   listTeamMembers,
   addTeamMember,
   removeTeamMember,
+  getUsageSummary,
   getPublicStatus,
   listMyNumbers,
   listWebhookEndpoints,
@@ -24,6 +25,7 @@ import {
   getPipedriveAuthorizeUrl,
   ApiError,
   type TeamMember,
+  type UsageSummary,
   type PublicStatus,
   type MyPhoneNumber,
   type WebhookEndpoint,
@@ -65,6 +67,11 @@ function BusinessPageContent() {
   const [newRole, setNewRole] = useState<"admin" | "member" | "viewer">("member");
   const [addingMember, setAddingMember] = useState(false);
   const [removingId, setRemovingId] = useState<string | null>(null);
+  // Bug ZL-11: "seat usage details" was only ever shown on the Billing
+  // page's generic usage bars, with nothing tying it back to this Team
+  // section - pulling the same seats resource here so someone managing
+  // the team can see "3 of 5 used" right next to the add/remove controls.
+  const [seatLimit, setSeatLimit] = useState<number | null>(null);
 
   const loadMembers = useCallback(() => {
     if (!token) return;
@@ -80,6 +87,12 @@ function BusinessPageContent() {
   useEffect(() => {
     if (!token) return;
     getCurrentUser(token).then((me) => setIsAdmin(me.role === "owner" || me.role === "admin"));
+    getUsageSummary(token)
+      .then((summary: UsageSummary) => {
+        const seats = summary.resources.find((r) => r.resource === "seats");
+        if (seats) setSeatLimit(seats.limit);
+      })
+      .catch(() => {});
     loadMembers();
   }, [token, loadMembers]);
 
@@ -331,13 +344,20 @@ function BusinessPageContent() {
   return (
     <div className="space-y-6">
       <div>
-        <h2 className="text-xl font-semibold text-slate-900">Business</h2>
+        <h2 className="text-xl font-semibold text-slate-900">Team &amp; Business</h2>
         <p className="text-sm text-slate-500">Your team, platform status, and developer integrations.</p>
       </div>
 
       {/* Team */}
       <div className="bg-white rounded-xl border border-slate-200 p-5 space-y-4">
-        <h3 className="font-semibold text-slate-900">Team</h3>
+        <div className="flex items-center justify-between">
+          <h3 className="font-semibold text-slate-900">Team</h3>
+          {seatLimit !== null && (
+            <span className="text-xs font-medium text-slate-500 bg-slate-100 rounded-full px-2.5 py-1">
+              {members.length} of {seatLimit} seat{seatLimit === 1 ? "" : "s"} used
+            </span>
+          )}
+        </div>
 
         {membersError && <p className="text-sm text-red-600 bg-red-50 rounded-lg px-3 py-2">{membersError}</p>}
 

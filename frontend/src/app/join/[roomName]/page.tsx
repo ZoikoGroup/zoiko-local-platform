@@ -32,10 +32,10 @@ const CHAT_DECODER = new TextDecoder();
 const POLL_INTERVAL_MS = 2000;
 
 // Public, unauthenticated page - anyone with the link can land here, no
-// Zoiko account or login involved. Deliberately a much smaller feature set
-// than the dashboard's video page (no create/end room, no screen share) -
-// a guest can request to join, wait for the host to admit them, then
-// see/hear everyone and leave. Recording is host-only and consent-gated on
+// Zoiko account or login involved. Deliberately a smaller feature set than
+// the dashboard's video page (no create/end room) - a guest can request to
+// join, wait for the host to admit them, then see/hear everyone, share
+// their own screen, and leave. Recording is host-only and consent-gated on
 // the dashboard side; this page only ever displays whether one is active.
 export default function GuestJoinPage() {
   const params = useParams<{ roomName: string }>();
@@ -57,13 +57,27 @@ export default function GuestJoinPage() {
   const [unreadChatCount, setUnreadChatCount] = useState(0);
   const [reactions, setReactions] = useState<ReactionEvent[]>([]);
   const [participants, setParticipants] = useState<{ identity: string; name: string }[]>([]);
+  const [screenSharing, setScreenSharing] = useState(false);
 
   const roomRef = useRef<Room | null>(null);
   const lobbyVideoRef = useRef<HTMLVideoElement>(null);
   const localVideoRef = useRef<HTMLVideoElement>(null);
+  const localScreenVideoRef = useRef<HTMLVideoElement>(null);
   const remoteContainerRef = useRef<HTMLDivElement>(null);
   const remoteScreenContainerRef = useRef<HTMLDivElement>(null);
   const [remoteScreenShare, setRemoteScreenShare] = useState<{ identity: string; name: string } | null>(null);
+  // Bug fix: a remote screen-share's <video> element was being appended into
+  // remoteScreenContainerRef.current synchronously, in the same tick as
+  // setRemoteScreenShare(...) - but that container div only exists in the
+  // DOM once remoteScreenShare is truthy (see MeetingRoom.tsx's conditional
+  // render), so on the FIRST screen share of a call the ref was still null
+  // at append time. The element was silently discarded (never attached
+  // anywhere) while the container div rendered empty right after - exactly
+  // the reported "black screen" for whoever's watching. Holding the pending
+  // element here and appending it from an effect keyed on remoteScreenShare
+  // (which runs after the container has committed to the DOM) fixes it -
+  // same pattern already used for the local screen-share preview below.
+  const pendingRemoteScreenEl = useRef<HTMLMediaElement | null>(null);
   const [connectionBanner, setConnectionBanner] = useState<string | null>(null);
   const attachedElements = useRef<Map<string, HTMLMediaElement>>(new Map());
   const participantTiles = useRef<Map<string, HTMLDivElement>>(new Map());
@@ -101,6 +115,30 @@ export default function GuestJoinPage() {
     const cameraPublication = room.localParticipant.getTrackPublication(Track.Source.Camera);
     cameraPublication?.videoTrack?.attach(videoEl);
   }, [callState]);
+
+  // See pendingRemoteScreenEl's comment above - the container div only
+  // exists once remoteScreenShare is set, so appending has to happen here,
+  // after that render has committed, not inside the LiveKit event handler.
+  useEffect(() => {
+    if (!remoteScreenShare) return;
+    const container = remoteScreenContainerRef.current;
+    const el = pendingRemoteScreenEl.current;
+    if (container && el && !container.contains(el)) {
+      container.appendChild(el);
+    }
+    pendingRemoteScreenEl.current = null;
+  }, [remoteScreenShare]);
+
+  // Same timing fix as the local camera/remote-screen effects above - the
+  // screen-share preview element only renders once screenSharing is true.
+  useEffect(() => {
+    if (!screenSharing) return;
+    const room = roomRef.current;
+    const videoEl = localScreenVideoRef.current;
+    if (!room || !videoEl) return;
+    const screenPublication = room.localParticipant.getTrackPublication(Track.Source.ScreenShare);
+    screenPublication?.videoTrack?.attach(videoEl);
+  }, [screenSharing]);
 
   useEffect(() => {
     chatOpenRef.current = chatOpen;
@@ -192,11 +230,16 @@ export default function GuestJoinPage() {
       const key = publication.trackSid;
       if (attachedElements.current.has(key)) return;
       if (publication.source === Track.Source.ScreenShare) {
+        const el = track.attach();
+        attachedElements.current.set(key, el);
         const container = remoteScreenContainerRef.current;
         if (container) {
-          const el = track.attach();
-          attachedElements.current.set(key, el);
           container.appendChild(el);
+        } else {
+          // Container not mounted yet (first share of the call) - the
+          // effect below appends it once remoteScreenShare flips truthy
+          // and MeetingRoom renders the container div.
+          pendingRemoteScreenEl.current = el;
         }
         setRemoteScreenShare({ identity: participant.identity, name: participant.name || participant.identity });
         return;
@@ -393,6 +436,35 @@ export default function GuestJoinPage() {
     roomRef.current?.localParticipant.setCameraEnabled(next);
   }
 
+  // Participants can now share their screen too, same as the host - a
+  // LiveKit guest token already grants can_publish by default (see
+  // build_participant_token), so the only thing missing was this button and
+  // its wiring; nothing needed on the backend.
+  async function handleToggleScreenShareInCall() {
+    const room = roomRef.current;
+    if (!room) return;
+
+    if (screenSharing) {
+      await room.localParticipant.setScreenShareEnabled(false);
+      setScreenSharing(false);
+      return;
+    }
+
+    try {
+      const publication = await room.localParticipant.setScreenShareEnabled(true);
+      // Detects the browser's own native "Stop sharing" bar, same as the
+      // host page - without this, the button would keep showing "Stop
+      // sharing" after the share already ended that way.
+      publication?.videoTrack?.mediaStreamTrack.addEventListener("ended", () => {
+        room.localParticipant.setScreenShareEnabled(false);
+        setScreenSharing(false);
+      });
+      setScreenSharing(true);
+    } catch {
+      // user canceled the browser's screen-picker dialog - not an error worth surfacing
+    }
+  }
+
   return (
     <main className="min-h-screen bg-slate-950 flex items-center justify-center p-6">
       <div className="w-full max-w-2xl">
@@ -561,6 +633,9 @@ export default function GuestJoinPage() {
             remoteScreenShareName={remoteScreenShare?.name}
             remoteScreenContainerRef={remoteScreenContainerRef}
             connectionBanner={connectionBanner}
+            screenSharing={screenSharing}
+            onToggleScreenShare={handleToggleScreenShareInCall}
+            localScreenVideoRef={localScreenVideoRef}
           />
         )}
       </div>

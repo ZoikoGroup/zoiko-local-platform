@@ -104,6 +104,12 @@ export default function VideoPage() {
   const remoteContainerRef = useRef<HTMLDivElement>(null);
   const remoteScreenContainerRef = useRef<HTMLDivElement>(null);
   const [remoteScreenShare, setRemoteScreenShare] = useState<{ identity: string; name: string } | null>(null);
+  // Bug fix: see the matching comment in join/[roomName]/page.tsx -
+  // remoteScreenContainerRef.current is null on the first screen share of a
+  // call (its container div only renders once remoteScreenShare is truthy),
+  // so appending synchronously in attachRemoteTrack silently drops the
+  // element. Held here and flushed by an effect once the container mounts.
+  const pendingRemoteScreenEl = useRef<HTMLMediaElement | null>(null);
   const [connectionBanner, setConnectionBanner] = useState<string | null>(null);
   const attachedElements = useRef<Map<string, HTMLMediaElement>>(new Map());
   const participantTiles = useRef<Map<string, HTMLDivElement>>(new Map());
@@ -251,6 +257,20 @@ export default function VideoPage() {
     const screenPublication = room.localParticipant.getTrackPublication(Track.Source.ScreenShare);
     screenPublication?.videoTrack?.attach(videoEl);
   }, [screenSharing]);
+
+  // See pendingRemoteScreenEl's comment above - appends a remote screen
+  // share's element once its container div has actually mounted, instead of
+  // trying to (and silently failing to) do so inside the LiveKit event
+  // handler that fires before this render commits.
+  useEffect(() => {
+    if (!remoteScreenShare) return;
+    const container = remoteScreenContainerRef.current;
+    const el = pendingRemoteScreenEl.current;
+    if (container && el && !container.contains(el)) {
+      container.appendChild(el);
+    }
+    pendingRemoteScreenEl.current = null;
+  }, [remoteScreenShare]);
 
   async function refreshDeviceList() {
     try {
@@ -420,11 +440,13 @@ export default function VideoPage() {
         const key = publication.trackSid;
         if (attachedElements.current.has(key)) return;
         if (publication.source === Track.Source.ScreenShare) {
+          const el = track.attach();
+          attachedElements.current.set(key, el);
           const container = remoteScreenContainerRef.current;
           if (container) {
-            const el = track.attach();
-            attachedElements.current.set(key, el);
             container.appendChild(el);
+          } else {
+            pendingRemoteScreenEl.current = el;
           }
           setRemoteScreenShare({ identity: participant.identity, name: participant.name || participant.identity });
           return;
