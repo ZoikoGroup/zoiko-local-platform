@@ -265,11 +265,12 @@ def test_preview_plan_change_downgrade_shows_lost_entitlements_and_resource_impa
     assert preview["direction"] == "downgrade"
     assert "team.enabled" in preview["entitlement_diff"]["lost"]
     assert preview["resource_impact"]["team_seats_used"] == 2
-    # Starter's numeric max_team_seats (5) isn't actually exceeded by 2
-    # seats - the real loss here is the boolean team.enabled capability
-    # itself (Starter is single-user per the doc), a distinct signal from
-    # "over the numeric cap."
-    assert preview["resource_impact"]["team_seats_over_target_limit"] == 0
+    # Stale-assertion fix (found while investigating Bug ZL-11's retest):
+    # this test predates migration 7411ac7ac55c, which lowered starter's
+    # max_team_seats from 5 to 1 to match its (already correct) lack of
+    # team.enabled - so 2 seats used now genuinely IS 1 over starter's cap,
+    # on top of the boolean team.enabled capability loss asserted below.
+    assert preview["resource_impact"]["team_seats_over_target_limit"] == 1
     assert preview["resource_impact"]["team_capability_lost"] is True
     assert preview["effective_at"] is not None
 
@@ -805,7 +806,7 @@ def test_usage_summary_route_returns_zeroed_resources_for_a_fresh_account(client
     assert resources["numbers"]["used"] == 0
     assert resources["numbers"]["limit"] == 1  # free_trial's max_numbers
     assert resources["seats"]["used"] == 1  # the signed-up owner
-    assert resources["seats"]["limit"] == 5  # free_trial's max_team_seats
+    assert resources["seats"]["limit"] == 1  # free_trial's max_team_seats (Bug ZL-11 fix)
 
 
 def test_number_purchase_blocked_once_plan_number_quota_is_reached(client, monkeypatch):

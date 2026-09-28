@@ -19,7 +19,10 @@ export const NAV_ITEMS = [
   { label: "Analytics", href: "/dashboard/reports", requiredEntitlement: "reporting.advanced" },
   { label: "Billing", href: "/dashboard/billing" },
   { label: "Notifications", href: "/dashboard/notifications" },
-  { label: "Business", href: "/dashboard/business", requiredEntitlement: "team.enabled" },
+  // Bug ZL-11: this page is where team/seat management actually lives, but
+  // "Business" alone gave no hint of that - real testers reported seat
+  // management as "missing" when it was really just unlabeled.
+  { label: "Team & Business", href: "/dashboard/business", requiredEntitlement: "team.enabled" },
   { label: "Security", href: "/dashboard/security" },
   { label: "Compliance", href: "/dashboard/compliance" },
   { label: "Settings", href: "/dashboard/settings" },
