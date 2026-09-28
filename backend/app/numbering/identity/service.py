@@ -28,7 +28,7 @@ from app.notifications.service import (
 from app.numbering.identity.models import Account, AccountType, User, UserRole
 from app.risk.service import check_fingerprint_on_signup
 
-PASSWORD_RESET_TOKEN_EXPIRE_MINUTES = 30
+PASSWORD_RESET_TOKEN_EXPIRE_MINUTES = 3
 # Email Communications System doc §5.3's normative token lifetime for
 # ZLOC-EM-AUTH-001 "Verify Email Address": 24 hours, single use.
 EMAIL_VERIFICATION_TOKEN_EXPIRE_MINUTES = 60 * 24

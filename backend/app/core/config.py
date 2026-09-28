@@ -199,14 +199,15 @@ class Settings(BaseSettings):
     # mail sharing one sending reputation with security/billing mail risks
     # dragging down deliverability for password resets if marketing ever
     # gets flagged as spam). zoikolocal.com is the real domain to use, per
-    # the founder (2026-08-22) - but Resend's own domain-verification step
-    # (adding real DKIM/SPF/DMARC DNS records it generates and waiting for
-    # them to propagate) has NOT been done yet, so this stays False until
-    # that's confirmed. While False, every category below falls back to
-    # email_from_address (today's single working address) - flipping this
-    # true before DNS is actually verified would make every category email
-    # start bouncing, not just marketing's.
-    email_domain_verified: bool = False
+    # the founder (2026-08-22). Resend's own domain-verification step
+    # (DKIM/SPF/DMARC DNS records) is now CONFIRMED verified (Resend
+    # dashboard shows "Domain verified" for zoikolocal.com, completed
+    # 2026-09-25) - flipped True 2026-09-28. Before this, every category
+    # below fell back to email_from_address (Resend's shared sandbox
+    # onboarding@resend.dev), which only delivers to the Resend account
+    # owner's own inbox - this was the real cause of new customer accounts
+    # never receiving password-reset/signup emails.
+    email_domain_verified: bool = True
     email_from_address_security: str = "security@zoikolocal.com"
     email_from_address_billing: str = "billing@zoikolocal.com"
     email_from_address_marketing: str = "marketing@zoikolocal.com"

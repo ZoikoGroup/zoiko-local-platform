@@ -139,6 +139,13 @@ services:
         sync: false
       - key: EMAIL_FROM_ADDRESS
         value: onboarding@resend.dev
+      # zoikolocal.com confirmed verified in Resend 2026-09-25 - real
+      # per-category senders (security@/billing@/marketing@/notifications@
+      # zoikolocal.com) are now used instead of the onboarding@resend.dev
+      # sandbox address, which only delivered to the Resend account owner's
+      # own inbox (this was why new customer accounts never got emails).
+      - key: EMAIL_DOMAIN_VERIFIED
+        value: "true"
 
       # Web Push (integrations/notifications/webpush.py)
       - key: VAPID_PUBLIC_KEY

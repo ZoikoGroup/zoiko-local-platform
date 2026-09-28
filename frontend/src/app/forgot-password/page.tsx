@@ -32,7 +32,7 @@ export default function ForgotPasswordPage() {
     return (
       <AuthLayout
         title="Check your email"
-        subtitle={`If an account exists for ${email}, we've sent a link to reset your password. It expires in 30 minutes.`}
+        subtitle={`If an account exists for ${email}, we've sent a link to reset your password. It expires in 3 minutes.`}
       >
         <p className="text-sm text-slate-500 text-center">
           <Link href="/login" className="text-indigo-600 font-medium hover:text-indigo-700">

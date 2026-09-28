@@ -106,7 +106,7 @@ function ResetPasswordForm() {
   }
 
   return (
-    <AuthLayout title="Choose a new password" subtitle="This link can only be used once and expires in 30 minutes.">
+    <AuthLayout title="Choose a new password" subtitle="This link can only be used once and expires in 3 minutes.">
       <form onSubmit={handleSubmit} className="space-y-4">
         <div>
           <label className="block text-sm font-medium text-slate-700 mb-1.5">New password</label>
