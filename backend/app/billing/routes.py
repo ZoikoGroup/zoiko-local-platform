@@ -436,13 +436,24 @@ def set_ai_receptionist_addon(
     current_user: User = Depends(require_admin),
 ):
     """Owner/Admin only, same commercial-decision gating as change_plan
-    above. Bug ZL-8 fix: kept for staff/internal use and for DISABLING
-    (no payment needed to turn a paid feature off) - same "kept for
-    internal use, not a customer button" posture as change_plan above.
-    The customer-facing way to enable it now goes through POST
-    /subscription/ai-receptionist-addon/checkout-session below, which
-    requires real Stripe payment first."""
-    return service.set_ai_receptionist_addon(db, current_user.account_id, enabled=payload.enabled, actor=current_user.id)
+    above. DISABLING needs no payment, so it stays open to any account
+    admin here. Bug ZL-8 retest fix: ENABLING was never actually blocked
+    server-side for this route - the previous fix only changed what the
+    frontend button does, so any customer admin could still call this
+    endpoint directly (curl/devtools/Postman) with {"enabled": true} and
+    turn on the paid add-on with zero Stripe interaction, same gap as
+    before, just no longer reachable by clicking the UI. There is no
+    legitimate customer-facing caller of this route with enabled=True -
+    the real path is POST /subscription/ai-receptionist-addon/checkout-
+    session below, which requires real Stripe payment first and enables
+    it via the webhook (service.handle_ai_receptionist_addon_checkout_
+    completed), never through this route."""
+    if payload.enabled:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Enabling the AI Receptionist add-on requires payment - use the checkout-session endpoint instead.",
+        )
+    return service.set_ai_receptionist_addon(db, current_user.account_id, enabled=False, actor=current_user.id)
 
 
 @router.post("/subscription/ai-receptionist-addon/checkout-session", response_model=AIReceptionistAddonCheckoutSessionResponse)

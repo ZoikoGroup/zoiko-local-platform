@@ -116,6 +116,21 @@ export default function GuestJoinPage() {
     cameraPublication?.videoTrack?.attach(videoEl);
   }, [callState]);
 
+  // Bug ZL-12 fix: remoteContainerRef only exists once callState is
+  // "in-call" (MeetingRoom hasn't mounted before that), but a participant
+  // already in the room when we connect - the common case, since the host
+  // is usually already there - can have its camera track subscribed and
+  // attached to a tile before that render commits (see getOrCreateTile's
+  // comment). Re-running getOrCreateTile here, after the container is
+  // guaranteed real, re-parents any tile that was created too early.
+  useEffect(() => {
+    if (callState !== "in-call") return;
+    const room = roomRef.current;
+    if (!room) return;
+    room.remoteParticipants.forEach((p) => getOrCreateTile(p.identity, p.name || p.identity));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [callState]);
+
   // See pendingRemoteScreenEl's comment above - the container div only
   // exists once remoteScreenShare is set, so appending has to happen here,
   // after that render has committed, not inside the LiveKit event handler.
@@ -186,7 +201,24 @@ export default function GuestJoinPage() {
 
   function getOrCreateTile(identity: string, name: string): HTMLDivElement {
     const existing = participantTiles.current.get(identity);
-    if (existing) return existing;
+    if (existing) {
+      // Bug ZL-12 fix: if this tile was first created before
+      // remoteContainerRef existed yet (see the comment below on the
+      // "already in the room" block - the host's camera track can get
+      // subscribed and attached before callState flips to "in-call" and
+      // MeetingRoom actually mounts), remoteContainerRef.current was null
+      // at creation time and the tile - with the host's <video> already
+      // correctly appended inside it - was silently left detached from
+      // the DOM. Every later call short-circuited on this cache hit and
+      // never retried, so the participant never saw the host's video for
+      // the rest of the call. Re-parenting here (a no-op once it's already
+      // correctly placed) guarantees it lands as soon as the container is
+      // real, cheaply, on every call rather than just the first.
+      if (remoteContainerRef.current && !remoteContainerRef.current.contains(existing)) {
+        remoteContainerRef.current.appendChild(existing);
+      }
+      return existing;
+    }
     const tile = createParticipantTile(identity, name);
     remoteContainerRef.current?.appendChild(tile);
     participantTiles.current.set(identity, tile);

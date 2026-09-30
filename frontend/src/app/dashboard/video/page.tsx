@@ -122,7 +122,18 @@ export default function VideoPage() {
 
   function getOrCreateTile(identity: string, name: string): HTMLDivElement {
     const existing = participantTiles.current.get(identity);
-    if (existing) return existing;
+    if (existing) {
+      // Bug ZL-12 fix: see the matching comment in join/[roomName]/page.tsx -
+      // a tile created before remoteContainerRef existed (a participant
+      // already in the room when this side connects, e.g. rejoining a call
+      // a guest started) had its video correctly attached inside it but was
+      // left detached from the DOM, with every later call short-circuiting
+      // on this cache hit and never retrying. Re-parenting here fixes it.
+      if (remoteContainerRef.current && !remoteContainerRef.current.contains(existing)) {
+        remoteContainerRef.current.appendChild(existing);
+      }
+      return existing;
+    }
     const tile = createParticipantTile(identity, name);
     remoteContainerRef.current?.appendChild(tile);
     participantTiles.current.set(identity, tile);
@@ -218,6 +229,18 @@ export default function VideoPage() {
     if (!room || !videoEl) return;
     const cameraPublication = room.localParticipant.getTrackPublication(Track.Source.Camera);
     cameraPublication?.videoTrack?.attach(videoEl);
+  }, [callState]);
+
+  // Bug ZL-12 fix: see the matching effect in join/[roomName]/page.tsx -
+  // re-runs getOrCreateTile for anyone already in the room once
+  // remoteContainerRef is guaranteed to actually exist, re-parenting any
+  // tile whose video got attached before that container had mounted.
+  useEffect(() => {
+    if (callState !== "in-call") return;
+    const room = roomRef.current;
+    if (!room) return;
+    room.remoteParticipants.forEach((p) => getOrCreateTile(p.identity, p.name || p.identity));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [callState]);
 
   // Polls for guests waiting to be let in, while actually in a call - not

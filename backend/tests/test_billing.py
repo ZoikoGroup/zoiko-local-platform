@@ -579,11 +579,12 @@ def test_ai_receptionist_addon_grants_included_minutes_on_a_zero_allowance_plan(
 
     assert _included_minutes() == 0
 
-    response = client.put(
-        "/billing/subscription/ai-receptionist-addon", json={"enabled": True}, headers=headers,
-    )
-    assert response.status_code == 200, response.text
-    assert response.json()["ai_receptionist_addon_enabled"] is True
+    # Enabling only ever happens via the webhook-driven checkout path (Bug
+    # ZL-8) - the HTTP route now rejects enabled=True (see
+    # test_ai_receptionist_addon_route_rejects_direct_enable), so this test's
+    # actual concern (does enabling grant the included minutes) goes through
+    # the service function directly, same as the webhook handler would call it.
+    service.set_ai_receptionist_addon(db_session, account_id, enabled=True, actor="test-setup")
     assert _included_minutes() == 100
 
     disabled = client.put(
@@ -902,6 +903,34 @@ def test_team_member_add_blocked_once_seat_quota_is_reached(client, db_session):
 
 
 # --- Bug ZL-8: AI Receptionist add-on required real Stripe payment ---
+
+
+def test_ai_receptionist_addon_route_rejects_direct_enable(client, db_session):
+    """Bug ZL-8 retest (QA marked REVIEW FAILED): the earlier fix only
+    changed what the frontend button does - it never stopped a customer
+    admin from calling PUT /subscription/ai-receptionist-addon directly
+    (curl/devtools/Postman) with {"enabled": true}, which still granted
+    the paid add-on with zero Stripe interaction. The route must now
+    reject enabled=True outright; disabling must keep working with no
+    payment required."""
+    token = _signup_and_login(client, "aiaddondirect@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    response = client.put(
+        "/billing/subscription/ai-receptionist-addon", json={"enabled": True}, headers=headers,
+    )
+    assert response.status_code == 403, response.text
+
+    account_id = client.get("/auth/me", headers=headers).json()["account_id"]
+    assert service.get_or_create_subscription(db_session, account_id).ai_receptionist_addon_enabled is False
+
+    # Disabling (already off, but must not itself be rejected) still works
+    # with no payment involved - only enabling is blocked.
+    disable_response = client.put(
+        "/billing/subscription/ai-receptionist-addon", json={"enabled": False}, headers=headers,
+    )
+    assert disable_response.status_code == 200, disable_response.text
+    assert disable_response.json()["ai_receptionist_addon_enabled"] is False
 
 
 def test_ai_receptionist_addon_checkout_session_requires_real_payment_before_enabling(client, db_session, monkeypatch):
