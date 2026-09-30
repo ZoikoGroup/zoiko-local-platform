@@ -997,6 +997,47 @@ def test_ai_receptionist_addon_enables_only_after_webhook_confirms_payment(clien
     assert sub_again.ai_receptionist_addon_enabled is True
 
 
+def test_ai_receptionist_addon_activation_sends_a_confirmation_email(client, db_session, monkeypatch):
+    """Bug ZL-6 (retest, addon variant): tester-reported - a real
+    disable/re-enable round trip through the paid checkout flow sent no
+    confirmation email at all. set_ai_receptionist_addon never called any
+    notify_* function for either direction; this locks in the fix for the
+    enable side (a genuine off->on transition only, not a redundant
+    re-enable)."""
+    from app.notifications.models import NotificationDelivery
+
+    monkeypatch.setattr("app.core.config.settings.resend_api_key", "")
+    token = _signup_and_login(client, "aiaddonemail@example.com")
+    account_id = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"}).json()["account_id"]
+    service.change_plan(db_session, account_id, "starter", actor="test-actor")
+
+    service.set_ai_receptionist_addon(db_session, account_id, enabled=True, actor="stripe_checkout_webhook")
+
+    delivery = (
+        db_session.query(NotificationDelivery)
+        .filter(
+            NotificationDelivery.account_id == account_id,
+            NotificationDelivery.event_name == "billing.ai_receptionist_addon_activated",
+        )
+        .first()
+    )
+    assert delivery is not None
+    assert delivery.recipient_email == "aiaddonemail@example.com"
+
+    # Re-enabling without first disabling (already on) must not send a
+    # second, redundant confirmation.
+    service.set_ai_receptionist_addon(db_session, account_id, enabled=True, actor="stripe_checkout_webhook")
+    count = (
+        db_session.query(NotificationDelivery)
+        .filter(
+            NotificationDelivery.account_id == account_id,
+            NotificationDelivery.event_name == "billing.ai_receptionist_addon_activated",
+        )
+        .count()
+    )
+    assert count == 1
+
+
 def test_disabling_ai_receptionist_addon_cancels_the_real_stripe_subscription(client, db_session, monkeypatch):
     canceled = []
     monkeypatch.setattr(

@@ -50,6 +50,7 @@ from app.integrations.cache.redis import cache_get, cache_set
 from app.integrations.telecom import twilio as telecom
 from app.notifications.models import NotificationDelivery
 from app.notifications.service import (
+    notify_ai_receptionist_addon_activated,
     notify_credit_or_refund_processed,
     notify_invoice_available,
     notify_payment_failed,
@@ -3023,6 +3024,24 @@ def set_ai_receptionist_addon(db: Session, account_id: str, *, enabled: bool, ac
 
     db.commit()
     db.refresh(sub)
+
+    # Bug ZL-6 (retest, addon variant): this function never notified either
+    # direction before - only fire on a genuine off->on transition (not a
+    # redundant re-enable) so a customer gets exactly one confirmation per
+    # real activation, matching change_plan's notify_plan_changed pattern.
+    if enabled and not previous:
+        from app.numbering.identity.models import Account, User, UserRole
+
+        owner = db.query(User).filter(User.account_id == account_id, User.role == UserRole.OWNER).first()
+        if owner is not None:
+            account = db.query(Account).filter(Account.id == account_id).first()
+            rate = get_active_ai_receptionist_addon_rate(db)
+            notify_ai_receptionist_addon_activated(
+                db, account_id=account_id, account_email=owner.email,
+                organization_name=account.name if account else "your organization",
+                included_minutes=rate.included_minutes if rate else 0,
+            )
+
     log_event(
         db, actor_id=actor, action="billing.ai_receptionist_addon_changed",
         target_type="subscription", target_id=sub.id, account_id=account_id,

@@ -1588,6 +1588,23 @@ def notify_plan_changed(
     )
 
 
+def notify_ai_receptionist_addon_activated(
+    db: Session, *, account_id: str, account_email: str, organization_name: str, included_minutes: int,
+) -> None:
+    """Bug ZL-6 (retest, addon variant) - set_ai_receptionist_addon never
+    notified either direction; this is called only on a real enabled=True
+    transition (see that function), which today only happens from the
+    Stripe-webhook-confirmed checkout path (Bug ZL-8)."""
+    send_notification(
+        db, event_name="billing.ai_receptionist_addon_activated", account_id=account_id, recipient_email=account_email,
+        context={
+            "user_display_name": account_email,
+            "organization_name": organization_name,
+            "addon_included_minutes": included_minutes,
+        },
+    )
+
+
 def notify_payment_failed(
     db: Session, *, account_id: str, account_email: str, plan_name: str, idempotency_key: str | None = None
 ) -> None:
