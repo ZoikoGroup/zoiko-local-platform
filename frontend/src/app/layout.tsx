@@ -31,6 +31,9 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
+  // Resolves the relative canonical / Open Graph URLs in page metadata to
+  // absolute ones. Override per environment with NEXT_PUBLIC_SITE_URL.
+  metadataBase: new URL(process.env.NEXT_PUBLIC_SITE_URL ?? "https://zoikolocal.com"),
   title: "Zoiko Local",
   description: "AI-native cross-border communications platform.",
 };

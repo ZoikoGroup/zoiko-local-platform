@@ -9,6 +9,39 @@ import AuthLayout from "@/components/AuthLayout";
 import GoogleSignInButton from "@/components/GoogleSignInButton";
 import PasswordInput from "@/components/PasswordInput";
 
+const iconProps = { width: 20, height: 20, viewBox: "0 0 24 24", "aria-hidden": true } as const;
+
+const SOCIAL_PLACEHOLDERS = [
+  {
+    label: "Continue with Microsoft",
+    icon: (
+      <svg {...iconProps}>
+        <rect x="2" y="2" width="9.5" height="9.5" fill="#f25022" />
+        <rect x="12.5" y="2" width="9.5" height="9.5" fill="#7fba00" />
+        <rect x="2" y="12.5" width="9.5" height="9.5" fill="#00a4ef" />
+        <rect x="12.5" y="12.5" width="9.5" height="9.5" fill="#ffb900" />
+      </svg>
+    ),
+  },
+  {
+    label: "Continue with Apple",
+    icon: (
+      <svg {...iconProps} fill="currentColor">
+        <path d="M16.4 12.6c0-2.4 2-3.5 2.1-3.6-1.1-1.7-2.9-1.9-3.5-1.9-1.5-.2-2.9.9-3.7.9-.8 0-1.9-.9-3.200-.8-1.600 0-3.100 1-4 2.400-1.700 3-.4 7.400 1.200 9.800.8 1.200 1.800 2.500 3 2.400 1.200 0 1.700-.8 3.100-.8s1.900.8 3.200.8c1.300 0 2.100-1.200 2.900-2.300.9-1.300 1.300-2.600 1.300-2.700-.1 0-2.400-.9-2.400-3.600zM14 5.500c.7-.8 1.100-1.900 1-3-1 0-2.100.7-2.800 1.500-.6.700-1.100 1.800-1 2.900 1.100.1 2.100-.6 2.800-1.400z" />
+      </svg>
+    ),
+  },
+  {
+    label: "Continue with Company SSO",
+    icon: (
+      <svg {...iconProps} fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round">
+        <rect x="4" y="3" width="16" height="18" rx="1.500" />
+        <path d="M9 21v-4h6v4M8.500 7.500h.01M12 7.500h.01M15.500 7.500h.01M8.500 11.500h.01M12 11.500h.01M15.500 11.500h.01" />
+      </svg>
+    ),
+  },
+];
+
 export default function LoginPage() {
   const router = useRouter();
   const [email, setEmail] = useState("");
@@ -115,40 +148,65 @@ export default function LoginPage() {
   }
 
   return (
-    <AuthLayout title="Welcome back" subtitle="Log in to continue to your account.">
-      <GoogleSignInButton onCredential={handleGoogleCredential} />
+    <AuthLayout title="Welcome back!" subtitle="Sign in to your Zoiko Local account.">
+      <div className="space-y-2.5">
+        <GoogleSignInButton onCredential={handleGoogleCredential} />
+        {/* No backend for these providers yet (only Google is implemented) -
+            shown disabled rather than as buttons that do nothing. */}
+        {SOCIAL_PLACEHOLDERS.map((p) => (
+          <button
+            key={p.label}
+            type="button"
+            disabled
+            title="Coming soon"
+            className="w-full flex items-center gap-3 rounded-lg border border-slate-200 bg-white px-4 py-3 text-sm font-semibold text-slate-900 opacity-60 cursor-not-allowed"
+          >
+            {p.icon}
+            <span className="flex-1 text-left">{p.label}</span>
+            <span className="text-[11px] font-medium text-slate-500">Coming soon</span>
+          </button>
+        ))}
+      </div>
 
       <div className="flex items-center gap-3 my-5">
         <div className="h-px bg-slate-200 flex-1" />
-        <span className="text-xs text-slate-600">or continue with email</span>
+        <span className="text-xs text-slate-500">or sign in with email</span>
         <div className="h-px bg-slate-200 flex-1" />
       </div>
 
       <form onSubmit={handleSubmit} className="space-y-4">
         <div>
-          <label className="block text-sm font-medium text-slate-700 mb-1.5">Email</label>
+          <label htmlFor="login-email" className="block text-sm font-semibold text-slate-800 mb-1.5">
+            Email address
+          </label>
           <input
+            id="login-email"
             type="email"
             required
+            autoComplete="email"
             value={email}
             onChange={(e) => setEmail(e.target.value)}
-            className="w-full rounded-lg border border-slate-300 px-3.5 py-2.5 text-sm placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-indigo-500/40 focus:border-indigo-500 transition"
-            placeholder="you@example.com"
+            className="w-full rounded-lg border border-slate-200 px-3.5 py-3 text-sm placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-indigo-500/40 focus:border-indigo-500 transition"
+            placeholder="name@company.com"
           />
         </div>
         <div>
           <div className="flex items-center justify-between mb-1.5">
-            <label className="block text-sm font-medium text-slate-700">Password</label>
-            <Link href="/forgot-password" className="text-xs text-indigo-600 hover:text-indigo-700">
+            <label htmlFor="login-password" className="block text-sm font-semibold text-slate-800">
+              Password
+            </label>
+            <Link href="/forgot-password" className="text-xs font-semibold text-indigo-600 hover:text-indigo-700">
               Forgot password?
             </Link>
           </div>
           <PasswordInput
+            id="login-password"
             required
+            autoComplete="current-password"
             value={password}
             onChange={(e) => setPassword(e.target.value)}
-            className="w-full rounded-lg border border-slate-300 px-3.5 py-2.5 text-sm placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-indigo-500/40 focus:border-indigo-500 transition"
-            placeholder="••••••••"
+            className="w-full rounded-lg border border-slate-200 px-3.5 py-3 text-sm placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-indigo-500/40 focus:border-indigo-500 transition"
+            placeholder="Enter your password"
           />
         </div>
 
@@ -159,19 +217,19 @@ export default function LoginPage() {
         <button
           type="submit"
           disabled={loading}
-          className="w-full flex items-center justify-center gap-2 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-60 text-white rounded-lg py-2.5 text-sm font-medium transition shadow-sm shadow-indigo-600/20"
+          className="w-full flex items-center justify-center gap-2 bg-slate-800 hover:bg-slate-900 disabled:opacity-60 text-white rounded-lg py-3.5 text-base font-semibold transition shadow-md shadow-slate-800/25"
         >
           {loading && (
             <span className="w-4 h-4 border-2 border-white/40 border-t-white rounded-full animate-spin" />
           )}
-          {loading ? "Logging in..." : "Log in"}
+          {loading ? "Logging in..." : "Log In"}
         </button>
       </form>
 
-      <p className="text-sm text-slate-500 mt-6 text-center">
-        Don&apos;t have an account?{" "}
-        <Link href="/signup" className="text-indigo-600 font-medium hover:text-indigo-700">
-          Sign up
+      <p className="text-sm text-slate-500 mt-5 text-center">
+        New to Zoiko Local?{" "}
+        <Link href="/signup" className="text-indigo-600 font-semibold hover:text-indigo-700">
+          Register
         </Link>
       </p>
     </AuthLayout>

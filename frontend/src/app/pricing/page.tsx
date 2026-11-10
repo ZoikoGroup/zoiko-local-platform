@@ -241,7 +241,7 @@ export default function PricingPage() {
         )}
 
         {countries.length > 0 && (
-          <div className="rounded-xl bg-slate-900 text-white p-10 text-center mb-4">
+          <div id="coverage" className="rounded-xl bg-slate-900 text-white p-10 text-center mb-4 scroll-mt-6">
             <p className="text-xs font-semibold tracking-wide uppercase text-indigo-300 mb-3">Ready when you are</p>
             <h2 className="text-2xl font-semibold mb-6">Get your local number where business and life happen.</h2>
             <Link
