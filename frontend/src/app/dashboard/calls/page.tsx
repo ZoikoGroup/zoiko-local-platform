@@ -275,7 +275,7 @@ export default function CallsPage() {
               )}
             </div>
             <p className="text-xs text-slate-500">
-              <strong>Announce</strong> plays a one-way message and hangs up. <strong>Talk Live</strong> rings a real phone first, then connects it live to the "To" number. <strong>Call from Browser</strong> uses your computer&apos;s microphone directly — no phone needed at all, talk right here in the tab.
+              <strong>Announce</strong> plays a one-way message and hangs up. <strong>Talk Live</strong> rings a real phone first, then connects it live to the &quot;To&quot; number. <strong>Call from Browser</strong> uses your computer&apos;s microphone directly — no phone needed at all, talk right here in the tab.
             </p>
             <div>
               <label className="block text-xs font-medium text-slate-500 mb-1">

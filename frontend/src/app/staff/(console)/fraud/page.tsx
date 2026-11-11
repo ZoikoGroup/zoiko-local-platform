@@ -257,7 +257,7 @@ function FraudCasesSection({
                 </button>
                 <p className="text-xs text-slate-500 mt-1.5 max-w-md">
                   Reactivates every number the risk engine auto-suspended on this account - separate from
-                  resolving the case above, since "Clear" only lifts the account's risk tier, not the numbers
+                  resolving the case above, since &quot;Clear&quot; only lifts the account&apos;s risk tier, not the numbers
                   themselves.
                 </p>
               </div>

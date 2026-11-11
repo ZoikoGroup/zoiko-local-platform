@@ -261,9 +261,9 @@ export default function StaffKillSwitchesPage() {
           <div>
             <div className="font-medium text-sm text-slate-100">Fix stuck calls</div>
             <p className="text-xs text-slate-500 mt-1 max-w-xl">
-              A call can occasionally get stuck "in progress" forever if the browser tab closes or the connection
+              A call can occasionally get stuck &quot;in progress&quot; forever if the browser tab closes or the connection
               drops mid-call - this silently blocks that account from placing new calls. Checks every stuck call
-              against Twilio's real status and fixes any that have actually ended.
+              against Twilio&apos;s real status and fixes any that have actually ended.
             </p>
           </div>
           <button
