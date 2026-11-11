@@ -8,6 +8,20 @@
    (deliberately light-only - see the color-scheme comment further down). */
 @custom-variant dark (&:where(.dark, .dark *));
 
+/* `short:` = laptop-height viewports (<= 800px tall). Used by the auth pages
+   to stay on one screen with no vertical scrolling. */
+@custom-variant short {
+  @media (max-height: 800px) {
+    @slot;
+  }
+  @media (max-width: 1023px) {
+    @slot;
+  }
+}
+@custom-variant tiny (@media (max-height: 760px));
+/* `xshort:` = very short windows (<= 700px): hero previews are dropped. */
+@custom-variant xshort (@media (max-height: 700px));
+
 /* ==========================================================================
    ZOIKO LOCAL — GREEN + BEIGE DASHBOARD THEME
    --------------------------------------------------------------------------

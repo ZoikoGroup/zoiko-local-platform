@@ -11,41 +11,66 @@ import PasswordInput from "@/components/PasswordInput";
 
 const iconProps = { width: 20, height: 20, viewBox: "0 0 24 24", "aria-hidden": true } as const;
 
-const SOCIAL_PLACEHOLDERS = [
-  {
-    label: "Continue with Microsoft",
-    icon: (
-      <svg {...iconProps}>
-        <rect x="2" y="2" width="9.5" height="9.5" fill="#f25022" />
-        <rect x="12.5" y="2" width="9.5" height="9.5" fill="#7fba00" />
-        <rect x="2" y="12.5" width="9.5" height="9.5" fill="#00a4ef" />
-        <rect x="12.5" y="12.5" width="9.5" height="9.5" fill="#ffb900" />
-      </svg>
-    ),
-  },
-  {
-    label: "Continue with Apple",
-    icon: (
-      <svg {...iconProps} fill="currentColor">
-        <path d="M16.4 12.6c0-2.4 2-3.5 2.1-3.6-1.1-1.7-2.9-1.9-3.5-1.9-1.5-.2-2.9.9-3.7.9-.8 0-1.9-.9-3.200-.8-1.600 0-3.100 1-4 2.400-1.700 3-.4 7.400 1.200 9.800.8 1.200 1.800 2.500 3 2.400 1.200 0 1.700-.8 3.100-.8s1.900.8 3.200.8c1.300 0 2.100-1.200 2.900-2.300.9-1.300 1.300-2.600 1.300-2.700-.1 0-2.400-.9-2.400-3.600zM14 5.500c.7-.8 1.100-1.900 1-3-1 0-2.100.7-2.800 1.500-.6.700-1.100 1.800-1 2.900 1.100.1 2.100-.6 2.800-1.400z" />
-      </svg>
-    ),
-  },
-  {
-    label: "Continue with Company SSO",
-    icon: (
-      <svg {...iconProps} fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round">
-        <rect x="4" y="3" width="16" height="18" rx="1.500" />
-        <path d="M9 21v-4h6v4M8.500 7.500h.01M12 7.500h.01M15.500 7.500h.01M8.500 11.500h.01M12 11.500h.01M15.500 11.500h.01" />
-      </svg>
-    ),
-  },
-];
+const MICROSOFT = {
+  label: "Continue with Microsoft",
+  icon: (
+    <svg {...iconProps}>
+      <rect x="2" y="2" width="9.5" height="9.5" fill="#f25022" />
+      <rect x="12.5" y="2" width="9.5" height="9.5" fill="#7fba00" />
+      <rect x="2" y="12.5" width="9.5" height="9.5" fill="#00a4ef" />
+      <rect x="12.5" y="12.5" width="9.5" height="9.5" fill="#ffb900" />
+    </svg>
+  ),
+};
+const APPLE = {
+  label: "Continue with Apple",
+  icon: (
+    <svg {...iconProps} fill="currentColor">
+      <path d="M16.4 12.6c0-2.4 2-3.5 2.1-3.6-1.1-1.7-2.9-1.9-3.5-1.9-1.5-.2-2.9.9-3.7.9-.8 0-1.9-.9-3.2-.8-1.6 0-3.1 1-4 2.4-1.7 3-.4 7.4 1.2 9.8.8 1.2 1.8 2.5 3 2.4 1.2 0 1.7-.8 3.1-.8s1.9.8 3.2.8c1.3 0 2.1-1.2 2.9-2.3.9-1.3 1.3-2.6 1.3-2.7-.1 0-2.4-.9-2.4-3.6zM14 5.5c.7-.8 1.1-1.9 1-3-1 0-2.1.7-2.8 1.5-.6.7-1.1 1.8-1 2.9 1.1.1 2.1-.6 2.8-1.4z" />
+    </svg>
+  ),
+};
+const SSO = {
+  label: "Continue with Company SSO",
+  icon: (
+    <svg {...iconProps} fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round">
+      <rect x="4" y="3" width="16" height="18" rx="1.5" />
+      <path d="M9 21v-4h6v4M8.5 7.5h.01M12 7.5h.01M15.5 7.5h.01M8.5 11.5h.01M12 11.5h.01M15.5 11.5h.01" />
+    </svg>
+  ),
+};
+
+// Same sizing for every field/button so the stack stays even, scaled by the
+// viewport height so the whole screen fits without scrolling.
+const FIELD_H = "h-[clamp(2.25rem,5.1vh,2.875rem)]";
+const INPUT =
+  `w-full ${FIELD_H} rounded-lg border border-slate-200 bg-white pl-10 pr-3 text-sm placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-indigo-500/40 focus:border-indigo-500 transition`;
+const LABEL = "block text-[clamp(12px,1.75vh,14px)] font-semibold text-slate-800 mb-[0.5vh]";
+
+// No backend for these providers yet (only Google is implemented) - shown
+// disabled rather than as buttons that do nothing. On short windows
+// (`tiny:`) they collapse into one icon-only row to save vertical space.
+function ComingSoonRow({ label, icon }: { label: string; icon: React.ReactNode }) {
+  return (
+    <button
+      type="button"
+      disabled
+      title={`${label} - coming soon`}
+      aria-label={`${label} (coming soon)`}
+      className="w-full h-10 short:h-9 flex items-center gap-3 rounded-lg border border-slate-200 bg-white px-4 text-sm font-semibold text-slate-900 opacity-60 cursor-not-allowed tiny:justify-center tiny:px-0"
+    >
+      {icon}
+      <span className="flex-1 text-left tiny:hidden">{label}</span>
+      <span className="text-[11px] font-medium text-slate-500 tiny:hidden">Coming soon</span>
+    </button>
+  );
+}
 
 export default function LoginPage() {
   const router = useRouter();
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [rememberMe, setRememberMe] = useState(false);
   const [code, setCode] = useState("");
   const [mfaToken, setMfaToken] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -56,7 +81,7 @@ export default function LoginPage() {
     setError(null);
     setLoading(true);
     try {
-      const result = await login({ email, password });
+      const result = await login({ email, password, remember_me: rememberMe });
       if (result.mfa_required && result.mfa_token) {
         setMfaToken(result.mfa_token);
         return;
@@ -126,7 +151,7 @@ export default function LoginPage() {
           <button
             type="submit"
             disabled={loading || code.length !== 6}
-            className="w-full flex items-center justify-center gap-2 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-60 text-white rounded-lg py-2.5 text-sm font-medium transition shadow-sm shadow-indigo-600/20"
+            className="w-full flex items-center justify-center gap-2 bg-slate-800 hover:bg-slate-900 disabled:opacity-60 text-white rounded-lg py-2.5 text-sm font-semibold transition shadow-sm"
           >
             {loading ? "Verifying..." : "Verify"}
           </button>
@@ -149,75 +174,89 @@ export default function LoginPage() {
 
   return (
     <AuthLayout title="Welcome back!" subtitle="Sign in to your Zoiko Local account.">
-      <div className="space-y-2.5">
-        <GoogleSignInButton onCredential={handleGoogleCredential} />
-        {/* No backend for these providers yet (only Google is implemented) -
-            shown disabled rather than as buttons that do nothing. */}
-        {SOCIAL_PLACEHOLDERS.map((p) => (
-          <button
-            key={p.label}
-            type="button"
-            disabled
-            title="Coming soon"
-            className="w-full flex items-center gap-3 rounded-lg border border-slate-200 bg-white px-4 py-3 text-sm font-semibold text-slate-900 opacity-60 cursor-not-allowed"
-          >
-            {p.icon}
-            <span className="flex-1 text-left">{p.label}</span>
-            <span className="text-[11px] font-medium text-slate-500">Coming soon</span>
-          </button>
-        ))}
+      {/* Order matches the design: Microsoft, Google, Apple, SSO. */}
+      <div className="grid grid-cols-1 gap-[clamp(0.25rem,0.9vh,0.5rem)] tiny:grid-cols-3">
+        <ComingSoonRow {...MICROSOFT} />
+        <div className="tiny:order-first tiny:col-span-3">
+          <GoogleSignInButton onCredential={handleGoogleCredential} className="h-10 short:h-9" />
+        </div>
+        <ComingSoonRow {...APPLE} />
+        <ComingSoonRow {...SSO} />
       </div>
 
-      <div className="flex items-center gap-3 my-5">
+      <div className="flex items-center gap-3 my-[clamp(0.4rem,1.6vh,1rem)]">
         <div className="h-px bg-slate-200 flex-1" />
         <span className="text-xs text-slate-500">or sign in with email</span>
         <div className="h-px bg-slate-200 flex-1" />
       </div>
 
-      <form onSubmit={handleSubmit} className="space-y-4">
+      <form onSubmit={handleSubmit} className="space-y-[clamp(0.4rem,1.5vh,0.9rem)]">
         <div>
-          <label htmlFor="login-email" className="block text-sm font-semibold text-slate-800 mb-1.5">
+          <label htmlFor="login-email" className={LABEL}>
             Email address
           </label>
-          <input
-            id="login-email"
-            type="email"
-            required
-            autoComplete="email"
-            value={email}
-            onChange={(e) => setEmail(e.target.value)}
-            className="w-full rounded-lg border border-slate-200 px-3.5 py-3 text-sm placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-indigo-500/40 focus:border-indigo-500 transition"
-            placeholder="name@company.com"
-          />
-        </div>
-        <div>
-          <div className="flex items-center justify-between mb-1.5">
-            <label htmlFor="login-password" className="block text-sm font-semibold text-slate-800">
-              Password
-            </label>
-            <Link href="/forgot-password" className="text-xs font-semibold text-indigo-600 hover:text-indigo-700">
-              Forgot password?
-            </Link>
+          <div className="relative">
+            <svg className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+              <rect x="3" y="5" width="18" height="14" rx="2" />
+              <path d="M3 7l9 6 9-6" />
+            </svg>
+            <input
+              id="login-email"
+              type="email"
+              required
+              autoComplete="email"
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              className={INPUT}
+              placeholder="name@company.com"
+            />
           </div>
-          <PasswordInput
-            id="login-password"
-            required
-            autoComplete="current-password"
-            value={password}
-            onChange={(e) => setPassword(e.target.value)}
-            className="w-full rounded-lg border border-slate-200 px-3.5 py-3 text-sm placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-indigo-500/40 focus:border-indigo-500 transition"
-            placeholder="Enter your password"
-          />
+        </div>
+
+        <div>
+          <label htmlFor="login-password" className={LABEL}>
+            Password
+          </label>
+          <div className="relative">
+            <svg className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400 z-10" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+              <rect x="4" y="11" width="16" height="10" rx="2" />
+              <path d="M8 11V7a4 4 0 018 0v4" />
+            </svg>
+            <PasswordInput
+              id="login-password"
+              required
+              autoComplete="current-password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              className={INPUT}
+              placeholder="Enter your password"
+            />
+          </div>
+        </div>
+
+        <div className="flex items-center justify-between">
+          <label className="flex items-center gap-2 text-[clamp(11px,1.65vh,13px)] text-slate-600 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={rememberMe}
+              onChange={(e) => setRememberMe(e.target.checked)}
+              className="h-4 w-4 rounded border-slate-300 accent-slate-800"
+            />
+            Remember me for 30 days
+          </label>
+          <Link href="/forgot-password" className="text-[clamp(11px,1.65vh,13px)] font-semibold text-indigo-600 hover:text-indigo-700">
+            Forgot password?
+          </Link>
         </div>
 
         {error && (
-          <p className="text-sm text-red-600 bg-red-50 rounded-lg px-3 py-2">{error}</p>
+          <p className="text-[13px] text-red-600 bg-red-50 rounded-lg px-3 py-1.5">{error}</p>
         )}
 
         <button
           type="submit"
           disabled={loading}
-          className="w-full flex items-center justify-center gap-2 bg-slate-800 hover:bg-slate-900 disabled:opacity-60 text-white rounded-lg py-3.5 text-base font-semibold transition shadow-md shadow-slate-800/25"
+          className="w-full h-[clamp(2.4rem,5.6vh,3.1rem)] flex items-center justify-center gap-2 bg-slate-800 hover:bg-slate-900 disabled:opacity-60 text-white rounded-lg text-base font-semibold transition shadow-md shadow-slate-800/25"
         >
           {loading && (
             <span className="w-4 h-4 border-2 border-white/40 border-t-white rounded-full animate-spin" />
@@ -226,7 +265,7 @@ export default function LoginPage() {
         </button>
       </form>
 
-      <p className="text-sm text-slate-500 mt-5 text-center">
+      <p className="text-[13px] text-slate-500 mt-[clamp(0.4rem,1.4vh,0.9rem)] text-center">
         New to Zoiko Local?{" "}
         <Link href="/signup" className="text-indigo-600 font-semibold hover:text-indigo-700">
           Register

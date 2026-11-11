@@ -134,7 +134,11 @@ export type LoginResult = {
   mfa_token: string | null;
 };
 
-export async function login(input: { email: string; password: string }): Promise<LoginResult> {
+export async function login(input: {
+  email: string;
+  password: string;
+  remember_me?: boolean;
+}): Promise<LoginResult> {
   const fingerprint = await computeDeviceFingerprint();
   return request("/auth/login", {
     method: "POST",

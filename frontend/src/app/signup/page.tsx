@@ -65,30 +65,30 @@ export default function SignupPage() {
 
   return (
     <AuthLayout title="Create your account" subtitle="Get started with Zoiko Local.">
-      <GoogleSignInButton onCredential={handleGoogleCredential} />
+      <GoogleSignInButton onCredential={handleGoogleCredential} className="h-10 short:h-9" />
 
-      <div className="flex items-center gap-3 my-5">
+      <div className="flex items-center gap-3 my-[clamp(0.4rem,1.6vh,1rem)]">
         <div className="h-px bg-slate-200 flex-1" />
         <span className="text-xs text-slate-600">or continue with email</span>
         <div className="h-px bg-slate-200 flex-1" />
       </div>
 
-      <form onSubmit={handleSubmit} className="space-y-4">
+      <form onSubmit={handleSubmit} className="space-y-[clamp(0.35rem,1.3vh,0.9rem)]">
         <div>
-          <label className="block text-sm font-medium text-slate-700 mb-1.5">
+          <label className="block text-[clamp(12px,1.75vh,14px)] font-semibold text-slate-800 mb-[0.4vh]">
             Account name
           </label>
           <input
             required
             value={accountName}
             onChange={(e) => setAccountName(e.target.value)}
-            className="w-full rounded-lg border border-slate-300 px-3.5 py-2.5 text-sm placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-indigo-500/40 focus:border-indigo-500 transition"
+            className="w-full h-[clamp(2.1rem,4.9vh,2.75rem)] rounded-lg border border-slate-200 px-3.5 text-sm placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-indigo-500/40 focus:border-indigo-500 transition"
             placeholder="Your name or company"
           />
         </div>
 
         <div>
-          <label className="block text-sm font-medium text-slate-700 mb-1.5">
+          <label className="block text-[clamp(12px,1.75vh,14px)] font-semibold text-slate-800 mb-[0.4vh]">
             Account type
           </label>
           <div className="grid grid-cols-2 gap-2">
@@ -97,7 +97,7 @@ export default function SignupPage() {
                 type="button"
                 key={type}
                 onClick={() => setAccountType(type)}
-                className={`rounded-lg border px-3 py-2.5 text-sm font-medium capitalize transition ${
+                className={`h-[clamp(2.1rem,4.9vh,2.75rem)] rounded-lg border px-3 text-sm font-medium capitalize transition ${
                   accountType === type
                     ? "border-indigo-600 bg-indigo-50 text-indigo-700 ring-1 ring-indigo-600"
                     : "border-slate-300 text-slate-600 hover:bg-slate-50"
@@ -110,37 +110,37 @@ export default function SignupPage() {
         </div>
 
         <div>
-          <label className="block text-sm font-medium text-slate-700 mb-1.5">Email</label>
+          <label className="block text-[clamp(12px,1.75vh,14px)] font-semibold text-slate-800 mb-[0.4vh]">Email</label>
           <input
             type="email"
             required
             value={email}
             onChange={(e) => setEmail(e.target.value)}
-            className="w-full rounded-lg border border-slate-300 px-3.5 py-2.5 text-sm placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-indigo-500/40 focus:border-indigo-500 transition"
+            className="w-full h-[clamp(2.1rem,4.9vh,2.75rem)] rounded-lg border border-slate-200 px-3.5 text-sm placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-indigo-500/40 focus:border-indigo-500 transition"
             placeholder="you@example.com"
           />
         </div>
 
         <div>
-          <label className="block text-sm font-medium text-slate-700 mb-1.5">Password</label>
+          <label className="block text-[clamp(12px,1.75vh,14px)] font-semibold text-slate-800 mb-[0.4vh]">Password</label>
           <PasswordInput
             required
             minLength={8}
             value={password}
             onChange={(e) => setPassword(e.target.value)}
-            className="w-full rounded-lg border border-slate-300 px-3.5 py-2.5 text-sm placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-indigo-500/40 focus:border-indigo-500 transition"
+            className="w-full h-[clamp(2.1rem,4.9vh,2.75rem)] rounded-lg border border-slate-200 px-3.5 text-sm placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-indigo-500/40 focus:border-indigo-500 transition"
             placeholder="At least 8 characters"
           />
         </div>
 
         {error && (
-          <p className="text-sm text-red-600 bg-red-50 rounded-lg px-3 py-2">{error}</p>
+          <p className="text-[13px] text-red-600 bg-red-50 rounded-lg px-3 py-1.5">{error}</p>
         )}
 
         <button
           type="submit"
           disabled={loading}
-          className="w-full flex items-center justify-center gap-2 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-60 text-white rounded-lg py-2.5 text-sm font-medium transition shadow-sm shadow-indigo-600/20"
+          className="w-full h-[clamp(2.4rem,5.6vh,3.1rem)] flex items-center justify-center gap-2 bg-slate-800 hover:bg-slate-900 disabled:opacity-60 text-white rounded-lg text-base font-semibold transition shadow-md shadow-slate-800/25"
         >
           {loading && (
             <span className="w-4 h-4 border-2 border-white/40 border-t-white rounded-full animate-spin" />
@@ -149,9 +149,9 @@ export default function SignupPage() {
         </button>
       </form>
 
-      <p className="text-sm text-slate-500 mt-6 text-center">
+      <p className="text-[13px] text-slate-500 mt-[clamp(0.4rem,1.4vh,0.9rem)] text-center">
         Already have an account?{" "}
-        <Link href="/login" className="text-indigo-600 font-medium hover:text-indigo-700">
+        <Link href="/login" className="text-indigo-600 font-semibold hover:text-indigo-700">
           Log in
         </Link>
       </p>

@@ -4,7 +4,12 @@ from sqlalchemy.orm import Session
 from app.core.database import get_db
 from app.core.deps import get_current_user
 from app.core.rate_limit import limiter
-from app.core.security import create_access_token, decode_access_token, verify_google_id_token
+from app.core.security import (
+    create_access_token,
+    create_scoped_token,
+    decode_access_token,
+    verify_google_id_token,
+)
 from app.numbering.identity import service
 from app.numbering.identity.models import User
 from app.numbering.identity.schemas import (
@@ -27,6 +32,8 @@ from app.risk import service as risk_service
 
 router = APIRouter(prefix="/auth", tags=["identity"])
 MFA_TOKEN_EXPIRE_MINUTES = 5
+# Lifetime of the token when "Remember me" is ticked on the login form.
+REMEMBER_ME_EXPIRE_MINUTES = 60 * 24 * 30
 
 
 @router.post("/signup", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
@@ -67,12 +74,21 @@ def login(
     risk_service.check_fingerprint_on_login(db, fingerprint_hash=x_device_fingerprint, account_id=user.account_id)
 
     if user.mfa_enabled:
-        mfa_token = create_access_token(
-            subject=user.id, scope="mfa_pending", expire_minutes=MFA_TOKEN_EXPIRE_MINUTES
+        # remember_me rides along inside the short-lived mfa_pending token so
+        # /mfa/login can honour it once the code is verified.
+        mfa_token = create_scoped_token(
+            subject=user.id,
+            scope="mfa_pending",
+            expire_minutes=MFA_TOKEN_EXPIRE_MINUTES,
+            remember_me=payload.remember_me,
         )
         return LoginResponse(mfa_required=True, mfa_token=mfa_token)
 
-    token = create_access_token(subject=user.id, scope="customer")
+    token = create_access_token(
+        subject=user.id,
+        scope="customer",
+        expire_minutes=REMEMBER_ME_EXPIRE_MINUTES if payload.remember_me else None,
+    )
     return LoginResponse(access_token=token)
 
 
@@ -135,7 +151,11 @@ def mfa_login(request: Request, payload: MfaLoginRequest, db: Session = Depends(
     if user is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid code")
 
-    token = create_access_token(subject=user.id, scope="customer")
+    token = create_access_token(
+        subject=user.id,
+        scope="customer",
+        expire_minutes=REMEMBER_ME_EXPIRE_MINUTES if claims.get("remember_me") else None,
+    )
     return TokenResponse(access_token=token)
 
 

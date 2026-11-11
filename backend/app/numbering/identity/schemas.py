@@ -17,6 +17,9 @@ class SignupRequest(BaseModel):
 class LoginRequest(BaseModel):
     email: EmailStr
     password: str
+    # "Remember me for 30 days" on the login form - issues a 30-day token
+    # instead of the default 24h one. Optional, so existing clients unchanged.
+    remember_me: bool = False
 
 
 class GoogleAuthRequest(BaseModel):
