@@ -57,6 +57,7 @@ export default function GoogleSignInButton({
   className?: string;
 }) {
   const containerRef = useRef<HTMLDivElement>(null);
+  const wrapperRef = useRef<HTMLDivElement>(null);
   // Lazy-initialized from the actual DOM state at mount, rather than set
   // via a synchronous setState call inside the effect below - avoids an
   // extra render and a redundant initialize() call when the script (or a
@@ -110,15 +111,45 @@ export default function GoogleSignInButton({
       gsiInitialized = true;
     }
 
-    // Google caps the button width at 400px. The overlay below is stretched
-    // to the row, so any sliver beyond 400px is simply not clickable.
-    const width = Math.min(400, Math.round(containerRef.current.getBoundingClientRect().width)) || 320;
-    window.google.accounts.id.renderButton(containerRef.current, {
-      theme: "outline",
-      size: "large",
-      width,
-      text: "continue_with",
+    const wrapper = wrapperRef.current;
+    const overlay = containerRef.current;
+    if (!wrapper) return;
+
+    // Google caps its button at 400px wide, but our row can be wider (the
+    // login card makes it ~434px). Rendering at 400px and leaving it at that
+    // left the row's right-hand edge (and the chevron) un-clickable - "no
+    // action" on a click there. So: render at min(400, row width), then
+    // stretch the invisible overlay horizontally with a transform so it
+    // covers the WHOLE row. Hit-testing follows transforms, so a click
+    // anywhere on the row lands on Google's real button.
+    const layout = () => {
+      const rowWidth = Math.round(wrapper.getBoundingClientRect().width);
+      if (!rowWidth) return;
+      const width = Math.min(400, rowWidth);
+      overlay.innerHTML = "";
+      window.google?.accounts.id.renderButton(overlay, {
+        theme: "outline",
+        size: "large",
+        width,
+        text: "continue_with",
+      });
+      overlay.style.width = `${width}px`;
+      overlay.style.transformOrigin = "left center";
+      overlay.style.transform = width < rowWidth ? `scaleX(${rowWidth / width})` : "";
+    };
+
+    layout();
+    // The card's width changes with the window, so keep the overlay in sync.
+    let lastWidth = Math.round(wrapper.getBoundingClientRect().width);
+    const observer = new ResizeObserver(() => {
+      const w = Math.round(wrapper.getBoundingClientRect().width);
+      if (w !== lastWidth) {
+        lastWidth = w;
+        layout();
+      }
     });
+    observer.observe(wrapper);
+    return () => observer.disconnect();
   }, [scriptLoaded]);
 
   const row = (
@@ -126,8 +157,8 @@ export default function GoogleSignInButton({
       <svg width="20" height="20" viewBox="0 0 48 48" aria-hidden="true">
         <path fill="#EA4335" d="M24 9.5c3.5 0 6.6 1.2 9.1 3.6l6.8-6.8C35.8 2.4 30.3 0 24 0 14.6 0 6.5 5.4 2.6 13.2l7.9 6.1C12.4 13.6 17.7 9.5 24 9.5z" />
         <path fill="#4285F4" d="M46.5 24.5c0-1.6-.1-3.1-.4-4.5H24v9h12.7c-.6 3-2.3 5.5-4.8 7.2l7.6 5.9c4.4-4.1 7-10.1 7-17.6z" />
-        <path fill="#FBBC05" d="M10.5 28.7c-.5-1.4-.8-3-.8-4.7s.3-3.2.8-4.7l-7.9-6.1C.9 16.4 0 20.1 0 24s.9 7.6 2.600 10.8l7.9-6.1z" />
-        <path fill="#34A853" d="M24 48c6.5 0 11.9-2.1 15.9-5.8l-7.6-5.9c-2.1 1.400-4.9 2.300-8.3 2.300-6.300 0-11.6-4.1-13.5-9.8l-7.9 6.1C6.5 42.6 14.6 48 24 48z" />
+        <path fill="#FBBC05" d="M10.5 28.7c-.5-1.4-.8-3-.8-4.7s.3-3.2.8-4.7l-7.9-6.1C.9 16.4 0 20.1 0 24s.9 7.6 2.6 10.8l7.9-6.1z" />
+        <path fill="#34A853" d="M24 48c6.5 0 11.9-2.1 15.9-5.8l-7.6-5.9c-2.1 1.4-4.9 2.3-8.3 2.3-6.3 0-11.6-4.1-13.5-9.8l-7.9 6.1C6.5 42.6 14.6 48 24 48z" />
       </svg>
       <span className="flex-1 text-left">Continue with Google</span>
       <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" className="text-slate-500">
@@ -151,13 +182,11 @@ export default function GoogleSignInButton({
   }
 
   return (
-    <div className="relative">
+    <div ref={wrapperRef} className="relative">
       <div className={`${base} ${className}`}>{row}</div>
-      {/* Google's real button, invisible, covering the row. */}
-      <div
-        ref={containerRef}
-        className="absolute inset-0 overflow-hidden opacity-0 [&>div]:!w-full [&_iframe]:!w-full"
-      />
+      {/* Google's real button, invisible, covering the row (sized and
+          stretched by the layout effect above). */}
+      <div ref={containerRef} className="absolute left-0 top-0 h-full overflow-hidden opacity-0" />
     </div>
   );
 }
