@@ -11,6 +11,7 @@ from sqlalchemy.exc import DBAPIError
 
 from app.analytics.routes import router as analytics_router
 from app.apikeys.routes import router as apikeys_router
+from app.assistant.routes import public_router as assistant_public_router
 from app.audit.routes import router as audit_router
 from app.billing.routes import router as billing_router
 from app.careers.routes import public_router as careers_public_router
@@ -211,6 +212,10 @@ app.include_router(webhooks_router)
 app.include_router(apikeys_router)
 app.include_router(public_api_router)
 app.include_router(crm_router)
+# Genuinely public like careers_public_router above - the anonymous
+# website assistant (WF-01..WF-13) the marketing site calls with no
+# Zoiko account, session, or cookie involved.
+app.include_router(assistant_public_router)
 
 
 @app.get("/health")

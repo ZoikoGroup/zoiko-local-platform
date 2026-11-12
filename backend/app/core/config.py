@@ -228,6 +228,14 @@ class Settings(BaseSettings):
     # publishing (falls back to logging), same pattern as the other providers.
     kafka_bootstrap_servers: str = ""
 
+    # Public website assistant (app/assistant/, the WF-01..WF-13 chatbot
+    # wireframes) - master kill switch per WF-01's failure-isolation
+    # requirement. False disables the whole public surface: bootstrap
+    # reports enabled=false (the widget never opens) and the stateful
+    # endpoints return 503. Same "flip without a deploy" posture as every
+    # other flag in this file.
+    public_assistant_enabled: bool = True
+
     # Rate limiting (core/rate_limit.py) - shared counter store for slowapi.
     # Blank falls back to slowapi's default in-memory storage, which is
     # per-process: correct with WEB_CONCURRENCY=1, but with multiple uvicorn
