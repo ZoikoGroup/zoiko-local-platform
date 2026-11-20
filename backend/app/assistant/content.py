@@ -26,7 +26,7 @@ directory when this file was written.
 
 # Content version = the wireframe set this content was authored against.
 # Surfaced to clients in every bootstrap (WF-01 "content_version").
-CONTENT_VERSION = "wf-2026-10-24.1"
+CONTENT_VERSION = "wf-2026-11-19.2"
 
 # WF-12: en-US is the only reviewed, approved locale. Everything else
 # fails closed to en-US in the service layer (never machine-translated).
@@ -38,9 +38,188 @@ DEFAULT_LOCALE = "en-US"
 # in any customer-facing surface per the docs' brand rule).
 ASSISTANT_NAME = "Zoiko Local Assistant"
 AI_DISCLOSURE = (
-    "This assistant is automated and AI-assisted. It cannot place calls, "
-    "change your account, take payments, or confirm live number availability."
+    "This assistant is automated and uses approved Zoiko Local data. It is not "
+    "a live agent and cannot place calls, change your account, take payments, "
+    "or confirm live number availability."
 )
+GREETING_RESPONSE_TEXT = (
+    "Hi! I'm the Zoiko Local Assistant. I can help you find a local number, "
+    "understand calling and the AI Receptionist, compare plans and pricing, "
+    "start a port, or check getting-started guidance. What would you like to do?"
+)
+GENERAL_FAQ = [
+    {
+        "key": "about",
+        "patterns": [r"\b(what is|tell me about|about)\s+zoiko(\s+local)?\b", r"\bwho are you\b"],
+        "text": (
+            "Zoiko Local provides local business numbers, cloud calling with call flows and "
+            "voicemail, an AI Receptionist, video meetings, number porting, and guided setup. "
+            "I can explain these services and link you to the official pages; I cannot confirm "
+            "live availability in chat."
+        ),
+        "source_slugs": [
+            "global-coverage-page",
+            "get-local-number-product-page",
+            "cloud-calling-product-page",
+            "ai-receptionist-product-page",
+            "video-product-page",
+        ],
+        "actions": [("GET_LOCAL_NUMBER", "primary"), ("CLOUD_CALLING", "secondary")],
+        "suggestions": [
+            {"label": "Find a number", "value": "NUMBER_DISCOVERY", "kind": "intent"},
+            {"label": "How calling works", "value": "CALLING_OVERVIEW", "kind": "intent"},
+        ],
+    },
+    {
+        "key": "capabilities",
+        "patterns": [r"\bwhat can you do\b", r"\bhow can you help\b", r"\bwhat do you (do|offer|support)\b"],
+        "text": (
+            "I can guide you through local number discovery, calling, the AI Receptionist, "
+            "video meetings, plans and pricing, porting, activation, privacy, and "
+            "emergency-calling information. I cannot place calls, join meetings, change an "
+            "account, take payments, or confirm live availability."
+        ),
+        "source_slugs": [
+            "get-local-number-product-page",
+            "cloud-calling-product-page",
+            "ai-receptionist-product-page",
+            "video-product-page",
+            "pricing-product-page",
+        ],
+        "actions": [("GET_LOCAL_NUMBER", "primary"), ("PRICING", "secondary")],
+        "suggestions": [
+            {"label": "See plans", "value": "PLANS_OVERVIEW", "kind": "intent"},
+            {"label": "AI Receptionist", "value": "RECEPTIONIST_OVERVIEW", "kind": "intent"},
+        ],
+    },
+    {
+        "key": "get_number",
+        "patterns": [r"\bhow do i (get|buy|purchase|acquire|find)\b.{0,30}\b(number|numbers)\b", r"\bwhere (do|can) i (get|buy) (a\s+)?(local\s+)?numbers?\b"],
+        "text": (
+            "Start with number discovery: choose a market and customer type, then follow the "
+            "verification and activation steps on the official Get a Local Number page. Live "
+            "availability is confirmed there, not in chat."
+        ),
+        "source_slugs": ["get-local-number-product-page", "verification-help-overview", "activation-help-overview"],
+        "actions": [("GET_LOCAL_NUMBER", "primary")],
+        "suggestions": [{"label": "Start number discovery", "value": "NUMBER_DISCOVERY", "kind": "intent"}],
+    },
+    {
+        "key": "pricing_basics",
+        "patterns": [r"\bhow (does|do) pricing work\b", r"\bwhat (affects|is included in) (the\s+)?(price|pricing|total)\b"],
+        "text": (
+            "Plan prices shown here come from Zoiko Local's approved price catalog. Your final "
+            "total can also depend on number rental and usage, and is calculated during secure "
+            "checkout; I never quote a custom total."
+        ),
+        "source_slugs": ["pricing-product-page", "get-local-number-product-page"],
+        "actions": [("PRICING", "primary")],
+        "suggestions": [{"label": "See current plans", "value": "PLANS_OVERVIEW", "kind": "intent"}],
+    },
+    {
+        "key": "video",
+        "patterns": [r"\bvideo\b", r"\b(meetings?|video calls?)\b"],
+        "text": (
+            "Zoiko Local includes video meetings for supported workspaces. Availability can "
+            "depend on the plan, so I can link you to the official Video page; I cannot start "
+            "or join a meeting from chat."
+        ),
+        "source_slugs": ["video-product-page"],
+        "actions": [("VIDEO", "primary"), ("PRICING", "secondary")],
+        "suggestions": [{"label": "See plans", "value": "PLANS_OVERVIEW", "kind": "intent"}],
+    },
+    {
+        "key": "receptionist_features",
+        "patterns": [r"\b(how does|what is|tell me about)\b.{0,20}\b(ai\s+)?receptionist\b", r"\bwhat can (the|your) (ai\s+)?receptionist do\b"],
+        "text": (
+            "The AI Receptionist is a per-number feature that answers calls to your Zoiko Local "
+            "number, greets callers, asks what they need, takes messages, and can escalate urgent "
+            "calls to a team member you nominate. Setup happens in the dashboard; I cannot "
+            "configure it in chat."
+        ),
+        "source_slugs": ["ai-receptionist-product-page", "ai-receptionist-setup-help"],
+        "actions": [("AI_RECEPTIONIST", "primary")],
+        "suggestions": [{"label": "See a fictional example", "value": "RECEPTIONIST_EXAMPLE", "kind": "intent"}],
+    },
+    {
+        "key": "calling_features",
+        "patterns": [r"\b(how does|what is|tell me about)\b.{0,20}\b(cloud\s+)?calling\b", r"\bcall flows?\b", r"\bvoicemail\b"],
+        "text": (
+            "Zoiko Local cloud calling lets you make and receive calls on your local number from "
+            "the browser dashboard or the Zoiko Local app, with call flows, voicemail, and "
+            "optional recording. I cannot place calls, configure call flows, or quote your exact "
+            "call costs."
+        ),
+        "source_slugs": ["cloud-calling-product-page", "calling-considerations-help"],
+        "actions": [("CLOUD_CALLING", "primary")],
+        "suggestions": [{"label": "Get a local number", "value": "NUMBER_DISCOVERY", "kind": "intent"}],
+    },
+    {
+        "key": "porting_basics",
+        "patterns": [r"\bwhat is (number\s+)?porting\b", r"\bbring (my|an existing) number\b", r"\btransfer (my|an existing) number\b"],
+        "text": (
+            "You may be able to bring an existing number to Zoiko Local. Porting depends on the "
+            "country, your current carrier, and their release process. I cannot submit a port, "
+            "collect authorization documents, or guarantee a completion date."
+        ),
+        "source_slugs": ["porting-product-page", "porting-authorization-help"],
+        "actions": [("PORTING", "primary")],
+        "suggestions": [],
+    },
+    {
+        "key": "activation_steps",
+        "patterns": [r"\bhow do i (get started|start|activate|set up)\b", r"\bgetting started\b", r"\bactivation steps\b"],
+        "text": (
+            "Create a free Zoiko Local account, pick your country and local number, complete any "
+            "verification that country requires, and the number activates once the checks pass. "
+            "No card is needed to explore."
+        ),
+        "source_slugs": ["activation-help-overview", "first-call-readiness-help"],
+        "actions": [("START_FREE", "primary"), ("GET_LOCAL_NUMBER", "secondary")],
+        "suggestions": [{"label": "Find a number", "value": "NUMBER_DISCOVERY", "kind": "intent"}],
+    },
+    {
+        "key": "privacy",
+        "patterns": [r"\bprivacy\b", r"\b(what|how) (data|information) (do you|is) (collect|store|keep|handle)\b"],
+        "text": (
+            "Your chat stays in the browser for the session, and you can clear the chat view or "
+            "end the session at any time. Please don't share sensitive details like card numbers, "
+            "passwords, or one-time codes in chat. The Privacy Policy explains what Zoiko Local "
+            "collects."
+        ),
+        "source_slugs": ["privacy-policy-page"],
+        "actions": [("PRIVACY_POLICY", "primary")],
+        "suggestions": [],
+    },
+    {
+        "key": "emergency",
+        "patterns": [
+            r"\bemergency calling\b",
+            r"\b(what|how|why|when)\b.*\bemergency\b",
+            r"\b(what|how|why|when)\b.*\b(911|112|999)\b",
+        ],
+        "text": (
+            "Zoiko Local numbers are internet-based and are not a replacement for emergency "
+            "calling. If you are in danger, contact your local emergency number directly. The "
+            "Emergency Calling page explains what to consider before relying on any "
+            "internet-based number."
+        ),
+        "source_slugs": ["emergency-calling-product-page"],
+        "actions": [("EMERGENCY_CALLING", "primary")],
+        "suggestions": [],
+    },
+    {
+        "key": "support",
+        "patterns": [r"\b(contact|talk to|reach)\s+(support|a person|someone|human)\b"],
+        "text": (
+            "I can answer guided questions here, or you can use the official Contact Support "
+            "page for account-specific help."
+        ),
+        "source_slugs": ["contact-support-page"],
+        "actions": [("CONTACT_SUPPORT", "primary"), ("CONTACT_SALES", "secondary")],
+        "suggestions": [],
+    },
+]
 SAFETY_NOTICE = (
     "Zoiko Local numbers are not a replacement for emergency calling. "
     "In an emergency, contact your local emergency number (such as 911, "
@@ -361,6 +540,18 @@ KNOWLEDGE_SOURCES = [
         ),
     },
     {
+        "slug": "video-product-page",
+        "title": "Video - Zoiko Local",
+        "canonical_url": "https://zoikolocal.com/video",
+        "authority_class": "a3_product_content",
+        "intent_id": "CALLING_OVERVIEW",
+        "body": (
+            "Zoiko Local provides video meetings in the same workspace as numbers and "
+            "calling. Video availability and session capabilities can depend on the plan "
+            "and workspace configuration."
+        ),
+    },
+    {
         "slug": "privacy-policy-page",
         "title": "Zoiko Local Privacy Policy",
         "canonical_url": "https://zoikolocal.com/zoiko-local-privacy-policy",
@@ -371,6 +562,18 @@ KNOWLEDGE_SOURCES = [
             "and you can clear the chat view or end the session at any time. Please "
             "don't share sensitive details like card numbers, passwords, or one-time "
             "codes in chat. The privacy policy explains what Zoiko Local collects."
+        ),
+    },
+    {
+        "slug": "contact-support-page",
+        "title": "Contact Support - Zoiko Local",
+        "canonical_url": "https://zoikolocal.com/contact-support",
+        "authority_class": "a3_product_content",
+        "intent_id": "CONTACT_HANDOFF",
+        "body": (
+            "The official Contact Support page is the route for account-specific help. "
+            "The assistant can answer guided questions and link to that page, but it "
+            "cannot open, update, or resolve a support case."
         ),
     },
 ]
@@ -404,6 +607,7 @@ DESTINATIONS = [
     {"destination_key": "GET_LOCAL_NUMBER", "label": "Get a Local Number", "url": "/get-local-number"},
     {"destination_key": "CLOUD_CALLING", "label": "Cloud Calling", "url": "/calling"},
     {"destination_key": "AI_RECEPTIONIST", "label": "AI Receptionist", "url": "/ai-receptionist"},
+    {"destination_key": "VIDEO", "label": "Video Meetings", "url": "/video"},
     {"destination_key": "PRICING", "label": "Plans & Pricing", "url": "/pricing"},
     {"destination_key": "PORTING", "label": "Number Porting", "url": "/number-porting"},
     {"destination_key": "EMERGENCY_CALLING", "label": "Emergency Calling", "url": "/emergency-calling"},

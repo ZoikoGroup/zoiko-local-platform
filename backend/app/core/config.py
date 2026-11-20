@@ -235,6 +235,8 @@ class Settings(BaseSettings):
     # endpoints return 503. Same "flip without a deploy" posture as every
     # other flag in this file.
     public_assistant_enabled: bool = True
+    platform_assistant_enabled: bool = False
+    platform_assistant_llm_enabled: bool = False
 
     # Rate limiting (core/rate_limit.py) - shared counter store for slowapi.
     # Blank falls back to slowapi's default in-memory storage, which is

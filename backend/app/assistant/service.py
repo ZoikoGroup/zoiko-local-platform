@@ -272,6 +272,22 @@ def handle_message(
             verifiability_status="none",
         )
 
+    elif text and _is_greeting(text):
+        response = _build_response(
+            db=db,
+            response_type="answer",
+            text=content.GREETING_RESPONSE_TEXT,
+            actions=[("GET_LOCAL_NUMBER", "primary"), ("PRICING", "secondary")],
+            suggestions=[
+                {"label": "Find a number", "value": "NUMBER_DISCOVERY", "kind": "intent"},
+                {"label": "Plans and pricing", "value": "PLANS_OVERVIEW", "kind": "intent"},
+            ],
+            verifiability_status="none",
+        )
+
+    elif text and _match_general_faq(text) is not None:
+        response = _general_faq_response(db, _match_general_faq(text))
+
     else:
         intent = _resolve_intent(db, intent_id=intent_id, text=text)
         if intent is None:
@@ -314,6 +330,19 @@ def _matches_safety_category(db: Session, category: AssistantSafetyCategory, tex
         except re.error:
             continue
     return False
+
+
+def _is_greeting(text: str) -> bool:
+    value = text.strip().lower()
+    return bool(re.fullmatch(r"(hi|hello|hey|good (morning|afternoon|evening)|greetings)[.! ]*", value))
+
+
+def _match_general_faq(text: str) -> dict | None:
+    value = text or ""
+    for entry in content.GENERAL_FAQ:
+        if any(re.search(pattern, value, re.IGNORECASE) for pattern in entry["patterns"]):
+            return entry
+    return None
 
 
 def _resolve_intent(db: Session, *, intent_id: str | None, text: str | None) -> AssistantIntent | None:
@@ -378,6 +407,28 @@ def _claims_from_rows(rows: list[AssistantKnowledgeSource]) -> tuple[list[dict],
         for row in rows
     ]
     return claims, sources
+
+
+def _general_faq_response(db: Session, entry: dict) -> AssistantMessageResponse:
+    rows = (
+        db.query(AssistantKnowledgeSource)
+        .filter(
+            AssistantKnowledgeSource.is_active.is_(True),
+            AssistantKnowledgeSource.slug.in_(entry["source_slugs"]),
+        )
+        .all()
+    )
+    claims, sources = _claims_from_rows(rows)
+    return _build_response(
+        db=db,
+        response_type="answer",
+        text=entry["text"],
+        claims=claims,
+        sources=sources,
+        actions=entry["actions"],
+        suggestions=entry["suggestions"],
+        verifiability_status="qualified" if claims else "none",
+    )
 
 
 def _destination_row(db: Session, destination_key: str) -> AssistantDestination | None:
@@ -533,10 +584,11 @@ def _number_discovery(db: Session, session: AssistantSession, *, selection: dict
             "source_slugs": ["global-coverage-page"],
         })
     else:
+        market_status = country.market_status.value.replace("_", " ")
         dynamic_claims.append({
             "text": (
                 f"{country.name} is not a publicly open Zoiko Local market yet (current "
-                "status: launching or restricted) - I can't speak to availability there."
+                f"status: {market_status}) - I can't speak to availability there."
             ),
             "source_slugs": ["global-coverage-page"],
         })

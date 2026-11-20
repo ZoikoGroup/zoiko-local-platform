@@ -49,6 +49,7 @@ from app.numbering.identity.team_routes import router as team_router
 from app.numbering.numbers.routes import router as numbers_router
 from app.notifications.routes import router as notifications_router
 from app.ops.routes import router as ops_router
+from app.platform_assistant.routes import router as platform_assistant_router
 from app.porting.routes import router as porting_router
 from app.public_api.routes import router as public_api_router
 from app.queues.routes import router as queues_router
@@ -201,6 +202,7 @@ app.include_router(notifications_router)
 app.include_router(risk_router)
 app.include_router(usage_router)
 app.include_router(ops_router)
+app.include_router(platform_assistant_router)
 app.include_router(porting_router, dependencies=_TRIAL_GATE)
 app.include_router(call_flows_router, dependencies=_TRIAL_GATE)
 app.include_router(queues_router, dependencies=_TRIAL_GATE)

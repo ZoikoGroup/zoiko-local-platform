@@ -277,6 +277,8 @@ def test_end_session_is_idempotent_and_blocks_further_messages(client, db_sessio
 
 def test_purge_deletes_only_sessions_past_the_grace_window(db_session):
     _seed_assistant_content(db_session)
+    db_session.query(AssistantSession).delete()
+    db_session.commit()
 
     beyond_grace = service.create_session(db_session)
     just_expired = service.create_session(db_session)
@@ -415,6 +417,23 @@ def test_number_discovery_unknown_country_is_answered_honestly(client, db_sessio
     assert any(a["destination_key"] == "GLOBAL_COVERAGE" for a in body["actions"])
 
 
+def test_number_discovery_reports_the_real_market_status(client, db_session):
+    _seed_assistant_content(db_session)
+    _create_test_countries(db_session)
+    session = _start_session(client, db_session)
+
+    _send(client, session, {"intent_id": "NUMBER_DISCOVERY"})
+    _send(client, session, {
+        "intent_id": "NUMBER_DISCOVERY", "selection": {"country": "T2"},
+    })
+    body = _send(client, session, {
+        "intent_id": "NUMBER_DISCOVERY", "selection": {"customer_type": "business"},
+    }).json()
+
+    assert "current status: launching" in body["text"]
+    assert "launching or restricted" not in body["text"]
+
+
 # ---------------------------------------------------------------------------
 # WF-06 plans
 # ---------------------------------------------------------------------------
@@ -522,3 +541,54 @@ def test_contact_handoff_offers_both_teams(client, db_session):
     assert {a["destination_key"] for a in body["actions"]} == {"CONTACT_SALES", "CONTACT_SUPPORT"}
     assert body["verifiability_status"] == "none"
     assert body["claims"] == []
+
+
+def test_greeting_is_answered_instead_of_falling_through_to_unknown(client, db_session):
+    session = _start_session(client, db_session)
+
+    body = _send(client, session, {"text": "Hi"}).json()
+    assert body["response_type"] == "answer"
+    assert "Hi!" in body["text"]
+    assert {s["value"] for s in body["suggestions"]} >= {"NUMBER_DISCOVERY", "PLANS_OVERVIEW"}
+
+
+def test_general_zoiko_local_question_is_grounded(client, db_session):
+    session = _start_session(client, db_session)
+
+    body = _send(client, session, {"text": "What is Zoiko Local?"}).json()
+    assert body["response_type"] == "answer"
+    assert "local business numbers" in body["text"]
+    assert "video meetings" in body["text"]
+    assert body["claims"]
+    assert all(claim["source_slugs"] for claim in body["claims"])
+    assert {a["destination_key"] for a in body["actions"]} >= {"GET_LOCAL_NUMBER", "CLOUD_CALLING"}
+
+
+def test_public_video_question_is_grounded_and_links_only_to_registered_page(client, db_session):
+    session = _start_session(client, db_session)
+
+    body = _send(client, session, {"text": "Do you have video meetings?"}).json()
+    assert body["response_type"] == "answer"
+    assert "video meetings" in body["text"].lower()
+    assert "VIDEO" in {a["destination_key"] for a in body["actions"]}
+    assert "video-product-page" in {source["slug"] for source in body["sources"]}
+
+
+def test_public_pricing_explanation_avoids_custom_totals(client, db_session):
+    session = _start_session(client, db_session)
+
+    body = _send(client, session, {"text": "How does pricing work?"}).json()
+    assert body["response_type"] == "answer"
+    assert "approved price catalog" in body["text"]
+    assert "secure checkout" in body["text"]
+    assert "PRICING" in {a["destination_key"] for a in body["actions"]}
+
+
+def test_general_faq_references_registered_knowledge_and_destinations():
+    source_slugs = {source["slug"] for source in content.KNOWLEDGE_SOURCES}
+    destination_keys = {destination["destination_key"] for destination in content.DESTINATIONS}
+
+    for entry in content.GENERAL_FAQ:
+        assert entry["source_slugs"], entry["key"]
+        assert set(entry["source_slugs"]) <= source_slugs
+        assert {key for key, _style in entry["actions"]} <= destination_keys

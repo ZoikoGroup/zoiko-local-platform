@@ -16,7 +16,6 @@ import {
   cancelSubscription,
   getPriceCatalogEntry,
   getUsageSummary,
-  getAIUsageRate,
   getAIReceptionistAddonRate,
   ApiError,
   type UsageEvent,
@@ -25,7 +24,6 @@ import {
   type Subscription,
   type UsageSummary,
   type BillingPeriod,
-  type AIUsageRate,
   type AIReceptionistAddonRate,
   type PlanChangePreview,
 } from "@/lib/api";
@@ -104,7 +102,6 @@ export default function BillingPage() {
   const [cancelingScheduled, setCancelingScheduled] = useState(false);
   const [scheduledCancelError, setScheduledCancelError] = useState<string | null>(null);
 
-  const [aiUsageRate, setAiUsageRate] = useState<AIUsageRate | null>(null);
   const [addonRate, setAddonRate] = useState<AIReceptionistAddonRate | null>(null);
   const [addonBusy, setAddonBusy] = useState(false);
   const [addonError, setAddonError] = useState<string | null>(null);
@@ -145,9 +142,6 @@ export default function BillingPage() {
 
   useEffect(() => {
     if (!token) return;
-    getAIUsageRate(token)
-      .then(setAiUsageRate)
-      .catch(() => {});
     getAIReceptionistAddonRate(token)
       .then(setAddonRate)
       .catch(() => {});
