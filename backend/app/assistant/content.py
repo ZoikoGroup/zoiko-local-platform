@@ -26,7 +26,7 @@ directory when this file was written.
 
 # Content version = the wireframe set this content was authored against.
 # Surfaced to clients in every bootstrap (WF-01 "content_version").
-CONTENT_VERSION = "wf-2026-11-19.2"
+CONTENT_VERSION = "wf-2026-11-19.3"
 
 # WF-12: en-US is the only reviewed, approved locale. Everything else
 # fails closed to en-US in the service layer (never machine-translated).
@@ -93,6 +93,20 @@ GENERAL_FAQ = [
         ],
     },
     {
+        "key": "coverage",
+        "patterns": [
+            r"\bwhich countries\b.{0,40}\b(get|have|cover|support|operate in|available)\b",
+            r"\bwhat countries\b.{0,30}\b(cover|support|available|operate in)\b",
+            r"\bwhere (can|do) i get\b.{0,20}\b(local\s+)?numbers?\b",
+            r"\bglobal coverage\b",
+        ],
+        "text": "",
+        "source_slugs": ["global-coverage-page"],
+        "actions": [("GLOBAL_COVERAGE", "primary"), ("GET_LOCAL_NUMBER", "secondary")],
+        "suggestions": [],
+        "handler": "coverage",
+    },
+    {
         "key": "get_number",
         "patterns": [r"\bhow do i (get|buy|purchase|acquire|find)\b.{0,30}\b(number|numbers)\b", r"\bwhere (do|can) i (get|buy) (a\s+)?(local\s+)?numbers?\b"],
         "text": (
@@ -105,6 +119,50 @@ GENERAL_FAQ = [
         "suggestions": [{"label": "Start number discovery", "value": "NUMBER_DISCOVERY", "kind": "intent"}],
     },
     {
+        "key": "number_selection",
+        "patterns": [
+            r"\b(can|could) i (choose|select|pick|search for|filter)\b.{0,25}\b(numbers?|area codes?)\b",
+            r"\bby (city|area code|location|region)\b",
+        ],
+        "text": (
+            "The Get a Local Number page is where you search and choose a number for the "
+            "market you need. Exact number types, area codes and live availability are "
+            "confirmed there - I can't check inventory or reserve a number in chat."
+        ),
+        "source_slugs": ["get-local-number-product-page", "global-coverage-page"],
+        "actions": [("GET_LOCAL_NUMBER", "primary"), ("GLOBAL_COVERAGE", "secondary")],
+        "suggestions": [{"label": "Start number discovery", "value": "NUMBER_DISCOVERY", "kind": "intent"}],
+    },
+    {
+        "key": "assistant_limits",
+        "patterns": [
+            r"\b(can|could) you (buy|purchase|reserve|secure|order)\b.{0,25}\b(numbers?)\b",
+            r"\breset my password\b",
+            r"\b(change|update|modify|upgrade|downgrade) my plan\b",
+        ],
+        "text": (
+            "I can't buy or reserve a number, reset a password, or change a plan. Use the "
+            "secure Get a Local Number flow for numbers and the dashboard or Contact "
+            "Support for account and billing changes."
+        ),
+        "source_slugs": ["get-local-number-product-page", "pricing-product-page", "contact-support-page"],
+        "actions": [("GET_LOCAL_NUMBER", "primary"), ("CONTACT_SUPPORT", "secondary")],
+        "suggestions": [],
+    },
+    {
+        "key": "plans_available",
+        "patterns": [
+            r"\bwhat plans are available\b",
+            r"\bwhich plans\b.{0,20}\b(available|offered|do you have|do you offer)\b",
+            r"\bwhat (plans|packages) do you (offer|have)\b",
+        ],
+        "text": "",
+        "source_slugs": ["pricing-product-page"],
+        "actions": [("PRICING", "primary"), ("CONTACT_SALES", "secondary")],
+        "suggestions": [{"label": "See current plans", "value": "PLANS_OVERVIEW", "kind": "intent"}],
+        "handler": "PLANS_OVERVIEW",
+    },
+    {
         "key": "pricing_basics",
         "patterns": [r"\bhow (does|do) pricing work\b", r"\bwhat (affects|is included in) (the\s+)?(price|pricing|total)\b"],
         "text": (
@@ -114,6 +172,22 @@ GENERAL_FAQ = [
         ),
         "source_slugs": ["pricing-product-page", "get-local-number-product-page"],
         "actions": [("PRICING", "primary")],
+        "suggestions": [{"label": "See current plans", "value": "PLANS_OVERVIEW", "kind": "intent"}],
+    },
+    {
+        "key": "exact_bill",
+        "patterns": [
+            r"\b(what will|what(?:'s| is)) my\b.{0,30}\b(bill|cost|total)\b",
+            r"\bexact (monthly )?(bill|cost|total|price)\b",
+            r"\bhow much will (it|my|i)\b.{0,20}\b(cost|be)\b",
+        ],
+        "text": (
+            "I can't quote your exact monthly bill in chat. Plan prices come from the "
+            "approved catalog, and your final total also depends on number rental, usage "
+            "and taxes, which are calculated during secure checkout."
+        ),
+        "source_slugs": ["pricing-product-page", "get-local-number-product-page"],
+        "actions": [("PRICING", "primary"), ("CONTACT_SALES", "secondary")],
         "suggestions": [{"label": "See current plans", "value": "PLANS_OVERVIEW", "kind": "intent"}],
     },
     {
@@ -143,7 +217,13 @@ GENERAL_FAQ = [
     },
     {
         "key": "calling_features",
-        "patterns": [r"\b(how does|what is|tell me about)\b.{0,20}\b(cloud\s+)?calling\b", r"\bcall flows?\b", r"\bvoicemail\b"],
+        "patterns": [
+            r"\b(how does|what is|tell me about)\b.{0,20}\b(cloud\s+)?calling\b",
+            r"\b(can|could) i (make|receive)\b.{0,25}\bcalls?\b",
+            r"\bbrowser(?:-based)? dashboard\b",
+            r"\bcall flows?\b",
+            r"\bvoicemail\b",
+        ],
         "text": (
             "Zoiko Local cloud calling lets you make and receive calls on your local number from "
             "the browser dashboard or the Zoiko Local app, with call flows, voicemail, and "
@@ -156,7 +236,11 @@ GENERAL_FAQ = [
     },
     {
         "key": "porting_basics",
-        "patterns": [r"\bwhat is (number\s+)?porting\b", r"\bbring (my|an existing) number\b", r"\btransfer (my|an existing) number\b"],
+        "patterns": [
+            r"\bwhat is (number\s+)?porting\b",
+            r"\bbring\b.{0,35}\bnumbers?\b",
+            r"\btransfer\b.{0,35}\bnumbers?\b",
+        ],
         "text": (
             "You may be able to bring an existing number to Zoiko Local. Porting depends on the "
             "country, your current carrier, and their release process. I cannot submit a port, "
@@ -179,8 +263,28 @@ GENERAL_FAQ = [
         "suggestions": [{"label": "Find a number", "value": "NUMBER_DISCOVERY", "kind": "intent"}],
     },
     {
+        "key": "activation_after_pick",
+        "patterns": [
+            r"\bafter (i|we) (pick|choose|select|get)\b.{0,25}\bnumbers?\b",
+            r"\bwhat happens after\b.{0,35}\bnumbers?\b",
+        ],
+        "text": (
+            "After you pick a number, you complete any verification required for that "
+            "market and the number activates once the checks pass. I can't reserve or "
+            "activate it from chat."
+        ),
+        "source_slugs": ["activation-help-overview", "verification-help-overview", "first-call-readiness-help"],
+        "actions": [("GET_LOCAL_NUMBER", "primary")],
+        "suggestions": [{"label": "Get started", "value": "ACTIVATION_GUIDE", "kind": "intent"}],
+    },
+    {
         "key": "privacy",
-        "patterns": [r"\bprivacy\b", r"\b(what|how) (data|information) (do you|is) (collect|store|keep|handle)\b"],
+        "patterns": [
+            r"\bprivacy\b",
+            r"\b(what|how) (data|information) (do you|is) (collect|store|keep|handle)\b",
+            r"\bwhat data (does|will) (this|the) assistant (keep|store|collect|retain)\b",
+            r"\bwhat (does|do) you (keep|store|collect)\b",
+        ],
         "text": (
             "Your chat stays in the browser for the session, and you can clear the chat view or "
             "end the session at any time. Please don't share sensitive details like card numbers, "

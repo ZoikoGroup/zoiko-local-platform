@@ -286,7 +286,7 @@ def handle_message(
         )
 
     elif text and _match_general_faq(text) is not None:
-        response = _general_faq_response(db, _match_general_faq(text))
+        response = _general_faq_response(db, _match_general_faq(text), session)
 
     else:
         intent = _resolve_intent(db, intent_id=intent_id, text=text)
@@ -409,7 +409,13 @@ def _claims_from_rows(rows: list[AssistantKnowledgeSource]) -> tuple[list[dict],
     return claims, sources
 
 
-def _general_faq_response(db: Session, entry: dict) -> AssistantMessageResponse:
+def _general_faq_response(db: Session, entry: dict, session: AssistantSession) -> AssistantMessageResponse:
+    handler = entry.get("handler")
+    if handler == "coverage":
+        return _coverage_answer(db)
+    if handler in _INTENT_HANDLERS:
+        return _INTENT_HANDLERS[handler](db, session)
+
     rows = (
         db.query(AssistantKnowledgeSource)
         .filter(
@@ -680,6 +686,58 @@ def _country_suggestions(db: Session) -> list[dict]:
     return suggestions
 
 
+def _coverage_answer(db: Session) -> AssistantMessageResponse:
+    """Answer 'which countries' directly from the market registry. Public
+    statuses are the only ones that can be described as places where a
+    number may be available; LAUNCHING is named as upcoming, never sold."""
+    countries = db.query(SupportedCountry).order_by(SupportedCountry.sort_order, SupportedCountry.name).all()
+    public = [c for c in countries if c.market_status in _PUBLIC_MARKET_STATUSES]
+    launching = [c for c in countries if c.market_status == MarketActivationStatus.LAUNCHING]
+
+    if public:
+        names = ", ".join(c.name for c in public)
+        text = (
+            f"Zoiko Local currently has public local-number markets in {names}. "
+            "Exact number types and live availability are confirmed on the Get a Local "
+            "Number page; I can't check live inventory in chat."
+        )
+    elif launching:
+        names = ", ".join(c.name for c in launching)
+        text = (
+            "Zoiko Local currently has no public local-number markets open. Countries "
+            f"listed as Launching are {names}. I can't confirm live inventory or "
+            "availability in chat; check the Global Coverage page for the current status."
+        )
+    else:
+        text = (
+            "Zoiko Local currently has no public local-number markets listed. Check the "
+            "Global Coverage page for the current status; I can't confirm live inventory "
+            "or availability in chat."
+        )
+
+    source_rows = (
+        db.query(AssistantKnowledgeSource)
+        .filter(
+            AssistantKnowledgeSource.is_active.is_(True),
+            AssistantKnowledgeSource.slug == "global-coverage-page",
+        )
+        .all()
+    )
+    _claims, sources = _claims_from_rows(source_rows)
+    claims = [{"text": text, "source_slugs": ["global-coverage-page"]}]
+    return _build_response(
+        db=db,
+        response_type="answer",
+        intent_id="NUMBER_DISCOVERY",
+        text=text,
+        claims=claims,
+        sources=sources,
+        actions=[("GLOBAL_COVERAGE", "primary"), ("GET_LOCAL_NUMBER", "secondary")],
+        suggestions=_country_suggestions(db),
+        verifiability_status="qualified" if sources else "none",
+    )
+
+
 def _receptionist_overview(db: Session, session: AssistantSession) -> AssistantMessageResponse:
     claims, sources = _claims_from_rows(_knowledge_rows(db, "RECEPTIONIST_OVERVIEW"))
     return _build_response(
@@ -711,7 +769,8 @@ def _receptionist_example(db: Session, session: AssistantSession) -> AssistantMe
 
 
 def _calling_overview(db: Session, session: AssistantSession) -> AssistantMessageResponse:
-    claims, sources = _claims_from_rows(_knowledge_rows(db, "CALLING_OVERVIEW"))
+    rows = [row for row in _knowledge_rows(db, "CALLING_OVERVIEW") if row.slug != "video-product-page"]
+    claims, sources = _claims_from_rows(rows)
     return _build_response(
         db=db,
         response_type="answer",

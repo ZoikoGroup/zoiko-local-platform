@@ -589,6 +589,68 @@ def test_general_faq_references_registered_knowledge_and_destinations():
     destination_keys = {destination["destination_key"] for destination in content.DESTINATIONS}
 
     for entry in content.GENERAL_FAQ:
+        assert entry["patterns"], entry["key"]
+        assert entry["text"] or entry.get("handler"), entry["key"]
         assert entry["source_slugs"], entry["key"]
         assert set(entry["source_slugs"]) <= source_slugs
         assert {key for key, _style in entry["actions"]} <= destination_keys
+
+
+def test_coverage_question_is_answered_directly_from_public_market_registry(client, db_session):
+    _seed_assistant_content(db_session)
+    _create_test_countries(db_session)
+    session = _start_session(client, db_session)
+
+    body = _send(client, session, {"text": "Which countries can I get a local number in?"}).json()
+
+    assert body["response_type"] == "answer"
+    assert "public local-number markets in" in body["text"]
+    assert "Testland One" in body["text"]
+    assert "Testland Three" in body["text"]
+    assert "Testland Two" not in body["text"]
+    assert "Which country do you need" not in body["text"]
+    assert "live inventory" in body["text"]
+    assert {source["slug"] for source in body["sources"]} >= {"global-coverage-page"}
+    assert [(a["destination_key"], a["style"]) for a in body["actions"]][0] == ("GLOBAL_COVERAGE", "primary")
+
+
+def test_coverage_question_is_honest_when_no_public_markets_are_open(client, db_session):
+    _seed_assistant_content(db_session)
+    db_session.query(SupportedCountry).update(
+        {"market_status": MarketActivationStatus.LAUNCHING}, synchronize_session=False
+    )
+    db_session.commit()
+    session = _start_session(client, db_session)
+
+    body = _send(client, session, {"text": "Which countries do you cover?"}).json()
+
+    assert body["response_type"] == "answer"
+    assert "no public local-number markets open" in body["text"]
+    assert "Australia" in body["text"]
+    assert "United States" in body["text"]
+    assert "Which country do you need" not in body["text"]
+    assert "GLOBAL_COVERAGE" in {a["destination_key"] for a in body["actions"]}
+
+
+def test_common_questions_get_direct_answers_instead_of_generic_deflection(client, db_session):
+    _seed_assistant_content(db_session)
+    expected = {
+        "Which countries do you cover?": "public local-number markets in",
+        "What plans are available?": "pricing page",
+        "Can I choose a number by city or area code?": "Get a Local Number page",
+        "What happens after I pick a number?": "After you pick a number",
+        "Can I bring my existing business number?": "bring an existing number",
+        "Can you buy a number for me?": "can't buy or reserve",
+        "What data does this assistant keep?": "chat stays in the browser",
+        "What will my exact monthly bill be?": "can't quote your exact monthly bill",
+        "Can I make calls from the browser dashboard?": "make and receive calls",
+        "Can you reset my password or change my plan?": "reset a password, or change a plan",
+    }
+    session = _start_session(client, db_session)
+
+    for question, phrase in expected.items():
+        body = _send(client, session, {"text": question}).json()
+        assert body["response_type"] == "answer", question
+        assert phrase.lower() in body["text"].lower(), (question, body["text"])
+        assert "Which country do you need" not in body["text"], question
+        assert "I'm not sure I understood" not in body["text"], question
