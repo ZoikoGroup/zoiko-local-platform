@@ -44,6 +44,14 @@ class MarketActivationStatus(str, enum.Enum):
     RESTRICTED = "restricted"
 
 
+class MarketActivationState(str, enum.Enum):
+    CLOSED = "CLOSED"
+    INTERNAL_TEST = "INTERNAL_TEST"
+    CONTROLLED_BETA = "CONTROLLED_BETA"
+    PAID_OPEN = "PAID_OPEN"
+    SUSPENDED = "SUSPENDED"
+
+
 class SupportedCountry(Base):
     """Zoiko Local's curated launch-country list (Architecture doc's
     "6-8 priority countries", not "whatever Twilio happens to expose").
@@ -94,6 +102,15 @@ class SupportedCountry(Base):
     # remain honestly unaudited until someone actually does that review.
     legal_signoff_reference: Mapped[str | None] = mapped_column(String(100), nullable=True)
     legal_signoff_by: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    activation_state: Mapped[MarketActivationState] = mapped_column(
+        Enum(MarketActivationState, name="market_activation_state_enum"),
+        nullable=False,
+        default=MarketActivationState.CLOSED,
+        server_default="CLOSED",
+    )
+    activation_notes: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    activation_changed_by: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    activation_changed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     # Commercial Billing Operating Standard doc §34's "Market, Numbering,
     # Regulatory & Capability Release Registry" names 11 required
     # dimensions per market; this table only ever captured 2 of them

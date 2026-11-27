@@ -668,7 +668,7 @@ class PlanChangeCheckoutSession(Base):
     # publish_event_durably tried to write it into the Kafka event_outbox
     # payload - the webhook 500'd on every real checkout completion.
     account_id: Mapped[str] = mapped_column(
-        UUID(as_uuid=False), ForeignKey("accounts.id"), nullable=False, index=True
+        UUID(as_uuid=False), ForeignKey("accounts.id", ondelete="CASCADE"), nullable=False, index=True
     )
     plan_code: Mapped[str] = mapped_column(String(50), nullable=False)
     billing_period: Mapped[BillingPeriod] = mapped_column(

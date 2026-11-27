@@ -13,6 +13,7 @@ from app.apikeys import models as apikeys_models  # noqa: F401
 from app.assistant import models as assistant_models  # noqa: F401
 from app.audit import models as audit_models  # noqa: F401
 from app.billing import models as billing_models  # noqa: F401
+from app.careers import models as careers_models  # noqa: F401
 from app.compliance import models as compliance_models  # noqa: F401
 from app.consent import models as consent_models  # noqa: F401
 from app.contacts import models as contacts_models  # noqa: F401
@@ -28,6 +29,7 @@ from app.numbering.numbers import models as numbers_models  # noqa: F401
 from app.notifications import models as notifications_models  # noqa: F401
 from app.observability import models as observability_models  # noqa: F401
 from app.ops import models as ops_models  # noqa: F401
+from app.platform_assistant import models as platform_assistant_models  # noqa: F401
 from app.porting import models as porting_models  # noqa: F401
 from app.queues import models as queues_models  # noqa: F401
 from app.retention import models as retention_models  # noqa: F401
