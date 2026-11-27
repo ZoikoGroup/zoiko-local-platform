@@ -65,9 +65,10 @@ def _fallback() -> ToolResult:
 
 
 def _denied(destination_key: str, reason: str | None = None) -> ToolResult:
-    blocks = [_paragraph(reason or content.PERMISSION_FALLBACK)]
+    blocks = [_paragraph(content.PERMISSION_FALLBACK)]
     actions = [_action(destination_key)]
     if reason:
+        blocks.append(_paragraph(reason))
         blocks.append(_paragraph("Open Billing to review what your plan includes."))
         actions.append(_action("DASHBOARD_BILLING"))
     return ToolResult(
