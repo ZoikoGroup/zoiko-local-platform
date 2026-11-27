@@ -58,6 +58,26 @@ def _stub_buy_number(monkeypatch):
     )
 
 
+def _seed_active_gb_local_eligibility_rule(db_session):
+    from app.numbering.numbers.models import NumberEligibilityRule
+
+    db_session.query(NumberEligibilityRule).filter(
+        NumberEligibilityRule.country == "GB", NumberEligibilityRule.number_type == "local"
+    ).delete(synchronize_session=False)
+    db_session.add(
+        NumberEligibilityRule(
+            country="GB",
+            number_type="local",
+            required_evidence=["proof_of_address"],
+            is_active=True,
+            emergency_calling_supported=False,
+            recording_supported=True,
+            allowed_calling_directions="both",
+        )
+    )
+    db_session.commit()
+
+
 def _find_eligibility_case_id(db_session, e164: str) -> str:
     from app.numbering.numbers.models import NumberEligibilityCase, PhoneNumber
 
@@ -108,6 +128,7 @@ def test_purchase_succeeds_once_compliance_case_is_approved(client, db_session, 
         ComplianceRule(country="GB", requirement_type="kyc_individual", required_documents=["government_id"])
     )
     db_session.commit()
+    _seed_active_gb_local_eligibility_rule(db_session)
 
     token = _signup_and_login(client, "buyer3@example.com")
     headers = {"Authorization": f"Bearer {token}"}
@@ -491,6 +512,7 @@ def test_purchase_retries_successfully_from_compliance_pending_after_approval(cl
         ComplianceRule(country="GB", requirement_type="kyc_individual", required_documents=["government_id"])
     )
     db_session.commit()
+    _seed_active_gb_local_eligibility_rule(db_session)
 
     token = _signup_and_login(client, "compliancepending2@example.com")
     headers = {"Authorization": f"Bearer {token}"}

@@ -11,6 +11,17 @@ from livekit.protocol import webhook as webhook_pb
 from app.core.config import settings
 
 
+def _stub_room_lifecycle(monkeypatch):
+    async def create_room(room_name, *, max_participants=None):
+        return None
+
+    async def end_room(room_name):
+        return None
+
+    monkeypatch.setattr("app.media.service.video.create_room", create_room)
+    monkeypatch.setattr("app.media.service.video.end_room", end_room)
+
+
 def _livekit_webhook_body_and_token(event: str, room_name: str) -> tuple[bytes, str]:
     body = MessageToJson(webhook_pb.WebhookEvent(event=event, room=models_pb.Room(name=room_name))).encode()
     digest = base64.b64encode(hashlib.sha256(body).digest()).decode()
@@ -554,7 +565,7 @@ def test_webhook_egress_ended_attaches_recording_url_from_legacy_file_field(clie
     client.post(f"/media/video/rooms/{room_name}/end", headers=headers)
 
 
-def test_webhook_egress_ended_failure_clears_stuck_recording_state(client, db_session):
+def test_webhook_egress_ended_failure_clears_stuck_recording_state(client, db_session, monkeypatch):
     """Regression test for a real bug: a failed egress used to leave
     recording_egress_id set with recording_url still None forever -
     is_recording_in_progress stayed True permanently, blocking a new
@@ -564,6 +575,7 @@ def test_webhook_egress_ended_failure_clears_stuck_recording_state(client, db_se
     from app.media.models import VideoSession
     from app.media.service import RECORDING_FAILED_MARKER
 
+    _stub_room_lifecycle(monkeypatch)
     token = _signup_and_login(client, "videorecordfailedwebhook@example.com")
     headers = {"Authorization": f"Bearer {token}"}
     room_name = client.post("/media/video/rooms", headers=headers).json()["room_name"]
@@ -608,6 +620,7 @@ def test_sweep_stale_video_recordings_clears_a_lost_webhook_with_no_recoverable_
         return None
 
     monkeypatch.setattr("app.media.service.video.get_egress_status", _fake_get_egress_status)
+    _stub_room_lifecycle(monkeypatch)
 
     token = _signup_and_login(client, "videorecordstalesweep@example.com")
     headers = {"Authorization": f"Bearer {token}"}
@@ -643,6 +656,7 @@ def test_sweep_stale_video_recordings_recovers_a_lost_webhook_that_actually_succ
         return {"status": 3, "location": "https://example.com/recordings/recovered.mp4", "error": ""}
 
     monkeypatch.setattr("app.media.service.video.get_egress_status", _fake_get_egress_status)
+    _stub_room_lifecycle(monkeypatch)
 
     token = _signup_and_login(client, "videorecordstalesweeprecover@example.com")
     headers = {"Authorization": f"Bearer {token}"}
@@ -661,7 +675,7 @@ def test_sweep_stale_video_recordings_recovers_a_lost_webhook_that_actually_succ
     assert session.recording_url == "https://example.com/recordings/recovered.mp4"
 
 
-def test_sweep_stale_video_recordings_does_not_touch_a_recent_in_progress_recording(client, db_session):
+def test_sweep_stale_video_recordings_does_not_touch_a_recent_in_progress_recording(client, db_session, monkeypatch):
     """A recording that started 5 minutes ago is still legitimately in
     progress - the sweep must not treat every in-progress recording as
     stale, only ones well past any real call length."""
@@ -670,6 +684,7 @@ def test_sweep_stale_video_recordings_does_not_touch_a_recent_in_progress_record
     from app.media.models import VideoSession
     from app.media.service import sweep_stale_video_recordings
 
+    _stub_room_lifecycle(monkeypatch)
     token = _signup_and_login(client, "videorecordfreshinprogress@example.com")
     headers = {"Authorization": f"Bearer {token}"}
     room_name = client.post("/media/video/rooms", headers=headers).json()["room_name"]
@@ -701,6 +716,7 @@ def test_sweep_stale_video_recordings_leaves_a_genuinely_long_running_egress_alo
         return {"status": 1, "location": None, "error": ""}  # EGRESS_ACTIVE
 
     monkeypatch.setattr("app.media.service.video.get_egress_status", _fake_get_egress_status)
+    _stub_room_lifecycle(monkeypatch)
 
     token = _signup_and_login(client, "videorecordstillactivesweep@example.com")
     headers = {"Authorization": f"Bearer {token}"}

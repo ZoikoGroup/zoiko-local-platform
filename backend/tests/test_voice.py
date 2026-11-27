@@ -486,6 +486,8 @@ def test_enabling_ai_receptionist_is_blocked_without_plan_or_addon_entitlement(c
     """A fresh signup's default trial plan grants no AI Receptionist
     minutes and has the add-on off - configure_routing must reject turning
     the per-number toggle on rather than silently allowing a free feature."""
+    from app.billing import service as billing_service
+
     token = _signup_and_login(client, "voiceaidenied@example.com")
     account_id = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"}).json()["account_id"]
     number = PhoneNumber(
@@ -506,6 +508,7 @@ def test_enabling_ai_receptionist_is_blocked_without_plan_or_addon_entitlement(c
         "/billing/subscription/ai-receptionist-addon", json={"enabled": True},
         headers={"Authorization": f"Bearer {token}"},
     )
+    billing_service.set_ai_receptionist_addon(db_session, account_id, enabled=True, actor="test-setup")
     allowed = client.put(
         "/numbers/+15550004444/routing",
         json={"ai_receptionist_enabled": True},
