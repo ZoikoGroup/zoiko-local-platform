@@ -11,10 +11,6 @@ import PasswordInput from "@/components/PasswordInput";
 
 export default function SignupPage() {
   const router = useRouter();
-  const [accountName, setAccountName] = useState("");
-  const [accountType, setAccountType] = useState<"individual" | "business">(
-    "individual"
-  );
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -25,12 +21,7 @@ export default function SignupPage() {
     setError(null);
     setLoading(true);
     try {
-      await signup({
-        account_name: accountName,
-        account_type: accountType,
-        email,
-        password,
-      });
+      await signup({ email, password });
       const result = await login({ email, password });
       if (!result.access_token) {
         // Unreachable in practice - a brand new account has no MFA yet -
@@ -74,41 +65,6 @@ export default function SignupPage() {
       </div>
 
       <form onSubmit={handleSubmit} className="space-y-[clamp(0.35rem,1.3vh,0.9rem)]">
-        <div>
-          <label className="block text-[clamp(12px,1.75vh,14px)] font-semibold text-slate-800 mb-[0.4vh]">
-            Account name
-          </label>
-          <input
-            required
-            value={accountName}
-            onChange={(e) => setAccountName(e.target.value)}
-            className="w-full h-[clamp(2.1rem,4.9vh,2.75rem)] rounded-lg border border-slate-200 px-3.5 text-sm placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-indigo-500/40 focus:border-indigo-500 transition"
-            placeholder="Your name or company"
-          />
-        </div>
-
-        <div>
-          <label className="block text-[clamp(12px,1.75vh,14px)] font-semibold text-slate-800 mb-[0.4vh]">
-            Account type
-          </label>
-          <div className="grid grid-cols-2 gap-2">
-            {(["individual", "business"] as const).map((type) => (
-              <button
-                type="button"
-                key={type}
-                onClick={() => setAccountType(type)}
-                className={`h-[clamp(2.1rem,4.9vh,2.75rem)] rounded-lg border px-3 text-sm font-medium capitalize transition ${
-                  accountType === type
-                    ? "border-indigo-600 bg-indigo-50 text-indigo-700 ring-1 ring-indigo-600"
-                    : "border-slate-300 text-slate-600 hover:bg-slate-50"
-                }`}
-              >
-                {type}
-              </button>
-            ))}
-          </div>
-        </div>
-
         <div>
           <label className="block text-[clamp(12px,1.75vh,14px)] font-semibold text-slate-800 mb-[0.4vh]">Email</label>
           <input

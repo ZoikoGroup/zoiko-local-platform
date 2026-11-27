@@ -64,12 +64,17 @@ def _fallback() -> ToolResult:
     )
 
 
-def _denied(destination_key: str) -> ToolResult:
+def _denied(destination_key: str, reason: str | None = None) -> ToolResult:
+    blocks = [_paragraph(reason or content.PERMISSION_FALLBACK)]
+    actions = [_action(destination_key)]
+    if reason:
+        blocks.append(_paragraph("Open Billing to review what your plan includes."))
+        actions.append(_action("DASHBOARD_BILLING"))
     return ToolResult(
         answer_type="permission_denied",
-        content_blocks=[_paragraph(content.PERMISSION_FALLBACK)],
+        content_blocks=blocks,
         evidence=[],
-        actions=[_action(destination_key)],
+        actions=actions,
         uncertainty="low",
         risk_tier="R1",
         status="denied",
@@ -184,7 +189,7 @@ def _calls(db: Session, user: User) -> ToolResult:
 
 def _receptionist(db: Session, user: User) -> ToolResult:
     if not billing_service.is_ai_receptionist_enabled_for_account(db, user.account_id):
-        return _denied("DASHBOARD_CALL_FLOWS")
+        return _denied("DASHBOARD_CALL_FLOWS", "The AI Receptionist isn't enabled on your current plan.")
     calls = media_service.list_account_receptionist_calls(db, user)
     summaries = [
         _item_summary(call, [("status", ["status"]), ("urgency", ["urgency"]), ("created", ["created_at"])])
@@ -242,7 +247,7 @@ def _billing(db: Session, user: User) -> ToolResult:
 
 def _inbox(db: Session, user: User) -> ToolResult:
     if not billing_service.has_entitlement(db, user.account_id, "messaging.enabled"):
-        return _denied("DASHBOARD_MESSAGING")
+        return _denied("DASHBOARD_MESSAGING", "Messaging and voicemail aren't enabled on your current plan.")
     conversations = list_conversations(db, user.account_id)
     voicemails = media_service.list_account_voicemails(db, user)
     blocks = [
@@ -260,7 +265,7 @@ def _inbox(db: Session, user: User) -> ToolResult:
 
 def _analytics(db: Session, user: User) -> ToolResult:
     if not billing_service.has_entitlement(db, user.account_id, "reporting.advanced"):
-        return _denied("DASHBOARD_REPORTS")
+        return _denied("DASHBOARD_REPORTS", "Advanced reporting isn't enabled on your current plan.")
     overview = get_overview(db, user.account_id)
     metrics = [f"{key}: {value}" for key, value in overview.items() if isinstance(value, (int, float))]
     blocks = [_paragraph("Operational overview available to this workspace:"), _bullets(metrics or ["No summary metrics available."]), _paragraph(content.SUMMARY_CAVEAT)]

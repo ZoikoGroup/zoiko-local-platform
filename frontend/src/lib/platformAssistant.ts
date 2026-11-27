@@ -96,6 +96,27 @@ export type TranscriptEntry = {
 
 export class PlatformAssistantError extends ApiError {}
 
+const SESSION_ERROR_DETAILS = new Set([
+  "Session expired - create a new session.",
+  "Session not found or already ended.",
+]);
+
+export function isAssistantSessionError(error: unknown): boolean {
+  return (
+    error instanceof PlatformAssistantError &&
+    error.status === 401 &&
+    SESSION_ERROR_DETAILS.has(error.message)
+  );
+}
+
+export function isSignInError(error: unknown): boolean {
+  return (
+    error instanceof PlatformAssistantError &&
+    error.status === 401 &&
+    !isAssistantSessionError(error)
+  );
+}
+
 async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   const token = getToken();
   if (!token) {
