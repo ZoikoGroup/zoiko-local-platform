@@ -114,8 +114,6 @@ export async function computeDeviceFingerprint(): Promise<string | null> {
 }
 
 export async function signup(input: {
-  account_name: string;
-  account_type: "individual" | "business";
   email: string;
   password: string;
 }): Promise<User> {

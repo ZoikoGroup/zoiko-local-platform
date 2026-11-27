@@ -206,7 +206,6 @@ export default function VideoPage() {
       roomRef.current?.disconnect();
       lobbyVideoStreamRef.current?.getTracks().forEach((t) => t.stop());
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // Attaches the lobby's own getUserMedia preview stream (separate from any
@@ -240,7 +239,6 @@ export default function VideoPage() {
     const room = roomRef.current;
     if (!room) return;
     room.remoteParticipants.forEach((p) => getOrCreateTile(p.identity, p.name || p.identity));
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [callState]);
 
   // Polls for guests waiting to be let in, while actually in a call - not

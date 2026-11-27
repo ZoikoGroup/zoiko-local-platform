@@ -1,5 +1,6 @@
 "use client";
 
+import Image from "next/image";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import AuthMockups from "@/components/AuthMockups";
@@ -60,11 +61,14 @@ export default function AuthLayout({
       {/* Hero panel - complementary marketing content, so an <aside>, not
           part of the <main> landmark below. Hidden below lg. */}
       <aside className="hidden lg:block lg:w-[60%] relative overflow-hidden">
-        <img
+        <Image
           src="/auth/hero.png"
           alt=""
           aria-hidden="true"
-          className="absolute inset-0 w-full h-full object-cover object-[28%_center]"
+          fill
+          priority
+          sizes="(min-width: 1024px) 60vw, 100vw"
+          className="object-cover object-[28%_center]"
         />
         {/* Beige wash so the copy on the left stays readable over the photo */}
         <div className="absolute inset-0 bg-gradient-to-r from-slate-50 via-slate-50/80 to-transparent" />
@@ -76,7 +80,14 @@ export default function AuthLayout({
 
         <div className="relative h-full flex flex-col pt-[clamp(1.25rem,4.5vh,3.5rem)] pl-[clamp(2rem,4vw,4rem)] pr-8">
           <div>
-            <img src="/wordmark.svg" alt="Zoiko Local" className="h-[clamp(1.6rem,4.9vh,3.5rem)] w-auto" />
+            <Image
+              src="/wordmark.svg"
+              alt="Zoiko Local"
+              width={2384}
+              height={309}
+              unoptimized
+              className="h-[clamp(1.6rem,4.9vh,3.5rem)] w-auto"
+            />
             <p className="mt-[1.4vh] text-[clamp(9px,1.2vh,12px)] font-semibold tracking-[0.25em] text-slate-800 uppercase">
               Sound local. Reach anywhere.
             </p>
@@ -163,15 +174,21 @@ export default function AuthLayout({
 
             <div className="px-[clamp(1.25rem,2.4vw,2rem)] pt-[clamp(0.5rem,2vh,1.25rem)] pb-[clamp(0.4rem,1.2vh,0.9rem)]">
               <div className="flex flex-col items-center text-center mb-[clamp(0.35rem,1.3vh,1rem)]">
-                <img
+                <Image
                   src="/logo-icon.svg"
                   alt=""
                   aria-hidden="true"
+                  width={1024}
+                  height={1024}
+                  unoptimized
                   className="h-[clamp(2rem,5.6vh,4rem)] w-auto rounded-xl tiny:hidden"
                 />
-                <img
+                <Image
                   src="/wordmark.svg"
                   alt="Zoiko Local"
+                  width={2384}
+                  height={309}
+                  unoptimized
                   className="h-[clamp(0.95rem,2.4vh,1.5rem)] w-auto mt-[0.8vh]"
                 />
                 <h1 className="text-[clamp(1.2rem,3.6vh,1.9rem)] font-bold leading-tight text-slate-900 mt-[1.2vh]">

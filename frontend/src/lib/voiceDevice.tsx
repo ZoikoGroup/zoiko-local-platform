@@ -35,6 +35,25 @@ interface VoiceDeviceContextValue {
 
 const VoiceDeviceContext = createContext<VoiceDeviceContextValue | null>(null);
 
+// 31000-range codes the Voice SDK raises on the Call itself (not the
+// Device) when the underlying WebRTC media connection to Twilio's edge
+// drops or never establishes - always a network path problem between
+// the browser and Twilio (weak wifi/mobile signal, a VPN, or a firewall
+// blocking WebRTC/UDP), never something this app's backend controls, so
+// there's no reconnect to attempt here - just a clearer message than the
+// raw SDK string ("ConnectionError (31005): ...").
+const CALL_CONNECTION_ERROR_CODES = new Set([31003, 31005, 31009]);
+
+// Twilio Access Tokens carry a fixed lifetime (build_voice_access_token
+// issues them with ttl=3600, 1 hour) - a Device kept alive for the whole
+// dashboard session (see this provider's own docstring) will otherwise
+// hit a dead token well before the tab closes. AccessTokenInvalid (20101)
+// and AccessTokenExpired (20104) are the two codes Twilio actually raises
+// for this; treated as recoverable by tearing the Device down so the next
+// reconnect attempt mints a fresh token, rather than leaving the banner
+// stuck showing a permanent error until the page is manually refreshed.
+const RECOVERABLE_ERROR_CODES = new Set([20101, 20104]);
+
 /**
  * One Twilio Voice Device shared across the whole dashboard, not just the
  * Calls page - registered as soon as the dashboard mounts so an inbound
@@ -54,15 +73,6 @@ export function VoiceDeviceProvider({ children }: { children: ReactNode }) {
   const [error, setError] = useState<string | null>(null);
   const [incomingFrom, setIncomingFrom] = useState<string | null>(null);
   const [activeCallTo, setActiveCallTo] = useState<string | null>(null);
-
-  // 31000-range codes the Voice SDK raises on the Call itself (not the
-  // Device) when the underlying WebRTC media connection to Twilio's edge
-  // drops or never establishes - always a network path problem between
-  // the browser and Twilio (weak wifi/mobile signal, a VPN, or a firewall
-  // blocking WebRTC/UDP), never something this app's backend controls, so
-  // there's no reconnect to attempt here - just a clearer message than the
-  // raw SDK string ("ConnectionError (31005): ...").
-  const CALL_CONNECTION_ERROR_CODES = new Set([31003, 31005, 31009]);
 
   const describeCallError = useCallback((err: { code?: number; message?: string }) => {
     if (err.code !== undefined && CALL_CONNECTION_ERROR_CODES.has(err.code)) {
@@ -99,15 +109,6 @@ export function VoiceDeviceProvider({ children }: { children: ReactNode }) {
     });
   }, [describeCallError]);
 
-  // Twilio Access Tokens carry a fixed lifetime (build_voice_access_token
-  // issues them with ttl=3600, 1 hour) - a Device kept alive for the whole
-  // dashboard session (see this provider's own docstring) will otherwise
-  // hit a dead token well before the tab closes. AccessTokenInvalid (20101)
-  // and AccessTokenExpired (20104) are the two codes Twilio actually raises
-  // for this; treated as recoverable by tearing the Device down so the next
-  // reconnect attempt mints a fresh token, rather than leaving the banner
-  // stuck showing a permanent error until the page is manually refreshed.
-  const RECOVERABLE_ERROR_CODES = new Set([20101, 20104]);
   const reconnectingRef = useRef(false);
 
   const ensureDeviceRef = useRef<(() => Promise<Device>) | null>(null);

@@ -1,3 +1,5 @@
+import Image from "next/image";
+
 // Single source of truth for the logo <img> markup - was previously
 // hand-duplicated across 8 call sites in 6 files (Sidebar, AuthLayout x2,
 // choose-plan, join/[roomName], pricing x2, status), so a future asset
@@ -5,11 +7,12 @@
 // once here.
 export default function Logo({ size = 36, className = "" }: { size?: number; className?: string }) {
   return (
-    <img
+    <Image
       src="/logo-icon.svg"
       alt="Zoiko Local"
-      width={size}
-      height={size}
+      width={1024}
+      height={1024}
+      unoptimized
       className={`rounded-lg shrink-0 ${className}`}
       style={{ width: size, height: size }}
     />

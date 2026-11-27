@@ -6,6 +6,7 @@ import Sidebar from "@/components/Sidebar";
 import Topbar from "@/components/Topbar";
 import TrialBanner from "@/components/TrialBanner";
 import VoiceCallOverlay from "@/components/VoiceCallOverlay";
+import PlatformAssistantLauncher from "@/components/platform-assistant/PlatformAssistantLauncher";
 import {
   ApiError,
   getCurrentUser,
@@ -109,6 +110,7 @@ export default function DashboardLayout({
         </div>
       </div>
       <VoiceCallOverlay />
+      <PlatformAssistantLauncher />
     </VoiceDeviceProvider>
   );
 }

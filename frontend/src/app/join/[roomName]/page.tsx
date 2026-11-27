@@ -98,7 +98,6 @@ export default function GuestJoinPage() {
       roomRef.current?.disconnect();
       lobbyVideoStreamRef.current?.getTracks().forEach((t) => t.stop());
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
@@ -128,7 +127,6 @@ export default function GuestJoinPage() {
     const room = roomRef.current;
     if (!room) return;
     room.remoteParticipants.forEach((p) => getOrCreateTile(p.identity, p.name || p.identity));
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [callState]);
 
   // See pendingRemoteScreenEl's comment above - the container div only
@@ -362,6 +360,11 @@ export default function GuestJoinPage() {
     setCallState("in-call");
   }
 
+  const connectToRoomRef = useRef(connectToRoom);
+  useEffect(() => {
+    connectToRoomRef.current = connectToRoom;
+  });
+
   // Polls the waiting-room status while a request is pending - stops as
   // soon as the host responds (or the guest navigates away, via cleanup).
   useEffect(() => {
@@ -375,7 +378,7 @@ export default function GuestJoinPage() {
         if (result.status === "admitted" && result.token && result.url) {
           clearInterval(interval);
           setRecording(result.recording);
-          await connectToRoom(result.token, result.url);
+          await connectToRoomRef.current(result.token, result.url);
         } else if (result.status === "denied") {
           clearInterval(interval);
           setCallState("denied");

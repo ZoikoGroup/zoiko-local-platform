@@ -57,6 +57,7 @@ review via the existing retry_provisioning endpoint stays required.
 import logging
 import sys
 
+from app.assistant.service import purge_expired_sessions as purge_assistant_sessions
 from app.billing.service import run_zoikonex_reconciliation
 from app.compliance.service import expire_overdue_cases, flag_cases_due_for_reverification
 from app.core.database import SessionLocal
@@ -203,6 +204,14 @@ def main() -> int:
                 console_link=f"{settings.public_base_url}/staff/provisioning",
             )
 
+    def _purge_assistant_sessions() -> None:
+        # WF-10 data minimization: anonymous public-assistant sessions are
+        # deleted outright once past their purge grace window - there is no
+        # transcript to retain anywhere (chat text is never persisted), the
+        # row itself is just validated flow enums and counters.
+        purged_sessions = purge_assistant_sessions(db)
+        logger.info("assistant_sessions_purged count=%d", purged_sessions["deleted"])
+
     def _flush_outbox() -> None:
         nonlocal exit_code
         outbox_published = outbox_failed = 0
@@ -227,6 +236,7 @@ def main() -> int:
         _run_step("sweep_stale_calls", _sweep_stale_calls)
         _run_step("sync_eligibility", _sync_eligibility)
         _run_step("stuck_provisioning", _stuck_provisioning)
+        _run_step("purge_assistant_sessions", _purge_assistant_sessions)
         _run_step("flush_outbox", _flush_outbox)
     finally:
         db.close()

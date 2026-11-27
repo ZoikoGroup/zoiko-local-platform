@@ -36,6 +36,30 @@ def _signup_and_login(client, email: str) -> tuple[str, str]:
     return token, account_id
 
 
+def _enable_ai_receptionist_for_test(db_session, account_id: str):
+    from app.billing import service as billing_service
+
+    billing_service.change_plan(db_session, account_id, "business", actor="test-setup")
+    billing_service.set_ai_receptionist_addon(db_session, account_id, enabled=True, actor="test-setup")
+
+
+def _stub_urgent_qualification(monkeypatch):
+    monkeypatch.setattr(
+        "app.media.service.qualify_caller",
+        lambda db, account_id, transcript, jurisdiction=None: (
+            {
+                "name": "Jordan",
+                "company": "Acme",
+                "reason": "production system is down",
+                "summary": "Jordan called about a production outage.",
+                "urgency": "high",
+                "callback_preference": None,
+            },
+            "groq/test",
+        ),
+    )
+
+
 def test_incoming_call_uses_receptionist_when_enabled(client, db_session):
     token, account_id = _signup_and_login(client, "receptionistenabled@example.com")
     number = PhoneNumber(
@@ -406,7 +430,7 @@ def test_high_urgency_does_not_escalate_without_a_nominated_team_member(client, 
     assert calls[0]["escalated"] is False
 
 
-def test_escalation_uses_dedicated_phone_number_without_hijacking_calls_into_forwarding(client, db_session):
+def test_escalation_uses_dedicated_phone_number_without_hijacking_calls_into_forwarding(client, db_session, monkeypatch):
     """Confirmed live (2026-08-22): escalation used to dial forwarding_number
     unconditionally, so an AI-Receptionist-primary number (forwarding off)
     had no way to configure an escalation destination without
@@ -415,6 +439,8 @@ def test_escalation_uses_dedicated_phone_number_without_hijacking_calls_into_for
     This proves escalation_phone_number lets escalation work with
     forwarding_number left unset entirely."""
     token, account_id = _signup_and_login(client, "receptionistdedicated@example.com")
+    _enable_ai_receptionist_for_test(db_session, account_id)
+    _stub_urgent_qualification(monkeypatch)
     me = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"})
     owner_user_id = me.json()["id"]
 
@@ -457,7 +483,7 @@ def test_escalation_uses_dedicated_phone_number_without_hijacking_calls_into_for
     assert calls[0]["escalated"] is True
 
 
-def test_escalation_dial_is_recorded_when_ai_processing_consent_is_on_file(client, db_session):
+def test_escalation_dial_is_recorded_when_ai_processing_consent_is_on_file(client, db_session, monkeypatch):
     """Real gap fix: an escalated (human-handoff) call is a live two-way
     conversation with no other capture mechanism of its own - unlike the
     pre-escalation Gather utterance (already on the ReceptionistCall row)
@@ -469,6 +495,8 @@ def test_escalation_dial_is_recorded_when_ai_processing_consent_is_on_file(clien
     gate as should_record_forwarded_call, so this must be recorded once
     that consent is on file."""
     token, account_id = _signup_and_login(client, "receptionistrecorded1@example.com")
+    _enable_ai_receptionist_for_test(db_session, account_id)
+    _stub_urgent_qualification(monkeypatch)
     me = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"})
     owner_user_id = me.json()["id"]
 
@@ -522,11 +550,13 @@ def test_build_receptionist_reply_response_omits_record_without_a_callback_url()
     assert "record=" not in twiml
 
 
-def test_escalation_falls_back_to_forwarding_number_when_dedicated_field_unset(client, db_session):
+def test_escalation_falls_back_to_forwarding_number_when_dedicated_field_unset(client, db_session, monkeypatch):
     """Backward compatibility: a number configured before escalation_phone_number
     existed (forwarding_number set, escalation_phone_number left null) must
     keep escalating the same way it always did."""
     token, account_id = _signup_and_login(client, "receptionistlegacyesc@example.com")
+    _enable_ai_receptionist_for_test(db_session, account_id)
+    _stub_urgent_qualification(monkeypatch)
     me = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"})
     owner_user_id = me.json()["id"]
 

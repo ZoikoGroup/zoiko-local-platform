@@ -40,14 +40,15 @@ _DUMMY_PASSWORD_HASH_FOR_TIMING_SAFETY = hash_password("zoiko-local-timing-safet
 
 
 def create_account_with_owner(
-    db: Session, account_name: str, account_type: str, email: str, password: str,
+    db: Session, account_name: str | None, account_type: str | None, email: str, password: str,
     device_fingerprint_hash: str | None = None,
 ) -> User:
     existing = db.query(User).filter(User.email == email).first()
     if existing:
         raise ValueError("An account with this email already exists")
 
-    account = Account(name=account_name, account_type=AccountType(account_type))
+    resolved_account_type = AccountType(account_type) if account_type else AccountType.INDIVIDUAL
+    account = Account(name=account_name or email, account_type=resolved_account_type)
     db.add(account)
     db.flush()  # assigns account.id without committing yet
 
@@ -68,7 +69,9 @@ def create_account_with_owner(
         target=f"account:{account.id}",
         after={"account_id": account.id, "user_id": user.id, "email": user.email, "role": user.role},
     )
-    publish_account_created(account.id, user_id=user.id, email=user.email, account_type=account_type)
+    publish_account_created(
+        account.id, user_id=user.id, email=user.email, account_type=resolved_account_type.value
+    )
     notify_account_activated(db, account_id=account.id, user_email=user.email)
     notify_organization_created(db, account_id=account.id, account_email=user.email, organization_name=account.name)
     # Architecture doc §5 "Fraud and Risk: device fingerprinting" - detection

@@ -8,8 +8,8 @@ _PasswordField = Field(min_length=8, max_length=128)
 
 
 class SignupRequest(BaseModel):
-    account_name: str
-    account_type: str  # "individual" or "business"
+    account_name: str | None = None
+    account_type: str | None = None
     email: EmailStr
     password: str = _PasswordField
 

@@ -63,6 +63,19 @@ def _make_recorded_call(db_session, account_id: str, *, recording_url: str | Non
     return call
 
 
+def _stub_extract_conversation_summary(monkeypatch):
+    monkeypatch.setattr(
+        "app.intelligence.service.extract_conversation_summary",
+        lambda transcript: {
+            "summary": "Deterministic test summary.",
+            "language": "en",
+            "urgency": "low",
+            "action_items": [],
+            "suggested_follow_up": None,
+        },
+    )
+
+
 def test_summarize_call_rejects_other_account(client, db_session):
     _, owner_account_id = _signup_and_login(client, "intelcallowner@example.com", "Intel Call Owner Co")
     call = _make_recorded_call(db_session, owner_account_id)
@@ -535,6 +548,7 @@ def test_summarize_video_session_uses_the_real_stored_object_key(client, db_sess
         "app.intelligence.service.transcribe_audio",
         lambda audio_bytes, filename=None, content_type=None: "A real transcript.",
     )
+    _stub_extract_conversation_summary(monkeypatch)
 
     response = client.post(
         f"/intelligence/video-sessions/{session.room_name}/summarize",
@@ -788,7 +802,7 @@ def test_edit_summary_requires_auth(client, db_session):
 # --- AIJob retry lineage / failure observability ---
 
 
-def test_successful_summarize_creates_a_succeeded_ai_job(client, db_session):
+def test_successful_summarize_creates_a_succeeded_ai_job(client, db_session, monkeypatch):
     from app.intelligence.models import AIJob, AIJobStatus, SummarySourceType
 
     token, account_id = _signup_and_login(client, "aijobsuccess1@example.com", "AI Job Success Co")
@@ -798,6 +812,7 @@ def test_successful_summarize_creates_a_succeeded_ai_job(client, db_session):
     )
 
     from unittest.mock import patch as _patch
+    _stub_extract_conversation_summary(monkeypatch)
     with _patch("app.intelligence.service.download_recording", lambda url: b"fake-audio-bytes"), \
          _patch("app.intelligence.service.transcribe_audio", lambda audio_bytes: "Test voicemail content."):
         response = client.post(
@@ -865,6 +880,7 @@ def test_retry_after_failure_increments_the_same_job_and_can_succeed(client, db_
 
     monkeypatch.setattr("app.intelligence.service.download_recording", lambda url: b"fake-audio-bytes")
     monkeypatch.setattr("app.intelligence.service.transcribe_audio", lambda audio_bytes: "Recovered on retry.")
+    _stub_extract_conversation_summary(monkeypatch)
     second = client.post(
         f"/intelligence/voicemails/{voicemail.id}/summarize", headers={"Authorization": f"Bearer {token}"},
     )
