@@ -576,6 +576,8 @@ def test_webhook_egress_ended_failure_clears_stuck_recording_state(client, db_se
     from app.media.service import RECORDING_FAILED_MARKER
 
     _stub_room_lifecycle(monkeypatch)
+    monkeypatch.setattr(settings, "livekit_api_key", "ci-test-api-key-not-real-0123456789")
+    monkeypatch.setattr(settings, "livekit_api_secret", "ci-test-api-secret-not-real-0123456789")
     token = _signup_and_login(client, "videorecordfailedwebhook@example.com")
     headers = {"Authorization": f"Bearer {token}"}
     room_name = client.post("/media/video/rooms", headers=headers).json()["room_name"]
